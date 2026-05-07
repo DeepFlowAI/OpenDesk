@@ -1,0 +1,29 @@
+# Core
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+pydantic==2.13.3
+pydantic-settings==2.14.0
+sqlalchemy[asyncio]==2.0.49
+asyncpg==0.31.0
+psycopg2-binary==2.9.12
+alembic==1.18.4
+python-multipart==0.0.27
+
+# Redis
+redis==7.4.0
+
+# Realtime (Socket.IO)
+python-socketio[asyncio]==5.16.1
+
+# Auth
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+
+# Storage
+oss2==2.19.1
+
+# Testing
+httpx==0.28.1
+pytest==9.0.3
+pytest-asyncio==1.3.0
+fakeredis==2.35.1

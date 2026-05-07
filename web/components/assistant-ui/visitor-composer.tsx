@@ -1,0 +1,114 @@
+'use client'
+
+import { useState } from 'react'
+import { useRef, useCallback, type ChangeEvent, type CSSProperties } from 'react'
+import { ComposerPrimitive } from '@assistant-ui/react'
+import { useVisitorChatConfig } from './visitor-chat-runtime'
+import { IconArrowUp, IconLoader2, IconPaperclip } from '@tabler/icons-react'
+
+const MAX_ROWS = 3
+const LINE_HEIGHT = 22
+
+type VisitorComposerProps = {
+  disabled: boolean
+  isMobile: boolean
+}
+
+export function VisitorComposer({ disabled, isMobile }: VisitorComposerProps) {
+  const { locale, config, onTyping, onFileSend } = useVisitorChatConfig()
+  const [uploading, setUploading] = useState(false)
+  const [uploadError, setUploadError] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const placeholder =
+    config.input_placeholder ||
+    (locale === 'zh' ? '输入消息...' : 'Type a message...')
+  const disabledText =
+    locale === 'zh' ? '会话已结束' : 'Conversation ended'
+  const sendButtonStyle = {
+    '--opendesk-send-button-bg': config.send_button_bg_color || 'var(--color-primary)',
+  } as CSSProperties
+
+  const handleTypingDebounce = useCallback(() => {
+    if (typingTimerRef.current) clearTimeout(typingTimerRef.current)
+    typingTimerRef.current = setTimeout(onTyping, 300)
+  }, [onTyping])
+
+  const handleImageSelect = useCallback(() => {
+    fileInputRef.current?.click()
+  }, [])
+
+  const handleFileChange = useCallback(
+    async (e: ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0]
+      e.target.value = ''
+      if (!file) return
+
+      setUploading(true)
+      setUploadError(null)
+      try {
+        await onFileSend(file)
+      } catch {
+        setUploadError(locale === 'zh' ? '上传失败，请重试' : 'Upload failed. Please try again.')
+      } finally {
+        setUploading(false)
+      }
+    },
+    [locale, onFileSend],
+  )
+
+  return (
+    <div className="shrink-0 bg-background px-3 py-2 sm:px-4 sm:py-3">
+      <ComposerPrimitive.Root className="rounded-[14px] border border-border bg-background sm:rounded-2xl">
+        {/* Text input */}
+        <ComposerPrimitive.Input
+          placeholder={disabled ? disabledText : placeholder}
+          disabled={disabled}
+          submitMode={isMobile ? 'none' : 'enter'}
+          rows={1}
+          maxRows={MAX_ROWS}
+          onChange={handleTypingDebounce}
+          className="w-full resize-none border-0 bg-transparent px-3 pt-2.5 pb-1 text-sm text-foreground outline-none placeholder:text-[#9CA3AF] disabled:cursor-not-allowed disabled:opacity-50 sm:px-4 sm:pt-3"
+          style={{ lineHeight: `${LINE_HEIGHT}px` }}
+        />
+
+        {/* Action bar */}
+        <div className="flex items-center justify-between px-2 pb-2 sm:px-3 sm:pb-2.5">
+          {/* Left: attachment button */}
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40"
+              onClick={handleImageSelect}
+              disabled={disabled || uploading}
+            >
+              {uploading ? <IconLoader2 size={18} className="animate-spin" /> : <IconPaperclip size={18} />}
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/gif,image/webp,.pdf,.doc,.docx,.xls,.xlsx,.csv,.ppt,.pptx,.txt,.md,.zip,.rar,.7z"
+              className="hidden"
+              onChange={handleFileChange}
+            />
+          </div>
+
+          {/* Right: send button — circular; idle (empty) uses light fill per design */}
+          <ComposerPrimitive.Send
+            disabled={disabled}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#F4F4F5] text-[#9CA3AF] transition-colors enabled:cursor-pointer enabled:bg-[var(--opendesk-send-button-bg)] enabled:text-primary-foreground enabled:hover:opacity-90 disabled:cursor-not-allowed sm:h-9 sm:w-9"
+            style={sendButtonStyle}
+          >
+            <IconArrowUp size={isMobile ? 16 : 18} />
+          </ComposerPrimitive.Send>
+        </div>
+        {uploadError && (
+          <div className="px-3 pb-2 text-xs text-destructive sm:px-4">
+            {uploadError}
+          </div>
+        )}
+      </ComposerPrimitive.Root>
+    </div>
+  )
+}

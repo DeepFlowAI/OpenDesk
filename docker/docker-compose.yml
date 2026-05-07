@@ -1,0 +1,101 @@
+# OpenDesk — single-host docker compose.
+#
+# All configuration (including which dependencies to embed) lives in .env.
+# Copy .env.example → .env, edit, then always run:
+#
+#   docker compose up -d
+#
+# To use external PostgreSQL or Redis, edit COMPOSE_PROFILES in .env to
+# exclude "with-postgres" / "with-redis" and fill in DATABASE_URL / REDIS_URL.
+# See .env.example for the full reference.
+
+services:
+  # ── Optional embedded PostgreSQL ───────────────────────────────────────
+  postgres:
+    profiles: [with-postgres]
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-opendesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-opendesk}
+      POSTGRES_DB: ${POSTGRES_DB:-opendesk}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-opendesk}"]
+      interval: 5s
+      retries: 10
+
+  # ── Optional embedded Redis ────────────────────────────────────────────
+  redis:
+    profiles: [with-redis]
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+
+  # ── Backend API ────────────────────────────────────────────────────────
+  api:
+    image: deepflowagent/opendesk-api:${OPENDESK_VERSION:-latest}
+    restart: unless-stopped
+    # `required: false` lets api start even when postgres/redis are filtered
+    # out by inactive profiles (i.e. external DB / external Redis modes).
+    # When the profile IS active, Compose still waits for the healthcheck.
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_started
+        required: false
+    environment:
+      APP_ENV: production
+      # Defaults point at the embedded services; override DATABASE_URL/
+      # REDIS_URL to use external Postgres / Redis.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://opendesk:opendesk@postgres:5432/opendesk}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AUTO_MIGRATE: ${AUTO_MIGRATE:-true}
+      # Required. Generate with:
+      #   python -c "import secrets; print(secrets.token_hex(32))"
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set — run "python -c \"import secrets; print(secrets.token_hex(32))\"" and put it in .env}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_HOURS: ${JWT_EXPIRE_HOURS:-24}
+      # First-run only — change the admin password after first login.
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-default}
+      DEFAULT_TENANT_NAME: ${DEFAULT_TENANT_NAME:-Default Workspace}
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
+      # Optional SMTP (for password reset / email notifications)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      # Optional object storage (for file uploads). Leave empty to disable.
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-aliyun_oss}
+      OSS_ACCESS_KEY: ${OSS_ACCESS_KEY:-}
+      OSS_SECRET_KEY: ${OSS_SECRET_KEY:-}
+      OSS_ADDR: ${OSS_ADDR:-}
+      OSS_URL: ${OSS_URL:-}
+      OSS_BUCKET: ${OSS_BUCKET:-}
+    ports:
+      - "${API_PORT:-5001}:8000"
+
+  # ── Frontend ───────────────────────────────────────────────────────────
+  web:
+    image: deepflowagent/opendesk-web:${OPENDESK_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      # These are read by the BROWSER, so use a hostname the browser can
+      # reach (typically your public domain or http://localhost:5001 for
+      # single-host dev).
+      NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:5001/api/}
+      NEXT_PUBLIC_SOCKET_URL: ${PUBLIC_SOCKET_URL:-http://localhost:5001}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+
+volumes:
+  pgdata:
+  redisdata:
