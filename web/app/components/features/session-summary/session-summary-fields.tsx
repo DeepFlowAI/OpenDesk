@@ -9,7 +9,7 @@ import type { UnifiedField } from '@/models/field-definition'
 import type { CsSummaryInteractionRule, CsSummaryUsageField } from '@/models/session-summary'
 import { useSessionSummaryUsage, useUpdateSessionSummaryFieldValue } from '@/service/use-session-summary'
 import { FieldValueDisplay } from '@/app/components/features/field-system/field-value-display'
-import { FieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
+import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
 import { FieldType } from '@/types/field-enums'
 
 type FieldState = 'hidden' | 'required' | 'optional' | 'readonly'
@@ -191,16 +191,13 @@ function SummaryFieldRow({
           }}
         >
           <div className="relative">
-            <FieldValueEditor
-              fieldType={field.field_type}
+            <UnifiedFieldValueEditor
+              field={field}
               value={value}
               onChange={(nextValue) => {
                 onChange(nextValue)
                 if (shouldSaveOnChange) void onSaveValue(nextValue)
               }}
-              typeConfig={field.type_config ?? {}}
-              options={field.options}
-              treeNodes={field.tree_nodes}
               disabled={saving}
               className="min-h-8 text-[13px]"
               autoFocus

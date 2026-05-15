@@ -4,6 +4,7 @@ import { useMemo } from 'react'
 import { cn } from '@/lib/utils'
 import { DateInput, DateTimeInput, TimeInput } from '@/components/ui/time-input'
 import { TreeSelectEditor } from '@/app/components/features/field-system/tree-select-editor'
+import { OrganizationSelectEditor } from '@/app/components/features/field-system/field-value-editor'
 import { FieldType } from '@/types/field-enums'
 import type { UnifiedField } from '@/models/field-definition'
 import { OptionComboBox } from './option-combo-box'
@@ -182,6 +183,23 @@ export function FilterValueEditor({
           multi={shape === 'multi'}
           placeholder={safePlaceholder || 'Search users...'}
           disabled={disabled}
+          className={className}
+        />
+      )
+
+    case FieldType.ORGANIZATION_SELECT:
+      return (
+        <OrganizationSelectEditor
+          value={
+            shape === 'multi'
+              ? (Array.isArray(value) ? value.map(toNumericUserId).filter((v): v is number => v != null) : [])
+              : toNumericUserId(value)
+          }
+          onChange={onChange}
+          multi={shape === 'multi'}
+          typeConfig={(field.type_config ?? {}) as Record<string, unknown>}
+          placeholder={safePlaceholder || 'Search organizations...'}
+          disabled={disabled ?? false}
           className={className}
         />
       )

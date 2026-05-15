@@ -21,6 +21,7 @@ class EmployeeCreate(BaseModel):
     roles: list[str] = ["agent"]
     max_concurrent: int = 10
     default_language: str = "system"
+    group_ids: list[int] = []
 
     @field_validator("name")
     @classmethod
@@ -83,6 +84,14 @@ class EmployeeCreate(BaseModel):
             raise ValueError(f"Language must be one of: {', '.join(VALID_LANGUAGES)}")
         return v
 
+    @field_validator("group_ids")
+    @classmethod
+    def validate_group_ids(cls, v: list[int]) -> list[int]:
+        for group_id in v:
+            if group_id <= 0:
+                raise ValueError("Group ID must be positive")
+        return list(dict.fromkeys(v))
+
 
 class EmployeeUpdate(BaseModel):
     name: str | None = None
@@ -96,6 +105,7 @@ class EmployeeUpdate(BaseModel):
     roles: list[str] | None = None
     max_concurrent: int | None = None
     default_language: str | None = None
+    group_ids: list[int] | None = None
 
     @field_validator("name")
     @classmethod
@@ -164,6 +174,16 @@ class EmployeeUpdate(BaseModel):
             raise ValueError(f"Language must be one of: {', '.join(VALID_LANGUAGES)}")
         return v
 
+    @field_validator("group_ids")
+    @classmethod
+    def validate_group_ids(cls, v: list[int] | None) -> list[int] | None:
+        if v is None:
+            return v
+        for group_id in v:
+            if group_id <= 0:
+                raise ValueError("Group ID must be positive")
+        return list(dict.fromkeys(v))
+
 
 class StatusUpdate(BaseModel):
     is_active: bool
@@ -185,6 +205,7 @@ class EmployeeResponse(BaseModel):
     max_concurrent: int
     default_language: str
     is_super_admin: bool
+    group_ids: list[int] = []
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

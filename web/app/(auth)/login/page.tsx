@@ -6,13 +6,12 @@ import { IconHeadset, IconEye, IconEyeOff } from '@tabler/icons-react'
 import { useLogin } from '@/service/use-auth'
 import { useSystemInfo } from '@/service/use-system'
 import { useAuthStore } from '@/context/auth-store'
-import { useLocaleStore, type Locale } from '@/context/locale-store'
+import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import { loginSchema } from '@/utils/validators'
+import { loginSchema, TENANT_IDENTIFIER_REGEX } from '@/utils/validators'
 import { cn } from '@/lib/utils'
 import { LegalFooter } from '@/components/legal-footer'
 
-const TENANT_REGEX = /^[a-zA-Z0-9-]{2,32}$/
 const LAST_TENANT_KEY = 'opendesk_last_tenant'
 
 export default function LoginPageWrapper() {
@@ -46,12 +45,12 @@ function LoginPage() {
       return
     }
     const tenantParam = searchParams.get('tenant')
-    if (tenantParam && TENANT_REGEX.test(tenantParam)) {
+    if (tenantParam && TENANT_IDENTIFIER_REGEX.test(tenantParam)) {
       setFormData((prev) => ({ ...prev, tenant: tenantParam }))
     } else {
       try {
         const saved = localStorage.getItem(LAST_TENANT_KEY)
-        if (saved && TENANT_REGEX.test(saved)) {
+        if (saved && TENANT_IDENTIFIER_REGEX.test(saved)) {
           setFormData((prev) => ({ ...prev, tenant: saved }))
         } else if (saved) {
           localStorage.removeItem(LAST_TENANT_KEY)
@@ -210,11 +209,17 @@ function LoginPage() {
                 is auto-filled from /api/v1/system/info default_tenant_id. */}
             {!singleTenantMode && (
               <div>
-                <label className="mb-1 block text-sm font-medium text-foreground">
+                <label
+                  htmlFor="login-tenant"
+                  className="mb-1 block text-sm font-medium text-foreground"
+                >
                   {t('login.tenant', locale)}
                 </label>
                 <input
+                  id="login-tenant"
+                  name="tenant"
                   type="text"
+                  autoComplete="organization"
                   value={formData.tenant}
                   onChange={(e) => handleChange('tenant', e.target.value)}
                   onBlur={() => handleBlur('tenant')}
@@ -229,11 +234,17 @@ function LoginPage() {
 
             {/* Username */}
             <div>
-              <label className="mb-1 block text-sm font-medium text-foreground">
+              <label
+                htmlFor="login-username"
+                className="mb-1 block text-sm font-medium text-foreground"
+              >
                 {t('login.username', locale)}
               </label>
               <input
+                id="login-username"
+                name="username"
                 type="text"
+                autoComplete="username"
                 value={formData.username}
                 onChange={(e) => handleChange('username', e.target.value)}
                 onBlur={() => handleBlur('username')}
@@ -247,12 +258,18 @@ function LoginPage() {
 
             {/* Password */}
             <div>
-              <label className="mb-1 block text-sm font-medium text-foreground">
+              <label
+                htmlFor="login-password"
+                className="mb-1 block text-sm font-medium text-foreground"
+              >
                 {t('login.password', locale)}
               </label>
               <div className="relative">
                 <input
+                  id="login-password"
+                  name="password"
                   type={showPassword ? 'text' : 'password'}
+                  autoComplete="current-password"
                   value={formData.password}
                   onChange={(e) => handleChange('password', e.target.value)}
                   onBlur={() => handleBlur('password')}
@@ -292,7 +309,9 @@ function LoginPage() {
             {/* Forgot password */}
             <div className="flex justify-end">
               <a
-                href={`/login/forgot-password${formData.tenant ? `?tenant=${formData.tenant}` : ''}`}
+                href={`/login/forgot-password${
+                  formData.tenant ? `?tenant=${encodeURIComponent(formData.tenant)}` : ''
+                }`}
                 className="text-sm text-primary hover:underline"
               >
                 {t('login.forgot', locale)}

@@ -1,13 +1,39 @@
 'use client'
 
-import { useState } from 'react'
-import { useRef, useCallback, type ChangeEvent, type CSSProperties } from 'react'
+import {
+  useState,
+  useRef,
+  useCallback,
+  type ChangeEvent,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+} from 'react'
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useVisitorChatConfig } from './visitor-chat-runtime'
 import { IconArrowUp, IconLoader2, IconPaperclip } from '@tabler/icons-react'
 
 const MAX_ROWS = 3
 const LINE_HEIGHT = 22
+
+function focusComposerTextarea(e: ReactPointerEvent<HTMLElement>) {
+  // Prevent default so the click target does not participate in focus routing
+  // (otherwise the textarea often never receives caret on this filler strip).
+  e.preventDefault()
+  const form = e.currentTarget.closest('form')
+  const ta =
+    form?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
+    form?.querySelector('textarea')
+  if (!ta || ta.disabled) return
+  window.requestAnimationFrame(() => {
+    ta.focus({ preventScroll: true })
+    const len = ta.value.length
+    try {
+      ta.setSelectionRange(len, len)
+    } catch {
+      // Some hosts leave selection APIs unavailable; focus alone is enough
+    }
+  })
+}
 
 type VisitorComposerProps = {
   disabled: boolean
@@ -30,9 +56,10 @@ export function VisitorComposer({ disabled, isMobile }: VisitorComposerProps) {
     '--opendesk-send-button-bg': config.send_button_bg_color || 'var(--color-primary)',
   } as CSSProperties
 
-  const handleTypingDebounce = useCallback(() => {
+  const handleTypingDebounce = useCallback((e: ChangeEvent<HTMLTextAreaElement>) => {
+    const content = e.currentTarget.value
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current)
-    typingTimerRef.current = setTimeout(onTyping, 300)
+    typingTimerRef.current = setTimeout(() => onTyping(content), 300)
   }, [onTyping])
 
   const handleImageSelect = useCallback(() => {
@@ -93,6 +120,15 @@ export function VisitorComposer({ disabled, isMobile }: VisitorComposerProps) {
               onChange={handleFileChange}
             />
           </div>
+
+          <div
+            role="presentation"
+            className="min-h-8 flex-1 cursor-text self-stretch"
+            onPointerDown={(e) => {
+              if (e.button !== 0) return
+              focusComposerTextarea(e)
+            }}
+          />
 
           {/* Right: send button — circular; idle (empty) uses light fill per design */}
           <ComposerPrimitive.Send

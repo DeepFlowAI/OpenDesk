@@ -77,6 +77,7 @@ class UserService:
         result = await db.execute(
             select(
                 FdFieldDefinition.id,
+                FdFieldDefinition.field_key,
                 FdFieldDefinition.slot_column,
                 FdFieldDefinition.name,
             ).where(
@@ -87,7 +88,7 @@ class UserService:
         rows = result.all()
         slot_to_key: dict[str, str] = {}
         for row in rows:
-            key = str(row.id)
+            key = row.field_key or str(row.id)
             slot_to_key[row.slot_column] = key
         return slot_to_key
 
@@ -105,28 +106,41 @@ class UserService:
 
     @staticmethod
     async def _get_key_to_slot_map(db: AsyncSession, tenant_id: int) -> dict[str, str]:
-        """Build { field_id_str: slot_column } for writing custom fields."""
+        """Build { field_key and legacy field_id_str: slot_column } for writing custom fields."""
         result = await db.execute(
-            select(FdFieldDefinition.id, FdFieldDefinition.slot_column).where(
+            select(FdFieldDefinition.id, FdFieldDefinition.field_key, FdFieldDefinition.slot_column).where(
                 FdFieldDefinition.tenant_id == tenant_id,
                 FdFieldDefinition.status == "active",
             )
         )
-        return {str(row.id): row.slot_column for row in result.all()}
+        key_to_slot: dict[str, str] = {}
+        for row in result.all():
+            key_to_slot[str(row.id)] = row.slot_column
+            if row.field_key:
+                key_to_slot[row.field_key] = row.slot_column
+        return key_to_slot
 
     @staticmethod
     async def _get_key_to_field_meta(db: AsyncSession, tenant_id: int) -> dict[str, dict[str, str]]:
-        """Build { field_id_str: {name, slot_column} } for user custom fields."""
+        """Build { field_key and legacy field_id_str: {name, slot_column} } for user custom fields."""
         result = await db.execute(
-            select(FdFieldDefinition.id, FdFieldDefinition.name, FdFieldDefinition.slot_column).where(
+            select(
+                FdFieldDefinition.id,
+                FdFieldDefinition.field_key,
+                FdFieldDefinition.name,
+                FdFieldDefinition.slot_column,
+            ).where(
                 FdFieldDefinition.tenant_id == tenant_id,
                 FdFieldDefinition.status == "active",
             )
         )
-        return {
-            str(row.id): {"name": row.name, "slot_column": row.slot_column}
-            for row in result.all()
-        }
+        key_to_meta: dict[str, dict[str, str]] = {}
+        for row in result.all():
+            meta = {"name": row.name, "slot_column": row.slot_column}
+            key_to_meta[str(row.id)] = meta
+            if row.field_key:
+                key_to_meta[row.field_key] = meta
+        return key_to_meta
 
     @staticmethod
     async def _validate_organization(db: AsyncSession, tenant_id: int, organization_id: int | None) -> None:

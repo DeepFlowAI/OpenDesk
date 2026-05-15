@@ -13,6 +13,7 @@ type ChatState = {
   selectedConversationId: number | null
   messages: Map<number, Message[]>
   visitorTyping: Map<number, boolean>
+  visitorTypingContent: Map<number, string>
   recentReadAt: Map<number, number>
 
   setConversations: (items: Conversation[]) => void
@@ -26,7 +27,7 @@ type ChatState = {
   prependMessages: (conversationId: number, msgs: Message[]) => void
   addMessage: (conversationId: number, msg: Message) => void
 
-  setVisitorTyping: (conversationId: number, typing: boolean) => void
+  setVisitorTyping: (conversationId: number, typing: boolean, content?: string) => void
 }
 
 function mergeUnreadOnSync(
@@ -59,6 +60,7 @@ export const useChatStore = create<ChatState>()(
       selectedConversationId: null,
       messages: new Map(),
       visitorTyping: new Map(),
+      visitorTypingContent: new Map(),
       recentReadAt: new Map(),
 
       setConversations: (items) =>
@@ -143,11 +145,17 @@ export const useChatStore = create<ChatState>()(
           return { messages: map }
         }),
 
-      setVisitorTyping: (conversationId, typing) =>
+      setVisitorTyping: (conversationId, typing, content) =>
         set((state) => {
-          const map = new Map(state.visitorTyping)
-          map.set(conversationId, typing)
-          return { visitorTyping: map }
+          const typingMap = new Map(state.visitorTyping)
+          const contentMap = new Map(state.visitorTypingContent)
+          typingMap.set(conversationId, typing)
+          if (typing && content !== undefined) {
+            contentMap.set(conversationId, content)
+          } else if (!typing) {
+            contentMap.delete(conversationId)
+          }
+          return { visitorTyping: typingMap, visitorTypingContent: contentMap }
         }),
     }),
     {

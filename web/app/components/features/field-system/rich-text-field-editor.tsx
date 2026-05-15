@@ -1,28 +1,68 @@
 'use client'
 
-import { useEffect, type ReactNode } from 'react'
-import { useEditor, EditorContent } from '@tiptap/react'
+import { useEffect, useRef, useState } from 'react'
+import { useEditor, EditorContent, type Editor } from '@tiptap/react'
+import { Node, mergeAttributes } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
 import Link from '@tiptap/extension-link'
+import Highlight from '@tiptap/extension-highlight'
 import TurndownService from 'turndown'
 import { marked } from 'marked'
-import {
-  IconBold,
-  IconItalic,
-  IconStrikethrough,
-  IconList,
-  IconListNumbers,
-  IconQuote,
-  IconSeparator,
-  IconArrowBackUp,
-  IconArrowForwardUp,
-  IconLink,
-} from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
-import { Button } from '@/components/ui/button'
+import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
+import { useUploadCustomFieldFile } from '@/service/use-upload'
+import { BlockquoteButton } from '@/components/tiptap-ui/blockquote-button'
+import { ColorHighlightPopover } from '@/components/tiptap-ui/color-highlight-popover'
+import { HeadingDropdownMenu } from '@/components/tiptap-ui/heading-dropdown-menu'
+import { LinkPopover } from '@/components/tiptap-ui/link-popover'
+import { ListDropdownMenu } from '@/components/tiptap-ui/list-dropdown-menu'
+import { MarkButton } from '@/components/tiptap-ui/mark-button'
+import { UndoRedoButton } from '@/components/tiptap-ui/undo-redo-button'
+import { ButtonGroup } from '@/components/tiptap-ui-primitive/button-group'
+import { Separator } from '@/components/tiptap-ui-primitive/separator'
+
+const MAX_PASTE_IMAGE_SIZE = 10 * 1024 * 1024
+
+const RichTextImage = Node.create({
+  name: 'image',
+  group: 'block',
+  inline: false,
+  atom: true,
+  draggable: true,
+
+  addAttributes() {
+    return {
+      src: { default: null },
+      alt: { default: null },
+      title: { default: null },
+    }
+  },
+
+  parseHTML() {
+    return [{ tag: 'img[src]' }]
+  },
+
+  renderHTML({ HTMLAttributes }) {
+    return ['img', mergeAttributes(HTMLAttributes)]
+  },
+})
 
 const turndown = new TurndownService({ headingStyle: 'atx' })
+turndown.addRule('opendeskPreserveMarkHighlight', {
+  filter: 'mark',
+  replacement(content, node) {
+    const el = node as HTMLElement
+    const dataColor = el.getAttribute('data-color')
+    const style = el.getAttribute('style')
+    const parts = [
+      dataColor ? `data-color="${dataColor}"` : '',
+      style ? `style="${style.replace(/"/g, '&quot;')}"` : '',
+    ].filter(Boolean)
+    const attr = parts.length > 0 ? ` ${parts.join(' ')}` : ''
+    return `<mark${attr}>${content}</mark>`
+  },
+})
 
 function markdownToHtml(src: string): string {
   if (!src.trim()) return ''
@@ -63,6 +103,10 @@ export function RichTextFieldEditor({
 }: RichTextFieldEditorProps) {
   const richFormat = ((typeConfig.rich_format as string) ?? 'html').toLowerCase()
   const isMarkdown = richFormat === 'markdown'
+  const uploadMutation = useUploadCustomFieldFile()
+  const [pasteImageError, setPasteImageError] = useState<string | null>(null)
+  const [isPastingImage, setIsPastingImage] = useState(false)
+  const editorRef = useRef<Editor | null>(null)
 
   const stringVal = value != null ? String(value) : ''
   const contentForEditor = !stringVal.trim()
@@ -75,7 +119,9 @@ export function RichTextFieldEditor({
     immediatelyRender: false,
     extensions: [
       StarterKit.configure({
-        heading: { levels: [2, 3] },
+        heading: { levels: [1, 2, 3, 4, 5, 6] },
+        // Custom Link extension below; avoid registering Link twice.
+        link: false,
       }),
       Placeholder.configure({
         placeholder: placeholder || '…',
@@ -85,6 +131,10 @@ export function RichTextFieldEditor({
         autolink: true,
         defaultProtocol: 'https',
       }),
+      Highlight.configure({
+        multicolor: true,
+      }),
+      RichTextImage,
     ],
     content: contentForEditor,
     editable: !disabled,
@@ -93,7 +143,54 @@ export function RichTextFieldEditor({
         class: cn(
           'prose prose-sm dark:prose-invert max-w-none min-h-[140px] px-3 py-2 outline-none',
           'prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1',
+          richTextListStyleClass,
         ),
+      },
+      handlePaste: (_view, event) => {
+        if (disabled) return false
+
+        const clipboard = event.clipboardData
+        const files = Array.from(clipboard?.items ?? [])
+          .filter((item) => item.kind === 'file')
+          .map((item) => item.getAsFile())
+          .filter((file): file is File => !!file && file.type.startsWith('image/'))
+
+        if (files.length === 0) return false
+
+        event.preventDefault()
+        setPasteImageError(null)
+        setIsPastingImage(true)
+
+        void (async () => {
+          try {
+            for (const file of files) {
+              if (file.size > MAX_PASTE_IMAGE_SIZE) {
+                setPasteImageError(`图片过大: ${file.name || 'clipboard image'}`)
+                continue
+              }
+
+              const meta = await uploadMutation.mutateAsync(file)
+              editorRef.current
+                ?.chain()
+                .focus()
+                .insertContent({
+                  type: 'image',
+                  attrs: {
+                    src: meta.url,
+                    alt: meta.name || file.name || 'pasted image',
+                    title: meta.name || file.name || null,
+                  },
+                })
+                .run()
+            }
+          } catch {
+            setPasteImageError('图片上传失败')
+          } finally {
+            setIsPastingImage(false)
+          }
+        })()
+
+        return true
       },
     },
     onUpdate: ({ editor: ed }) => {
@@ -114,6 +211,10 @@ export function RichTextFieldEditor({
       }
     },
   })
+
+  useEffect(() => {
+    editorRef.current = editor
+  }, [editor])
 
   useEffect(() => {
     if (!editor || editor.isDestroyed) return
@@ -157,19 +258,6 @@ export function RichTextFieldEditor({
     )
   }
 
-  const runLink = () => {
-    const prev = editor.getAttributes('link').href as string | undefined
-    const url = window.prompt('URL', prev ?? 'https://')
-    if (url === null) return
-    if (url === '') {
-      editor.chain().focus().extendMarkRange('link').unsetLink().run()
-      return
-    }
-    editor.chain().focus().extendMarkRange('link').setLink({ href: url }).run()
-  }
-
-  const toolbarIconSize = plainChrome ? 14 : 16
-
   return (
     <div
       className={cn(
@@ -187,144 +275,42 @@ export function RichTextFieldEditor({
           plainChrome ? 'bg-white px-0.5 py-0.5' : 'bg-muted/30 px-1 py-1',
         )}
       >
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled}
-          active={editor.isActive('bold')}
-          onClick={() => editor.chain().focus().toggleBold().run()}
-          label="Bold"
-        >
-          <IconBold size={toolbarIconSize} />
-        </ToolbarBtn>
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled}
-          active={editor.isActive('italic')}
-          onClick={() => editor.chain().focus().toggleItalic().run()}
-          label="Italic"
-        >
-          <IconItalic size={toolbarIconSize} />
-        </ToolbarBtn>
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled}
-          active={editor.isActive('strike')}
-          onClick={() => editor.chain().focus().toggleStrike().run()}
-          label="Strike"
-        >
-          <IconStrikethrough size={toolbarIconSize} />
-        </ToolbarBtn>
-        <span
-          className={cn('mx-0.5 w-px bg-border', plainChrome ? 'h-3' : 'h-4')}
-          aria-hidden
-        />
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled}
-          active={editor.isActive('bulletList')}
-          onClick={() => editor.chain().focus().toggleBulletList().run()}
-          label="Bullet list"
-        >
-          <IconList size={toolbarIconSize} />
-        </ToolbarBtn>
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled}
-          active={editor.isActive('orderedList')}
-          onClick={() => editor.chain().focus().toggleOrderedList().run()}
-          label="Ordered list"
-        >
-          <IconListNumbers size={toolbarIconSize} />
-        </ToolbarBtn>
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled}
-          active={editor.isActive('blockquote')}
-          onClick={() => editor.chain().focus().toggleBlockquote().run()}
-          label="Quote"
-        >
-          <IconQuote size={toolbarIconSize} />
-        </ToolbarBtn>
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled}
-          active={false}
-          onClick={() => editor.chain().focus().setHorizontalRule().run()}
-          label="Horizontal rule"
-        >
-          <IconSeparator size={toolbarIconSize} />
-        </ToolbarBtn>
-        <span
-          className={cn('mx-0.5 w-px bg-border', plainChrome ? 'h-3' : 'h-4')}
-          aria-hidden
-        />
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled}
-          active={editor.isActive('link')}
-          onClick={runLink}
-          label="Link"
-        >
-          <IconLink size={toolbarIconSize} />
-        </ToolbarBtn>
-        <span
-          className={cn('mx-0.5 w-px bg-border', plainChrome ? 'h-3' : 'h-4')}
-          aria-hidden
-        />
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled || !editor.can().undo()}
-          active={false}
-          onClick={() => editor.chain().focus().undo().run()}
-          label="Undo"
-        >
-          <IconArrowBackUp size={toolbarIconSize} />
-        </ToolbarBtn>
-        <ToolbarBtn
-          compact={plainChrome}
-          disabled={disabled || !editor.can().redo()}
-          active={false}
-          onClick={() => editor.chain().focus().redo().run()}
-          label="Redo"
-        >
-          <IconArrowForwardUp size={toolbarIconSize} />
-        </ToolbarBtn>
+        <ButtonGroup>
+          <HeadingDropdownMenu editor={editor} levels={[1, 2, 3, 4, 5, 6]} disabled={disabled} />
+        </ButtonGroup>
+        <Separator />
+        <ButtonGroup>
+          <MarkButton editor={editor} type="bold" disabled={disabled} />
+          <MarkButton editor={editor} type="italic" disabled={disabled} />
+          <MarkButton editor={editor} type="strike" disabled={disabled} />
+          <ColorHighlightPopover editor={editor} disabled={disabled} />
+        </ButtonGroup>
+        <Separator />
+        <ButtonGroup>
+          <ListDropdownMenu editor={editor} types={['bulletList', 'orderedList']} disabled={disabled} />
+          <BlockquoteButton editor={editor} disabled={disabled} />
+        </ButtonGroup>
+        <Separator />
+        <ButtonGroup>
+          <LinkPopover editor={editor} disabled={disabled} autoOpenOnLinkActive={false} />
+        </ButtonGroup>
+        <Separator />
+        <ButtonGroup>
+          <UndoRedoButton editor={editor} action="undo" disabled={disabled} />
+          <UndoRedoButton editor={editor} action="redo" disabled={disabled} />
+        </ButtonGroup>
       </div>
+      {(isPastingImage || pasteImageError) && (
+        <div className="border-b border-border px-3 py-1 text-xs">
+          {isPastingImage ? (
+            <span className="text-muted-foreground">图片上传中…</span>
+          ) : (
+            <span className="text-destructive">{pasteImageError}</span>
+          )}
+        </div>
+      )}
       <EditorContent editor={editor} className="max-h-[min(360px,50vh)] overflow-y-auto" />
     </div>
   )
 }
 
-function ToolbarBtn({
-  children,
-  onClick,
-  active,
-  disabled,
-  label,
-  compact = false,
-}: {
-  children: ReactNode
-  onClick: () => void
-  active: boolean
-  disabled?: boolean
-  label: string
-  compact?: boolean
-}) {
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon"
-      className={cn(
-        compact ? 'h-7 w-7 shrink-0' : 'h-8 w-8 shrink-0',
-        active && 'bg-muted text-foreground',
-      )}
-      disabled={disabled}
-      onClick={onClick}
-      aria-label={label}
-      aria-pressed={active}
-    >
-      {children}
-    </Button>
-  )
-}

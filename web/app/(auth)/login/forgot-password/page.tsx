@@ -4,13 +4,16 @@ import { useState, useEffect, useCallback, useRef, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { IconHeadset, IconEye, IconEyeOff } from '@tabler/icons-react'
 import { useSendVerifyCode, useResetPassword } from '@/service/use-password-reset'
-import { useLocaleStore, type Locale } from '@/context/locale-store'
+import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import { sendCodeSchema, forgotPasswordSchema } from '@/utils/validators'
+import {
+  sendCodeSchema,
+  forgotPasswordSchema,
+  TENANT_IDENTIFIER_REGEX,
+} from '@/utils/validators'
 import { cn } from '@/lib/utils'
 import { LegalFooter } from '@/components/legal-footer'
 
-const TENANT_REGEX = /^[a-zA-Z0-9-]{2,32}$/
 const LAST_TENANT_KEY = 'opendesk_last_tenant'
 const COOLDOWN_SECONDS = 60
 const COOLDOWN_STORAGE_KEY = 'verify_code_cooldown_end'
@@ -56,12 +59,12 @@ function ForgotPasswordPage() {
 
   useEffect(() => {
     const tenantParam = searchParams.get('tenant')
-    if (tenantParam && TENANT_REGEX.test(tenantParam)) {
+    if (tenantParam && TENANT_IDENTIFIER_REGEX.test(tenantParam)) {
       setFormData((prev) => ({ ...prev, tenant: tenantParam }))
     } else {
       try {
         const saved = localStorage.getItem(LAST_TENANT_KEY)
-        if (saved && TENANT_REGEX.test(saved)) {
+        if (saved && TENANT_IDENTIFIER_REGEX.test(saved)) {
           setFormData((prev) => ({ ...prev, tenant: saved }))
         } else if (saved) {
           localStorage.removeItem(LAST_TENANT_KEY)
@@ -265,7 +268,9 @@ function ForgotPasswordPage() {
       })
       setSuccessMessage(t('forgot.resetSuccess', locale))
       setTimeout(() => {
-        router.push(`/login${formData.tenant ? `?tenant=${formData.tenant}` : ''}`)
+        router.push(
+          `/login${formData.tenant ? `?tenant=${encodeURIComponent(formData.tenant)}` : ''}`
+        )
       }, 2000)
     } catch (err: unknown) {
       const { status, code } = await parseApiError(err)
@@ -333,11 +338,17 @@ function ForgotPasswordPage() {
           <form onSubmit={handleSubmit} className="flex flex-col gap-4">
             {/* Tenant */}
             <div>
-              <label className="mb-1 block text-sm font-medium text-foreground">
+              <label
+                htmlFor="forgot-tenant"
+                className="mb-1 block text-sm font-medium text-foreground"
+              >
                 {t('forgot.tenant', locale)}
               </label>
               <input
+                id="forgot-tenant"
+                name="tenant"
                 type="text"
+                autoComplete="organization"
                 value={formData.tenant}
                 onChange={(e) => handleChange('tenant', e.target.value)}
                 onBlur={() => handleBlur('tenant')}
@@ -351,11 +362,17 @@ function ForgotPasswordPage() {
 
             {/* Username */}
             <div>
-              <label className="mb-1 block text-sm font-medium text-foreground">
+              <label
+                htmlFor="forgot-username"
+                className="mb-1 block text-sm font-medium text-foreground"
+              >
                 {t('forgot.username', locale)}
               </label>
               <input
+                id="forgot-username"
+                name="username"
                 type="text"
+                autoComplete="username"
                 value={formData.username}
                 onChange={(e) => handleChange('username', e.target.value)}
                 onBlur={() => handleBlur('username')}
@@ -369,12 +386,18 @@ function ForgotPasswordPage() {
 
             {/* Verify code */}
             <div>
-              <label className="mb-1 block text-sm font-medium text-foreground">
+              <label
+                htmlFor="forgot-verify-code"
+                className="mb-1 block text-sm font-medium text-foreground"
+              >
                 {t('forgot.verifyCode', locale)}
               </label>
               <div className="flex gap-2">
                 <input
+                  id="forgot-verify-code"
+                  name="verifyCode"
                   type="text"
+                  autoComplete="one-time-code"
                   value={formData.verifyCode}
                   onChange={(e) => handleChange('verifyCode', e.target.value)}
                   onBlur={() => handleBlur('verifyCode')}
@@ -398,12 +421,18 @@ function ForgotPasswordPage() {
 
             {/* New password */}
             <div>
-              <label className="mb-1 block text-sm font-medium text-foreground">
+              <label
+                htmlFor="forgot-new-password"
+                className="mb-1 block text-sm font-medium text-foreground"
+              >
                 {t('forgot.newPassword', locale)}
               </label>
               <div className="relative">
                 <input
+                  id="forgot-new-password"
+                  name="newPassword"
                   type={showNewPwd ? 'text' : 'password'}
+                  autoComplete="new-password"
                   value={formData.newPassword}
                   onChange={(e) => handleChange('newPassword', e.target.value)}
                   onBlur={() => handleBlur('newPassword')}
@@ -426,12 +455,18 @@ function ForgotPasswordPage() {
 
             {/* Confirm password */}
             <div>
-              <label className="mb-1 block text-sm font-medium text-foreground">
+              <label
+                htmlFor="forgot-confirm-password"
+                className="mb-1 block text-sm font-medium text-foreground"
+              >
                 {t('forgot.confirmPassword', locale)}
               </label>
               <div className="relative">
                 <input
+                  id="forgot-confirm-password"
+                  name="confirmPassword"
                   type={showConfirmPwd ? 'text' : 'password'}
+                  autoComplete="new-password"
                   value={formData.confirmPassword}
                   onChange={(e) => handleChange('confirmPassword', e.target.value)}
                   onBlur={() => handleBlur('confirmPassword')}
@@ -480,7 +515,9 @@ function ForgotPasswordPage() {
             {/* Back to login */}
             <div className="flex justify-center">
               <a
-                href={`/login${formData.tenant ? `?tenant=${formData.tenant}` : ''}`}
+                href={`/login${
+                  formData.tenant ? `?tenant=${encodeURIComponent(formData.tenant)}` : ''
+                }`}
                 className="text-sm text-primary hover:underline"
               >
                 {t('forgot.backToLogin', locale)}

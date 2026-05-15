@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconGripVertical, IconPencil, IconTrash } from '@tabler/icons-react'
+import { IconGripVertical, IconPencil, IconTrash, IconPlus } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { Switch } from '@/components/ui/switch'
@@ -140,8 +140,9 @@ export default function SessionRoutingPage() {
         <button
           type="button"
           onClick={() => router.push('/session-routing/new')}
-          className="flex h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white hover:bg-primary/80"
+          className="flex h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
         >
+          <IconPlus size={18} />
           {t('sr.new', locale)}
         </button>
       </div>
@@ -154,8 +155,9 @@ export default function SessionRoutingPage() {
           <button
             type="button"
             onClick={() => router.push('/session-routing/new')}
-            className="h-10 rounded-lg bg-primary px-5 text-sm font-medium text-white"
+            className="flex h-10 items-center gap-2 rounded-lg bg-primary px-5 text-sm font-medium text-white"
           >
+            <IconPlus size={18} />
             {t('sr.new', locale)}
           </button>
         </div>

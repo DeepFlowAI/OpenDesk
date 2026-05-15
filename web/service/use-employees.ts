@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient, type UseQueryOptions } from '@tanstack/react-query'
 import { get, post, put, del, patch } from './base'
+import { employeeGroupKeys } from './use-employee-groups'
 import type {
   Employee,
   CreateEmployeePayload,
@@ -73,7 +74,10 @@ export const useCreateEmployee = () => {
   return useMutation({
     mutationFn: (data: CreateEmployeePayload) =>
       post<Employee>('v1/employees', { json: data }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: employeeKeys.lists() }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: employeeKeys.lists() })
+      qc.invalidateQueries({ queryKey: employeeGroupKeys.all })
+    },
   })
 }
 
@@ -85,6 +89,7 @@ export const useUpdateEmployee = () => {
     onSuccess: (_, v) => {
       qc.invalidateQueries({ queryKey: employeeKeys.detail(v.id) })
       qc.invalidateQueries({ queryKey: employeeKeys.lists() })
+      qc.invalidateQueries({ queryKey: employeeGroupKeys.all })
     },
   })
 }
@@ -93,7 +98,10 @@ export const useDeleteEmployee = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => del(`v1/employees/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: employeeKeys.lists() }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: employeeKeys.lists() })
+      qc.invalidateQueries({ queryKey: employeeGroupKeys.all })
+    },
   })
 }
 

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useCallback, useEffect } from 'react'
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react'
 import { IconChevronDown, IconChevronRight } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { cn } from '@/lib/utils'
@@ -9,22 +9,20 @@ import { useUnifiedFields } from '@/service/use-field-definitions'
 import type { FdFormLayoutTab, FdFormLayoutSection, FdFormLayoutField } from '@/models/form-layout'
 import type { FdInteractionRule, InteractionRuleCondition } from '@/models/interaction-rule'
 import type { UnifiedField } from '@/models/field-definition'
+import type { CustomFieldValue } from '@/models/ticket'
 import { FieldType } from '@/types/field-enums'
-import { FieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
+import {
+  FieldValueEditor,
+  UnifiedFieldValueEditor,
+} from '@/app/components/features/field-system/field-value-editor'
 import {
   coalescePillOptions,
-  PillMultiSelectField,
-  PillSelectCombobox,
-  type FieldSelectOption,
 } from '@/app/components/features/field-system/field-select-pill-editors'
-import { UserSelect } from '@/app/components/features/ticket/user-select'
-import { EmployeeSelect } from '@/app/components/features/ticket/employee-select'
-import { EmployeeGroupSelect } from '@/app/components/features/ticket/employee-group-select'
+import { collectLayoutFieldDefaults, mergeCustomFieldDefaultsIntoForm } from '@/lib/ticket-field-defaults'
 
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { DateInput, DateTimeInput } from '@/components/ui/time-input'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 
@@ -133,6 +131,9 @@ export function TicketCreateForm({
     return m
   }, [ticketFieldsData, sharedFieldsData])
 
+  const initialValuesRef = useRef(initialValues)
+  initialValuesRef.current = initialValues
+
   const [formValues, setFormValues] = useState<Record<string, unknown>>(() => ({
     ...DEFAULT_CREATE_VALUES,
     ...(initialValues ?? {}),
@@ -153,11 +154,18 @@ export function TicketCreateForm({
   useEffect(() => {
     setFormValues({
       ...DEFAULT_CREATE_VALUES,
+      ...collectLayoutFieldDefaults(layout, fieldDefMap),
       ...(initialValues ?? {}),
     })
     setActiveTab(0)
     setCollapsedSections(new Set())
   }, [resetKey]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    setFormValues((prev) =>
+      mergeCustomFieldDefaultsIntoForm(prev, layout, fieldDefMap, initialValuesRef.current),
+    )
+  }, [layout, fieldDefMap])
 
   useEffect(() => {
     onValuesChange?.(formValues)
@@ -239,6 +247,7 @@ export function TicketCreateForm({
 
       for (const [key, value] of Object.entries(formValues)) {
         if (!allowedFormKeys.has(key)) continue
+        if (Array.isArray(value) && value.length === 0) continue
         if (value === '' || value === null || value === undefined) continue
         const payloadKey = key === 'assignee' ? 'agent_id' : key === 'assignee_group' ? 'assignee_group_id' : key
         if (systemFields.includes(payloadKey)) {
@@ -267,7 +276,7 @@ export function TicketCreateForm({
         user_id: payload.user_id as number | undefined,
         agent_id: payload.agent_id as number | undefined,
         assignee_group_id: payload.assignee_group_id as number | undefined,
-        custom_fields: customFields as Record<string, string | number | boolean | null>,
+        custom_fields: customFields as Record<string, CustomFieldValue>,
       })
       onSuccess()
     } catch {
@@ -518,201 +527,50 @@ function FieldInput({
   const isRequired = state === 'required'
   const isReadonly = state === 'readonly' || fieldKey === 'conversation_id' || fieldDef?.type_config?.readonly === true
 
-  const fieldType = fieldDef?.field_type ?? 'single_line_text'
+  const fieldType = fieldDef?.field_type ?? FieldType.SINGLE_LINE_TEXT
 
   const isLabelLeft = labelPosition === 'left'
 
-  const pillOptions: FieldSelectOption[] = useMemo(() => {
-    if (fieldType === 'single_select' || fieldType === 'multi_select') {
-      if (fieldDef) {
-        return coalescePillOptions(fieldDef.options ?? [], fieldDef.type_config)
-      }
-      return []
+  const editorField = useMemo<UnifiedField>(() => (
+    fieldDef ?? {
+      key: fieldKey,
+      id: null,
+      domain: 'ticket',
+      source: 'system',
+      name: label,
+      description: null,
+      help_text: null,
+      field_type: FieldType.SINGLE_LINE_TEXT,
+      type_config: {},
+      applicable_modules: null,
+      slot_column: null,
+      show_in_workspace: null,
+      sort_order: 0,
+      status: 'active',
+      options: [],
+      tree_nodes: [],
+      created_at: null,
+      updated_at: null,
     }
-    if (fieldDef?.tree_nodes?.length) {
-      return fieldDef.tree_nodes
-        .filter((n) => n.is_active)
-        .sort((a, b) => a.sort_order - b.sort_order)
-        .map((n) => ({
-          value: n.value,
-          label: n.label,
-          color: null,
-          is_active: n.is_active,
-          sort_order: n.sort_order,
-        }))
-    }
-    const cfgOpts = (fieldDef?.type_config as { options?: { label: string; value: string }[] })?.options
-    if (cfgOpts) {
-      return coalescePillOptions([], { options: cfgOpts } as Record<string, unknown>)
-    }
-    return []
-  }, [fieldType, fieldDef])
+  ), [fieldDef, fieldKey, label])
 
-  const renderInput = () => {
-    const strVal = value != null ? String(value) : ''
+  const editorTypeConfig = useMemo(() => {
+    const base = { ...((fieldDef?.type_config ?? {}) as Record<string, unknown>) }
 
-    if (fieldType === FieldType.USER_SELECT || fieldKey === 'user_id') {
-      return (
-        <UserSelect
-          value={typeof value === 'number' ? value : null}
-          onChange={onChange}
-          placeholder={isZh ? '搜索昵称、手机、邮箱...' : 'Search users...'}
-          disabled={isReadonly}
-          dropdownPlacement="top"
-        />
-      )
-    }
-
-    if (fieldType === FieldType.EMPLOYEE_SELECT || fieldKey === 'assignee') {
+    if (fieldType === FieldType.EMPLOYEE_SELECT) {
       const groupValue = formValues.assignee_group ?? formValues.assignee_group_id
-      const groupId = typeof groupValue === 'number' ? groupValue : null
-      return (
-        <EmployeeSelect
-          value={typeof value === 'number' ? value : null}
-          onChange={onChange}
-          groupId={groupId}
-          placeholder={isZh ? '搜索员工…' : 'Search employees...'}
-          disabled={isReadonly}
-          dropdownPlacement="top"
-        />
-      )
+      if (typeof groupValue === 'number') base.group_id = groupValue
     }
 
-    if (fieldType === FieldType.GROUP_SELECT || fieldKey === 'assignee_group') {
+    if (fieldType === FieldType.GROUP_SELECT) {
       const assigneeValue = formValues.assignee ?? formValues.agent_id
-      const memberId = typeof assigneeValue === 'number' ? assigneeValue : null
-      return (
-        <EmployeeGroupSelect
-          value={typeof value === 'number' ? value : null}
-          onChange={onChange}
-          memberId={memberId}
-          placeholder={isZh ? '搜索负责组…' : 'Search groups...'}
-          disabled={isReadonly}
-          dropdownPlacement="top"
-        />
-      )
+      if (typeof assigneeValue === 'number') base.member_id = assigneeValue
     }
 
-    if (fieldType === 'single_select') {
-      return (
-        <PillSelectCombobox
-          value={strVal || null}
-          onChange={(v) => onChange(v ?? '')}
-          options={pillOptions}
-          placeholder={isZh ? '请选择' : 'Select...'}
-          disabled={isReadonly}
-        />
-      )
-    }
+    return base
+  }, [fieldDef, fieldType, formValues.assignee_group, formValues.assignee_group_id, formValues.assignee, formValues.agent_id])
 
-    if (fieldType === 'single_select_tree') {
-      return (
-        <FieldValueEditor
-          fieldType={FieldType.SINGLE_SELECT_TREE}
-          value={value}
-          onChange={onChange}
-          treeNodes={fieldDef?.tree_nodes ?? []}
-          typeConfig={(fieldDef?.type_config ?? {}) as Record<string, unknown>}
-          placeholder={isZh ? '请选择' : 'Select...'}
-          disabled={isReadonly}
-        />
-      )
-    }
-
-    if (fieldType === 'multi_select') {
-      const selected = strVal ? strVal.split(',').filter(Boolean) : []
-      return (
-        <PillMultiSelectField
-          value={selected}
-          onChange={(v) => onChange(v != null && v.length > 0 ? v.join(',') : '')}
-          options={pillOptions}
-          placeholder={isZh ? '暂无选项' : 'No options'}
-          disabled={isReadonly}
-        />
-      )
-    }
-
-    if (fieldType === 'multi_select_tree') {
-      const selected = strVal ? strVal.split(',').filter(Boolean) : []
-      return (
-        <FieldValueEditor
-          fieldType={FieldType.MULTI_SELECT_TREE}
-          value={selected}
-          onChange={(v) =>
-            onChange(Array.isArray(v) && v.length > 0 ? (v as string[]).join(',') : '')
-          }
-          treeNodes={fieldDef?.tree_nodes ?? []}
-          typeConfig={(fieldDef?.type_config ?? {}) as Record<string, unknown>}
-          placeholder={isZh ? '请选择' : 'Select...'}
-          disabled={isReadonly}
-        />
-      )
-    }
-
-    if (fieldType === 'multi_line_text') {
-      return (
-        <Textarea
-          value={strVal}
-          onChange={(e) => onChange(e.target.value)}
-          disabled={isReadonly}
-          rows={3}
-        />
-      )
-    }
-
-    if (fieldType === 'rich_text') {
-      return (
-        <FieldValueEditor
-          fieldType={FieldType.RICH_TEXT}
-          value={value}
-          onChange={onChange}
-          typeConfig={(fieldDef?.type_config ?? {}) as Record<string, unknown>}
-          placeholder={isZh ? '请输入' : 'Enter...'}
-          disabled={isReadonly}
-        />
-      )
-    }
-
-    if (fieldType === 'number') {
-      return (
-        <Input
-          type="number"
-          value={strVal}
-          onChange={(e) => onChange(e.target.value ? Number(e.target.value) : '')}
-          disabled={isReadonly}
-        />
-      )
-    }
-
-    if (fieldType === 'date') {
-      return (
-        <DateInput value={strVal} onChange={(e) => onChange(e.target.value)} disabled={isReadonly} />
-      )
-    }
-
-    if (fieldType === 'datetime') {
-      return (
-        <DateTimeInput value={strVal} onChange={(e) => onChange(e.target.value)} disabled={isReadonly} />
-      )
-    }
-
-    if (fieldType === FieldType.FILE) {
-      return (
-        <FieldValueEditor
-          fieldType={FieldType.FILE}
-          value={value}
-          onChange={onChange}
-          typeConfig={(fieldDef?.type_config ?? {}) as Record<string, unknown>}
-          placeholder={isZh ? '选择文件上传' : 'Upload files'}
-          disabled={isReadonly}
-        />
-      )
-    }
-
-    return (
-      <Input type="text" value={strVal} onChange={(e) => onChange(e.target.value)} disabled={isReadonly} />
-    )
-  }
+  const placeholder = fieldPlaceholder(editorField, isZh)
 
   const isTallControl =
     fieldType === 'multi_line_text' ||
@@ -735,10 +593,44 @@ function FieldInput({
         {isRequired && <span className="ml-0.5 text-destructive">*</span>}
       </Label>
       <div className={cn(isLabelLeft && 'min-w-0 flex-1')}>
-        {renderInput()}
+        <UnifiedFieldValueEditor
+          field={editorField}
+          value={value}
+          onChange={onChange}
+          typeConfig={editorTypeConfig}
+          placeholder={placeholder}
+          disabled={isReadonly}
+          dropdownPlacement="top"
+        />
       </div>
     </div>
   )
+}
+
+function fieldPlaceholder(field: UnifiedField, isZh: boolean): string {
+  const config = field.type_config ?? {}
+  const localizedSearch = isZh ? config.search_placeholder_zh : config.search_placeholder_en
+  if (typeof localizedSearch === 'string' && localizedSearch) return localizedSearch
+  if (typeof config.placeholder === 'string' && config.placeholder) return config.placeholder
+
+  switch (field.field_type) {
+    case FieldType.SINGLE_SELECT:
+    case FieldType.SINGLE_SELECT_TREE:
+    case FieldType.MULTI_SELECT:
+    case FieldType.MULTI_SELECT_TREE:
+    case FieldType.DATE:
+    case FieldType.TIME:
+    case FieldType.DATETIME:
+    case FieldType.USER_SELECT:
+    case FieldType.ORGANIZATION_SELECT:
+    case FieldType.EMPLOYEE_SELECT:
+    case FieldType.GROUP_SELECT:
+      return isZh ? '请选择' : 'Select...'
+    case FieldType.FILE:
+      return isZh ? '选择文件上传' : 'Upload files'
+    default:
+      return isZh ? '请输入' : 'Enter...'
+  }
 }
 
 // ── Interaction rule evaluation ──
@@ -838,6 +730,7 @@ function NoLayoutFallback({
     () => coalescePillOptions(priorityFieldDef?.options ?? [], priorityFieldDef?.type_config ?? {}),
     [priorityFieldDef],
   )
+  const descFieldType = descriptionFieldDef?.field_type ?? FieldType.RICH_TEXT
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-muted-foreground">
@@ -855,13 +748,28 @@ function NoLayoutFallback({
         </div>
         <div className="flex flex-col gap-1.5">
           <Label>{isZh ? '描述' : 'Description'}</Label>
-          <FieldValueEditor
-            fieldType={FieldType.RICH_TEXT}
-            value={formValues.description}
-            onChange={(v) => setFieldValue('description', v)}
-            typeConfig={(descriptionFieldDef?.type_config ?? {}) as Record<string, unknown>}
-            placeholder={isZh ? '请输入' : 'Enter...'}
-          />
+          {descFieldType === FieldType.RICH_TEXT ? (
+            <FieldValueEditor
+              fieldType={FieldType.RICH_TEXT}
+              value={formValues.description}
+              onChange={(v) => setFieldValue('description', v)}
+              typeConfig={(descriptionFieldDef?.type_config ?? {}) as Record<string, unknown>}
+              placeholder={isZh ? '请输入' : 'Enter...'}
+            />
+          ) : descFieldType === FieldType.MULTI_LINE_TEXT ? (
+            <Textarea
+              value={String(formValues.description ?? '')}
+              onChange={(e) => setFieldValue('description', e.target.value)}
+              rows={4}
+              placeholder={isZh ? '请输入' : 'Enter...'}
+            />
+          ) : (
+            <Input
+              value={String(formValues.description ?? '')}
+              onChange={(e) => setFieldValue('description', e.target.value)}
+              placeholder={isZh ? '请输入' : 'Enter...'}
+            />
+          )}
         </div>
         <div className="grid grid-cols-2 gap-4">
           <div className="flex flex-col gap-1.5">

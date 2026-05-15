@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconPencil, IconTrash } from '@tabler/icons-react'
+import { IconPencil, IconTrash, IconPlus } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useEmployeeGroups, useDeleteEmployeeGroup } from '@/service/use-employee-groups'
@@ -122,8 +122,9 @@ export default function EmployeeGroupsPage() {
         <h1 className="text-xl font-semibold text-foreground">{t('eg.title', locale)}</h1>
         <button
           onClick={() => router.push('/employee-groups/new')}
-          className="flex h-9 items-center justify-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
+          className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
         >
+          <IconPlus size={18} />
           {t('eg.new', locale)}
         </button>
       </div>
@@ -157,8 +158,9 @@ export default function EmployeeGroupsPage() {
           <p className="text-sm text-muted-foreground">{t('eg.empty', locale)}</p>
           <button
             onClick={() => router.push('/employee-groups/new')}
-            className="flex h-9 items-center rounded-lg bg-primary px-4 text-sm font-medium text-white"
+            className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white"
           >
+            <IconPlus size={18} />
             {t('eg.new', locale)}
           </button>
         </div>
@@ -167,16 +169,16 @@ export default function EmployeeGroupsPage() {
           {/* Table */}
           <div className="overflow-hidden rounded-lg border border-border">
             <div className="flex h-14 items-center gap-6 rounded-t-lg bg-muted px-6">
-              <div className="flex flex-1 items-center">
+              <div className="flex w-[220px] shrink-0 items-center">
                 <span className="text-sm font-semibold text-foreground/80">{t('eg.col.name', locale)}</span>
               </div>
-              <div className="flex flex-1 items-center">
+              <div className="flex min-w-0 flex-1 items-center">
                 <span className="text-sm font-semibold text-foreground/80">{t('eg.col.desc', locale)}</span>
               </div>
-              <div className="flex w-[80px] items-center">
+              <div className="flex w-[80px] shrink-0 items-center">
                 <span className="text-sm font-semibold text-foreground/80">{t('eg.col.memberCount', locale)}</span>
               </div>
-              <div className="flex w-[70px] items-center">
+              <div className="flex w-[70px] shrink-0 items-center">
                 <span className="text-sm font-semibold text-foreground/80">{t('eg.col.actions', locale)}</span>
               </div>
             </div>
@@ -186,16 +188,20 @@ export default function EmployeeGroupsPage() {
                 key={item.id}
                 className="flex h-14 items-center gap-6 border-t border-border px-6"
               >
-                <div className="flex flex-1 items-center">
-                  <span className="text-sm text-foreground">{item.name}</span>
+                <div className="flex w-[220px] shrink-0 items-center">
+                  <span className="truncate text-sm text-foreground" title={item.name}>
+                    {item.name}
+                  </span>
                 </div>
-                <div className="flex flex-1 items-center">
-                  <span className="truncate text-sm text-muted-foreground">{item.description || '—'}</span>
+                <div className="flex min-w-0 flex-1 items-center">
+                  <span className="truncate text-sm text-muted-foreground" title={item.description || undefined}>
+                    {item.description || '—'}
+                  </span>
                 </div>
-                <div className="flex w-[80px] items-center">
+                <div className="flex w-[80px] shrink-0 items-center">
                   <span className="text-sm text-muted-foreground">{item.member_count}</span>
                 </div>
-                <div className="flex w-[70px] items-center gap-3">
+                <div className="flex w-[70px] shrink-0 items-center gap-3">
                   <button
                     onClick={() => router.push(`/employee-groups/${item.id}`)}
                     className="text-foreground/80 transition-colors hover:text-foreground"

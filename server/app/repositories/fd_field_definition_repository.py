@@ -195,6 +195,28 @@ class FdFieldDefinitionRepository:
         result = await db.execute(q)
         return result.scalar_one() > 0
 
+    @staticmethod
+    async def check_field_key_exists(
+        db: AsyncSession,
+        tenant_id: int,
+        domain: str,
+        field_key: str,
+        exclude_id: int | None = None,
+    ) -> bool:
+        q = (
+            select(func.count())
+            .select_from(FdFieldDefinition)
+            .where(
+                FdFieldDefinition.tenant_id == tenant_id,
+                FdFieldDefinition.domain == domain,
+                FdFieldDefinition.field_key == field_key,
+            )
+        )
+        if exclude_id:
+            q = q.where(FdFieldDefinition.id != exclude_id)
+        result = await db.execute(q)
+        return result.scalar_one() > 0
+
     # ── Field Options ──
 
     @staticmethod

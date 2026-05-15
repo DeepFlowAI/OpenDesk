@@ -145,6 +145,10 @@ export default function UserFieldsListPage() {
 
   const [deleteTarget, setDeleteTarget] = useState<UnifiedField | null>(null)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const pendingWorkspaceToggleKeysRef = useRef<Set<string>>(new Set())
+  const [pendingWorkspaceToggleKeys, setPendingWorkspaceToggleKeys] = useState<Set<string>>(
+    () => new Set(),
+  )
 
   const showToast = useCallback(
     (type: 'success' | 'error', key: string) => {
@@ -191,8 +195,19 @@ export default function UserFieldsListPage() {
 
   const sortItemIds = useMemo(() => sortItems.map(fieldUid), [sortItems])
 
+  const isWorkspaceToggleSaving = useCallback(
+    (field: UnifiedField) => pendingWorkspaceToggleKeys.has(fieldUid(field)),
+    [pendingWorkspaceToggleKeys],
+  )
+
   const handleToggleWorkspace = useCallback(
     async (field: UnifiedField) => {
+      const pendingKey = fieldUid(field)
+      if (pendingWorkspaceToggleKeysRef.current.has(pendingKey)) return
+
+      pendingWorkspaceToggleKeysRef.current.add(pendingKey)
+      setPendingWorkspaceToggleKeys((prev) => new Set(prev).add(pendingKey))
+
       try {
         if (field.source === 'system' && field.key) {
           await overrideMutation.mutateAsync({
@@ -208,6 +223,13 @@ export default function UserFieldsListPage() {
         }
       } catch {
         showToast('error', 'uf.saveFailed')
+      } finally {
+        pendingWorkspaceToggleKeysRef.current.delete(pendingKey)
+        setPendingWorkspaceToggleKeys((prev) => {
+          const next = new Set(prev)
+          next.delete(pendingKey)
+          return next
+        })
       }
     },
     [updateMutation, overrideMutation, showToast],
@@ -413,7 +435,7 @@ export default function UserFieldsListPage() {
                         <ToggleSwitch
                           checked={field.show_in_workspace ?? false}
                           onChange={() => handleToggleWorkspace(field)}
-                          disabled={false}
+                          disabled={isWorkspaceToggleSaving(field)}
                         />
                       </div>
                       <div className="w-[60px] shrink-0">

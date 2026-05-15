@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { IconArrowLeft, IconPlus, IconTrash, IconChevronDown } from '@tabler/icons-react'
-import { useLocaleStore } from '@/context/locale-store'
+import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import { Switch } from '@/components/ui/switch'
@@ -15,7 +15,8 @@ import {
   useCreateSessionRoutingRule,
   useUpdateSessionRoutingRule,
 } from '@/service/use-session-routing-rules'
-import type { Locale } from '@/context/locale-store'
+import { useChannels } from '@/service/use-channels'
+import type { Channel } from '@/models/channel'
 
 type RowState = {
   _key: string
@@ -27,6 +28,42 @@ type RowState = {
 function newKey() {
   return `k-${Math.random().toString(36).slice(2, 11)}`
 }
+
+/** Normalize condition values so API JSONB shapes match controlled form state for dirty detection */
+function normalizeConditionValue(
+  conditionType: SessionConditionType,
+  operator: string,
+  value: unknown
+): string | string[] {
+  if (conditionType === 'web_sdk' && (operator === 'any_eq' || operator === 'any_ne')) {
+    if (!Array.isArray(value)) return []
+    return value.map((v) => String(v))
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v))
+  }
+  return String(value ?? '')
+}
+
+function serializeRoutingComparePayload(
+  name: string,
+  enabled: boolean,
+  targetGroupId: number | '',
+  conditions: Array<{ condition_type: SessionConditionType; operator: string; value: unknown }>
+): string {
+  return JSON.stringify({
+    name: name.trim(),
+    enabled,
+    target: targetGroupId === '' ? '' : Number(targetGroupId),
+    conditions: conditions.map((c) => ({
+      condition_type: c.condition_type,
+      operator: c.operator,
+      value: normalizeConditionValue(c.condition_type, c.operator, c.value),
+    })),
+  })
+}
+
+const EMPTY_NEW_ROUTING_SNAPSHOT = serializeRoutingComparePayload('', true, '', [])
 
 function defaultRow(): RowState {
   return { _key: newKey(), condition_type: 'channel', operator: 'eq', value: '' }
@@ -52,6 +89,14 @@ function isMultiSelect(op: string): boolean {
   return op === 'any_eq' || op === 'any_ne'
 }
 
+function channelRoutingLabel(ch: Channel, locale: Locale): string {
+  const mode =
+    ch.access_mode === 'embed'
+      ? t('ch.accessMode.embed', locale)
+      : t('ch.accessMode.url', locale)
+  return `${ch.name} (${mode})`
+}
+
 type SessionRoutingFormProps = { ruleId?: number }
 
 export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
@@ -61,10 +106,16 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
   const { data: rule, isLoading: loadingRule } = useSessionRoutingRule(ruleId ?? 0)
   const { data: groupsData } = useEmployeeGroups({ page: 1, per_page: 200 })
   const { data: serviceHoursList } = useServiceHours()
+  const { data: channelsData } = useChannels()
   const createMut = useCreateSessionRoutingRule()
   const updateMut = useUpdateSessionRoutingRule()
 
   const groups = groupsData?.items ?? []
+
+  const sdkChannelOptions = useMemo(() => {
+    const list = (channelsData ?? []) as Channel[]
+    return [...list].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+  }, [channelsData])
 
   const [name, setName] = useState('')
   const [enabled, setEnabled] = useState(true)
@@ -103,29 +154,23 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
     }
     if (rule && initialized) {
       setSavedSnapshot(
-        JSON.stringify({
-          name: rule.name.trim(),
-          enabled: rule.enabled,
-          target: rule.target_group_id,
-          conditions: rule.conditions ?? [],
-        })
+        serializeRoutingComparePayload(
+          rule.name,
+          rule.enabled,
+          rule.target_group_id,
+          rule.conditions ?? []
+        )
       )
     }
   }, [isNew, rule, initialized])
 
   const payloadForCompare = useMemo(
     () =>
-      JSON.stringify({
-        name: name.trim(),
-        enabled,
-        target: targetGroupId === '' ? '' : Number(targetGroupId),
-        conditions: rows.map(({ _key: _, ...c }) => c),
-      }),
+      serializeRoutingComparePayload(name, enabled, targetGroupId, rows.map(({ _key: _, ...c }) => c)),
     [name, enabled, targetGroupId, rows]
   )
 
-  const emptyNewSnapshot = '{"name":"","enabled":true,"target":"","conditions":[]}'
-  const isDirty = isNew ? payloadForCompare !== emptyNewSnapshot : payloadForCompare !== savedSnapshot
+  const isDirty = isNew ? payloadForCompare !== EMPTY_NEW_ROUTING_SNAPSHOT : payloadForCompare !== savedSnapshot
 
   const goBack = () => {
     if (isDirty && typeof window !== 'undefined' && !window.confirm(t('sr.form.leaveConfirm', locale))) {
@@ -185,7 +230,9 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
       } else if (ruleId != null) {
         await updateMut.mutateAsync({ id: ruleId, data: body })
         showToast('success', t('sr.form.saveSuccess', locale))
-        setSavedSnapshot(JSON.stringify({ name: tn, enabled, target: Number(targetGroupId), conditions }))
+        setSavedSnapshot(
+          serializeRoutingComparePayload(tn, enabled, Number(targetGroupId), conditions)
+        )
       }
     } catch {
       showToast('error', t('sr.form.saveFailed', locale))
@@ -337,7 +384,11 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                             }}
                             className="h-20 w-full rounded-lg border border-border bg-white px-2.5 text-[13px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
                           >
-                            <option value="web-sdk-default">Web SDK Default</option>
+                            {sdkChannelOptions.map((ch) => (
+                              <option key={ch.id} value={String(ch.id)}>
+                                {channelRoutingLabel(ch, locale)}
+                              </option>
+                            ))}
                           </select>
                         </>
                       ) : (
@@ -348,7 +399,11 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                             className="h-9 w-full appearance-none rounded-lg border border-border bg-white px-2.5 pr-7 text-[13px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
                           >
                             <option value="">{t('sr.cond.value.sdk.placeholder', locale)}</option>
-                            <option value="web-sdk-default">Web SDK Default</option>
+                            {sdkChannelOptions.map((ch) => (
+                              <option key={ch.id} value={String(ch.id)}>
+                                {channelRoutingLabel(ch, locale)}
+                              </option>
+                            ))}
                           </select>
                           <IconChevronDown size={14} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
                         </>

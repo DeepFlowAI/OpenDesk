@@ -186,8 +186,9 @@ export default function OrganizationViewsPage() {
               <button
                 onClick={handleNewView}
                 disabled={createView.isPending}
-                className="flex h-10 items-center rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
+                className="flex h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
               >
+                <IconPlus size={18} />
                 {t('ov.newView', locale)}
               </button>
             </>
@@ -217,9 +218,10 @@ export default function OrganizationViewsPage() {
             <p className="text-sm text-muted-foreground">{t('ov.empty', locale)}</p>
             <button
               onClick={handleNewView}
-              className="flex items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/80"
+              disabled={createView.isPending}
+              className="flex h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
             >
-              <IconPlus size={16} />
+              <IconPlus size={18} />
               {t('ov.newView', locale)}
             </button>
           </div>

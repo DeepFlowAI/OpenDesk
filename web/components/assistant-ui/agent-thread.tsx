@@ -271,6 +271,7 @@ export function AgentThread({ socket }: AgentThreadProps) {
     locale: cfgLocale,
     isClosed,
     isTyping,
+    visitorTypingContent,
     hasMore,
     loadingMore,
     historyAvailable,
@@ -451,9 +452,28 @@ export function AgentThread({ socket }: AgentThreadProps) {
           )}
         </ThreadPrimitive.Messages>
 
-        {/* Visitor typing indicator */}
+        {/* Visitor typing preview */}
         {isTyping && (
-          <div className="mb-2 text-[12px] italic text-[#999999]">{t('ws.chat.visitorTyping', locale)}</div>
+          <div className="mb-4 flex gap-2.5">
+            <div
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-medium text-white"
+              style={{ backgroundColor: visitorAvatarBg }}
+            >
+              {visitorAvatarChar}
+            </div>
+            <div className="flex max-w-[70%] flex-col items-start gap-1">
+              {visitorTypingContent ? (
+                <>
+                  <div className="rounded-[18px] border border-dashed border-[#D0D0D0] bg-white px-3.5 py-2.5 text-sm leading-normal whitespace-pre-wrap text-[#1a1a1a] shadow-sm">
+                    {visitorTypingContent}
+                  </div>
+                  <span className="pl-1 text-[11px] italic text-[#999999]">{t('ws.chat.visitorTyping', locale)}</span>
+                </>
+              ) : (
+                <div className="text-[12px] italic text-[#999999]">{t('ws.chat.visitorTyping', locale)}</div>
+              )}
+            </div>
+          </div>
         )}
       </ThreadPrimitive.Viewport>
 

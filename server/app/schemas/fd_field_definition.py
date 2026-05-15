@@ -82,6 +82,7 @@ class FdFieldDefinitionBase(BaseModel):
 
 
 class FdFieldDefinitionCreate(FdFieldDefinitionBase):
+    key: str = Field(..., min_length=2, max_length=64, pattern=r"^[a-z_][a-z0-9_]*$")
     source: str = Field(default="custom", max_length=16)
     options: list[FdFieldOptionCreate] | None = None
     tree_nodes: list[FdTreeNodeCreate] | None = None

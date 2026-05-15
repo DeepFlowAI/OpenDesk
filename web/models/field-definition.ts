@@ -109,6 +109,7 @@ export type UnifiedField = {
 
 export type CreateFdFieldDefinitionPayload = {
   domain: FieldDomain
+  key: string
   name: string
   description?: string | null
   help_text?: string | null

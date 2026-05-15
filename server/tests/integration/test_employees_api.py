@@ -128,6 +128,45 @@ class TestEmployeesAPI:
         assert update_resp.json()["nickname"] == "Nick"
 
     @pytest.mark.asyncio
+    async def test_update_employee_syncs_group_membership(self, client: AsyncClient):
+        headers = _auth_header()
+        ts = __import__("time").time_ns()
+        group_resp = await client.post(
+            "/api/v1/employee-groups",
+            json={"name": f"Employee Edit Group {ts}"},
+            headers=headers,
+        )
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        payload = {
+            "name": "Group Sync Test",
+            "username": f"groupsync_{ts}",
+            "email": f"groupsync_{ts}@example.com",
+            "password": "Test1234abc",
+        }
+        create_resp = await client.post("/api/v1/employees", json=payload, headers=headers)
+        assert create_resp.status_code == 201
+        emp_id = create_resp.json()["id"]
+
+        update_resp = await client.put(
+            f"/api/v1/employees/{emp_id}",
+            json={"group_ids": [group_id]},
+            headers=headers,
+        )
+        assert update_resp.status_code == 200
+        assert update_resp.json()["group_ids"] == [group_id]
+
+        detail_resp = await client.get(f"/api/v1/employees/{emp_id}", headers=headers)
+        assert detail_resp.status_code == 200
+        assert detail_resp.json()["group_ids"] == [group_id]
+
+        group_detail_resp = await client.get(f"/api/v1/employee-groups/{group_id}", headers=headers)
+        assert group_detail_resp.status_code == 200
+        member_ids = [member["employee_id"] for member in group_detail_resp.json()["members"]]
+        assert emp_id in member_ids
+
+    @pytest.mark.asyncio
     async def test_delete_employee_returns_200(self, client: AsyncClient):
         headers = _auth_header()
         ts = __import__("time").time_ns()

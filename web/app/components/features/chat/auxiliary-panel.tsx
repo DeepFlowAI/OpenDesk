@@ -13,7 +13,7 @@ import type { CustomFieldValue, UpdateUserPayload, User } from '@/models/user'
 import { useUnifiedFields } from '@/service/use-field-definitions'
 import { useUpdateUser, useUser } from '@/service/use-users'
 import { FieldValueDisplay } from '@/app/components/features/field-system/field-value-display'
-import { FieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
+import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
 import { SessionSummaryFields } from '@/app/components/features/session-summary/session-summary-fields'
 import { ChatTicketDraftPanel, hasTicketDraft } from '@/app/components/features/chat/chat-ticket-draft-panel'
 import { FieldType } from '@/types/field-enums'
@@ -377,16 +377,13 @@ function EditableInfoRow({
           }}
         >
           <div className="relative">
-            <FieldValueEditor
-              fieldType={field.field_type}
+            <UnifiedFieldValueEditor
+              field={field}
               value={value}
               onChange={(nextValue) => {
                 onChange(nextValue)
                 if (shouldSaveOnChange) void onSaveValue(nextValue)
               }}
-              typeConfig={field.type_config ?? {}}
-              options={field.options}
-              treeNodes={field.tree_nodes}
               disabled={saving}
               className="min-h-8 text-[13px]"
               autoFocus
@@ -516,6 +513,7 @@ function getFieldIdentity(field: UnifiedField): string {
 }
 
 function getSystemKey(field: UnifiedField): keyof User | null {
+  if (field.source === 'custom') return null
   if (!field.key) return null
   return SYSTEM_KEY_ALIAS[field.key] ?? (field.key as keyof User)
 }
@@ -523,6 +521,7 @@ function getSystemKey(field: UnifiedField): keyof User | null {
 function getFieldRawValue(user: User, field: UnifiedField): unknown {
   const systemKey = getSystemKey(field)
   if (systemKey) return user[systemKey]
+  if (field.key) return user.custom_fields?.[field.key] ?? (field.id != null ? user.custom_fields?.[String(field.id)] : null)
   if (field.id != null) return user.custom_fields?.[String(field.id)] ?? null
   return null
 }
@@ -539,8 +538,9 @@ function buildUpdatePayload(field: UnifiedField, value: unknown): UpdateUserPayl
   if (systemKey && EDITABLE_SYSTEM_KEYS.has(systemKey)) {
     return { [systemKey]: normalizeEmptyValue(value) } as UpdateUserPayload
   }
-  if (field.id != null) {
-    return { custom_fields: { [String(field.id)]: normalizeEmptyValue(value) as CustomFieldValue } }
+  const customKey = field.key ?? (field.id != null ? String(field.id) : null)
+  if (customKey) {
+    return { custom_fields: { [customKey]: normalizeEmptyValue(value) as CustomFieldValue } }
   }
   return {}
 }

@@ -31,8 +31,9 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(inbound_routing_rules.router, prefix="/api/v1")
     app.include_router(session_routing_rules.router, prefix="/api/v1")
     app.include_router(channels.router, prefix="/api/v1")
-    # Tenant CRUD API moved to closed-source extension (private/extensions/server/tenants/).
-    # Open-source deployments rely on the auto-provisioned default tenant from app.db.seed.
+    # Tenant CRUD endpoints are provided by an optional tenant-management
+    # extension (see app.extensions). Single-tenant deployments rely on the
+    # auto-provisioned default tenant from app.db.seed instead.
 
     from app.routers.v1 import conversations, public, session_records, field_definitions, transfer
     app.include_router(conversations.router, prefix="/api/v1")

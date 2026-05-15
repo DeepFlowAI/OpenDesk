@@ -4,8 +4,6 @@ Socket.IO event handlers for the agent-side /chat namespace.
 Events:
   connect    — authenticate agent via JWT, join agent room
   disconnect — cleanup
-  join_conversation  — join a conversation room
-  leave_conversation — leave a conversation room
   send_message       — agent sends a message
   typing             — agent is typing
   update_status      — change agent online status
@@ -198,38 +196,6 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         status_data = await AgentStatusService.get_status(r, tenant_id, user_id, max_c)
         return {"ok": True, "status": status_data}
 
-    @rt.on("join_conversation", namespace=NAMESPACE)  # type: ignore
-    async def on_join_conversation(sid: str, data: dict):
-        conversation_id = data.get("conversation_id")
-        if not conversation_id:
-            return {"error": "conversation_id required"}
-
-        session = await rt.get_session(sid, namespace=NAMESPACE)
-        room = f"conv:{conversation_id}"
-        await rt.join_room(sid, room, namespace=NAMESPACE)
-
-        # Mark messages as read and notify visitor
-        async with AsyncSessionLocal() as db:
-            await ConversationService.mark_read(db, conversation_id)
-
-        await rt.emit("messages_read", {
-            "conversation_id": conversation_id,
-        }, room=room, namespace="/visitor")
-        await rt.emit("conversation_updated", {
-            "conversation_id": conversation_id,
-            "unread_count": 0,
-        }, room=room, namespace=NAMESPACE)
-
-        return {"ok": True}
-
-    @rt.on("leave_conversation", namespace=NAMESPACE)  # type: ignore
-    async def on_leave_conversation(sid: str, data: dict):
-        conversation_id = data.get("conversation_id")
-        if conversation_id:
-            room = f"conv:{conversation_id}"
-            await rt.leave_room(sid, room, namespace=NAMESPACE)
-        return {"ok": True}
-
     @rt.on("send_message", namespace=NAMESPACE)  # type: ignore
     async def on_send_message(sid: str, data: dict):
         session = await rt.get_session(sid, namespace=NAMESPACE)
@@ -269,9 +235,11 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
         }
 
-        # Broadcast to conversation room (both agent and visitor namespaces)
+        # Broadcast through the same message stream used for visitor messages so
+        # every agent-side UI update is driven by server-confirmed data.
         conv_room = f"conv:{conversation_id}"
-        await rt.emit("new_message", msg_payload, room=conv_room, namespace=NAMESPACE)
+        agent_room = f"agent:{tenant_id}:{user_id}"
+        await rt.emit("new_message", msg_payload, room=agent_room, namespace=NAMESPACE)
         await rt.emit("new_message", msg_payload, room=conv_room, namespace="/visitor")
 
         return {"ok": True, "message": msg_payload}
@@ -300,26 +268,30 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
         end_payload = {"conversation_id": conversation_id, "ended_by": "agent"}
         conv_room = f"conv:{conversation_id}"
-        await rt.emit("conversation_ended", end_payload, room=conv_room, namespace=NAMESPACE)
+        agent_room = f"agent:{tenant_id}:{session.get('user_id')}"
+        await rt.emit("conversation_ended", end_payload, room=agent_room, namespace=NAMESPACE)
         await rt.emit("conversation_ended", end_payload, room=conv_room, namespace="/visitor")
 
         return {"ok": True}
 
     @rt.on("mark_read", namespace=NAMESPACE)  # type: ignore
     async def on_mark_read(sid: str, data: dict):
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        tenant_id = session.get("tenant_id")
+        user_id = session.get("user_id")
         conversation_id = data.get("conversation_id")
         if conversation_id:
             async with AsyncSessionLocal() as db:
                 await ConversationService.mark_read(db, conversation_id)
 
-            # Notify visitor that their messages have been read
             conv_room = f"conv:{conversation_id}"
+            agent_room = f"agent:{tenant_id}:{user_id}"
             await rt.emit("messages_read", {
                 "conversation_id": conversation_id,
             }, room=conv_room, namespace="/visitor")
             await rt.emit("conversation_updated", {
                 "conversation_id": conversation_id,
                 "unread_count": 0,
-            }, room=conv_room, namespace=NAMESPACE)
+            }, room=agent_room, namespace=NAMESPACE)
 
         return {"ok": True}

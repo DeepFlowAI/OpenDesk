@@ -16,6 +16,7 @@ class FdFieldDefinition(Base, TimestampMixin):
     __tablename__ = "fd_field_definitions"
     __table_args__ = (
         UniqueConstraint("tenant_id", "domain", "name", name="uq_fd_field_defs_tenant_domain_name"),
+        UniqueConstraint("tenant_id", "domain", "field_key", name="uq_fd_field_defs_tenant_domain_field_key"),
         Index("ix_fd_field_defs_tenant_domain", "tenant_id", "domain"),
         Index("ix_fd_field_defs_tenant_domain_status", "tenant_id", "domain", "status"),
     )
@@ -30,6 +31,7 @@ class FdFieldDefinition(Base, TimestampMixin):
     field_type: Mapped[str] = mapped_column(String(32), nullable=False)
     type_config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     slot_column: Mapped[str] = mapped_column(String(16), nullable=False)
+    field_key: Mapped[str] = mapped_column(String(64), nullable=False)
     applicable_modules: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
     show_in_workspace: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="active")
@@ -44,6 +46,11 @@ class FdFieldDefinition(Base, TimestampMixin):
         "FdTreeNode", back_populates="field_definition",
         cascade="all, delete-orphan", lazy="selectin",
     )
+
+    @property
+    def key(self) -> str:
+        """Alias for API / Pydantic (`FdFieldDefinitionResponse.key`)."""
+        return self.field_key
 
 
 from app.models.fd_field_option import FdFieldOption  # noqa: E402

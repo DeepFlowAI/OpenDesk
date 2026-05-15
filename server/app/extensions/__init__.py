@@ -1,16 +1,16 @@
-"""Extension loader for closed-source modules.
+"""Extension loader for optional add-on modules.
 
-This package is intentionally empty in the open-source distribution. Private
-deployments overlay closed-source modules into this package before docker
+This package is intentionally empty in the default distribution. Deployments
+that bundle additional modules overlay them into this package before docker
 build (see deploy.sh / .github/workflows/deploy.yml).
 
 On startup, every subpackage that defines a top-level callable
 ``register(app: FastAPI) -> None`` is auto-loaded — typically registering
 extra routers or replacing default service implementations.
 
-Adding a new extension is purely additive: drop a new subpackage under
-``private/extensions/server/<name>/`` with a ``register(app)`` function;
-nothing in the open-source code needs to change.
+Adding a new extension is purely additive: drop a new subpackage into this
+package with a ``register(app)`` function; nothing in the default codebase
+needs to change.
 """
 import importlib
 import logging
@@ -25,13 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 def _augment_path_with_private_overlay() -> None:
-    """In local development, mount ``private/extensions/server`` into this package.
+    """In local development, mount the ``private/extensions/server`` overlay into this package.
 
-    Production deploy copies private extensions into ``server/app/extensions/`` at
+    Production deploy copies overlay extensions into ``server/app/extensions/`` at
     build time (see deploy.sh). In a local checkout we keep them in ``private/``
     and extend ``__path__`` instead so ``pkgutil.iter_modules`` finds them as
     additional ``app.extensions.<name>`` subpackages — no copy required.
-    No-op when the directory is absent (e.g. inside the OSS docker image).
+    No-op when the directory is absent (e.g. inside the default docker image).
     """
     repo_root = Path(__file__).resolve().parents[3]
     private_dir = repo_root / "private" / "extensions" / "server"
@@ -77,6 +77,6 @@ def load_extensions(app: "FastAPI") -> list[str]:
     if loaded:
         logger.info("Loaded %d extension(s): %s", len(loaded), ", ".join(loaded))
     # Expose to request handlers (e.g. /api/v1/system/info) as a single source
-    # of truth for "which closed-source modules are active in this build".
+    # of truth for which add-on modules are active in this build.
     app.state.loaded_extensions = loaded
     return loaded

@@ -12,6 +12,16 @@ from app.schemas.employee import EmployeeCreate, EmployeeUpdate, StatusUpdate
 class EmployeeService:
 
     @staticmethod
+    async def _validate_group_ids(
+        db: AsyncSession, tenant_id: int, group_ids: list[int]
+    ) -> None:
+        """Ensure all selected employee groups belong to the current tenant."""
+        existing_ids = await EmployeeRepository.get_existing_group_ids(db, tenant_id, group_ids)
+        missing_ids = [group_id for group_id in group_ids if group_id not in existing_ids]
+        if missing_ids:
+            raise ValidationError("Employee group not found")
+
+    @staticmethod
     async def list_employees(
         db: AsyncSession,
         tenant_id: int,
@@ -33,6 +43,7 @@ class EmployeeService:
             status=status,
             group_id=group_id,
         )
+        await EmployeeRepository.attach_group_ids(db, items)
         pages = (total + per_page - 1) // per_page if total > 0 else 0
         return {
             "items": items,
@@ -48,6 +59,7 @@ class EmployeeService:
         user = await EmployeeRepository.get_by_id(db, employee_id)
         if not user or user.tenant_id != tenant_id:
             raise NotFoundError("Employee not found")
+        await EmployeeRepository.attach_group_ids(db, [user])
         return user
 
     @staticmethod
@@ -56,6 +68,8 @@ class EmployeeService:
         existing = await EmployeeRepository.get_by_username_in_tenant(db, tenant_id, data.username)
         if existing:
             raise ValidationError("Username already exists in this tenant")
+
+        await EmployeeService._validate_group_ids(db, tenant_id, data.group_ids)
 
         create_data = {
             "tenant_id": tenant_id,
@@ -71,7 +85,11 @@ class EmployeeService:
             "max_concurrent": data.max_concurrent,
             "default_language": data.default_language,
         }
-        return await EmployeeRepository.create(db, create_data)
+        user = await EmployeeRepository.create(db, create_data)
+        if data.group_ids:
+            await EmployeeRepository.replace_group_ids(db, user.id, data.group_ids)
+        user.group_ids = data.group_ids
+        return user
 
     @staticmethod
     async def update(
@@ -83,6 +101,9 @@ class EmployeeService:
             raise NotFoundError("Employee not found")
 
         update_data = data.model_dump(exclude_unset=True)
+        group_ids = update_data.pop("group_ids", None)
+        if group_ids is not None:
+            await EmployeeService._validate_group_ids(db, tenant_id, group_ids)
 
         if "username" in update_data and update_data["username"] != user.username:
             existing = await EmployeeRepository.get_by_username_in_tenant(
@@ -96,7 +117,13 @@ class EmployeeService:
             if pwd:
                 update_data["password_hash"] = hash_password(pwd)
 
-        return await EmployeeRepository.update(db, user, update_data)
+        user = await EmployeeRepository.update(db, user, update_data)
+        if group_ids is not None:
+            await EmployeeRepository.replace_group_ids(db, user.id, group_ids)
+            user.group_ids = group_ids
+        else:
+            await EmployeeRepository.attach_group_ids(db, [user])
+        return user
 
     @staticmethod
     async def delete(db: AsyncSession, tenant_id: int, employee_id: int) -> None:
@@ -116,4 +143,6 @@ class EmployeeService:
         user = await EmployeeRepository.get_by_id(db, employee_id)
         if not user or user.tenant_id != tenant_id:
             raise NotFoundError("Employee not found")
-        return await EmployeeRepository.update(db, user, {"is_active": data.is_active})
+        user = await EmployeeRepository.update(db, user, {"is_active": data.is_active})
+        await EmployeeRepository.attach_group_ids(db, [user])
+        return user

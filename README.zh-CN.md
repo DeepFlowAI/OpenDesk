@@ -52,7 +52,7 @@ docker compose up -d        # 默认自带 PostgreSQL + Redis
 | -------- | ------------ |
 | 企业 ID  | `default`    |
 | 账号     | `admin`      |
-| 密码     | `admin123`   |
+| 密码     | `Admin123456`   |
 
 > ⚠️ **任何非本地环境，首次登录后请立即修改密码。**
 

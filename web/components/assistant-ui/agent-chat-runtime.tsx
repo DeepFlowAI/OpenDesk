@@ -26,6 +26,7 @@ export type AgentChatConfigValue = {
   locale: string
   isClosed: boolean
   isTyping: boolean
+  visitorTypingContent: string
   hasMore: boolean
   loadingMore: boolean
   historyAvailable: boolean

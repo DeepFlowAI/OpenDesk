@@ -1,6 +1,8 @@
 import type { Metadata } from 'next'
 import { QueryProvider } from '@/context/query-client'
 import '@/styles/globals.css'
+import '@/styles/_variables.scss'
+import '@/styles/_keyframe-animations.scss'
 import 'yet-another-react-lightbox/styles.css'
 import 'yet-another-react-lightbox/plugins/thumbnails.css'
 import 'jit-viewer/style.css'

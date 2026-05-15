@@ -125,7 +125,7 @@ class TicketService:
     async def _get_field_key_slot_map(db: AsyncSession, tenant_id: int) -> dict[str, str]:
         ticket_mod = ApplicableModule.TICKET.value
         result = await db.execute(
-            select(FdFieldDefinition.id, FdFieldDefinition.slot_column).where(
+            select(FdFieldDefinition.id, FdFieldDefinition.field_key, FdFieldDefinition.slot_column).where(
                 FdFieldDefinition.tenant_id == tenant_id,
                 FdFieldDefinition.status == "active",
                 or_(
@@ -137,13 +137,13 @@ class TicketService:
                 ),
             )
         )
-        return {row.slot_column: str(row.id) for row in result.all()}
+        return {row.slot_column: (row.field_key or str(row.id)) for row in result.all()}
 
     @staticmethod
     async def _get_key_to_slot_map(db: AsyncSession, tenant_id: int) -> dict[str, str]:
         ticket_mod = ApplicableModule.TICKET.value
         result = await db.execute(
-            select(FdFieldDefinition.id, FdFieldDefinition.slot_column).where(
+            select(FdFieldDefinition.id, FdFieldDefinition.field_key, FdFieldDefinition.slot_column).where(
                 FdFieldDefinition.tenant_id == tenant_id,
                 FdFieldDefinition.status == "active",
                 or_(
@@ -155,13 +155,23 @@ class TicketService:
                 ),
             )
         )
-        return {str(row.id): row.slot_column for row in result.all()}
+        key_to_slot: dict[str, str] = {}
+        for row in result.all():
+            key_to_slot[str(row.id)] = row.slot_column
+            if row.field_key:
+                key_to_slot[row.field_key] = row.slot_column
+        return key_to_slot
 
     @staticmethod
     async def _get_key_to_field_meta(db: AsyncSession, tenant_id: int) -> dict[str, dict[str, str]]:
         ticket_mod = ApplicableModule.TICKET.value
         result = await db.execute(
-            select(FdFieldDefinition.id, FdFieldDefinition.name, FdFieldDefinition.slot_column).where(
+            select(
+                FdFieldDefinition.id,
+                FdFieldDefinition.field_key,
+                FdFieldDefinition.name,
+                FdFieldDefinition.slot_column,
+            ).where(
                 FdFieldDefinition.tenant_id == tenant_id,
                 FdFieldDefinition.status == "active",
                 or_(
@@ -173,10 +183,13 @@ class TicketService:
                 ),
             )
         )
-        return {
-            str(row.id): {"name": row.name, "slot_column": row.slot_column}
-            for row in result.all()
-        }
+        key_to_meta: dict[str, dict[str, str]] = {}
+        for row in result.all():
+            meta = {"name": row.name, "slot_column": row.slot_column}
+            key_to_meta[str(row.id)] = meta
+            if row.field_key:
+                key_to_meta[row.field_key] = meta
+        return key_to_meta
 
     @staticmethod
     def _normalize_change_value(value: object) -> object:

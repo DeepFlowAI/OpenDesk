@@ -5,11 +5,12 @@ import { IconChevronDown, IconSearch, IconX } from '@tabler/icons-react'
 import { DateInput, DateTimeInput, TimeInput } from '@/components/ui/time-input'
 import { cn } from '@/lib/utils'
 import { FieldType } from '@/types/field-enums'
-import type { FdFieldOption, FdTreeNode } from '@/models/field-definition'
+import type { FdFieldOption, FdTreeNode, UnifiedField } from '@/models/field-definition'
 import type { Organization } from '@/models/organization'
 import { FieldFileEditor } from '@/app/components/features/field-system/field-file-editor'
 import { TreeSelectEditor } from '@/app/components/features/field-system/tree-select-editor'
 import { RichTextFieldEditor } from '@/app/components/features/field-system/rich-text-field-editor'
+import { UserSelect } from '@/app/components/features/ticket/user-select'
 import { EmployeeSelect } from '@/app/components/features/ticket/employee-select'
 import { EmployeeGroupSelect } from '@/app/components/features/ticket/employee-group-select'
 import { useOrganization, useQueryOrganizations } from '@/service/use-organizations'
@@ -31,6 +32,7 @@ type FieldValueEditorProps = {
   disabled?: boolean
   className?: string
   autoFocus?: boolean
+  dropdownPlacement?: 'top' | 'bottom'
 }
 
 const inputClass =
@@ -52,8 +54,82 @@ const DEFAULT_PLACEHOLDERS: Record<string, string> = {
   url: '请输入',
   file: '请上传',
   rich_text: '请输入',
+  user_select: '请选择用户',
+  organization_select: '请选择组织',
   employee_select: '请选择员工',
   group_select: '请选择负责组',
+}
+
+type UnifiedFieldValueEditorProps = Omit<FieldValueEditorProps, 'fieldType' | 'options' | 'treeNodes'> & {
+  field: UnifiedField
+}
+
+export function UnifiedFieldValueEditor({
+  field,
+  value,
+  onChange,
+  typeConfig,
+  ...props
+}: UnifiedFieldValueEditorProps) {
+  const mergedTypeConfig = typeConfig ?? ((field.type_config ?? {}) as Record<string, unknown>)
+
+  return (
+    <FieldValueEditor
+      {...props}
+      fieldType={field.field_type}
+      value={normalizeFieldEditorValue(field.field_type, value)}
+      onChange={(next) => onChange(normalizeFieldEditorOutput(field.field_type, next))}
+      typeConfig={mergedTypeConfig}
+      options={field.options ?? []}
+      treeNodes={field.tree_nodes ?? []}
+    />
+  )
+}
+
+function toStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean)
+  if (typeof value === 'string') return value.split(',').map((item) => item.trim()).filter(Boolean)
+  return []
+}
+
+function toNullableNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function normalizeFieldEditorValue(fieldType: FieldType, value: unknown): unknown {
+  if (fieldType === FieldType.MULTI_SELECT || fieldType === FieldType.MULTI_SELECT_TREE) {
+    return toStringArray(value)
+  }
+  if (
+    fieldType === FieldType.USER_SELECT ||
+    fieldType === FieldType.ORGANIZATION_SELECT ||
+    fieldType === FieldType.EMPLOYEE_SELECT ||
+    fieldType === FieldType.GROUP_SELECT
+  ) {
+    return toNullableNumber(value)
+  }
+  return value
+}
+
+function normalizeFieldEditorOutput(fieldType: FieldType, value: unknown): unknown {
+  if (fieldType === FieldType.MULTI_SELECT || fieldType === FieldType.MULTI_SELECT_TREE) {
+    const values = toStringArray(value)
+    return values.length > 0 ? values : null
+  }
+  if (
+    fieldType === FieldType.USER_SELECT ||
+    fieldType === FieldType.ORGANIZATION_SELECT ||
+    fieldType === FieldType.EMPLOYEE_SELECT ||
+    fieldType === FieldType.GROUP_SELECT
+  ) {
+    return toNullableNumber(value)
+  }
+  return value
 }
 
 function getDropdownPlacement(root: HTMLElement | null, expectedHeight = 256): 'top' | 'bottom' {
@@ -94,6 +170,7 @@ export function FieldValueEditor({
   disabled = false,
   className,
   autoFocus = false,
+  dropdownPlacement = 'bottom',
 }: FieldValueEditorProps) {
   const ph = placeholder ?? (typeConfig.placeholder as string) ?? DEFAULT_PLACEHOLDERS[fieldType] ?? ''
 
@@ -255,42 +332,57 @@ export function FieldValueEditor({
         />
       )
 
+    case FieldType.USER_SELECT:
+      return (
+        <UserSelect
+          value={toNullableNumber(value)}
+          onChange={onChange}
+          placeholder={ph}
+          disabled={disabled}
+          className={className}
+          dropdownPlacement={dropdownPlacement}
+        />
+      )
+
     case FieldType.ORGANIZATION_SELECT:
       return (
         <OrganizationSelectEditor
-          value={typeof value === 'number' ? value : value != null && value !== '' ? Number(value) : null}
+          value={toNullableNumber(value)}
           onChange={onChange}
           typeConfig={typeConfig}
           placeholder={ph}
           disabled={disabled}
           className={className}
           autoFocus={autoFocus}
+          dropdownPlacement={dropdownPlacement}
         />
       )
 
     case FieldType.EMPLOYEE_SELECT:
       return (
         <EmployeeSelect
-          value={typeof value === 'number' ? value : value != null && value !== '' ? Number(value) : null}
+          value={toNullableNumber(value)}
           onChange={onChange}
-          groupId={typeof typeConfig.group_id === 'number' ? typeConfig.group_id : null}
+          groupId={toNullableNumber(typeConfig.group_id)}
           placeholder={ph}
           disabled={disabled}
           className={className}
           autoFocus={autoFocus}
+          dropdownPlacement={dropdownPlacement}
         />
       )
 
     case FieldType.GROUP_SELECT:
       return (
         <EmployeeGroupSelect
-          value={typeof value === 'number' ? value : value != null && value !== '' ? Number(value) : null}
+          value={toNullableNumber(value)}
           onChange={onChange}
-          memberId={typeof typeConfig.member_id === 'number' ? typeConfig.member_id : null}
+          memberId={toNullableNumber(typeConfig.member_id)}
           placeholder={ph}
           disabled={disabled}
           className={className}
           autoFocus={autoFocus}
+          dropdownPlacement={dropdownPlacement}
         />
       )
 
@@ -322,7 +414,7 @@ export function FieldValueEditor({
   }
 }
 
-function OrganizationSelectEditor({
+export function OrganizationSelectEditor({
   value,
   onChange,
   typeConfig,
@@ -330,14 +422,18 @@ function OrganizationSelectEditor({
   disabled,
   className,
   autoFocus,
+  multi = false,
+  dropdownPlacement,
 }: {
-  value: number | null
-  onChange: (value: number | null) => void
+  value: number | number[] | null
+  onChange: (value: number | number[] | null) => void
   typeConfig: Record<string, unknown>
   placeholder: string
   disabled: boolean
   className?: string
   autoFocus?: boolean
+  multi?: boolean
+  dropdownPlacement?: 'top' | 'bottom'
 }) {
   const [open, setOpen] = useState(false)
   const [placement, setPlacement] = useState<'top' | 'bottom'>('bottom')
@@ -345,7 +441,12 @@ function OrganizationSelectEditor({
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
 
-  const { data: selectedOrganization } = useOrganization(value ?? 0)
+  const selectedIds = useMemo(() => {
+    if (multi) return Array.isArray(value) ? value : []
+    return typeof value === 'number' ? [value] : []
+  }, [multi, value])
+
+  const { data: selectedOrganization } = useOrganization(!multi && selectedIds[0] ? selectedIds[0] : 0)
   const { data: organizationsData, isLoading } = useQueryOrganizations({
     search: debouncedSearch || undefined,
     page: 1,
@@ -354,9 +455,9 @@ function OrganizationSelectEditor({
 
   useEffect(() => {
     if (!autoFocus || disabled) return
-    setPlacement(getDropdownPlacement(rootRef.current))
+    setPlacement(dropdownPlacement ?? getDropdownPlacement(rootRef.current))
     setOpen(true)
-  }, [autoFocus, disabled])
+  }, [autoFocus, disabled, dropdownPlacement])
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 250)
@@ -374,7 +475,7 @@ function OrganizationSelectEditor({
 
   useEffect(() => {
     if (!open) return
-    const updatePlacement = () => setPlacement(getDropdownPlacement(rootRef.current))
+    const updatePlacement = () => setPlacement(dropdownPlacement ?? getDropdownPlacement(rootRef.current))
     updatePlacement()
     window.addEventListener('resize', updatePlacement)
     window.addEventListener('scroll', updatePlacement, true)
@@ -382,7 +483,7 @@ function OrganizationSelectEditor({
       window.removeEventListener('resize', updatePlacement)
       window.removeEventListener('scroll', updatePlacement, true)
     }
-  }, [open])
+  }, [open, dropdownPlacement])
 
   const options = useMemo<Organization[]>(() => {
     const items = organizationsData?.items ?? []
@@ -394,15 +495,31 @@ function OrganizationSelectEditor({
     (typeConfig.search_placeholder_zh as string | undefined) ??
     (typeConfig.search_placeholder as string | undefined) ??
     placeholder
-  const selectedName = selectedOrganization?.name
+  const selectedName = useMemo(() => {
+    if (selectedIds.length === 0) return ''
+    return selectedIds
+      .map((id) => options.find((organization) => organization.id === id)?.name ?? `Organization #${id}`)
+      .join(', ')
+  }, [options, selectedIds])
 
   const pick = useCallback(
     (organizationId: number | null) => {
+      if (multi) {
+        if (organizationId == null) {
+          onChange([])
+          return
+        }
+        const next = selectedIds.includes(organizationId)
+          ? selectedIds.filter((id) => id !== organizationId)
+          : [...selectedIds, organizationId]
+        onChange(next)
+        return
+      }
       onChange(organizationId)
       setOpen(false)
       setSearch('')
     },
-    [onChange],
+    [multi, onChange, selectedIds],
   )
 
   return (
@@ -419,7 +536,7 @@ function OrganizationSelectEditor({
           disabled={disabled}
           className="flex min-w-0 flex-1 items-center text-left disabled:cursor-not-allowed"
           onClick={() => {
-            if (!open) setPlacement(getDropdownPlacement(rootRef.current))
+            if (!open) setPlacement(dropdownPlacement ?? getDropdownPlacement(rootRef.current))
             setOpen((prev) => !prev)
           }}
           aria-haspopup="listbox"
@@ -431,7 +548,7 @@ function OrganizationSelectEditor({
             <span className="truncate text-muted-foreground">{searchPlaceholder}</span>
           )}
         </button>
-        {value != null && !disabled && (
+        {selectedIds.length > 0 && !disabled && (
           <button
             type="button"
             className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
@@ -449,7 +566,7 @@ function OrganizationSelectEditor({
           disabled={disabled}
           className="flex h-6 w-6 shrink-0 items-center justify-center text-muted-foreground disabled:cursor-not-allowed"
           onClick={() => {
-            if (!open) setPlacement(getDropdownPlacement(rootRef.current))
+            if (!open) setPlacement(dropdownPlacement ?? getDropdownPlacement(rootRef.current))
             setOpen((prev) => !prev)
           }}
           aria-label="Open organization list"
@@ -478,17 +595,19 @@ function OrganizationSelectEditor({
           </div>
 
           <ul role="listbox" className="mt-1 max-h-60 overflow-y-auto py-1">
-            <li>
-              <button
-                type="button"
-                role="option"
-                aria-selected={value == null}
-                className="w-full rounded-md px-2 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-muted/80"
-                onClick={() => pick(null)}
-              >
-                无组织
-              </button>
-            </li>
+            {!multi && (
+              <li>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={selectedIds.length === 0}
+                  className="w-full rounded-md px-2 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-muted/80"
+                  onClick={() => pick(null)}
+                >
+                  无组织
+                </button>
+              </li>
+            )}
             {isLoading ? (
               <li className="px-2 py-3 text-center text-xs text-muted-foreground">加载中...</li>
             ) : options.length === 0 ? (
@@ -499,10 +618,10 @@ function OrganizationSelectEditor({
                   <button
                     type="button"
                     role="option"
-                    aria-selected={value === organization.id}
+                    aria-selected={selectedIds.includes(organization.id)}
                     className={cn(
                       'flex w-full flex-col rounded-md px-2 py-1.5 text-left transition-colors',
-                      value === organization.id ? 'bg-primary/10' : 'hover:bg-muted/80',
+                      selectedIds.includes(organization.id) ? 'bg-primary/10' : 'hover:bg-muted/80',
                     )}
                     onClick={() => pick(organization.id)}
                   >
@@ -624,7 +743,7 @@ function MultiSelectEditor({
   className?: string
   autoFocus?: boolean
 }) {
-  const selected = Array.isArray(value) ? (value as string[]) : []
+  const selected = toStringArray(value)
   const pillOptions = coalescePillOptions(options, typeConfig)
 
   return (

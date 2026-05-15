@@ -65,6 +65,28 @@ async def test_create_tenant_with_remark(client):
 
 
 @pytest.mark.asyncio
+async def test_create_tenant_with_slug(client):
+    name = _unique("tenant")
+    slug = f"QDMA/{_unique('brand')}"
+    resp = await client.post(BASE, headers=HEADERS, json={
+        "name": name,
+        "slug": slug,
+        "admin_username": "adm_slug",
+        "admin_password": "Passw0rd123",
+    })
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["slug"] == slug.lower()
+
+    login_resp = await client.post("/api/v1/auth/login", json={
+        "tenant": slug.upper(),
+        "username": "adm_slug",
+        "password": "Passw0rd123",
+    })
+    assert login_resp.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_create_tenant_duplicate_name(client):
     name = _unique("tenant")
     await client.post(BASE, headers=HEADERS, json={
@@ -75,6 +97,42 @@ async def test_create_tenant_duplicate_name(client):
     resp = await client.post(BASE, headers=HEADERS, json={
         "name": name,
         "admin_username": "adm2",
+        "admin_password": "Passw0rd123",
+    })
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_create_tenant_duplicate_slug_returns_409(client):
+    slug = _unique("slug")
+    await client.post(BASE, headers=HEADERS, json={
+        "name": _unique("tenant"),
+        "slug": slug,
+        "admin_username": "adm_dup1",
+        "admin_password": "Passw0rd123",
+    })
+    resp = await client.post(BASE, headers=HEADERS, json={
+        "name": _unique("tenant"),
+        "slug": slug.upper(),
+        "admin_username": "adm_dup2",
+        "admin_password": "Passw0rd123",
+    })
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_create_tenant_slug_conflicts_with_other_tenant_id(client):
+    create_resp = await client.post(BASE, headers=HEADERS, json={
+        "name": _unique("tenant"),
+        "admin_username": "adm_conflict1",
+        "admin_password": "Passw0rd123",
+    })
+    tenant_id = create_resp.json()["id"]
+
+    resp = await client.post(BASE, headers=HEADERS, json={
+        "name": _unique("tenant"),
+        "slug": tenant_id,
+        "admin_username": "adm_conflict2",
         "admin_password": "Passw0rd123",
     })
     assert resp.status_code == 409
@@ -158,6 +216,30 @@ async def test_update_tenant(client):
     assert resp.status_code == 200
     assert resp.json()["name"] == new_name
     assert resp.json()["remark"] == "updated remark"
+
+
+@pytest.mark.asyncio
+async def test_update_tenant_slug_and_clear(client):
+    name = _unique("tenant")
+    create_resp = await client.post(BASE, headers=HEADERS, json={
+        "name": name,
+        "admin_username": "adm_slug_upd",
+        "admin_password": "Passw0rd123",
+    })
+    tid = create_resp.json()["id"]
+
+    slug = _unique("updated")
+    resp = await client.put(f"{BASE}/{tid}", headers=HEADERS, json={
+        "slug": slug.upper(),
+    })
+    assert resp.status_code == 200
+    assert resp.json()["slug"] == slug
+
+    resp = await client.put(f"{BASE}/{tid}", headers=HEADERS, json={
+        "slug": None,
+    })
+    assert resp.status_code == 200
+    assert resp.json()["slug"] is None
 
 
 @pytest.mark.asyncio

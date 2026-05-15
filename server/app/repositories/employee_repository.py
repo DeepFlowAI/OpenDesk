@@ -3,12 +3,12 @@ Employee repository — data access for employees / admins
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import cast, select, or_, func
+from sqlalchemy import cast, select, or_, func, delete
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
-from app.models.employee_group import EmployeeGroupMember
+from app.models.employee_group import EmployeeGroup, EmployeeGroupMember
 from app.schemas.employee import VALID_ROLES
 
 
@@ -53,6 +53,60 @@ class EmployeeRepository:
             select(Employee).where(Employee.id.in_(employee_ids))
         )
         return list(result.scalars().all())
+
+    @staticmethod
+    async def get_group_ids_by_employee_ids(
+        db: AsyncSession, employee_ids: list[int]
+    ) -> dict[int, list[int]]:
+        """Get employee group IDs keyed by employee ID."""
+        if not employee_ids:
+            return {}
+        result = await db.execute(
+            select(EmployeeGroupMember.employee_id, EmployeeGroupMember.group_id)
+            .where(EmployeeGroupMember.employee_id.in_(employee_ids))
+            .order_by(EmployeeGroupMember.group_id.asc())
+        )
+        grouped: dict[int, list[int]] = {employee_id: [] for employee_id in employee_ids}
+        for employee_id, group_id in result.all():
+            grouped.setdefault(employee_id, []).append(group_id)
+        return grouped
+
+    @staticmethod
+    async def attach_group_ids(db: AsyncSession, employees: list[Employee]) -> list[Employee]:
+        """Attach group_ids attributes for API serialization."""
+        grouped = await EmployeeRepository.get_group_ids_by_employee_ids(
+            db, [employee.id for employee in employees]
+        )
+        for employee in employees:
+            employee.group_ids = grouped.get(employee.id, [])
+        return employees
+
+    @staticmethod
+    async def get_existing_group_ids(
+        db: AsyncSession, tenant_id: int, group_ids: list[int]
+    ) -> set[int]:
+        """Return group IDs that exist in the tenant."""
+        if not group_ids:
+            return set()
+        result = await db.execute(
+            select(EmployeeGroup.id).where(
+                EmployeeGroup.tenant_id == tenant_id,
+                EmployeeGroup.id.in_(group_ids),
+            )
+        )
+        return set(result.scalars().all())
+
+    @staticmethod
+    async def replace_group_ids(
+        db: AsyncSession, employee_id: int, group_ids: list[int]
+    ) -> None:
+        """Replace all group memberships for an employee."""
+        await db.execute(
+            delete(EmployeeGroupMember).where(EmployeeGroupMember.employee_id == employee_id)
+        )
+        for group_id in group_ids:
+            db.add(EmployeeGroupMember(group_id=group_id, employee_id=employee_id))
+        await db.commit()
 
     @staticmethod
     async def get_paginated(

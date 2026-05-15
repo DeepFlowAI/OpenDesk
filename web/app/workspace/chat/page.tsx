@@ -18,9 +18,10 @@ import { MessagePanel } from '@/app/components/features/chat/message-panel'
 import { AuxiliaryPanel } from '@/app/components/features/chat/auxiliary-panel'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import type { Message, Conversation } from '@/models/conversation'
+import type { Message, Conversation, AgentStats } from '@/models/conversation'
 
 const BACKGROUND_MESSAGE_ALERT_SRC = '/audio/notification-alert.mp3'
+const AUDIO_UNLOCK_EVENTS = ['pointerdown', 'keydown', 'touchstart'] as const
 
 function buildMessagePreview(msg: Message): string {
   if (msg.content_type === 'text' || msg.content_type === 'system') return msg.content
@@ -61,15 +62,32 @@ export default function ChatPage() {
   const [ticketDraftConversationIds, setTicketDraftConversationIds] = useState<Set<number>>(new Set())
   const [transferToast, setTransferToast] = useState<string | null>(null)
   const transferToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const backgroundAlertAudioRef = useRef<HTMLAudioElement | null>(null)
+  const backgroundAlertAudioUnlockedRef = useRef(false)
+
+  const getBackgroundAlertAudio = useCallback(() => {
+    if (typeof window === 'undefined') return null
+    if (!backgroundAlertAudioRef.current) {
+      const audio = new Audio(BACKGROUND_MESSAGE_ALERT_SRC)
+      audio.preload = 'auto'
+      backgroundAlertAudioRef.current = audio
+    }
+    return backgroundAlertAudioRef.current
+  }, [])
 
   const playBackgroundMessageAlert = useCallback(() => {
     if (document.visibilityState === 'visible') return
 
-    const audio = new Audio(BACKGROUND_MESSAGE_ALERT_SRC)
+    const audio = getBackgroundAlertAudio()
+    if (!audio) return
+
+    audio.pause()
+    audio.currentTime = 0
+    audio.muted = false
     audio.play().catch(() => {
       // Browsers may block autoplay until the user interacts with the page.
     })
-  }, [])
+  }, [getBackgroundAlertAudio])
 
   // Connect Socket.IO on mount
   useEffect(() => {
@@ -77,6 +95,41 @@ export default function ChatPage() {
       connect(token)
     }
   }, [token, connected, connecting, connect])
+
+  // Unlock alert audio on the first in-page user gesture so later background
+  // Socket.IO messages can play the notification sound after a page refresh.
+  useEffect(() => {
+    const unlockBackgroundAlertAudio = () => {
+      if (backgroundAlertAudioUnlockedRef.current) return
+
+      const audio = getBackgroundAlertAudio()
+      if (!audio) return
+
+      audio.muted = true
+      audio.currentTime = 0
+      audio
+        .play()
+        .then(() => {
+          audio.pause()
+          audio.currentTime = 0
+          audio.muted = false
+          backgroundAlertAudioUnlockedRef.current = true
+        })
+        .catch(() => {
+          audio.muted = false
+        })
+    }
+
+    AUDIO_UNLOCK_EVENTS.forEach((eventName) => {
+      document.addEventListener(eventName, unlockBackgroundAlertAudio, { capture: true })
+    })
+
+    return () => {
+      AUDIO_UNLOCK_EVENTS.forEach((eventName) => {
+        document.removeEventListener(eventName, unlockBackgroundAlertAudio, { capture: true })
+      })
+    }
+  }, [getBackgroundAlertAudio])
 
   // When the user switches back to this tab after it was backgrounded (and
   // possibly frozen by the browser), check if the socket silently died and
@@ -137,6 +190,7 @@ export default function ChatPage() {
     const handleNewMessage = (msg: Message) => {
       if (msg.sender_type === 'visitor') {
         playBackgroundMessageAlert()
+        setVisitorTyping(msg.conversation_id, false)
       }
       addMessage(msg.conversation_id, msg)
       const preview = buildMessagePreview(msg)
@@ -164,6 +218,10 @@ export default function ChatPage() {
 
     const handleConversationEnded = (data: { conversation_id: number }) => {
       removeConversation(data.conversation_id)
+    }
+
+    const handleAgentStatsUpdated = (data: AgentStats) => {
+      queryClient.setQueryData(agentKeys.stats, data)
     }
 
     const handleConversationTransferred = (data: {
@@ -196,8 +254,18 @@ export default function ChatPage() {
       }
     }
 
-    const handleVisitorTyping = (data: { conversation_id: number }) => {
-      setVisitorTyping(data.conversation_id, true)
+    const handleVisitorTyping = (data: { conversation_id: number; content?: string }) => {
+      const content = data.content
+      const hasContent = typeof content === 'string'
+      if (hasContent && content.trim().length === 0) {
+        setVisitorTyping(data.conversation_id, false)
+        const staleTimer = typingTimerRef.current.get(data.conversation_id)
+        if (staleTimer) clearTimeout(staleTimer)
+        typingTimerRef.current.delete(data.conversation_id)
+        return
+      }
+
+      setVisitorTyping(data.conversation_id, true, hasContent ? content : undefined)
       const existing = typingTimerRef.current.get(data.conversation_id)
       if (existing) clearTimeout(existing)
       typingTimerRef.current.set(
@@ -233,6 +301,7 @@ export default function ChatPage() {
     socket.on('conversation_transferred', handleConversationTransferred)
     socket.on('visitor_typing', handleVisitorTyping)
     socket.on('conversation_updated', handleConversationUpdated)
+    socket.on('agent_stats_updated', handleAgentStatsUpdated)
 
     return () => {
       socket.off('new_conversation', handleNewConversation)
@@ -241,6 +310,7 @@ export default function ChatPage() {
       socket.off('conversation_transferred', handleConversationTransferred)
       socket.off('visitor_typing', handleVisitorTyping)
       socket.off('conversation_updated', handleConversationUpdated)
+      socket.off('agent_stats_updated', handleAgentStatsUpdated)
     }
   }, [socket, token, queryClient, addConversation, addMessage, updateConversation, removeConversation, setVisitorTyping, playBackgroundMessageAlert])
 

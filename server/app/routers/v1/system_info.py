@@ -3,11 +3,10 @@
 This endpoint is intentionally **not** an authorisation gate. It tells the
 frontend whether to render multi-tenant UI (login form's tenant field, tenant
 admin pages, etc.). The actual authority over multi-tenant features comes
-from whether the closed-source ``tenants`` extension is loaded — which
-itself is controlled by file-system presence of the extension package, not
-by any config flag.
+from whether an optional ``tenants`` extension is loaded — controlled by
+file-system presence of the extension package, not by any config flag.
 
-OSS deployments never see closed-source extensions, so ``single_tenant_mode``
+Single-tenant deployments do not load this extension, so ``single_tenant_mode``
 is always ``true`` for them.
 """
 from fastapi import APIRouter, Request

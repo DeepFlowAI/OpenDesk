@@ -14,7 +14,6 @@ from app.models.service_hours import ServiceHours
 from app.schemas.channel import ChannelCreate, ChannelUpdate
 from app.schemas.channel import ChannelConfig, DEFAULT_OFFLINE_MESSAGE, DEFAULT_OFFLINE_TITLE
 from app.services.agent_status_service import AgentStatusService
-from app.services.routing_service import RoutingService
 
 
 class ChannelService:
@@ -183,6 +182,9 @@ class ChannelService:
                     "offline_message": offline_message,
                     "checked_at": checked_at,
                 }
+
+        # Lazy import to avoid circular dependency with routing_service
+        from app.services.routing_service import RoutingService
 
         _, group_member_ids, max_concurrent_map = await RoutingService.route_conversation(
             db, item.tenant_id, item.id

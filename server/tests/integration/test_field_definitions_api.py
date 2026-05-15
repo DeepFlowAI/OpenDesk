@@ -16,6 +16,12 @@ def _unique(prefix: str = "test") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
+def _field_payload(payload: dict, key: str | None = None) -> dict:
+    data = {**payload}
+    data.setdefault("key", key or _unique("field"))
+    return data
+
+
 async def _setup_tenant_and_auth(client: AsyncClient) -> dict:
     """Create a fresh tenant, login, and return auth headers."""
     tenant_name = _unique("fd_test")
@@ -42,6 +48,7 @@ async def _setup_tenant_and_auth(client: AsyncClient) -> dict:
 
 SAMPLE_FIELD = {
     "domain": "user",
+    "key": "vip_level",
     "name": "VIP等级",
     "description": "VIP level of the user",
     "help_text": "请选择VIP等级",
@@ -52,6 +59,7 @@ SAMPLE_FIELD = {
 
 SAMPLE_SELECT_FIELD = {
     "domain": "user",
+    "key": "gender",
     "name": "性别",
     "field_type": "single_select",
     "type_config": {},
@@ -63,6 +71,7 @@ SAMPLE_SELECT_FIELD = {
 
 SAMPLE_TREE_FIELD = {
     "domain": "organization",
+    "key": "industry_category",
     "name": "行业分类",
     "field_type": "single_select_tree",
     "type_config": {"tree_source": "static", "leaf_only": False},
@@ -74,6 +83,7 @@ SAMPLE_TREE_FIELD = {
 
 SAMPLE_SHARED_POOL_FIELD = {
     "domain": "shared_pool",
+    "key": "urgency",
     "name": "紧急程度",
     "field_type": "single_select",
     "type_config": {},
@@ -106,7 +116,23 @@ class TestFieldDefinitionCRUD:
         assert data["field_type"] == "single_line_text"
         assert data["slot_column"].startswith("str_")
         assert data["domain"] == "user"
+        assert data["key"] == "vip_level"
         assert "id" in data
+
+    @pytest.mark.asyncio
+    async def test_create_duplicate_field_key_returns_409(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        await client.post("/api/v1/field-definitions", json=SAMPLE_FIELD, headers=headers)
+        payload = {**SAMPLE_FIELD, "name": "VIP等级2"}
+        resp = await client.post("/api/v1/field-definitions", json=payload, headers=headers)
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_create_invalid_field_key_returns_422(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        payload = {**SAMPLE_FIELD, "key": "VIP Level"}
+        resp = await client.post("/api/v1/field-definitions", json=payload, headers=headers)
+        assert resp.status_code == 422
 
     @pytest.mark.asyncio
     async def test_create_select_field_with_options(self, client: AsyncClient):
@@ -141,6 +167,7 @@ class TestFieldDefinitionCRUD:
         headers = await _setup_tenant_and_auth(client)
         payload = {
             "domain": "shared_pool",
+            "key": "missing_modules",
             "name": "缺少模块",
             "field_type": "single_line_text",
         }
@@ -176,6 +203,21 @@ class TestFieldDefinitionCRUD:
         )
         assert resp.status_code == 200
         assert resp.json()["name"] == "VIP等级_updated"
+        assert resp.json()["key"] == "vip_level"
+
+    @pytest.mark.asyncio
+    async def test_update_field_key_is_ignored(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        create_resp = await client.post("/api/v1/field-definitions", json=SAMPLE_FIELD, headers=headers)
+        created_id = create_resp.json()["id"]
+
+        resp = await client.put(
+            f"/api/v1/field-definitions/{created_id}",
+            json={"name": "VIP等级_updated", "key": "changed_key"},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["key"] == "vip_level"
 
     @pytest.mark.asyncio
     async def test_delete_returns_200(self, client: AsyncClient):
@@ -224,6 +266,7 @@ class TestSlotAllocation:
         for i in range(3):
             payload = {
                 "domain": "user",
+                "key": _unique("field"),
                 "name": f"字段_{i}",
                 "field_type": "single_line_text",
             }
@@ -237,9 +280,9 @@ class TestSlotAllocation:
     async def test_different_types_use_different_prefixes(self, client: AsyncClient):
         headers = await _setup_tenant_and_auth(client)
 
-        text_payload = {"domain": "user", "name": "文本字段", "field_type": "single_line_text"}
-        num_payload = {"domain": "user", "name": "数值字段", "field_type": "number"}
-        json_payload = {"domain": "user", "name": "多选字段", "field_type": "multi_select"}
+        text_payload = {"domain": "user", "key": "text_field", "name": "文本字段", "field_type": "single_line_text"}
+        num_payload = {"domain": "user", "key": "number_field", "name": "数值字段", "field_type": "number"}
+        json_payload = {"domain": "user", "key": "multi_select_field", "name": "多选字段", "field_type": "multi_select"}
 
         resp1 = await client.post("/api/v1/field-definitions", json=text_payload, headers=headers)
         resp2 = await client.post("/api/v1/field-definitions", json=num_payload, headers=headers)
@@ -249,6 +292,93 @@ class TestSlotAllocation:
         assert resp2.json()["slot_column"] == "num_1"
         assert resp3.json()["slot_column"] == "json_1"
 
+    @pytest.mark.asyncio
+    async def test_selector_types_share_num_slot_pool_with_number(self, client: AsyncClient):
+        """user/org/employee/group select store ids in num_* slots like number fields."""
+        headers = await _setup_tenant_and_auth(client)
+        num_payload = {"domain": "user", "key": _unique("num_first"), "name": _unique("num_first"), "field_type": "number"}
+        usr_payload = {"domain": "user", "key": _unique("ref_user"), "name": _unique("ref_user"), "field_type": "user_select"}
+        r1 = await client.post("/api/v1/field-definitions", json=num_payload, headers=headers)
+        r2 = await client.post("/api/v1/field-definitions", json=usr_payload, headers=headers)
+        assert r1.status_code == 201
+        assert r2.status_code == 201
+        assert r1.json()["slot_column"] == "num_1"
+        assert r2.json()["slot_column"] == "num_2"
+
+
+class TestSelectorFieldTypes:
+    """Custom fields that reference entities must allocate num_* slots (regression)."""
+
+    @pytest.mark.asyncio
+    async def test_create_user_select_field_returns_201(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        payload = {
+            "domain": "user",
+            "key": _unique("user_select"),
+            "name": _unique("用户选择"),
+            "field_type": "user_select",
+            "type_config": {},
+        }
+        resp = await client.post("/api/v1/field-definitions", json=payload, headers=headers)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["field_type"] == "user_select"
+        assert data["slot_column"].startswith("num_")
+        assert data["domain"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_create_organization_select_field_returns_201(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        payload = {
+            "domain": "organization",
+            "key": _unique("organization_select"),
+            "name": _unique("组织选择"),
+            "field_type": "organization_select",
+            "type_config": {},
+        }
+        resp = await client.post("/api/v1/field-definitions", json=payload, headers=headers)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["field_type"] == "organization_select"
+        assert data["slot_column"].startswith("num_")
+        assert data["domain"] == "organization"
+
+    @pytest.mark.asyncio
+    async def test_create_employee_select_shared_pool_returns_201(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        payload = {
+            "domain": "shared_pool",
+            "key": _unique("employee_select"),
+            "name": _unique("员工选择"),
+            "field_type": "employee_select",
+            "type_config": {},
+            "applicable_modules": ["ticket"],
+        }
+        resp = await client.post("/api/v1/field-definitions", json=payload, headers=headers)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["field_type"] == "employee_select"
+        assert data["slot_column"].startswith("num_")
+        assert data["applicable_modules"] == ["ticket"]
+
+    @pytest.mark.asyncio
+    async def test_create_group_select_shared_pool_returns_201(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        payload = {
+            "domain": "shared_pool",
+            "key": _unique("group_select"),
+            "name": _unique("员工组选择"),
+            "field_type": "group_select",
+            "type_config": {},
+            "applicable_modules": ["ticket"],
+        }
+        resp = await client.post("/api/v1/field-definitions", json=payload, headers=headers)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["field_type"] == "group_select"
+        assert data["slot_column"].startswith("num_")
+        assert data["applicable_modules"] == ["ticket"]
+
 
 class TestFieldOptions:
 
@@ -257,6 +387,7 @@ class TestFieldOptions:
         headers = await _setup_tenant_and_auth(client)
         field_payload = {
             "domain": "user",
+            "key": "status_field",
             "name": "状态",
             "field_type": "single_select",
         }
@@ -277,6 +408,7 @@ class TestFieldOptions:
         headers = await _setup_tenant_and_auth(client)
         create_resp = await client.post("/api/v1/field-definitions", json={
             "domain": "user",
+            "key": "color",
             "name": "颜色",
             "field_type": "single_select",
             "options": [
@@ -295,6 +427,7 @@ class TestFieldOptions:
         headers = await _setup_tenant_and_auth(client)
         create_resp = await client.post("/api/v1/field-definitions", json={
             "domain": "user",
+            "key": "plain_text",
             "name": "纯文本",
             "field_type": "single_line_text",
         }, headers=headers)
@@ -315,6 +448,7 @@ class TestTreeNodes:
         headers = await _setup_tenant_and_auth(client)
         create_resp = await client.post("/api/v1/field-definitions", json={
             "domain": "organization",
+            "key": "region",
             "name": "地区",
             "field_type": "single_select_tree",
             "type_config": {"tree_source": "static"},
@@ -334,6 +468,7 @@ class TestTreeNodes:
         headers = await _setup_tenant_and_auth(client)
         create_resp = await client.post("/api/v1/field-definitions", json={
             "domain": "user",
+            "key": "plain_text",
             "name": "纯文本",
             "field_type": "single_line_text",
         }, headers=headers)

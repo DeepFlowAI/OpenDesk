@@ -247,8 +247,9 @@ class TransferService:
         tenant_id = conversation.tenant_id
         conv_room = f"conv:{conversation.id}"
 
-        # System message — both agent and visitor namespaces
-        await rt.emit("new_message", message_payload, room=conv_room, namespace=CHAT_NAMESPACE)
+        # System message to target agent's personal room + visitor conv room
+        to_agent_room = f"agent:{tenant_id}:{target_agent_id}"
+        await rt.emit("new_message", message_payload, room=to_agent_room, namespace=CHAT_NAMESPACE)
         await rt.emit("new_message", message_payload, room=conv_room, namespace=VISITOR_NAMESPACE)
 
         base_payload = {

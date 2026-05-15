@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconPencil, IconTrash } from '@tabler/icons-react'
+import { IconPencil, IconTrash, IconPlus } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useServiceHours, useDeleteServiceHours } from '@/service/use-service-hours'
@@ -120,8 +120,9 @@ export default function ServiceHoursListPage() {
         <h1 className="text-xl font-semibold text-foreground">{t('sh.title', locale)}</h1>
         <button
           onClick={() => router.push('/service-hours/new')}
-          className="flex h-9 items-center justify-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
+          className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
         >
+          <IconPlus size={18} />
           {t('sh.new', locale)}
         </button>
       </div>
@@ -132,8 +133,9 @@ export default function ServiceHoursListPage() {
           <p className="text-sm text-muted-foreground">{t('sh.empty', locale)}</p>
           <button
             onClick={() => router.push('/service-hours/new')}
-            className="flex h-9 items-center rounded-lg bg-primary px-4 text-sm font-medium text-white"
+            className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white"
           >
+            <IconPlus size={18} />
             {t('sh.new', locale)}
           </button>
         </div>

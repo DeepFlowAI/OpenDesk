@@ -21,9 +21,14 @@ async def seed_data():
         return
     async with AsyncSessionLocal() as db:
         await db.execute(text("""
-            INSERT INTO tenants (tenant_id, name, is_active)
-            VALUES ('test-corp', 'Test Corp', true)
+            INSERT INTO tenants (tenant_id, slug, name, is_active)
+            VALUES ('test-corp', 'test-corp-slug', 'Test Corp', true)
             ON CONFLICT (tenant_id) DO NOTHING
+        """))
+        await db.execute(text("""
+            UPDATE tenants
+            SET slug = 'test-corp-slug'
+            WHERE tenant_id = 'test-corp'
         """))
         await db.commit()
 
@@ -32,8 +37,8 @@ async def seed_data():
 
         hashed = hash_password("OldPass123")
         await db.execute(text("""
-            INSERT INTO employees (tenant_id, username, email, password_hash, display_name, role, is_active)
-            VALUES (:tid, 'resetuser', 'reset@example.com', :pw, 'Reset User', 'admin', true)
+            INSERT INTO employees (tenant_id, username, email, password_hash, display_name, roles, is_active)
+            VALUES (:tid, 'resetuser', 'reset@example.com', :pw, 'Reset User', '["admin"]'::jsonb, true)
             ON CONFLICT ON CONSTRAINT uq_employees_tenant_username DO NOTHING
         """), {"tid": tenant_pk, "pw": hashed})
         await db.commit()
@@ -50,6 +55,31 @@ class TestSendVerifyCodeAPI:
 
         resp = await client.post("/api/v1/auth/send-verify-code", json={
             "tenant": "test-corp",
+            "username": "resetuser",
+            "locale": "zh",
+        })
+        assert resp.status_code == 200
+        mock_client.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("app.services.password_reset_service.create_email_client")
+    async def test_send_code_with_slug_success(self, mock_factory, client: AsyncClient):
+        mock_client = AsyncMock()
+        mock_factory.return_value = mock_client
+
+        from tests.conftest import _get_fake_redis
+        fake_redis = await _get_fake_redis()
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(text("SELECT id FROM tenants WHERE tenant_id = 'test-corp'"))
+            tenant_pk = result.scalar_one()
+            result = await db.execute(text(
+                "SELECT id FROM employees WHERE tenant_id = :tid AND username = 'resetuser'"
+            ), {"tid": tenant_pk})
+            user_id = result.scalar_one()
+        await fake_redis.delete(f"verify_cooldown:{tenant_pk}:{user_id}")
+
+        resp = await client.post("/api/v1/auth/send-verify-code", json={
+            "tenant": "TEST-CORP-SLUG",
             "username": "resetuser",
             "locale": "zh",
         })
@@ -132,6 +162,29 @@ class TestResetPasswordAPI:
             "password": "NewPass123",
         })
         assert login_resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_reset_password_with_slug_success(self, client: AsyncClient):
+        from tests.conftest import _get_fake_redis
+        fake_redis = await _get_fake_redis()
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(text("SELECT id FROM tenants WHERE tenant_id = 'test-corp'"))
+            tenant_pk = result.scalar_one()
+            result = await db.execute(text(
+                "SELECT id FROM employees WHERE tenant_id = :tid AND username = 'resetuser'"
+            ), {"tid": tenant_pk})
+            user_id = result.scalar_one()
+
+        await fake_redis.setex(f"verify_code:{tenant_pk}:{user_id}", 600, "654321")
+
+        resp = await client.post("/api/v1/auth/reset-password", json={
+            "tenant": "TEST-CORP-SLUG",
+            "username": "resetuser",
+            "verify_code": "654321",
+            "new_password": "NewPass456",
+        })
+        assert resp.status_code == 200
 
     @pytest.mark.asyncio
     async def test_reset_password_wrong_code_returns_400(self, client: AsyncClient):

@@ -157,11 +157,9 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
         }
 
         conv_room = f"conv:{conversation_id}"
-        await rt.emit("new_message", msg_payload, room=conv_room, namespace="/chat")
         await rt.emit("new_message", msg_payload, room=conv_room, namespace=NAMESPACE)
 
-        # Also send to agent's personal room so messages arrive
-        # even when the agent hasn't opened this conversation
+        # Send to agent's personal room — the single delivery path for /chat
         async with AsyncSessionLocal() as db:
             conv = await ConversationService.get_by_id(db, conversation_id)
             if conv and conv.agent_id:
@@ -178,7 +176,17 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
 
     @rt.on("typing", namespace=NAMESPACE)  # type: ignore
     async def on_typing(sid: str, data: dict):
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        tenant_id = session.get("tenant_id")
         conversation_id = data.get("conversation_id")
+        content = data.get("content")
+        typing_content = content[:5000] if isinstance(content, str) else None
         if conversation_id:
-            conv_room = f"conv:{conversation_id}"
-            await rt.emit("visitor_typing", {"conversation_id": conversation_id}, room=conv_room, namespace="/chat")
+            async with AsyncSessionLocal() as db:
+                conv = await ConversationService.get_by_id(db, conversation_id)
+                if conv and conv.agent_id:
+                    agent_room = f"agent:{tenant_id}:{conv.agent_id}"
+                    payload = {"conversation_id": conversation_id}
+                    if typing_content is not None:
+                        payload["content"] = typing_content
+                    await rt.emit("visitor_typing", payload, room=agent_room, namespace="/chat")

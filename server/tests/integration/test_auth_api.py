@@ -20,9 +20,14 @@ async def seed_data():
         return
     async with AsyncSessionLocal() as db:
         await db.execute(text("""
-            INSERT INTO tenants (tenant_id, name, is_active)
-            VALUES ('test-corp', 'Test Corp', true)
+            INSERT INTO tenants (tenant_id, slug, name, is_active)
+            VALUES ('test-corp', 'test-corp-slug', 'Test Corp', true)
             ON CONFLICT (tenant_id) DO NOTHING
+        """))
+        await db.execute(text("""
+            UPDATE tenants
+            SET slug = 'test-corp-slug'
+            WHERE tenant_id = 'test-corp'
         """))
         await db.commit()
 
@@ -67,6 +72,17 @@ class TestAuthAPI:
         resp = await client.post("/api/v1/auth/login", json={
             "tenant": "test-corp",
             "username": "test@example.com",
+            "password": "Test1234",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["user"]["username"] == "testuser"
+
+    @pytest.mark.asyncio
+    async def test_login_with_slug_success(self, client: AsyncClient):
+        resp = await client.post("/api/v1/auth/login", json={
+            "tenant": "TEST-CORP-SLUG",
+            "username": "testuser",
             "password": "Test1234",
         })
         assert resp.status_code == 200

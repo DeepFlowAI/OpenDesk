@@ -1,6 +1,6 @@
 import { z } from 'zod'
 
-const TENANT_REGEX = /^[a-zA-Z0-9-]{2,32}$/
+export const TENANT_IDENTIFIER_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{1,127}$/
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{4,32}$/
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const PASSWORD_REGEX = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,32}$/
@@ -9,8 +9,9 @@ const VERIFY_CODE_REGEX = /^\d{6}$/
 export const loginSchema = z.object({
   tenant: z
     .string()
-    .min(1, 'validation.tenant.required')
-    .regex(TENANT_REGEX, 'validation.tenant.format'),
+    .trim()
+    .min(1, 'validation.loginTenant.required')
+    .regex(TENANT_IDENTIFIER_REGEX, 'validation.tenant.format'),
   username: z
     .string()
     .min(1, 'validation.username.required')
@@ -29,8 +30,9 @@ export type LoginFormData = z.infer<typeof loginSchema>
 export const sendCodeSchema = z.object({
   tenant: z
     .string()
+    .trim()
     .min(1, 'validation.tenant.required')
-    .regex(TENANT_REGEX, 'validation.tenant.format'),
+    .regex(TENANT_IDENTIFIER_REGEX, 'validation.tenant.format'),
   username: z
     .string()
     .min(1, 'validation.username.required')
@@ -44,8 +46,9 @@ export const forgotPasswordSchema = z
   .object({
     tenant: z
       .string()
+      .trim()
       .min(1, 'validation.tenant.required')
-      .regex(TENANT_REGEX, 'validation.tenant.format'),
+      .regex(TENANT_IDENTIFIER_REGEX, 'validation.tenant.format'),
     username: z
       .string()
       .min(1, 'validation.username.required')

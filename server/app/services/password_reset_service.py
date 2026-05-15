@@ -52,7 +52,7 @@ class PasswordResetService:
         data: SendVerifyCodeRequest,
     ) -> None:
         """Generate verification code and send to user email."""
-        tenant = await TenantRepository.get_by_tenant_id(db, data.tenant)
+        tenant = await TenantRepository.resolve_by_identifier(db, data.tenant)
         if not tenant or not tenant.is_active:
             raise NotFoundError("Tenant not found")
 
@@ -92,7 +92,7 @@ class PasswordResetService:
         data: ResetPasswordRequest,
     ) -> None:
         """Verify code and reset user password."""
-        tenant = await TenantRepository.get_by_tenant_id(db, data.tenant)
+        tenant = await TenantRepository.resolve_by_identifier(db, data.tenant)
         if not tenant or not tenant.is_active:
             raise NotFoundError("Tenant not found")
 

@@ -63,42 +63,55 @@ class OrganizationService:
 
     @staticmethod
     async def _get_field_key_slot_map(db: AsyncSession, tenant_id: int) -> dict[str, str]:
-        """Build { slot_column: field_id_str } reverse map for response enrichment."""
+        """Build { slot_column: field_key } reverse map for response enrichment."""
         result = await db.execute(
-            select(FdFieldDefinition.id, FdFieldDefinition.slot_column).where(
+            select(FdFieldDefinition.id, FdFieldDefinition.field_key, FdFieldDefinition.slot_column).where(
                 FdFieldDefinition.tenant_id == tenant_id,
                 FdFieldDefinition.status == "active",
                 FdFieldDefinition.domain == "organization",
             )
         )
-        return {row.slot_column: str(row.id) for row in result.all()}
+        return {row.slot_column: (row.field_key or str(row.id)) for row in result.all()}
 
     @staticmethod
     async def _get_key_to_slot_map(db: AsyncSession, tenant_id: int) -> dict[str, str]:
-        """Build { field_id_str: slot_column } for writing custom fields."""
+        """Build { field_key and legacy field_id_str: slot_column } for writing custom fields."""
         result = await db.execute(
-            select(FdFieldDefinition.id, FdFieldDefinition.slot_column).where(
+            select(FdFieldDefinition.id, FdFieldDefinition.field_key, FdFieldDefinition.slot_column).where(
                 FdFieldDefinition.tenant_id == tenant_id,
                 FdFieldDefinition.status == "active",
                 FdFieldDefinition.domain == "organization",
             )
         )
-        return {str(row.id): row.slot_column for row in result.all()}
+        key_to_slot: dict[str, str] = {}
+        for row in result.all():
+            key_to_slot[str(row.id)] = row.slot_column
+            if row.field_key:
+                key_to_slot[row.field_key] = row.slot_column
+        return key_to_slot
 
     @staticmethod
     async def _get_key_to_field_meta(db: AsyncSession, tenant_id: int) -> dict[str, dict[str, str]]:
-        """Build { field_id_str: {name, slot_column} } for organization custom fields."""
+        """Build { field_key and legacy field_id_str: {name, slot_column} } for organization custom fields."""
         result = await db.execute(
-            select(FdFieldDefinition.id, FdFieldDefinition.name, FdFieldDefinition.slot_column).where(
+            select(
+                FdFieldDefinition.id,
+                FdFieldDefinition.field_key,
+                FdFieldDefinition.name,
+                FdFieldDefinition.slot_column,
+            ).where(
                 FdFieldDefinition.tenant_id == tenant_id,
                 FdFieldDefinition.status == "active",
                 FdFieldDefinition.domain == "organization",
             )
         )
-        return {
-            str(row.id): {"name": row.name, "slot_column": row.slot_column}
-            for row in result.all()
-        }
+        key_to_meta: dict[str, dict[str, str]] = {}
+        for row in result.all():
+            meta = {"name": row.name, "slot_column": row.slot_column}
+            key_to_meta[str(row.id)] = meta
+            if row.field_key:
+                key_to_meta[row.field_key] = meta
+        return key_to_meta
 
     @staticmethod
     def _enrich_response(org: Organization, slot_to_key: dict[str, str], user_count: int = 0) -> dict:

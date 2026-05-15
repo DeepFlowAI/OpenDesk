@@ -202,14 +202,26 @@ class AgentStatusService:
         return bool(changed)
 
     @staticmethod
+    async def _notify_stats_changed(
+        r: aioredis.Redis, tenant_id: int, user_id: int
+    ) -> None:
+        """Best-effort push of updated stats via WebSocket after count change."""
+        from app.services.agent_realtime_service import AgentRealtimeService
+
+        await AgentRealtimeService.emit_stats_updated(r, tenant_id, user_id)
+
+    @staticmethod
     async def set_count(r: aioredis.Redis, tenant_id: int, user_id: int, count: int) -> None:
         key = AgentStatusService._key(tenant_id, user_id)
         await r.hset(key, "current_count", max(0, count))
+        await AgentStatusService._notify_stats_changed(r, tenant_id, user_id)
 
     @staticmethod
     async def increment_count(r: aioredis.Redis, tenant_id: int, user_id: int) -> int:
         key = AgentStatusService._key(tenant_id, user_id)
-        return await r.hincrby(key, "current_count", 1)
+        val = await r.hincrby(key, "current_count", 1)
+        await AgentStatusService._notify_stats_changed(r, tenant_id, user_id)
+        return val
 
     @staticmethod
     async def decrement_count(r: aioredis.Redis, tenant_id: int, user_id: int) -> int:
@@ -217,7 +229,8 @@ class AgentStatusService:
         val = await r.hincrby(key, "current_count", -1)
         if val < 0:
             await r.hset(key, "current_count", 0)
-            return 0
+            val = 0
+        await AgentStatusService._notify_stats_changed(r, tenant_id, user_id)
         return val
 
     @staticmethod

@@ -61,6 +61,7 @@ export const OPERATORS_BY_TYPE: Record<string, string[]> = {
 
   [FieldType.FILE]: ['is_empty', 'is_not_empty'],
   [FieldType.USER_SELECT]: ['is_empty', 'is_not_empty', 'eq', 'ne', 'in', 'not_in'],
+  [FieldType.ORGANIZATION_SELECT]: ['is_empty', 'is_not_empty', 'eq', 'ne', 'in', 'not_in'],
   [FieldType.EMPLOYEE_SELECT]: ['is_empty', 'is_not_empty', 'eq', 'ne', 'in', 'not_in'],
   [FieldType.GROUP_SELECT]: ['is_empty', 'is_not_empty', 'eq', 'ne', 'in', 'not_in'],
 }

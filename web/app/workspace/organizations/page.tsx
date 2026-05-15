@@ -708,7 +708,7 @@ function buildFieldLookup(fields: UnifiedField[], _locale: string): FieldValueLo
     const ft = f.field_type
     if (!['single_select', 'multi_select', 'single_select_tree', 'multi_select_tree'].includes(ft)) continue
 
-    const key = f.id != null ? String(f.id) : f.key ?? ''
+    const key = f.key ?? (f.id != null ? String(f.id) : '')
     const valueMap = new Map<string, string>()
 
     if (f.options?.length) {
@@ -726,7 +726,10 @@ function buildFieldLookup(fields: UnifiedField[], _locale: string): FieldValueLo
       for (const o of cfgOpts) valueMap.set(o.value, o.label)
     }
 
-    if (valueMap.size > 0) lookup.set(key, valueMap)
+    if (valueMap.size > 0) {
+      lookup.set(key, valueMap)
+      if (f.id != null) lookup.set(String(f.id), valueMap)
+    }
   }
   return lookup
 }
@@ -762,9 +765,15 @@ function getCellValue(
     return String(raw)
   }
 
-  // Custom field
-  if (field_id != null && org.custom_fields) {
-    const val = org.custom_fields[String(field_id)]
+  if (org.custom_fields) {
+    const customKey = field_key && !ORG_SYSTEM_KEYS.has(field_key) ? field_key : null
+    const legacyIdKey = field_id != null ? String(field_id) : null
+    const lookupKey = customKey ?? legacyIdKey ?? ''
+    const val = customKey && org.custom_fields[customKey] != null
+      ? org.custom_fields[customKey]
+      : legacyIdKey
+        ? org.custom_fields[legacyIdKey]
+        : null
     if (val == null) return ''
     if (field_type === 'file') {
       return formatFileFieldValue(val, locale === 'zh')
@@ -774,26 +783,9 @@ function getCellValue(
       return formatDatetimeForDisplay(str)
     }
     if (['single_select', 'multi_select', 'single_select_tree', 'multi_select_tree'].includes(field_type)) {
-      return resolveSelectLabel(str, String(field_id), fieldLookup)
+      return resolveSelectLabel(str, lookupKey, fieldLookup)
     }
     return str
-  }
-
-  if (field_key && org.custom_fields) {
-    const val = org.custom_fields[field_key]
-    if (val != null) {
-      if (field_type === 'file') {
-        return formatFileFieldValue(val, locale === 'zh')
-      }
-      const str = String(val)
-      if (field_type === 'datetime') {
-        return formatDatetimeForDisplay(str)
-      }
-      if (['single_select', 'multi_select'].includes(field_type)) {
-        return resolveSelectLabel(str, field_key, fieldLookup)
-      }
-      return str
-    }
   }
 
   return ''

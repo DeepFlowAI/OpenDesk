@@ -35,10 +35,11 @@ async def seed_system_defaults(db: AsyncSession) -> None:
 async def _ensure_default_tenant(db: AsyncSession) -> None:
     """Auto-provision a default tenant + super-admin employee on first boot.
 
-    Fires only when the ``tenants`` table is empty. This makes the open-source
+    Fires only when the ``tenants`` table is empty. This makes the default
     distribution usable out of the box (no separate tenant-provisioning step
-    needed). Once any tenant exists — whether created here, by the closed-source
-    Tenant API, or directly via SQL — this function becomes a no-op forever.
+    needed). Once any tenant exists — whether created here, by a tenant-
+    management extension, or directly via SQL — this function becomes a no-op
+    forever.
     """
     count = (await db.execute(select(func.count()).select_from(Tenant))).scalar_one()
     if count > 0:

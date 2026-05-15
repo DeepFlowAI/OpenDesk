@@ -40,7 +40,7 @@ export function MessagePanel({
 }: Props) {
   const { locale } = useLocaleStore()
   const queryClient = useQueryClient()
-  const { messages, setMessages, visitorTyping, markConversationRead } = useChatStore()
+  const { messages, setMessages, visitorTyping, visitorTypingContent, markConversationRead } = useChatStore()
   const [hasMore, setHasMore] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [historyConversations, setHistoryConversations] = useState<WorkspaceConversationHistoryItem[]>([])
@@ -55,6 +55,7 @@ export function MessagePanel({
   const convId = conversation?.id || 0
   const currentMessages = messages.get(convId) || []
   const isTyping = visitorTyping.get(convId) || false
+  const typingContent = visitorTypingContent.get(convId) || ''
   const isClosed = conversation?.status === 'closed'
 
   // Force refetch when switching conversations
@@ -82,17 +83,13 @@ export function MessagePanel({
     }
   }, [msgData, convId, setMessages])
 
-  // Join/leave conversation room via Socket.IO. The local read-state shield
-  // (`markConversationRead`) is updated synchronously so a polling GET racing
-  // with the server-side reset cannot revive the unread badge.
+  // Mark messages as read when the agent opens a conversation. The local
+  // read-state shield is updated synchronously so a polling GET racing with
+  // the server-side reset cannot revive the unread badge.
   useEffect(() => {
     if (!socket || !convId || !connected) return
-    socket.emit('join_conversation', { conversation_id: convId })
     socket.emit('mark_read', { conversation_id: convId })
     markConversationRead(convId)
-    return () => {
-      socket.emit('leave_conversation', { conversation_id: convId })
-    }
   }, [socket, convId, connected, markConversationRead])
 
   // Load more messages
@@ -195,6 +192,7 @@ export function MessagePanel({
         locale={locale}
         isClosed={isClosed || false}
         isTyping={isTyping}
+        visitorTypingContent={typingContent}
         hasMore={hasMore}
         loadingMore={loadingMore}
         historyAvailable={Boolean(conversation.has_history_conversations || historyConversations.length > 0)}

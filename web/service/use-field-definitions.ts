@@ -104,7 +104,8 @@ export const useUpdateFieldDefinition = () => {
       put<FdFieldDefinition>(`v1/field-definitions/${id}`, { json: data }),
     onSuccess: (_, v) => {
       qc.invalidateQueries({ queryKey: fieldDefinitionKeys.detail(v.id) })
-      qc.invalidateQueries({ queryKey: fieldDefinitionKeys.lists() })
+      // Unified list (admin user/org fields) uses keys under .../unified; not matched by lists().
+      qc.invalidateQueries({ queryKey: fieldDefinitionKeys.all })
     },
   })
 }

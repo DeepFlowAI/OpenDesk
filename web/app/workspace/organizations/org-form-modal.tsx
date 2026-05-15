@@ -11,13 +11,12 @@ import type {
   CustomFieldValue,
 } from '@/models/organization'
 import type { UnifiedField } from '@/models/field-definition'
-import { FieldType } from '@/types/field-enums'
-import { FieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
+import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
+import { defaultCfValuesFromFieldDefinitions } from '@/lib/ticket-field-defaults'
 
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { DateInput, DateTimeInput, TimeInput } from '@/components/ui/time-input'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 
@@ -31,6 +30,10 @@ type OrgFormModalProps = {
 type SystemFormData = {
   name: string
   description: string
+}
+
+function customFieldKey(field: UnifiedField): string {
+  return field.key ?? (field.id != null ? String(field.id) : '')
 }
 
 export function OrgFormModal({ mode, organization, onClose, onSuccess }: OrgFormModalProps) {
@@ -52,6 +55,22 @@ export function OrgFormModal({ mode, organization, onClose, onSuccess }: OrgForm
   const [form, setForm] = useState<SystemFormData>({ name: '', description: '' })
   const [errors, setErrors] = useState<Partial<Record<string, string>>>({})
   const [cfValues, setCfValues] = useState<Record<string, CustomFieldValue>>({})
+
+  useEffect(() => {
+    if (isEdit) return
+    setCfValues((prev) => {
+      const defaults = defaultCfValuesFromFieldDefinitions(customFields)
+      let changed = false
+      const next = { ...prev }
+      for (const [k, v] of Object.entries(defaults)) {
+        const cur = next[k]
+        if (cur !== undefined && cur !== null && cur !== '') continue
+        next[k] = v
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [isEdit, customFields])
 
   useEffect(() => {
     if (isEdit && organization) {
@@ -91,6 +110,7 @@ export function OrgFormModal({ mode, organization, onClose, onSuccess }: OrgForm
   const buildCfPayload = useCallback((): Record<string, CustomFieldValue> => {
     const cf: Record<string, CustomFieldValue> = {}
     for (const [key, val] of Object.entries(cfValues)) {
+      if (Array.isArray(val) && val.length === 0) continue
       if (val !== null && val !== undefined && val !== '') cf[key] = val
     }
     return cf
@@ -109,10 +129,11 @@ export function OrgFormModal({ mode, organization, onClose, onSuccess }: OrgForm
         const origCf = organization.custom_fields ?? {}
         const changedCf: Record<string, CustomFieldValue> = {}
         for (const field of customFields) {
-          const fid = String(field.id)
-          const newVal = cfValues[fid] ?? null
-          const oldVal = origCf[fid] ?? null
-          if (newVal !== oldVal) changedCf[fid] = newVal
+          const key = customFieldKey(field)
+          const legacyKey = field.id != null ? String(field.id) : null
+          const newVal = cfValues[key] ?? null
+          const oldVal = origCf[key] ?? (legacyKey ? origCf[legacyKey] : null) ?? null
+          if (newVal !== oldVal) changedCf[key] = newVal
         }
         if (Object.keys(changedCf).length > 0) payload.custom_fields = changedCf
 
@@ -171,7 +192,7 @@ export function OrgFormModal({ mode, organization, onClose, onSuccess }: OrgForm
         )}
 
         {/* Form body */}
-        <div className="flex-1 overflow-y-auto px-6 py-5">
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
           <h3 className="mb-4 text-sm font-semibold">
             {isZh ? '基本信息' : 'Basic Info'}
           </h3>
@@ -202,15 +223,18 @@ export function OrgFormModal({ mode, organization, onClose, onSuccess }: OrgForm
                 {isZh ? '自定义字段' : 'Custom Fields'}
               </h3>
               <div className="flex flex-col gap-4">
-                {customFields.map((field) => (
-                  <CustomFieldInput
-                    key={field.id}
-                    field={field}
-                    value={cfValues[String(field.id)] ?? null}
-                    onChange={(v) => setCfField(String(field.id), v)}
-                    isZh={isZh}
-                  />
-                ))}
+                {customFields.map((field) => {
+                  const key = customFieldKey(field)
+                  return (
+                    <CustomFieldInput
+                      key={field.id ?? key}
+                      field={field}
+                      value={cfValues[key] ?? null}
+                      onChange={(v) => setCfField(key, v)}
+                      isZh={isZh}
+                    />
+                  )
+                })}
               </div>
             </>
           )}
@@ -246,142 +270,18 @@ function CustomFieldInput({
   onChange: (v: CustomFieldValue) => void
   isZh: boolean
 }) {
-  const strVal = value != null ? String(value) : ''
   const placeholder = isZh ? `请输入${field.name}` : `Enter ${field.name}`
-  const ft = field.field_type as FieldType
-
-  const renderInput = () => {
-    switch (ft) {
-      case 'single_line_text':
-      case 'url':
-        return (
-          <Input type={ft === 'url' ? 'url' : 'text'} value={strVal}
-            onChange={(e) => onChange(e.target.value)} placeholder={placeholder} />
-        )
-      case 'email':
-        return (
-          <Input type="email" value={strVal}
-            onChange={(e) => onChange(e.target.value)} placeholder={placeholder} />
-        )
-      case 'phone':
-        return (
-          <Input type="tel" value={strVal}
-            onChange={(e) => onChange(e.target.value)} placeholder={placeholder} />
-        )
-      case 'multi_line_text':
-        return (
-          <Textarea value={strVal} onChange={(e) => onChange(e.target.value)}
-            placeholder={placeholder} rows={3} />
-        )
-      case 'rich_text':
-        return (
-          <FieldValueEditor
-            fieldType={FieldType.RICH_TEXT}
-            value={value}
-            onChange={(v) => onChange(v as CustomFieldValue)}
-            typeConfig={(field.type_config ?? {}) as Record<string, unknown>}
-            placeholder={placeholder}
-          />
-        )
-      case 'number':
-        return (
-          <Input type="number" value={strVal}
-            onChange={(e) => { const v = e.target.value; onChange(v === '' ? null : Number(v)) }}
-            placeholder={placeholder} />
-        )
-      case 'date':
-        return <DateInput value={strVal} onChange={(e) => onChange(e.target.value || null)} />
-      case 'time':
-        return <TimeInput value={strVal} onChange={(e) => onChange(e.target.value || null)} />
-      case 'datetime':
-        return <DateTimeInput value={strVal} onChange={(e) => onChange(e.target.value || null)} />
-      case 'single_select':
-        return (
-          <FieldValueEditor
-            fieldType={FieldType.SINGLE_SELECT}
-            value={value}
-            onChange={(v) => onChange((v as string) || null)}
-            typeConfig={(field.type_config ?? {}) as Record<string, unknown>}
-            options={field.options ?? []}
-            placeholder={isZh ? '请选择' : 'Select'}
-          />
-        )
-      case 'single_select_tree':
-        return (
-          <FieldValueEditor
-            fieldType={FieldType.SINGLE_SELECT_TREE}
-            value={value}
-            onChange={(v) => onChange(v as CustomFieldValue)}
-            treeNodes={field.tree_nodes ?? []}
-            typeConfig={(field.type_config ?? {}) as Record<string, unknown>}
-            placeholder={isZh ? '请选择' : 'Select'}
-          />
-        )
-      case 'multi_select': {
-        const selected = parseMultiValue(value)
-        return (
-          <FieldValueEditor
-            fieldType={FieldType.MULTI_SELECT}
-            value={selected}
-            onChange={(v) =>
-              onChange(
-                Array.isArray(v) && (v as string[]).length > 0
-                  ? (v as string[]).join(',')
-                  : null,
-              )
-            }
-            typeConfig={(field.type_config ?? {}) as Record<string, unknown>}
-            options={field.options ?? []}
-            placeholder={isZh ? '暂无选项' : 'No options'}
-          />
-        )
-      }
-      case 'multi_select_tree': {
-        const selected = parseMultiValue(value)
-        return (
-          <FieldValueEditor
-            fieldType={FieldType.MULTI_SELECT_TREE}
-            value={selected}
-            onChange={(v) =>
-              onChange(
-                Array.isArray(v) && v.length > 0 ? (v as string[]).join(',') : null,
-              )
-            }
-            treeNodes={field.tree_nodes ?? []}
-            typeConfig={(field.type_config ?? {}) as Record<string, unknown>}
-            placeholder={isZh ? '请选择' : 'Select'}
-          />
-        )
-      }
-      case FieldType.FILE:
-        return (
-          <FieldValueEditor
-            fieldType={FieldType.FILE}
-            value={value}
-            onChange={(v) => onChange(v as CustomFieldValue)}
-            typeConfig={(field.type_config ?? {}) as Record<string, unknown>}
-            placeholder={isZh ? '选择文件上传' : 'Upload files'}
-          />
-        )
-      default:
-        return (
-          <Input type="text" value={strVal} onChange={(e) => onChange(e.target.value)}
-            placeholder={placeholder} />
-        )
-    }
-  }
 
   return (
     <FieldRow label={field.name} helpText={field.help_text}>
-      {renderInput()}
+      <UnifiedFieldValueEditor
+        field={field}
+        value={value}
+        onChange={(v) => onChange(v as CustomFieldValue)}
+        placeholder={placeholder}
+      />
     </FieldRow>
   )
-}
-
-function parseMultiValue(value: CustomFieldValue): string[] {
-  if (value == null) return []
-  if (typeof value === 'string') return value.split(',').filter(Boolean)
-  return []
 }
 
 function FieldRow({

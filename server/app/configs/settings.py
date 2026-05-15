@@ -72,11 +72,11 @@ class Settings(BaseSettings):
     DEFAULT_TENANT_ID: str = Field(default="default")
     DEFAULT_TENANT_NAME: str = Field(default="Default Workspace")
     DEFAULT_ADMIN_USERNAME: str = Field(default="admin")
-    DEFAULT_ADMIN_PASSWORD: str = Field(default="admin123")
+    DEFAULT_ADMIN_PASSWORD: str = Field(default="Admin123456")
 
-    # Tenant Platform API Key — only used by the closed-source tenants
-    # extension (private/extensions/server/tenants). Open-source builds
-    # never read it.
+    # Tenant Platform API Key — optional setting consumed by tenant-management
+    # extensions registered via the ``app.extensions`` loader. The default
+    # single-tenant build does not read this value.
     TENANT_API_KEY: str = Field(default="change-me-tenant-api-key")
 
     # Storage / OSS

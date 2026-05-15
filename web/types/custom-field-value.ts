@@ -9,5 +9,7 @@ export type CustomFieldValue =
   | string
   | number
   | boolean
+  | string[]
+  | number[]
   | null
   | CustomFieldFileAttachment[]

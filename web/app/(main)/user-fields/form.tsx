@@ -23,9 +23,11 @@ import type {
   CreateFdFieldOptionPayload,
 } from '@/models/field-definition'
 import { flattenTreeForPayload } from '@/lib/flatten-tree-nodes-for-create'
+import { generateFieldKey, isFieldKeyValid } from '@/lib/field-key'
 
 type FormData = {
   name: string
+  key: string
   description: string
   help_text: string
   field_type: string
@@ -54,6 +56,7 @@ function buildInitialForm(data?: FdFieldDefinition): FormData {
   if (!data) {
     return {
       name: '',
+      key: '',
       description: '',
       help_text: '',
       field_type: '',
@@ -66,6 +69,7 @@ function buildInitialForm(data?: FdFieldDefinition): FormData {
   }
   return {
     name: data.name,
+    key: data.key ?? '',
     description: data.description ?? '',
     help_text: data.help_text ?? '',
     field_type: data.field_type,
@@ -115,10 +119,12 @@ export default function UserFieldForm({ initialData, isEdit, onSubmit }: UserFie
   const [form, setForm] = useState<FormData>(() => buildInitialForm(initialData))
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [typeOpen, setTypeOpen] = useState(false)
+  const [keyTouched, setKeyTouched] = useState(false)
 
   useEffect(() => {
     if (initialData) {
       setForm(buildInitialForm(initialData))
+      setKeyTouched(true)
     }
   }, [initialData])
 
@@ -134,10 +140,43 @@ export default function UserFieldForm({ initialData, isEdit, onSubmit }: UserFie
     [],
   )
 
+  const handleNameChange = useCallback(
+    (value: string) => {
+      setForm((prev) => ({
+        ...prev,
+        name: value,
+        key: !isEdit && !keyTouched ? generateFieldKey(value) : prev.key,
+      }))
+      setErrors((prev) => {
+        const next = { ...prev }
+        delete next.name
+        if (!isEdit && !keyTouched) delete next.key
+        return next
+      })
+    },
+    [isEdit, keyTouched],
+  )
+
+  const handleKeyChange = useCallback(
+    (value: string) => {
+      setKeyTouched(true)
+      set('key', value)
+    },
+    [set],
+  )
+
   const validate = useCallback((): boolean => {
     const errs: Record<string, string> = {}
     if (!form.name.trim()) {
       errs.name = t('uf.form.name.required', locale)
+    }
+    const key = form.key.trim()
+    if (!key) {
+      errs.key = t('uf.form.key.required', locale)
+    } else if (key.length < 2 || key.length > 64) {
+      errs.key = t('uf.form.key.length', locale)
+    } else if (!isFieldKeyValid(key)) {
+      errs.key = t('uf.form.key.format', locale)
     }
     if (!form.field_type) {
       errs.field_type = t('uf.form.fieldType.required', locale)
@@ -177,6 +216,7 @@ export default function UserFieldForm({ initialData, isEdit, onSubmit }: UserFie
 
         const payload: CreateFdFieldDefinitionPayload = {
           domain: FieldDomain.USER,
+          key: form.key.trim(),
           name: form.name.trim(),
           description: form.description.trim() || null,
           help_text: form.help_text.trim() || null,
@@ -211,12 +251,32 @@ export default function UserFieldForm({ initialData, isEdit, onSubmit }: UserFie
         <input
           type="text"
           value={form.name}
-          onChange={(e) => set('name', e.target.value)}
+          onChange={(e) => handleNameChange(e.target.value)}
           placeholder={t('uf.form.name.placeholder', locale)}
           maxLength={64}
           className={cn(inputClass, errors.name && 'border-destructive')}
         />
         {errors.name && <p className="text-xs text-destructive">{errors.name}</p>}
+      </div>
+
+      {/* Field key */}
+      <div className="flex flex-col gap-2">
+        <label className="text-sm font-medium text-foreground/80">
+          {t('uf.form.key', locale)} <span className="text-destructive">*</span>
+        </label>
+        <input
+          type="text"
+          value={form.key}
+          onChange={(e) => handleKeyChange(e.target.value)}
+          placeholder={t('uf.form.key.placeholder', locale)}
+          maxLength={64}
+          disabled={isEdit}
+          className={cn(inputClass, isEdit && 'bg-accent text-muted-foreground', errors.key && 'border-destructive')}
+        />
+        <p className="text-xs text-muted-foreground">
+          {isEdit ? t('uf.form.key.locked', locale) : t('uf.form.key.help', locale)}
+        </p>
+        {errors.key && <p className="text-xs text-destructive">{errors.key}</p>}
       </div>
 
       {/* Description */}

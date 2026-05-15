@@ -10,6 +10,10 @@ from app.schemas.fd_form_layout import FdFormLayoutCreate, FdFormLayoutUpdate
 from app.services.tenant_init_service import init_tenant_data
 
 RESTRICTED_SOURCES_FOR_NEW_TICKET = {"ticket_metadata", "user", "organization"}
+# Post-create metadata / audit fields — not configurable on the new-ticket layout.
+DISALLOWED_TICKET_KEYS_FOR_NEW_TICKET = frozenset(
+    {"conversation_id", "created_by", "updated_by"},
+)
 REFERENCE_FIELD_SOURCES = {"ticket_metadata", "user", "organization"}
 REFERENCE_FIELD_ALLOWED_STATES = {"readonly", "hidden"}
 
@@ -50,6 +54,12 @@ class FdFormLayoutService:
                         raise ValidationError(
                             f"Field source '{src}' is not allowed in new_ticket layout"
                         )
+                    if scene == "new_ticket" and src == "ticket":
+                        fkey = field.get("field_key")
+                        if fkey and fkey in DISALLOWED_TICKET_KEYS_FOR_NEW_TICKET:
+                            raise ValidationError(
+                                f"Field '{fkey}' is not allowed in new_ticket layout"
+                            )
                     state = field.get("default_state", "optional")
                     if src in REFERENCE_FIELD_SOURCES and state not in REFERENCE_FIELD_ALLOWED_STATES:
                         raise ValidationError(

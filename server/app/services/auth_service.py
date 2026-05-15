@@ -15,7 +15,7 @@ class AuthService:
     @staticmethod
     async def login(db: AsyncSession, data: LoginRequest) -> LoginResponse:
         """Authenticate user and return JWT token."""
-        tenant = await TenantRepository.get_by_tenant_id(db, data.tenant)
+        tenant = await TenantRepository.resolve_by_identifier(db, data.tenant)
         if not tenant or not tenant.is_active:
             raise NotFoundError("Tenant not found")
 

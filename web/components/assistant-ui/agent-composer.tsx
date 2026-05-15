@@ -1,12 +1,38 @@
 'use client'
 
-import { useRef, useCallback, useState, type ChangeEvent } from 'react'
+import {
+  useRef,
+  useCallback,
+  useState,
+  type ChangeEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react'
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useAgentChatConfig } from './agent-chat-runtime'
 import { IconLoader2, IconPaperclip } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { Socket } from 'socket.io-client'
+
+function focusComposerTextarea(e: ReactPointerEvent<HTMLElement>) {
+  // Prevent default so the click target does not participate in focus routing
+  // (otherwise the textarea often never receives caret on this filler strip).
+  e.preventDefault()
+  const form = e.currentTarget.closest('form')
+  const ta =
+    form?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
+    form?.querySelector('textarea')
+  if (!ta || ta.disabled) return
+  window.requestAnimationFrame(() => {
+    ta.focus({ preventScroll: true })
+    const len = ta.value.length
+    try {
+      ta.setSelectionRange(len, len)
+    } catch {
+      // Some hosts leave selection APIs unavailable; focus alone is enough
+    }
+  })
+}
 
 type AgentComposerProps = {
   disabled: boolean
@@ -90,6 +116,15 @@ export function AgentComposer({ disabled, socket }: AgentComposerProps) {
               <IconPaperclip size={18} stroke={1.5} />
             )}
           </button>
+          {/* Hit target between attachment and send: empty flex gap did not focus the textarea */}
+          <div
+            role="presentation"
+            className="min-h-8 flex-1 cursor-text self-stretch"
+            onPointerDown={(e) => {
+              if (e.button !== 0) return
+              focusComposerTextarea(e)
+            }}
+          />
           <input
             ref={fileInputRef}
             type="file"

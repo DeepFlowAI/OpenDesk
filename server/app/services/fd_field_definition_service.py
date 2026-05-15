@@ -11,6 +11,7 @@ unified response.
 """
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,6 +50,11 @@ FIELD_TYPE_TO_SLOT_PREFIX: dict[str, str] = {
     FieldType.MULTI_SELECT: "json",
     FieldType.MULTI_SELECT_TREE: "json",
     FieldType.FILE: "json",
+    # FK-style selectors store numeric entity ids in num_* slots (same as NUMBER).
+    FieldType.USER_SELECT: "num",
+    FieldType.ORGANIZATION_SELECT: "num",
+    FieldType.EMPLOYEE_SELECT: "num",
+    FieldType.GROUP_SELECT: "num",
 }
 
 SLOT_CAPACITY: dict[str, int] = {
@@ -149,6 +155,7 @@ def coerce_slot_value(slot_column: str, value: Any) -> Any:
 
 SELECT_TYPES = {FieldType.SINGLE_SELECT, FieldType.MULTI_SELECT}
 TREE_TYPES = {FieldType.SINGLE_SELECT_TREE, FieldType.MULTI_SELECT_TREE}
+FIELD_KEY_PATTERN = re.compile(r"^[a-z_][a-z0-9_]{1,63}$")
 
 
 def _localize_system_type_config(sfd: SystemFieldDef, locale: str) -> dict:
@@ -276,7 +283,7 @@ def _metadata_field_to_unified(
 def _custom_field_to_unified(item: "FdFieldDefinition") -> dict:
     """Convert an ORM FdFieldDefinition into UnifiedFieldResponse dict."""
     return {
-        "key": None,
+        "key": item.field_key,
         "id": item.id,
         "domain": item.domain,
         "source": item.source,
@@ -334,6 +341,13 @@ class FdFieldDefinitionService:
         valid_domains = {d.value for d in FieldDomain}
         if domain not in valid_domains:
             raise ValidationError(f"Invalid domain: {domain}")
+
+    @staticmethod
+    async def _validate_field_key(field_key: str) -> None:
+        if not FIELD_KEY_PATTERN.fullmatch(field_key):
+            raise ValidationError(
+                "Only lowercase letters, numbers, and underscores are allowed. Must start with a letter or underscore.",
+            )
 
     # ── System field list (constants only, no custom fields) ──
 
@@ -448,6 +462,7 @@ class FdFieldDefinitionService:
     async def create(db: AsyncSession, tenant_id: int, data: FdFieldDefinitionCreate) -> "FdFieldDefinition":
         await FdFieldDefinitionService._validate_domain(data.domain)
         await FdFieldDefinitionService._validate_field_type(data.field_type)
+        await FdFieldDefinitionService._validate_field_key(data.key)
 
         if data.domain == FieldDomain.SHARED_POOL and not data.applicable_modules:
             raise ValidationError("applicable_modules is required for shared_pool domain")
@@ -458,16 +473,23 @@ class FdFieldDefinitionService:
         if name_exists:
             raise ConflictError(f"Field name '{data.name}' already exists in domain '{data.domain}'")
 
+        field_key_exists = await FdFieldDefinitionRepository.check_field_key_exists(
+            db, tenant_id, data.domain, data.key,
+        )
+        if field_key_exists:
+            raise ConflictError("This field key is already in use.")
+
         slot_column = await FdFieldDefinitionService._allocate_slot(
             db, tenant_id, data.domain, data.field_type, data.applicable_modules,
         )
 
         options_data = data.options or []
         tree_nodes_data = data.tree_nodes or []
-        create_data = data.model_dump(exclude={"options", "tree_nodes"})
+        create_data = data.model_dump(exclude={"key", "options", "tree_nodes"})
         create_data["tenant_id"] = tenant_id
         create_data["slot_column"] = slot_column
         create_data["source"] = "custom"
+        create_data["field_key"] = data.key
 
         # New custom fields default to sort_order=0 in the schema, which sorts
         # before system fields (e.g. user domain starts at 1). Place at the end.
@@ -553,10 +575,10 @@ class FdFieldDefinitionService:
         custom_items = []
         system_items = []
         for item in data.items:
-            if item.key:
-                system_items.append({"field_key": item.key, "sort_order": item.sort_order})
-            elif item.id:
+            if item.id:
                 custom_items.append({"id": item.id, "sort_order": item.sort_order})
+            elif item.key:
+                system_items.append({"field_key": item.key, "sort_order": item.sort_order})
 
         if custom_items:
             await FdFieldDefinitionRepository.batch_update_sort(db, tenant_id, custom_items)

@@ -691,7 +691,7 @@ function buildFieldLookup(fields: UnifiedField[], _locale: string): FieldValueLo
     const ft = f.field_type
     if (!['single_select', 'multi_select', 'single_select_tree', 'multi_select_tree'].includes(ft)) continue
 
-    const key = f.id != null ? String(f.id) : f.key ?? ''
+    const key = f.key ?? (f.id != null ? String(f.id) : '')
     const valueMap = new Map<string, string>()
 
     if (f.options?.length) {
@@ -709,7 +709,10 @@ function buildFieldLookup(fields: UnifiedField[], _locale: string): FieldValueLo
       for (const o of cfgOpts) valueMap.set(o.value, o.label)
     }
 
-    if (valueMap.size > 0) lookup.set(key, valueMap)
+    if (valueMap.size > 0) {
+      lookup.set(key, valueMap)
+      if (f.id != null) lookup.set(String(f.id), valueMap)
+    }
   }
   return lookup
 }
@@ -752,9 +755,11 @@ function getCellValue(
       return labelForSelectValue(fieldByKey.get('priority'), String(raw))
     }
 
-    if (field_key === 'description' || field_type === 'rich_text') {
-      const f = field_key ? fieldByKey.get(field_key) : undefined
-      return richTextToPlainCell(raw, f?.type_config)
+    const unifiedSys = fieldByKey.get(field_key)
+    const sysFieldType = unifiedSys?.field_type ?? field_type
+
+    if (sysFieldType === 'rich_text') {
+      return richTextToPlainCell(raw, unifiedSys?.type_config)
     }
 
     if (['single_select', 'multi_select'].includes(field_type) && field_key) {
@@ -764,39 +769,28 @@ function getCellValue(
     return String(raw)
   }
 
-  if (field_id != null && ticket.custom_fields) {
-    const val = ticket.custom_fields[String(field_id)]
+  if (ticket.custom_fields) {
+    const customKey = field_key && !SYSTEM_KEYS.has(field_key) ? field_key : null
+    const legacyIdKey = field_id != null ? String(field_id) : null
+    const lookupKey = customKey ?? legacyIdKey ?? ''
+    const val = customKey && ticket.custom_fields[customKey] != null
+      ? ticket.custom_fields[customKey]
+      : legacyIdKey
+        ? ticket.custom_fields[legacyIdKey]
+        : null
     if (val == null) return ''
     if (field_type === 'file') {
       return formatFileFieldValue(val, locale === 'zh')
     }
     const str = Array.isArray(val) ? val.join(',') : String(val)
     if (['single_select', 'multi_select', 'single_select_tree', 'multi_select_tree'].includes(field_type)) {
-      return resolveSelectLabel(str, String(field_id), fieldLookup)
+      return resolveSelectLabel(str, lookupKey, fieldLookup)
     }
     if (field_type === 'rich_text') {
-      const f = fieldByKey.get(String(field_id))
+      const f = fieldByKey.get(lookupKey)
       return richTextToPlainCell(val, f?.type_config)
     }
     return str
-  }
-
-  if (field_key && ticket.custom_fields) {
-    const val = ticket.custom_fields[field_key]
-    if (val != null) {
-      if (field_type === 'file') {
-        return formatFileFieldValue(val, locale === 'zh')
-      }
-      const str = String(val)
-      if (['single_select', 'multi_select'].includes(field_type)) {
-        return resolveSelectLabel(str, field_key, fieldLookup)
-      }
-      if (field_type === 'rich_text') {
-        const f = fieldByKey.get(field_key)
-        return richTextToPlainCell(str, f?.type_config)
-      }
-      return str
-    }
   }
 
   return ''
@@ -808,7 +802,6 @@ function getColumnMinWidth(fieldType: string, fieldKey: string | null): number {
   if (fieldKey === 'ticket_number') return 180
   if (fieldKey === 'user_id') return 180
   if (fieldKey === 'created_by' || fieldKey === 'updated_by') return 160
-  if (fieldKey === 'description') return 200
   switch (fieldType) {
     case 'email': return 180
     case 'url': return 180

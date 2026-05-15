@@ -39,7 +39,7 @@ export type VisitorChatConfigValue = {
   historyLimitReached: boolean
   onLoadMore: () => void
   onLoadHistory: (beforeId?: number) => Promise<void>
-  onTyping: () => void
+  onTyping: (content: string) => void
   onRestartConversation: () => Promise<void>
   onFileSend: (file: File) => Promise<void>
 }

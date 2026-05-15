@@ -6,10 +6,12 @@ import { FieldType } from '@/types/field-enums'
 import type { FdFieldOption, FdTreeNode } from '@/models/field-definition'
 import { FieldOptionPill, coalescePillOptions } from '@/app/components/features/field-system/field-select-pill-editors'
 import { formatDatetimeForDisplay } from '@/lib/datetime-display'
+import { useUser } from '@/service/use-users'
 import { useOrganization } from '@/service/use-organizations'
 import { useEmployee } from '@/service/use-employees'
 import { useEmployeeGroup } from '@/service/use-employee-groups'
 import { FieldFileDisplay } from '@/app/components/features/field-system/field-file-display'
+import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 
 type FieldValueDisplayProps = {
   fieldType: FieldType
@@ -40,9 +42,11 @@ export function FieldValueDisplay({
     case FieldType.SINGLE_LINE_TEXT:
     case FieldType.MULTI_LINE_TEXT:
       if (typeConfig.value_kind === 'actor') {
-        return <span className={className}>{formatActorFieldValue(value)}</span>
+        return (
+          <span className={cn('min-w-0 max-w-full break-words', className)}>{formatActorFieldValue(value)}</span>
+        )
       }
-      return <span className={className}>{String(value)}</span>
+      return <span className={cn('min-w-0 max-w-full whitespace-pre-wrap break-words', className)}>{String(value)}</span>
 
     case FieldType.NUMBER: {
       const num = Number(value)
@@ -154,14 +158,24 @@ export function FieldValueDisplay({
       const fmt = ((typeConfig.rich_format as string) ?? 'html').toLowerCase()
       if (fmt === 'markdown') {
         return (
-          <div className={cn('prose prose-sm dark:prose-invert max-w-none', className)}>
+          <div
+            className={cn(
+              'prose prose-sm dark:prose-invert max-w-none min-w-0 break-words',
+              richTextListStyleClass,
+              className,
+            )}
+          >
             <ReactMarkdown>{String(value)}</ReactMarkdown>
           </div>
         )
       }
       return (
         <div
-          className={cn('prose prose-sm dark:prose-invert max-w-none', className)}
+          className={cn(
+            'prose prose-sm dark:prose-invert max-w-none min-w-0 break-words',
+            richTextListStyleClass,
+            className,
+          )}
           dangerouslySetInnerHTML={{ __html: String(value) }}
         />
       )
@@ -170,6 +184,9 @@ export function FieldValueDisplay({
     case FieldType.ORGANIZATION_SELECT:
       return <OrganizationValueDisplay value={value} className={className} />
 
+    case FieldType.USER_SELECT:
+      return <UserValueDisplay value={value} className={className} />
+
     case FieldType.EMPLOYEE_SELECT:
       return <EmployeeValueDisplay value={value} className={className} />
 
@@ -177,7 +194,7 @@ export function FieldValueDisplay({
       return <EmployeeGroupValueDisplay value={value} className={className} />
 
     default:
-      return <span className={className}>{String(value)}</span>
+      return <span className={cn('min-w-0 max-w-full break-words', className)}>{String(value)}</span>
   }
 }
 
@@ -207,6 +224,13 @@ function OrganizationValueDisplay({ value, className }: { value: unknown; classN
   const organizationId = typeof value === 'number' ? value : Number(value)
   const { data: organization } = useOrganization(Number.isFinite(organizationId) ? organizationId : 0)
   return <span className={className}>{organization?.name ?? String(value)}</span>
+}
+
+function UserValueDisplay({ value, className }: { value: unknown; className?: string }) {
+  const userId = typeof value === 'number' ? value : Number(value)
+  const { data: user } = useUser(Number.isFinite(userId) ? userId : 0)
+  const label = user?.name || String(value)
+  return <span className={className}>{label}</span>
 }
 
 function EmployeeValueDisplay({ value, className }: { value: unknown; className?: string }) {

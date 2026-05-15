@@ -52,7 +52,7 @@ Open <http://localhost:3000> and sign in:
 | -------- | ------------ |
 | Tenant   | `default`    |
 | Username | `admin`      |
-| Password | `admin123`   |
+| Password | `Admin123456`   |
 
 > ⚠️ **Change the password immediately after first login in any non-local deployment.**
 
