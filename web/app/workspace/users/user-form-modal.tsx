@@ -240,8 +240,9 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
 
         {isEdit && user && (
           <div className="px-6 pt-3">
-            <p className="text-xs text-muted-foreground">
-              {isZh ? '终端用户 ID' : 'User ID'}: {user.id}
+            <p className="truncate text-xs text-muted-foreground">
+              {isZh ? '终端用户 ID' : 'User ID'}:{' '}
+              <span className="font-mono">{user.public_id || '—'}</span>
             </p>
           </div>
         )}

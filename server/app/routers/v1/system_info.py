@@ -20,10 +20,12 @@ router = APIRouter(prefix="/system", tags=["System"])
 async def get_system_info(request: Request) -> dict:
     loaded = list(getattr(request.app.state, "loaded_extensions", []))
     has_tenants_ext = "tenants" in loaded
+    has_reports_ext = "reports" in loaded
     return {
         "app_name": settings.APP_NAME,
         "app_version": settings.APP_VERSION,
         "edition": "enterprise" if has_tenants_ext else "community",
         "single_tenant_mode": not has_tenants_ext,
         "default_tenant_id": settings.DEFAULT_TENANT_ID,
+        "reports_enabled": has_reports_ext,
     }

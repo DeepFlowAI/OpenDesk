@@ -66,6 +66,72 @@ class AgentStatusService:
         }
 
     @staticmethod
+    async def get_statuses_bulk(
+        r: aioredis.Redis,
+        tenant_id: int,
+        users: list[tuple[int, int]],
+    ) -> dict[int, dict]:
+        """Fetch statuses for many agents in a single Redis round-trip.
+
+        Each ``users`` entry is ``(user_id, max_concurrent)``. Returns a dict
+        keyed by ``user_id`` with the same payload shape as ``get_status``.
+
+        Same self-heal semantics as ``get_status``: an expired
+        ``pending_offline_until`` marker surfaces as ``offline``. Per-user
+        Redis errors do not abort the batch — affected users get ``offline``.
+        """
+        if not users:
+            return {}
+
+        # Pipeline (non-transactional) is enough: we only read, no atomicity
+        # required across keys.
+        async with r.pipeline(transaction=False) as pipe:
+            for uid, _max in users:
+                pipe.hgetall(AgentStatusService._key(tenant_id, uid))
+            try:
+                raw = await pipe.execute()
+            except Exception:
+                # If the entire pipeline fails (e.g. Redis down), surface every
+                # caller as "offline" rather than raising — keeps the monitor
+                # page usable during transient Redis outages.
+                return {
+                    uid: {
+                        "user_id": uid,
+                        "status": AgentOnlineStatus.OFFLINE.value,
+                        "current_count": 0,
+                        "max_concurrent": max_c,
+                    }
+                    for uid, max_c in users
+                }
+
+        now = time.time()
+        result: dict[int, dict] = {}
+        for (uid, max_c), data in zip(users, raw):
+            if not data:
+                result[uid] = {
+                    "user_id": uid,
+                    "status": AgentOnlineStatus.OFFLINE.value,
+                    "current_count": 0,
+                    "max_concurrent": max_c,
+                }
+                continue
+            status = data.get("status", AgentOnlineStatus.OFFLINE.value)
+            pending = data.get(_PENDING_OFFLINE_FIELD)
+            if pending:
+                try:
+                    if now >= float(pending):
+                        status = AgentOnlineStatus.OFFLINE.value
+                except ValueError:
+                    pass
+            result[uid] = {
+                "user_id": uid,
+                "status": status,
+                "current_count": int(data.get("current_count", 0)),
+                "max_concurrent": max_c,
+            }
+        return result
+
+    @staticmethod
     async def set_status(
         r: aioredis.Redis, tenant_id: int, user_id: int, status: str
     ) -> None:

@@ -1,6 +1,9 @@
 """
 Integration tests for Session Records API
 """
+from secrets import choice
+from string import ascii_lowercase
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
@@ -12,6 +15,8 @@ from app.db.session import AsyncSessionLocal
 _SEEDED = False
 _TOKEN = ""
 _CONV_ID = 0
+_CONV_PUBLIC_ID = "cv_session_records_public_" + "".join(choice(ascii_lowercase) for _ in range(16))
+_CONV_SHARE_CODE = "CV-" + "".join(choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -61,10 +66,10 @@ async def seed_data():
         visitor_id = v_row.scalar_one()
 
         await db.execute(text("""
-            INSERT INTO conversations (tenant_id, visitor_id, agent_id, status, started_at, ended_at, ended_by)
-            VALUES (:tid, :vid, :aid, 'closed', NOW() - interval '1 hour', NOW(), 'agent')
+            INSERT INTO conversations (public_id, share_code, tenant_id, visitor_id, agent_id, status, started_at, ended_at, ended_by)
+            VALUES (:public_id, :share_code, :tid, :vid, :aid, 'closed', NOW() - interval '1 hour', NOW(), 'agent')
             RETURNING id
-        """), {"tid": tenant_pk, "vid": visitor_id, "aid": agent_id})
+        """), {"public_id": _CONV_PUBLIC_ID, "share_code": _CONV_SHARE_CODE, "tid": tenant_pk, "vid": visitor_id, "aid": agent_id})
         await db.commit()
 
         conv_row = await db.execute(text("""
@@ -116,6 +121,41 @@ class TestSessionRecordsAPI:
         assert data["total"] >= 1
 
     @pytest.mark.asyncio
+    async def test_list_with_public_id_keyword_filter(self, client: AsyncClient):
+        resp = await client.get(
+            "/api/v1/session-records",
+            params={"keyword": _CONV_PUBLIC_ID},
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_list_with_share_code_keyword_filter(self, client: AsyncClient):
+        resp = await client.get(
+            "/api/v1/session-records",
+            params={"keyword": _CONV_SHARE_CODE},
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] >= 1
+        assert any(item["share_code"] == _CONV_SHARE_CODE for item in data["items"])
+
+    @pytest.mark.asyncio
+    async def test_list_with_internal_id_keyword_does_not_match(self, client: AsyncClient):
+        resp = await client.get(
+            "/api/v1/session-records",
+            params={"keyword": str(_CONV_ID)},
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 0
+        assert data["items"] == []
+
+    @pytest.mark.asyncio
     async def test_list_with_nonexistent_keyword_returns_empty(self, client: AsyncClient):
         resp = await client.get(
             "/api/v1/session-records",
@@ -136,6 +176,7 @@ class TestSessionRecordsAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert data["id"] == _CONV_ID
+        assert data["share_code"] == _CONV_SHARE_CODE
         assert data["status"] == "closed"
 
     @pytest.mark.asyncio

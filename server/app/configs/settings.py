@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = Field(default="change-me")
     JWT_ALGORITHM: str = Field(default="HS256")
     JWT_EXPIRE_HOURS: int = Field(default=24)
+    VISITOR_SESSION_EXPIRE_SECONDS: int = Field(default=86400)
 
     SMTP_HOST: str = Field(default="")
     SMTP_PORT: int = Field(default=465)

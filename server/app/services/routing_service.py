@@ -102,10 +102,12 @@ class RoutingService:
             if ct == "channel":
                 if channel is None:
                     return False
-                kind = "sdk" if channel.access_mode == "embed" else "web"
-                if op == "eq" and kind != value:
+                if value not in ("websdk", "web", "sdk"):
                     return False
-                if op == "ne" and kind == value:
+                is_web_sdk_channel = getattr(channel, "channel_type", "web") == "web"
+                if op == "eq" and not is_web_sdk_channel:
+                    return False
+                if op == "ne" and is_web_sdk_channel:
                     return False
 
             elif ct == "web_sdk":

@@ -175,6 +175,30 @@ class ConversationFileService:
         )
 
     @staticmethod
+    async def upload_visitor_file_for_session(
+        db: AsyncSession,
+        conversation_public_id: str,
+        visitor_context: dict,
+        file: UploadFile,
+    ) -> dict:
+        """Upload a visitor file for a token-bound public conversation."""
+        from app.services.conversation_service import ConversationService
+
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        return await ConversationFileService._upload_file(
+            db,
+            conversation_id=conversation.id,
+            tenant_id=conversation.tenant_id,
+            file=file,
+        )
+
+    @staticmethod
     async def upload_agent_file(
         db: AsyncSession,
         conversation_id: int,
@@ -222,3 +246,55 @@ class ConversationFileService:
             download_name=ConversationFileService._safe_download_name(download_name or "download") if download else None,
         )
         return {"url": url, "expires_seconds": TEMPORARY_URL_EXPIRES_SECONDS}
+
+    @staticmethod
+    async def get_temporary_url_for_visitor_session(
+        db: AsyncSession,
+        conversation_public_id: str,
+        visitor_context: dict,
+        file_id: str,
+        download_name: str | None = None,
+        download: bool = False,
+    ) -> dict:
+        """Create a short-lived URL for a token-bound visitor conversation file."""
+        from app.services.conversation_service import ConversationService
+
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        return await ConversationFileService.get_temporary_url(
+            db,
+            conversation_id=conversation.id,
+            file_id=file_id,
+            download_name=download_name,
+            download=download,
+        )
+
+    @staticmethod
+    async def get_temporary_url_for_agent(
+        db: AsyncSession,
+        conversation_id: int,
+        tenant_id: int,
+        agent_id: int,
+        file_id: str,
+        download_name: str | None = None,
+        download: bool = False,
+    ) -> dict:
+        """Create a short-lived URL for an agent-accessible conversation file."""
+        await ConversationFileService._get_conversation_for_agent(
+            db,
+            conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+        )
+        return await ConversationFileService.get_temporary_url(
+            db,
+            conversation_id=conversation_id,
+            file_id=file_id,
+            download_name=download_name,
+            download=download,
+        )

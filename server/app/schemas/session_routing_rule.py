@@ -26,8 +26,9 @@ class SessionRoutingCondition(BaseModel):
         if ct == "channel":
             if op not in ("eq", "ne"):
                 raise ValueError("Invalid operator for channel condition; expected 'eq' or 'ne'")
-            if val not in ("web", "sdk"):
-                raise ValueError("Channel value must be 'web' or 'sdk'")
+            if val not in ("websdk", "web", "sdk"):
+                raise ValueError("Channel value must be 'websdk'")
+            self.value = "websdk"
 
         elif ct == "web_sdk":
             if op in ("eq", "ne"):

@@ -6,7 +6,7 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useSessionRecordDetail } from '@/service/use-session-records'
 import { MessageList } from './message-list'
-import { SessionInfoPanel } from './session-info-panel'
+import { SessionInfoPanel, type SessionInfoTab } from './session-info-panel'
 
 type Props = {
   recordId: number
@@ -17,6 +17,7 @@ export function SessionDetailDrawer({ recordId, onClose }: Props) {
   const { locale } = useLocaleStore()
   const { data: record, isLoading } = useSessionRecordDetail(recordId)
   const [summaryDirty, setSummaryDirty] = useState(false)
+  const [infoTab, setInfoTab] = useState<SessionInfoTab>('basic')
 
   const requestClose = () => {
     if (summaryDirty) {
@@ -33,6 +34,11 @@ export function SessionDetailDrawer({ recordId, onClose }: Props) {
     window.addEventListener('keydown', handleEsc)
     return () => window.removeEventListener('keydown', handleEsc)
   }, [requestClose])
+
+  useEffect(() => {
+    setInfoTab('basic')
+    setSummaryDirty(false)
+  }, [recordId])
 
   useEffect(() => {
     document.body.style.overflow = 'hidden'
@@ -73,12 +79,26 @@ export function SessionDetailDrawer({ recordId, onClose }: Props) {
           <div className="flex flex-1 overflow-hidden">
             {/* Left: Chat messages (read-only) */}
             <div className="flex min-w-0 flex-1 flex-col border-r border-border">
-              <MessageList recordId={recordId} />
+              <MessageList
+                recordId={recordId}
+                onSatisfactionEventClick={() => {
+                  if (infoTab === 'summary' && summaryDirty) {
+                    const confirmed = window.confirm(t('ws.summary.unsavedConfirm', locale))
+                    if (!confirmed) return
+                  }
+                  setInfoTab('basic')
+                }}
+              />
             </div>
 
             {/* Right: session info (~40% per spec). Avoid w-[min(...,...)] — Tailwind splits on comma and breaks width. */}
             <div className="flex w-[40%] min-w-[260px] max-w-sm shrink-0 flex-col overflow-x-hidden">
-              <SessionInfoPanel record={record} onSummaryDirtyChange={setSummaryDirty} />
+              <SessionInfoPanel
+                record={record}
+                activeTab={infoTab}
+                onActiveTabChange={setInfoTab}
+                onSummaryDirtyChange={setSummaryDirty}
+              />
             </div>
           </div>
         )}

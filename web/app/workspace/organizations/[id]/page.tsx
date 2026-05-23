@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect } from 'react'
 import { useParams, useSearchParams, useRouter } from 'next/navigation'
 import {
   IconArrowLeft,
@@ -31,7 +31,7 @@ import { formatDatetimeForDisplay } from '@/lib/datetime-display'
 import { OrgFormModal } from '../org-form-modal'
 
 const DATETIME_KEYS = new Set(['created_at', 'updated_at'])
-const SYSTEM_INFO_SYSTEM_KEYS = new Set(['created_by', 'updated_by'])
+const SYSTEM_INFO_SYSTEM_KEYS = new Set(['public_id', 'created_by', 'updated_by'])
 const SELECT_TYPES = new Set([
   'single_select',
   'multi_select',
@@ -47,10 +47,11 @@ export default function OrganizationDetailPage() {
   const { locale } = useLocaleStore()
   const isZh = locale === 'zh'
 
-  const orgId = Number(params.id)
+  const orgRef = params.id
   const fromList = searchParams.get('from') === 'list'
 
-  const { data: org, isLoading, error } = useOrganization(orgId)
+  const { data: org, isLoading, error } = useOrganization(orgRef)
+  const orgId = org?.id ?? 0
   const { data: fieldsData } = useUnifiedFields({
     domain: 'organization',
     include_metadata: true,
@@ -106,11 +107,11 @@ export default function OrganizationDetailPage() {
   const {
     data: usersData,
     isLoading: usersLoading,
-  } = useOrgUsers(orgId, {
+  } = useOrgUsers(org?.public_id ?? orgRef, {
     page: userPage,
     per_page: userPerPage,
     search: userSearch || undefined,
-  })
+  }, !!org)
   const {
     data: changesData,
     isLoading: changesLoading,
@@ -128,11 +129,13 @@ export default function OrganizationDetailPage() {
 
   const handleEditSuccess = useCallback(() => {
     setEditModalOpen(false)
+    queryClient.invalidateQueries({ queryKey: orgKeys.detail(orgRef) })
     queryClient.invalidateQueries({ queryKey: orgKeys.detail(orgId) })
     queryClient.invalidateQueries({ queryKey: orgKeys.queries() })
-  }, [queryClient, orgId])
+  }, [queryClient, orgId, orgRef])
 
   const handleDelete = useCallback(async () => {
+    if (!orgId) return
     const msg = isZh
       ? '确定要删除此组织吗？此操作不可撤销。'
       : 'Are you sure you want to delete this organization? This action cannot be undone.'
@@ -144,6 +147,12 @@ export default function OrganizationDetailPage() {
       // handled by mutation
     }
   }, [isZh, orgId, deleteMutation, router])
+
+  useEffect(() => {
+    if (!org?.public_id || !orgRef || !/^\d+$/.test(orgRef)) return
+    const qs = searchParams.toString()
+    router.replace(`/workspace/organizations/${org.public_id}${qs ? `?${qs}` : ''}`)
+  }, [router, searchParams, org?.public_id, orgRef])
 
   const handleUserSearch = useCallback(() => {
     setUserSearch(userSearchInput)
@@ -460,7 +469,7 @@ export default function OrganizationDetailPage() {
                       <td className="px-4 py-3 text-sm text-foreground/80">{user.phone ?? '—'}</td>
                       <td className="px-4 py-3">
                         <button
-                          onClick={() => router.push(`/workspace/users/${user.id}`)}
+                          onClick={() => router.push(`/workspace/users/${user.public_id || user.id}`)}
                           className="text-sm font-medium text-primary transition-colors hover:underline"
                         >
                           {isZh ? '查看详情' : 'View Detail'}

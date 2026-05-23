@@ -5,8 +5,9 @@ import type { Message } from '@/models/conversation'
 import type { ChannelConfig } from '@/models/channel'
 import { MessageBubble } from './message-bubble'
 import { SystemMessage } from './system-message'
+import { WelcomeMessage } from './welcome-message'
 import { TypingIndicator } from './typing-indicator'
-import { IconLoader2, IconMessage } from '@tabler/icons-react'
+import { IconLoader2 } from '@tabler/icons-react'
 
 type MessageListProps = {
   messages: Message[]
@@ -72,6 +73,13 @@ export function MessageList({
   const listRef = useRef<HTMLDivElement>(null)
   const [autoScroll, setAutoScroll] = useState(true)
   const latestAgentMessage = [...messages].reverse().find((msg) => msg.sender_type === 'agent')
+  const hasConversationMessages = messages.some(
+    (msg) =>
+      msg.sender_type !== 'system'
+      && msg.content_type !== 'system'
+      && msg.content_type !== 'welcome',
+  )
+  const hasWelcomeMessage = messages.some((msg) => msg.content_type === 'welcome')
 
   useEffect(() => {
     if (autoScroll) {
@@ -89,15 +97,16 @@ export function MessageList({
   if (messages.length === 0 && !loading) {
     return (
       <div
-        className="flex flex-1 flex-col items-center justify-center gap-3 p-8"
+        className="flex flex-1 flex-col py-3"
         style={{ backgroundColor: config.message_area_bg_color || 'var(--color-background)' }}
       >
-        <div className="flex h-14 w-14 items-center justify-center rounded-full bg-muted">
-          <IconMessage size={28} className="text-muted-foreground" />
-        </div>
-        <p className="max-w-xs text-center text-sm text-muted-foreground">
-          {welcomeMessage}
-        </p>
+        {welcomeMessage && (
+          <WelcomeMessage
+            content={welcomeMessage}
+            config={config}
+            showAvatar={config.use_agent_avatar === true}
+          />
+        )}
       </div>
     )
   }
@@ -123,10 +132,39 @@ export function MessageList({
         </button>
       )}
 
+      {!hasConversationMessages && !hasWelcomeMessage && !loading && (
+        <div className="py-1">
+          {welcomeMessage && (
+            <WelcomeMessage
+              content={welcomeMessage}
+              config={config}
+              showAvatar={config.use_agent_avatar === true}
+            />
+          )}
+        </div>
+      )}
+
       {messages.map((msg, idx) => {
         const prev = idx > 0 ? messages[idx - 1] : null
         const next = idx < messages.length - 1 ? messages[idx + 1] : null
         const showTs = shouldShowTimestamp(msg, prev)
+
+        if (msg.content_type === 'welcome') {
+          return (
+            <div key={msg.id}>
+              {showTs && (
+                <div className="py-2 text-center text-[10px] text-muted-foreground">
+                  {formatTimestamp(msg.created_at, locale)}
+                </div>
+              )}
+              <WelcomeMessage
+                content={msg.content}
+                config={config}
+                showAvatar={config.use_agent_avatar === true}
+              />
+            </div>
+          )
+        }
 
         if (msg.sender_type === 'system' || msg.content_type === 'system') {
           return (

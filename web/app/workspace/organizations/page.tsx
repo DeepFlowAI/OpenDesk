@@ -594,7 +594,7 @@ export default function WorkspaceOrganizationsPage() {
                   <tr
                     key={org.id}
                     className="border-b border-border transition-colors hover:bg-accent/50 cursor-pointer"
-                    onClick={() => router.push(`/workspace/organizations/${org.id}?from=list`)}
+                    onClick={() => router.push(`/workspace/organizations/${org.public_id || org.id}?from=list`)}
                   >
                     {displayColumns.map((col, idx) => {
                       const val = getCellValue(org, col, fieldLookup, locale)
@@ -697,7 +697,7 @@ function buildOrgsUrl(
   return qs ? `/workspace/organizations?${qs}` : '/workspace/organizations'
 }
 
-const ORG_SYSTEM_KEYS = new Set(['name', 'description', 'created_by', 'updated_by', 'created_at', 'updated_at'])
+const ORG_SYSTEM_KEYS = new Set(['public_id', 'name', 'description', 'created_by', 'updated_by', 'created_at', 'updated_at'])
 const DATETIME_KEYS = new Set(['created_at', 'updated_at'])
 
 type FieldValueLookup = Map<string, Map<string, string>>
@@ -794,6 +794,7 @@ function getCellValue(
 function getColumnMinWidth(fieldType: string, fieldKey: string | null): number {
   if (fieldKey === 'created_at' || fieldKey === 'updated_at') return 160
   if (fieldKey === 'created_by' || fieldKey === 'updated_by') return 160
+  if (fieldKey === 'public_id') return 220
   if (fieldKey === '__user_count') return 100
   if (fieldKey === 'description') return 180
   switch (fieldType) {

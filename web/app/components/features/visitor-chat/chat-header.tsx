@@ -1,13 +1,17 @@
 'use client'
 
 import type { ChannelPublicConfig } from '@/service/use-visitor-chat'
+import { IconX } from '@tabler/icons-react'
+import { cn } from '@/lib/utils'
 
 type ChatHeaderProps = {
   channel: ChannelPublicConfig
   isMobile: boolean
+  isEmbed?: boolean
+  onEmbedClose?: () => void
 }
 
-export function ChatHeader({ channel, isMobile }: ChatHeaderProps) {
+export function ChatHeader({ channel, isMobile, isEmbed = false, onEmbedClose }: ChatHeaderProps) {
   const config = channel.config
   const gradientStart = config.header_gradient_start || 'oklch(0.205 0 0)'
   const gradientEnd = config.header_gradient_end || 'oklch(0.205 0 0)'
@@ -16,7 +20,10 @@ export function ChatHeader({ channel, isMobile }: ChatHeaderProps) {
 
   return (
     <header
-      className="flex shrink-0 items-center gap-3 px-4 py-3"
+      className={cn(
+        'flex shrink-0 items-center gap-3 px-4 py-3',
+        isEmbed && 'overflow-hidden rounded-t-[14px]',
+      )}
       style={{
         background: `linear-gradient(to right, ${gradientStart}, ${gradientEnd})`,
         minHeight: isMobile ? 56 : 60,
@@ -30,11 +37,22 @@ export function ChatHeader({ channel, isMobile }: ChatHeaderProps) {
         />
       )}
       <h1
-        className="truncate text-base font-semibold"
+        className="min-w-0 flex-1 truncate text-base font-semibold"
         style={{ color: titleColor }}
       >
         {title}
       </h1>
+      {isEmbed && (
+        <button
+          type="button"
+          aria-label="Close chat"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60"
+          style={{ color: titleColor }}
+          onClick={onEmbedClose}
+        >
+          <IconX size={18} />
+        </button>
+      )}
     </header>
   )
 }

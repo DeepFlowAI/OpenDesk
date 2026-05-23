@@ -28,6 +28,7 @@ from app.services.fd_field_definition_service import coerce_slot_value
 
 
 ORG_SYSTEM_FIELD_LABELS: dict[str, str] = {
+    "public_id": "组织 ID",
     "name": "名称",
     "description": "描述",
     "created_by": "创建人",
@@ -133,6 +134,20 @@ class OrganizationService:
             raise NotFoundError("Organization not found")
         slot_to_key = await OrganizationService._get_field_key_slot_map(db, tenant_id)
         user_count = await OrganizationRepository.count_users(db, tenant_id, org_id)
+        return OrganizationService._enrich_response(item, slot_to_key, user_count)
+
+    @staticmethod
+    async def get_by_ref(db: AsyncSession, tenant_id: int, org_ref: str) -> dict:
+        """Get an organization by public ID, with short-term numeric ID compatibility."""
+        item = None
+        if org_ref.isdigit():
+            item = await OrganizationRepository.get_by_id(db, int(org_ref))
+        else:
+            item = await OrganizationRepository.get_by_public_id(db, org_ref)
+        if not item or item.tenant_id != tenant_id:
+            raise NotFoundError("Organization not found")
+        slot_to_key = await OrganizationService._get_field_key_slot_map(db, tenant_id)
+        user_count = await OrganizationRepository.count_users(db, tenant_id, item.id)
         return OrganizationService._enrich_response(item, slot_to_key, user_count)
 
     @staticmethod

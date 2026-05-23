@@ -13,6 +13,8 @@ Events:
 import asyncio
 import logging
 
+from fastapi.encoders import jsonable_encoder
+
 from app.configs.settings import settings
 from app.core.security import decode_access_token
 from app.db.session import AsyncSessionLocal
@@ -21,6 +23,7 @@ from app.enums import MessageSenderType, AgentOnlineStatus
 from app.libs.realtime.base import BaseRealtimeTransport
 from app.services.conversation_service import ConversationService
 from app.services.agent_status_service import AgentStatusService
+from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +90,7 @@ async def _assign_queued_conversations(
                 "conversation_id": conv.id,
                 "visitor": {
                     "id": conv.visitor.id,
+                    "public_id": conv.visitor.public_id,
                     "name": conv.visitor.name,
                     "avatar_color": conv.visitor.avatar_color,
                 } if conv.visitor else None,
@@ -98,6 +102,7 @@ async def _assign_queued_conversations(
             visitor_room = f"conv:{conv.id}"
             await rt.emit("conversation_assigned", {
                 "conversation_id": conv.id,
+                "conversation_public_id": conv.public_id,
                 "agent": {
                     "id": user.id,
                     "name": user.display_name or user.name,
@@ -233,6 +238,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             "content_type": msg.content_type,
             "content": msg.content,
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            **ConversationService._message_event_overlay(msg),
         }
 
         # Broadcast through the same message stream used for visitor messages so
@@ -243,6 +249,27 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         await rt.emit("new_message", msg_payload, room=conv_room, namespace="/visitor")
 
         return {"ok": True, "message": msg_payload}
+
+    @rt.on("send_satisfaction_invitation", namespace=NAMESPACE)  # type: ignore
+    async def on_send_satisfaction_invitation(sid: str, data: dict):
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        user_id = session.get("user_id")
+        tenant_id = session.get("tenant_id")
+        conversation_id = data.get("conversation_id")
+        force = bool(data.get("force"))
+
+        if not conversation_id:
+            return {"error": "conversation_id required"}
+
+        async with AsyncSessionLocal() as db:
+            state = await SatisfactionSurveyRecordService.send_agent_invitation(
+                db,
+                conversation_id=int(conversation_id),
+                tenant_id=int(tenant_id),
+                user={"user_id": int(user_id), "tenant_id": int(tenant_id), "roles": ["agent"]},
+                force=force,
+            )
+        return {"ok": True, "state": jsonable_encoder(state)}
 
     @rt.on("typing", namespace=NAMESPACE)  # type: ignore
     async def on_typing(sid: str, data: dict):
@@ -266,7 +293,11 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                 db, r, conversation_id, ended_by="agent"
             )
 
-        end_payload = {"conversation_id": conversation_id, "ended_by": "agent"}
+        end_payload = {
+            "conversation_id": conversation_id,
+            "conversation_public_id": conv.public_id,
+            "ended_by": "agent",
+        }
         conv_room = f"conv:{conversation_id}"
         agent_room = f"agent:{tenant_id}:{session.get('user_id')}"
         await rt.emit("conversation_ended", end_payload, room=agent_room, namespace=NAMESPACE)
@@ -283,11 +314,13 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         if conversation_id:
             async with AsyncSessionLocal() as db:
                 await ConversationService.mark_read(db, conversation_id)
+                conv = await ConversationService.get_by_id(db, conversation_id)
 
             conv_room = f"conv:{conversation_id}"
             agent_room = f"agent:{tenant_id}:{user_id}"
             await rt.emit("messages_read", {
                 "conversation_id": conversation_id,
+                "conversation_public_id": conv.public_id,
             }, room=conv_room, namespace="/visitor")
             await rt.emit("conversation_updated", {
                 "conversation_id": conversation_id,

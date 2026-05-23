@@ -9,8 +9,10 @@ from app.db.deps import get_db, get_redis, get_current_user
 from app.schemas.conversation import (
     ConversationResponse,
     ConversationListResponse,
+    VisitorWebStatusResponse,
 )
 from app.schemas.conversation_file import ConversationFileUploadResponse
+from app.schemas.conversation_file import ConversationFileAccessResponse
 from app.schemas.message import (
     MessageCreate,
     MessageResponse,
@@ -18,9 +20,15 @@ from app.schemas.message import (
     WorkspaceConversationHistoryResponse,
 )
 from app.schemas.agent_status import AgentStatusResponse, AgentStatusUpdate, AgentStatsResponse
+from app.schemas.satisfaction_survey_record import (
+    SatisfactionConversationState,
+    SatisfactionInviteRequest,
+)
 from app.services.conversation_file_service import ConversationFileService
 from app.services.conversation_service import ConversationService
 from app.services.agent_status_service import AgentStatusService
+from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
+from app.services.visitor_web_status_service import VisitorWebStatusService
 from app.enums import MessageSenderType
 
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
@@ -100,6 +108,56 @@ async def list_conversation_history(
     )
 
 
+@router.get("/{conversation_id}/visitor-web-status", response_model=VisitorWebStatusResponse)
+async def get_visitor_web_status(
+    conversation_id: int,
+    db: AsyncSession = Depends(get_db),
+    r: aioredis.Redis = Depends(get_redis),
+    user: dict = Depends(get_current_user),
+):
+    """Get the selected conversation's visitor Web SDK online status."""
+    return await VisitorWebStatusService.get_conversation_status(
+        db,
+        r,
+        conversation_id=conversation_id,
+        tenant_id=user["tenant_id"],
+        agent_id=user["user_id"],
+        roles=user.get("roles", ["agent"]),
+    )
+
+
+@router.get("/{conversation_id}/satisfaction", response_model=SatisfactionConversationState)
+async def get_conversation_satisfaction(
+    conversation_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Get satisfaction survey state for a workspace conversation."""
+    return await SatisfactionSurveyRecordService.get_conversation_state(
+        db,
+        conversation_id=conversation_id,
+        tenant_id=user["tenant_id"],
+        user=user,
+    )
+
+
+@router.post("/{conversation_id}/satisfaction/invitations", response_model=SatisfactionConversationState)
+async def send_satisfaction_invitation(
+    conversation_id: int,
+    body: SatisfactionInviteRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Create or resend a satisfaction survey invitation."""
+    return await SatisfactionSurveyRecordService.send_agent_invitation(
+        db,
+        conversation_id=conversation_id,
+        tenant_id=user["tenant_id"],
+        user=user,
+        force=bool(body and body.force),
+    )
+
+
 @router.post(
     "/{conversation_id}/files",
     response_model=ConversationFileUploadResponse,
@@ -117,6 +175,30 @@ async def upload_conversation_file(
         tenant_id=user["tenant_id"],
         agent_id=user["user_id"],
         file=file,
+    )
+
+
+@router.get(
+    "/{conversation_id}/files/{file_id}/url",
+    response_model=ConversationFileAccessResponse,
+)
+async def get_conversation_file_url(
+    conversation_id: int,
+    file_id: str,
+    download_name: str | None = Query(None),
+    download: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Get a short-lived URL for an agent-accessible conversation file."""
+    return await ConversationFileService.get_temporary_url_for_agent(
+        db,
+        conversation_id=conversation_id,
+        tenant_id=user["tenant_id"],
+        agent_id=user["user_id"],
+        file_id=file_id,
+        download_name=download_name,
+        download=download,
     )
 
 
@@ -149,6 +231,7 @@ async def send_message(
         "content_type": msg.content_type,
         "content": msg.content,
         "created_at": msg.created_at,
+        **ConversationService._message_event_overlay(msg),
     }
 
 

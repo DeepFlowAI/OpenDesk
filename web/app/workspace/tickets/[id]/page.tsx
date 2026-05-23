@@ -438,6 +438,7 @@ export default function TicketDetailPage() {
                     editingFieldId={editingFieldId}
                     onStartEdit={setEditingFieldId}
                     onOpenSessionDrawer={setSelectedSessionRecordId}
+                    conversationPublicId={ticket.conversation_public_id ?? undefined}
                     isZh={isZh}
                   />
                 ))}
@@ -728,7 +729,7 @@ function UserChangeValue({
 
   return (
     <Link
-      href={`/workspace/users/${userValue.id}`}
+      href={`/workspace/users/${user?.public_id || userValue.id}`}
       className="rounded-md bg-muted px-1.5 py-0.5 font-medium text-primary underline-offset-2 hover:underline"
     >
       {label}
@@ -968,6 +969,7 @@ function TabBlock({
   editingFieldId,
   onStartEdit,
   onOpenSessionDrawer,
+  conversationPublicId,
   isZh,
 }: {
   tab: FdFormLayoutTab
@@ -986,6 +988,7 @@ function TabBlock({
   editingFieldId: number | null
   onStartEdit: (id: number | null) => void
   onOpenSessionDrawer: (recordId: number) => void
+  conversationPublicId?: string
   isZh: boolean
 }) {
   const sections = useMemo(
@@ -1038,6 +1041,7 @@ function TabBlock({
               editingFieldId={editingFieldId}
               onStartEdit={onStartEdit}
               onOpenSessionDrawer={onOpenSessionDrawer}
+              conversationPublicId={conversationPublicId}
               isZh={isZh}
             />
           ))}
@@ -1064,6 +1068,7 @@ function SectionBlock({
   editingFieldId,
   onStartEdit,
   onOpenSessionDrawer,
+  conversationPublicId,
   isZh,
 }: {
   section: FdFormLayoutSection
@@ -1080,6 +1085,7 @@ function SectionBlock({
   editingFieldId: number | null
   onStartEdit: (id: number | null) => void
   onOpenSessionDrawer: (recordId: number) => void
+  conversationPublicId?: string
   isZh: boolean
 }) {
   const fields = useMemo(
@@ -1128,6 +1134,11 @@ function SectionBlock({
                     fieldDef={def}
                     fieldKey={getFieldKey(field)}
                     value={value}
+                    displayValueOverride={
+                      field.field_source === 'ticket' && getFieldKey(field) === 'conversation_id'
+                        ? conversationPublicId
+                        : undefined
+                    }
                     state={state}
                     onChange={(val) => setEditFieldValue(getFieldKey(field), val)}
                     editValues={editValues}
@@ -1167,6 +1178,7 @@ function FieldDisplay({
   fieldDef,
   fieldKey,
   value,
+  displayValueOverride,
   state,
   onChange,
   editValues,
@@ -1181,6 +1193,7 @@ function FieldDisplay({
   fieldDef: UnifiedField | undefined
   fieldKey: string
   value: unknown
+  displayValueOverride?: string
   state: FieldState
   onChange: (val: unknown) => void
   editValues: Record<string, unknown>
@@ -1255,6 +1268,7 @@ function FieldDisplay({
   }, [fieldType, fieldDef])
 
   const displayValue = useMemo(() => {
+    if (displayValueOverride) return displayValueOverride
     if (value == null || value === '') return '-'
 
     if (fieldDef?.type_config?.value_kind === 'actor') {
@@ -1264,7 +1278,7 @@ function FieldDisplay({
     if (isUserSelect) {
       if (!userId) return '-'
       if (!selectedUser) return `User #${userId}`
-      const secondary = selectedUser.phone || selectedUser.email
+      const secondary = selectedUser.public_id || selectedUser.phone || selectedUser.email
       return secondary ? `${selectedUser.name} · ${secondary}` : selectedUser.name
     }
 
@@ -1319,7 +1333,7 @@ function FieldDisplay({
       return formatDatetimeForDisplay(strVal)
     }
     return strVal
-  }, [value, fieldType, strVal, pillOptions, fieldDef?.tree_nodes, fieldDef?.type_config, isZh, isUserSelect, selectedUser, userId, isEmployeeSelect, entityId, selectedEmployee, isGroupSelect, selectedGroup])
+  }, [displayValueOverride, value, fieldType, strVal, pillOptions, fieldDef?.tree_nodes, fieldDef?.type_config, isZh, isUserSelect, selectedUser, userId, isEmployeeSelect, entityId, selectedEmployee, isGroupSelect, selectedGroup])
 
   const readOnlyPillView = useMemo((): ReactNode | null => {
     if (fieldType === 'file' || fieldType === 'rich_text' || isLongTextField) return null
@@ -1533,7 +1547,7 @@ function FieldDisplay({
               </button>
             ) : isUserSelect && userId > 0 ? (
               <Link
-                href={`/workspace/users/${userId}`}
+                href={`/workspace/users/${selectedUser?.public_id || userId}`}
                 onClick={(event) => event.stopPropagation()}
                 className="inline-block max-w-full truncate font-medium text-primary hover:underline"
               >

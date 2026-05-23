@@ -8,6 +8,7 @@ import {
   IconUser,
   IconUsers,
   IconMessageCircle,
+  IconMessageCircleCog,
   IconGitBranch,
   IconSettings,
   IconClock,
@@ -47,6 +48,7 @@ const NAV_GROUPS: NavGroup[] = [
   {
     labelKey: 'nav.group.onlineService',
     items: [
+      { labelKey: 'nav.conversationSettings', href: '/online-service/conversation-settings', icon: IconMessageCircleCog },
       { labelKey: 'nav.channels', href: '/channels', icon: IconMessageCircle },
       { labelKey: 'nav.sessionRouting', href: '/session-routing', icon: IconGitBranch },
       { labelKey: 'nav.sessionSummary', href: '/session-summary', icon: IconNotes },
@@ -128,7 +130,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
                 {t(group.labelKey, locale)}
               </span>
               {group.items.map((item) => {
-                const prefixRoutes = ['/session-routing', '/channels', '/user-fields', '/organization-fields', '/shared-fields', '/form-layouts', '/session-summary', '/user-views', '/ticket-views', '/organization-views']
+                const prefixRoutes = ['/online-service/conversation-settings', '/session-routing', '/channels', '/user-fields', '/organization-fields', '/shared-fields', '/form-layouts', '/session-summary', '/user-views', '/ticket-views', '/organization-views']
                 const active = prefixRoutes.includes(item.href)
                   ? pathname.startsWith(item.href)
                   : pathname === item.href

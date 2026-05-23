@@ -18,6 +18,7 @@ class TicketResponse(TimestampSchema):
     ticket_number: str | None = None
     layout_id: int | None = None
     conversation_id: int | None = None
+    conversation_public_id: str | None = None
     user_id: int | None = None
     agent_id: int | None = None
     assignee_group_id: int | None = None

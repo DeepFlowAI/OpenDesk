@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, ValidationError
+from app.models.conversation import Conversation
 from app.models.ticket import Ticket
 from app.models.ticket_view import TicketView
 from app.models.fd_field_definition import FdFieldDefinition
@@ -358,8 +359,31 @@ class TicketService:
         ]
 
     @staticmethod
-    def _enrich_response(ticket: Ticket, slot_to_key: dict[str, str]) -> dict:
+    async def _get_conversation_public_id_map(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_ids: list[int],
+    ) -> dict[int, str]:
+        ids = sorted(set(conversation_ids))
+        if not ids:
+            return {}
+        result = await db.execute(
+            select(Conversation.id, Conversation.public_id)
+            .where(Conversation.tenant_id == tenant_id)
+            .where(Conversation.id.in_(ids))
+        )
+        return {row.id: row.public_id for row in result.all()}
+
+    @staticmethod
+    def _enrich_response(
+        ticket: Ticket,
+        slot_to_key: dict[str, str],
+        conversation_public_ids: dict[int, str] | None = None,
+    ) -> dict:
         resp = TicketResponse.model_validate(ticket).model_dump()
+        conversation_id = getattr(ticket, "conversation_id", None)
+        if conversation_id is not None:
+            resp["conversation_public_id"] = (conversation_public_ids or {}).get(conversation_id)
         custom_fields: dict[str, object] = {}
         for slot_col, field_key in slot_to_key.items():
             val = getattr(ticket, slot_col, None)
@@ -374,7 +398,12 @@ class TicketService:
         if not item or item.tenant_id != tenant_id:
             raise NotFoundError("Ticket not found")
         slot_to_key = await TicketService._get_field_key_slot_map(db, tenant_id)
-        return TicketService._enrich_response(item, slot_to_key)
+        conversation_public_ids = await TicketService._get_conversation_public_id_map(
+            db,
+            tenant_id,
+            [item.conversation_id] if item.conversation_id is not None else [],
+        )
+        return TicketService._enrich_response(item, slot_to_key, conversation_public_ids)
 
     @staticmethod
     async def create_ticket(
@@ -456,7 +485,13 @@ class TicketService:
         await db.commit()
         await db.refresh(ticket)
         slot_to_key = await TicketService._get_field_key_slot_map(db, tenant_id)
-        return TicketService._enrich_response(ticket, slot_to_key)
+        conversation_id = getattr(ticket, "conversation_id", None)
+        conversation_public_ids = await TicketService._get_conversation_public_id_map(
+            db,
+            tenant_id,
+            [conversation_id] if conversation_id is not None else [],
+        )
+        return TicketService._enrich_response(ticket, slot_to_key, conversation_public_ids)
 
     @staticmethod
     async def update_ticket(
@@ -532,7 +567,12 @@ class TicketService:
             item = await TicketRepository.update(db, item, update_data)
 
         slot_to_key = await TicketService._get_field_key_slot_map(db, tenant_id)
-        return TicketService._enrich_response(item, slot_to_key)
+        conversation_public_ids = await TicketService._get_conversation_public_id_map(
+            db,
+            tenant_id,
+            [item.conversation_id] if item.conversation_id is not None else [],
+        )
+        return TicketService._enrich_response(item, slot_to_key, conversation_public_ids)
 
     @staticmethod
     async def delete_ticket(db: AsyncSession, tenant_id: int, ticket_id: int) -> None:
@@ -577,7 +617,12 @@ class TicketService:
             per_page=req.per_page,
         )
 
-        enriched = [TicketService._enrich_response(t, slot_to_key) for t in items]
+        conversation_public_ids = await TicketService._get_conversation_public_id_map(
+            db,
+            tenant_id,
+            [t.conversation_id for t in items if t.conversation_id is not None],
+        )
+        enriched = [TicketService._enrich_response(t, slot_to_key, conversation_public_ids) for t in items]
         pages = (total + req.per_page - 1) // req.per_page if req.per_page > 0 else 0
         return {
             "items": enriched,

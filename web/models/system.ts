@@ -9,4 +9,7 @@ export type SystemInfo = {
   single_tenant_mode: boolean
   /** Tenant slug to auto-fill when single_tenant_mode is true. */
   default_tenant_id: string
+  /** Whether the enterprise reports module (session reports + online monitor)
+   *  is available in this build. Drives the records sub-nav visibility. */
+  reports_enabled: boolean
 }

@@ -18,7 +18,7 @@ type UserSelectProps = {
 
 function userDisplayName(user: User | undefined, fallbackId?: number): string {
   if (!user) return fallbackId ? `User #${fallbackId}` : ''
-  const secondary = user.phone || user.email
+  const secondary = user.public_id || user.phone || user.email
   return secondary ? `${user.name} · ${secondary}` : user.name
 }
 
@@ -148,8 +148,10 @@ export function UserSelect({
                     )}
                   >
                     <span className="font-medium text-foreground">{user.name}</span>
-                    {(user.phone || user.email) && (
-                      <span className="text-xs text-muted-foreground">{user.phone || user.email}</span>
+                    {(user.public_id || user.phone || user.email) && (
+                      <span className="text-xs text-muted-foreground">
+                        {user.public_id || user.phone || user.email}
+                      </span>
                     )}
                   </button>
                 )

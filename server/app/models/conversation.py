@@ -3,7 +3,7 @@ Conversation model — a chat session between an end user and an agent
 """
 from datetime import datetime
 
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Index
+from sqlalchemy import String, Integer, DateTime, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -14,6 +14,8 @@ from app.enums import ConversationStatus
 class Conversation(Base, TimestampMixin):
     __tablename__ = "conversations"
     __table_args__ = (
+        UniqueConstraint("public_id", name="uq_conversations_public_id"),
+        UniqueConstraint("share_code", name="uq_conversations_share_code"),
         Index("ix_conversations_tenant_agent_status", "tenant_id", "agent_id", "status"),
         Index("ix_conversations_tenant_status", "tenant_id", "status"),
         Index("ix_conversations_tenant_visitor", "tenant_id", "visitor_id"),
@@ -23,6 +25,8 @@ class Conversation(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    public_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    share_code: Mapped[str] = mapped_column(String(16), nullable=False)
     tenant_id: Mapped[int] = mapped_column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
     visitor_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     agent_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect } from 'react'
 import { useParams, useSearchParams, useRouter } from 'next/navigation'
 import {
   IconArrowLeft,
@@ -23,7 +23,7 @@ import { UserFormModal } from '../user-form-modal'
 
 const SYSTEM_KEY_ALIAS: Record<string, string> = { nickname: 'name' }
 const DATETIME_KEYS = new Set(['created_at', 'updated_at'])
-const SYSTEM_INFO_SYSTEM_KEYS = new Set(['created_by', 'updated_by'])
+const SYSTEM_INFO_SYSTEM_KEYS = new Set(['public_id', 'created_by', 'updated_by'])
 const GENDER_LABELS: Record<string, { zh: string; en: string }> = {
   male: { zh: '男', en: 'Male' },
   female: { zh: '女', en: 'Female' },
@@ -39,10 +39,10 @@ export default function UserDetailPage() {
   const { locale } = useLocaleStore()
   const isZh = locale === 'zh'
 
-  const userId = Number(params.id)
+  const userRef = params.id
   const fromList = searchParams.get('from') === 'list'
 
-  const { data: user, isLoading, error } = useUser(userId)
+  const { data: user, isLoading, error } = useUser(userRef)
   const { data: systemSettings } = useSystemSettings()
   const organizationEnabled = systemSettings?.organization_enabled === true
   const { data: organization, isLoading: organizationLoading } = useOrganization(
@@ -99,6 +99,12 @@ export default function UserDetailPage() {
   )
 
   const [editModalOpen, setEditModalOpen] = useState(false)
+
+  useEffect(() => {
+    if (!user?.public_id || !userRef || !/^\d+$/.test(userRef)) return
+    const qs = searchParams.toString()
+    router.replace(`/workspace/users/${user.public_id}${qs ? `?${qs}` : ''}`)
+  }, [router, searchParams, user?.public_id, userRef])
 
   const handleEditSuccess = useCallback(() => {
     setEditModalOpen(false)
@@ -230,7 +236,7 @@ export default function UserDetailPage() {
                       <button
                         type="button"
                         className="min-w-0 flex-1 break-words text-left text-sm font-medium text-primary outline-none hover:underline focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-ring"
-                        onClick={() => router.push(`/workspace/organizations/${user.organization_id}`)}
+                        onClick={() => router.push(`/workspace/organizations/${organization.public_id || user.organization_id}`)}
                         aria-label={
                           isZh
                             ? `查看组织 ${organization.name}`
@@ -264,7 +270,7 @@ export default function UserDetailPage() {
                     <button
                       type="button"
                       className="min-w-0 flex-1 break-words text-left text-sm font-medium text-primary outline-none hover:underline focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-ring"
-                      onClick={() => router.push(`/workspace/organizations/${user.organization_id}`)}
+                      onClick={() => router.push(`/workspace/organizations/${organization.public_id || user.organization_id}`)}
                       aria-label={
                         isZh
                           ? `查看组织 ${organization.name}`
@@ -355,7 +361,7 @@ export default function UserDetailPage() {
         </div>
 
         <UserRelatedTimeline
-          userId={userId}
+          userId={user.id}
           isZh={isZh}
           resolveFieldDef={(fieldKey) => fieldDefMap.get(fieldKey)}
         />

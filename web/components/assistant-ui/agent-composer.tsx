@@ -9,7 +9,7 @@ import {
 } from 'react'
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useAgentChatConfig } from './agent-chat-runtime'
-import { IconLoader2, IconPaperclip } from '@tabler/icons-react'
+import { IconLoader2, IconPaperclip, IconStar } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { Socket } from 'socket.io-client'
@@ -41,10 +41,19 @@ type AgentComposerProps = {
 
 export function AgentComposer({ disabled, socket }: AgentComposerProps) {
   const { locale } = useLocaleStore()
-  const { conversation, onFileSend } = useAgentChatConfig()
+  const {
+    conversation,
+    onFileSend,
+    satisfactionState,
+    satisfactionLoading,
+    satisfactionSending,
+    onSendSatisfaction,
+  } = useAgentChatConfig()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [uploading, setUploading] = useState(false)
+  const [sentToast, setSentToast] = useState(false)
+  const showSatisfactionInvite = satisfactionState?.disabled_reason !== 'agent_invite_disabled'
 
   const handleTypingDebounce = useCallback(() => {
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current)
@@ -59,6 +68,13 @@ export function AgentComposer({ disabled, socket }: AgentComposerProps) {
     if (uploading) return
     fileInputRef.current?.click()
   }, [uploading])
+
+  const handleSatisfactionSend = useCallback(async () => {
+    const sent = await onSendSatisfaction()
+    if (!sent) return
+    setSentToast(true)
+    window.setTimeout(() => setSentToast(false), 2200)
+  }, [onSendSatisfaction])
 
   const handleFileChange = useCallback(
     async (e: ChangeEvent<HTMLInputElement>) => {
@@ -89,7 +105,12 @@ export function AgentComposer({ disabled, socket }: AgentComposerProps) {
   }
 
   return (
-    <div className="shrink-0 bg-[#FAFAFA] px-6 pb-4 pt-0">
+    <div className="relative shrink-0 bg-[#FAFAFA] px-6 pb-4 pt-0">
+      {sentToast && (
+        <div className="pointer-events-none absolute left-1/2 top-[-38px] z-10 -translate-x-1/2 rounded-full bg-[#1a1a1a] px-3 py-1.5 text-xs font-medium text-white shadow-lg">
+          {t('ws.chat.satisfactionSent', locale)}
+        </div>
+      )}
       {/* 2.1 pen: input strip + card (vertical: field + toolbar) */}
       <ComposerPrimitive.Root className="flex flex-col gap-2 rounded-2xl border border-[#E5E5E5] bg-white pt-3 pb-2.5 pl-3.5 pr-3.5">
         <ComposerPrimitive.Input
@@ -116,6 +137,26 @@ export function AgentComposer({ disabled, socket }: AgentComposerProps) {
               <IconPaperclip size={18} stroke={1.5} />
             )}
           </button>
+          {showSatisfactionInvite && (
+            <button
+              type="button"
+              className="ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[#737373] transition-colors hover:bg-neutral-100 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={handleSatisfactionSend}
+              disabled={satisfactionLoading || satisfactionSending || !satisfactionState?.can_invite}
+              aria-label={t('ws.chat.satisfactionSend', locale)}
+              title={
+                satisfactionState?.can_invite
+                  ? t('ws.chat.satisfactionSend', locale)
+                  : t(`ws.chat.satisfactionDisabled.${satisfactionState?.disabled_reason || 'unknown'}`, locale)
+              }
+            >
+              {satisfactionSending ? (
+                <IconLoader2 size={18} stroke={1.5} className="animate-spin" />
+              ) : (
+                <IconStar size={18} stroke={1.5} />
+              )}
+            </button>
+          )}
           {/* Hit target between attachment and send: empty flex gap did not focus the textarea */}
           <div
             role="presentation"

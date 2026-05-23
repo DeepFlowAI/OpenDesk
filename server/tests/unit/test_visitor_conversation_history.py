@@ -47,6 +47,133 @@ async def test_get_visitor_history_returns_empty_when_visitor_missing(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_create_from_visitor_resumes_only_same_channel_active_conversation(monkeypatch):
+    visitor = SimpleNamespace(id=20, name="访客", external_id="visitor-1")
+    existing = SimpleNamespace(
+        id=30,
+        tenant_id=10,
+        channel_id=5,
+        visitor=visitor,
+        status="active",
+        agent_id=99,
+    )
+    get_active = AsyncMock(return_value=existing)
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_or_create",
+        AsyncMock(return_value=(visitor, False)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_active_visitor_conversation",
+        get_active,
+    )
+
+    result = await ConversationService.create_from_visitor(
+        AsyncMock(),
+        AsyncMock(),
+        tenant_id=10,
+        channel_id=5,
+        visitor_external_id="visitor-1",
+    )
+
+    assert result["conversation"] is existing
+    get_active.assert_awaited_once()
+    assert get_active.await_args.kwargs["tenant_id"] == 10
+    assert get_active.await_args.kwargs["visitor_id"] == 20
+    assert get_active.await_args.kwargs["channel_id"] == 5
+
+
+@pytest.mark.asyncio
+async def test_create_from_visitor_persists_matched_welcome_message(monkeypatch):
+    visitor = SimpleNamespace(id=20, name="访客", external_id="visitor-1")
+    channel = SimpleNamespace(id=5, tenant_id=10, channel_type="web")
+    conversation = SimpleNamespace(
+        id=30,
+        tenant_id=10,
+        channel_id=5,
+        visitor=visitor,
+        channel=channel,
+        status="queued",
+        agent_id=None,
+    )
+    system_msg = SimpleNamespace(
+        id=100,
+        content_type="system",
+        content="等待客服接入...",
+        created_at=_dt(1),
+    )
+    welcome_msg = SimpleNamespace(
+        id=101,
+        content_type="welcome",
+        content="<p>Hello&nbsp;<strong>there</strong></p>",
+        created_at=_dt(1),
+    )
+    create_message = AsyncMock(side_effect=[system_msg, welcome_msg])
+    update_last = AsyncMock()
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_or_create",
+        AsyncMock(return_value=(visitor, True)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_active_visitor_conversation",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.check_channel_availability",
+        AsyncMock(return_value={"can_start_conversation": True}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.RoutingService.route_conversation",
+        AsyncMock(return_value=(None, [], {})),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.generate_unique_public_id",
+        AsyncMock(return_value="cv_test"),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.generate_unique_share_code",
+        AsyncMock(return_value="CV-TEST123"),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.create",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.WelcomeMessageRuleService.match_public_welcome_message",
+        AsyncMock(return_value={"id": 1, "name": "Welcome", "content": welcome_msg.content}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.create",
+        create_message,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.update_last_message",
+        update_last,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+
+    result = await ConversationService.create_from_visitor(
+        AsyncMock(),
+        AsyncMock(),
+        tenant_id=10,
+        channel_id=5,
+        visitor_external_id="visitor-1",
+    )
+
+    assert result["is_new"] is True
+    assert create_message.await_count == 2
+    welcome_data = create_message.await_args_list[1].args[1]
+    assert welcome_data["sender_type"] == "system"
+    assert welcome_data["content_type"] == "welcome"
+    assert welcome_data["content"] == welcome_msg.content
+    update_last.assert_awaited_once()
+    assert update_last.await_args.args[2] == "Hello there"
+
+
+@pytest.mark.asyncio
 async def test_get_visitor_history_assembles_messages_and_has_more(monkeypatch):
     visitor = SimpleNamespace(id=20, name="访客")
     agent = SimpleNamespace(id=30, display_name="Alice", name="alice", avatar="avatar.png")

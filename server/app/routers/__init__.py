@@ -15,6 +15,7 @@ def register_routers(app: FastAPI) -> None:
         voice_flows,
         inbound_routing_rules,
         session_routing_rules,
+        conversation_settings,
         channels,
     )
 
@@ -30,6 +31,7 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(voice_flows.router, prefix="/api/v1")
     app.include_router(inbound_routing_rules.router, prefix="/api/v1")
     app.include_router(session_routing_rules.router, prefix="/api/v1")
+    app.include_router(conversation_settings.router, prefix="/api/v1")
     app.include_router(channels.router, prefix="/api/v1")
     # Tenant CRUD endpoints are provided by an optional tenant-management
     # extension (see app.extensions). Single-tenant deployments rely on the

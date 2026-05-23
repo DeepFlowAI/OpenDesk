@@ -270,10 +270,11 @@ function AccessLinkSection({ url }: { url: string }) {
   )
 }
 
-function EmbedCodeSection({ channelId }: { channelId: number }) {
+function EmbedCodeSection({ channelKey }: { channelKey: string }) {
   const { locale } = useLocaleStore()
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
-  const snippet = `<script src="${origin}/sdk/opendesk.js"></script>\n<script>\n  OpenDesk.init({ channelId: ${channelId} });\n</script>`
+  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || `${origin}/api/`
+  const snippet = `<script src="${origin}/sdk/opendesk.js"></script>\n<script>\n  OpenDesk.init({\n    channelKey: ${JSON.stringify(channelKey)},\n    apiBaseUrl: ${JSON.stringify(apiBaseUrl)},\n  });\n</script>`
 
   return (
     <div className="flex flex-col gap-3">
@@ -315,6 +316,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [config, setConfig] = useState<ChannelConfig>({ ...DEFAULT_CONFIG })
   const [initialized, setInitialized] = useState(false)
   const [savedId, setSavedId] = useState<number | null>(channelId ?? null)
+  const [savedChannelKey, setSavedChannelKey] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'interface' | 'service'>('interface')
   const [serviceConfigError, setServiceConfigError] = useState('')
   const [offlineTitleError, setOfflineTitleError] = useState('')
@@ -328,6 +330,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     setLogoUrl(channel.logo_url ?? '')
     setFaviconUrl(channel.favicon_url ?? '')
     setConfig({ ...DEFAULT_CONFIG, ...channel.config })
+    setSavedChannelKey(channel.channel_key)
     setInitialized(true)
   }, [isNew, channel, initialized])
 
@@ -444,6 +447,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       if (isNew || !savedId) {
         const created = await createMut.mutateAsync(body)
         setSavedId(created.id)
+        setSavedChannelKey(created.channel_key)
         setConfig(nextConfig)
         setSavedSnapshot(snap)
         router.replace(`/channels/web/${created.id}`)
@@ -497,7 +501,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
 
           {activeTab === 'interface' && (
             <>
-          {/* ── Section 0: Access Mode ── */}
+          {/* ── Section 0: Access info display ── */}
           <SectionTitle>{t('ch.section.accessMode', locale)}</SectionTitle>
           <SegmentedControl
             options={[
@@ -507,10 +511,10 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
             value={accessMode}
             onChange={setAccessMode}
           />
-          {savedId && (
+          {savedChannelKey && (
             accessMode === 'url'
-              ? <AccessLinkSection url={`${typeof window !== 'undefined' ? window.location.origin : ''}/chat/${savedId}`} />
-              : <EmbedCodeSection channelId={savedId} />
+              ? <AccessLinkSection url={`${typeof window !== 'undefined' ? window.location.origin : ''}/chat/${savedChannelKey}`} />
+              : <EmbedCodeSection channelKey={savedChannelKey} />
           )}
 
           <Separator />

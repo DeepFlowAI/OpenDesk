@@ -644,7 +644,7 @@ export default function WorkspaceTicketsPage() {
 function UserCell({ userId }: { userId: number | null | undefined }) {
   const { data: user } = useUser(userId ?? 0)
   if (!userId) return <span className="block truncate">-</span>
-  const secondary = user?.phone || user?.email
+  const secondary = user?.public_id || user?.phone || user?.email
   const label = user ? (secondary ? `${user.name} · ${secondary}` : user.name) : `User #${userId}`
   return <span className="block truncate">{label}</span>
 }
@@ -736,6 +736,9 @@ function getCellValue(
   const { field_key, field_id, field_type } = col
 
   if (field_key && SYSTEM_KEYS.has(field_key)) {
+    if (field_key === 'conversation_id') {
+      return ticket.conversation_public_id ?? ''
+    }
     const raw =
       field_key === 'assignee'
         ? ticket.agent_id

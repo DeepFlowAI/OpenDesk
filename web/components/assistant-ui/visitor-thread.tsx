@@ -10,9 +10,13 @@ import { useVisitorChatStore } from '@/context/visitor-chat-store'
 import { ChatHeader } from '@/app/components/features/visitor-chat/chat-header'
 import { MessageBubble } from '@/app/components/features/visitor-chat/message-bubble'
 import { SystemMessage } from '@/app/components/features/visitor-chat/system-message'
+import { WelcomeMessage } from '@/app/components/features/visitor-chat/welcome-message'
 import { TypingIndicator } from '@/app/components/features/visitor-chat/typing-indicator'
 import { VisitorComposer } from './visitor-composer'
-import { IconLoader2, IconMessage, IconArrowDown, IconAlertCircle } from '@tabler/icons-react'
+import { IconLoader2, IconArrowDown, IconAlertCircle, IconStar, IconX } from '@tabler/icons-react'
+import { SatisfactionSurveyModal } from '@/app/components/features/satisfaction-survey-modal'
+import { submitPublicSatisfaction } from '@/service/use-satisfaction-survey'
+import type { SatisfactionSubmissionPayload } from '@/models/satisfaction-survey'
 import type { Message, VisitorConversationHistoryItem } from '@/models/conversation'
 
 // ─── Timestamp formatting (reused from original) ────────────────
@@ -70,7 +74,8 @@ function toOriginalMessage(
 
   return {
     id: Number(message.id) || 0,
-    conversation_id: meta?.conversationId ?? 0,
+    conversation_id: 0,
+    conversation_public_id: meta?.conversationPublicId,
     sender_type: (meta?.senderType || (message.role === 'user' ? 'visitor' : 'agent')) as Message['sender_type'],
     sender_id: meta?.senderId ?? null,
     sender_name: meta?.senderName ?? null,
@@ -147,7 +152,16 @@ function HistoryConversationBlock({
           : shouldShowAvatar(msg, next)
 
         if (msg.sender_type === 'system') {
-          return <SystemMessage key={msg.id} content={msg.content} />
+          return msg.content_type === 'welcome' ? (
+            <WelcomeMessage
+              key={msg.id}
+              content={msg.content}
+              config={config}
+              showAvatar={config.use_agent_avatar === true}
+            />
+          ) : (
+            <SystemMessage key={msg.id} content={msg.content} />
+          )
         }
 
         return (
@@ -178,9 +192,16 @@ function HistoryConversationBlock({
 type VisitorThreadProps = {
   offlineTitle?: string
   offlineMessage?: string
+  isEmbed?: boolean
+  onEmbedClose?: () => void
 }
 
-export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadProps) {
+export function VisitorThread({
+  offlineTitle,
+  offlineMessage,
+  isEmbed = false,
+  onEmbedClose,
+}: VisitorThreadProps) {
   const {
     channel,
     config,
@@ -196,21 +217,43 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
     historyLoaded,
     historyError,
     historyLimitReached,
+    initializing,
+    satisfactionCanInitiate,
+    satisfactionLoading,
+    conversationPublicId,
+    visitorSessionToken,
     onLoadMore,
     onLoadHistory,
     onRestartConversation,
+    onSatisfactionInitiate,
+    onSatisfactionSubmitted,
   } = useVisitorChatConfig()
   const agentTyping = useVisitorChatStore((s) => s.agentTyping)
   const msgCount = useVisitorChatStore((s) => s.messages.length)
   const messages = useVisitorChatStore((s) => s.messages)
   const activeAgent = useVisitorChatStore((s) => s.activeAgent)
+  const satisfactionInvitation = useVisitorChatStore((s) => s.satisfactionInvitation)
+  const setSatisfactionInvitation = useVisitorChatStore((s) => s.setSatisfactionInvitation)
   const viewportRef = useRef<HTMLDivElement | null>(null)
   const pendingScrollDeltaRef = useRef<number | null>(null)
+  const [surveyOpen, setSurveyOpen] = useState(false)
+  const [surveyCollapsed, setSurveyCollapsed] = useState(false)
+  const [surveySubmitting, setSurveySubmitting] = useState(false)
+  const [surveySuccess, setSurveySuccess] = useState(false)
+  const [surveyError, setSurveyError] = useState<string | null>(null)
 
-  const welcomeMessage =
+  const defaultWelcomeMessage =
     locale === 'zh' ? '您好，有什么可以帮您？' : 'Hi, how can we help?'
+  const welcomeMessage = channel.welcome_message?.content || ''
+  const hasConversationMessages = messages.some(
+    (msg) =>
+      msg.sender_type !== 'system'
+      && msg.content_type !== 'system'
+      && msg.content_type !== 'welcome',
+  )
+  const hasWelcomeMessage = messages.some((msg) => msg.content_type === 'welcome')
   const isOffline = Boolean(offlineMessage)
-  const oldestHistoryId = historyConversations[0]?.id
+  const oldestHistoryId = historyConversations[0]?.conversation_public_id
   const showCurrentDivider = historyLoaded && !isOffline && historyConversations.length > 0
   const showHistoryEntry = historyAvailable && !historyLoaded
   const showHistoryDone =
@@ -222,9 +265,63 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
       avatar: activeAgent?.avatar ?? latestAgentMessage?.sender_avatar ?? null,
     }
   }, [activeAgent, messages])
+  const invitationLabel = useMemo(() => {
+    const types = satisfactionInvitation?.survey_types ?? []
+    if (types.includes('service') && types.includes('product')) {
+      return locale === 'zh' ? '评价本次体验' : 'Rate this experience'
+    }
+    if (types.includes('product')) {
+      return locale === 'zh' ? '评价产品体验' : 'Rate product experience'
+    }
+    return locale === 'zh' ? '评价本次服务' : 'Rate this service'
+  }, [locale, satisfactionInvitation?.survey_types])
+  const showFloatingInvitation =
+    satisfactionInvitation && (ended || satisfactionInvitation.invitation_source !== 'visitor')
+  const showComposerSatisfactionButton =
+    satisfactionCanInitiate || satisfactionInvitation?.invitation_source === 'visitor'
+
+  const handleComposerSatisfactionClick = useCallback(() => {
+    if (satisfactionInvitation) {
+      setSurveyOpen(true)
+      return
+    }
+
+    void (async () => {
+      try {
+        const record = await onSatisfactionInitiate()
+        if (record) setSurveyOpen(true)
+      } catch {
+        window.alert(locale === 'zh' ? '暂时无法打开满意度评价，请重试' : 'Unable to open rating. Please retry.')
+      }
+    })()
+  }, [locale, onSatisfactionInitiate, satisfactionInvitation])
+
+  const handleSubmitSatisfaction = async (payload: SatisfactionSubmissionPayload) => {
+    if (!conversationPublicId || !visitorSessionToken) return
+    setSurveySubmitting(true)
+    setSurveyError(null)
+    try {
+      await submitPublicSatisfaction({
+        conversationPublicId,
+        visitorSessionToken,
+        payload,
+      })
+      setSurveySuccess(true)
+      window.setTimeout(() => {
+        setSurveyOpen(false)
+        setSurveySuccess(false)
+        setSatisfactionInvitation(null)
+        onSatisfactionSubmitted()
+      }, 1500)
+    } catch {
+      setSurveyError(locale === 'zh' ? '提交失败，请重试' : 'Failed to submit, please retry')
+    } finally {
+      setSurveySubmitting(false)
+    }
+  }
 
   const loadHistoryWithAnchor = useCallback(
-    async (beforeId?: number) => {
+    async (beforeId?: string) => {
       const viewport = viewportRef.current
       pendingScrollDeltaRef.current = viewport ? viewport.scrollHeight - viewport.scrollTop : null
       await onLoadHistory(beforeId)
@@ -242,8 +339,13 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
   }, [historyConversations.length])
 
   return (
-    <ThreadPrimitive.Root className="flex h-full flex-col">
-      <ChatHeader channel={channel} isMobile={isMobile} />
+    <ThreadPrimitive.Root className="relative flex h-full flex-col">
+      <ChatHeader
+        channel={channel}
+        isMobile={isMobile}
+        isEmbed={isEmbed}
+        onEmbedClose={onEmbedClose}
+      />
 
       <ThreadPrimitive.Viewport
         ref={viewportRef}
@@ -253,7 +355,7 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
             config.message_area_bg_color || 'var(--color-background)',
         }}
       >
-        {showHistoryEntry && (
+        {!initializing && showHistoryEntry && (
           <HistoryActionButton
             label={
               historyError
@@ -269,7 +371,7 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
           />
         )}
 
-        {historyLoaded && historyHasMore && !historyLimitReached && (
+        {!initializing && historyLoaded && historyHasMore && !historyLimitReached && (
           <HistoryActionButton
             label={
               historyError
@@ -285,7 +387,7 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
           />
         )}
 
-        {showHistoryDone && (
+        {!initializing && showHistoryDone && (
           <HistoryActionButton
             label={
               historyLimitReached
@@ -300,20 +402,24 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
           />
         )}
 
-        {historyConversations.map((conversation) => (
+        {!initializing && historyConversations.map((conversation) => (
           <HistoryConversationBlock
-            key={conversation.id}
+            key={conversation.conversation_public_id}
             conversation={conversation}
             config={config}
             locale={locale}
           />
         ))}
 
-        {showCurrentDivider && (
+        {!initializing && showCurrentDivider && (
           <ConversationDivider label={locale === 'zh' ? '当前会话' : 'Current conversation'} />
         )}
 
-        {isOffline ? (
+        {initializing ? (
+          <div className="flex flex-1 items-center justify-center p-6">
+            <IconLoader2 size={28} className="animate-spin text-muted-foreground" />
+          </div>
+        ) : isOffline ? (
           <div className="flex flex-1 items-center justify-center p-6">
             <div className="w-full max-w-[520px] rounded-xl border border-border bg-card p-6 shadow-sm">
               <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
@@ -328,15 +434,14 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
           </div>
         ) : (
           <>
-            {/* ── Empty state ── */}
-            {msgCount === 0 && !loadingMore && (
-              <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8">
-                <div className="flex h-14 w-14 items-center justify-center rounded-full bg-muted">
-                  <IconMessage size={28} className="text-muted-foreground" />
-                </div>
-                <p className="max-w-xs text-center text-sm text-muted-foreground">
-                  {welcomeMessage}
-                </p>
+            {/* ── Initial welcome ── */}
+            {!hasConversationMessages && !hasWelcomeMessage && !loadingMore && (
+              <div className={msgCount === 0 ? 'py-2' : 'py-1'}>
+                <WelcomeMessage
+                  content={welcomeMessage || defaultWelcomeMessage}
+                  config={config}
+                  showAvatar={config.use_agent_avatar === true}
+                />
               </div>
             )}
 
@@ -372,7 +477,13 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
                         </div>
                       )}
 
-                      {message.role === 'system' ? (
+                      {meta?.contentType === 'welcome' ? (
+                        <WelcomeMessage
+                          content={original.content}
+                          config={config}
+                          showAvatar={config.use_agent_avatar === true}
+                        />
+                      ) : message.role === 'system' ? (
                         <SystemMessage content={original.content} />
                       ) : (
                         <MessageBubble
@@ -417,7 +528,44 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
         )}
       </ThreadPrimitive.Viewport>
 
-      {!isOffline && (
+      {!initializing && !isOffline && showFloatingInvitation && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-[88px] z-30 flex justify-center px-4">
+          <div className="pointer-events-auto flex items-center gap-2 rounded-full bg-[#1a1a1a] px-3 py-2 text-sm font-medium text-white shadow-lg">
+            <button
+              type="button"
+              onClick={() => setSurveyOpen(true)}
+              className="flex min-h-5 items-center gap-2"
+            >
+              <IconStar size={14} className="fill-current" aria-hidden />
+              <span>{surveyCollapsed ? (locale === 'zh' ? '评价' : 'Rate') : invitationLabel}</span>
+            </button>
+            {!surveyCollapsed && (
+              <button
+                type="button"
+                onClick={() => setSurveyCollapsed(true)}
+                className="flex h-5 w-5 items-center justify-center rounded-full text-white/80 hover:bg-white/10 hover:text-white"
+                aria-label={locale === 'zh' ? '收起评价入口' : 'Collapse survey entry'}
+              >
+                <IconX size={13} aria-hidden />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {!initializing && !isOffline && surveyOpen && satisfactionInvitation && (
+        <SatisfactionSurveyModal
+          record={satisfactionInvitation}
+          locale={locale}
+          submitting={surveySubmitting}
+          success={surveySuccess}
+          error={surveyError}
+          onSubmit={handleSubmitSatisfaction}
+          onClose={() => setSurveyOpen(false)}
+        />
+      )}
+
+      {!initializing && !isOffline && (
         ended ? (
           <ConversationEndedPanel
             locale={locale}
@@ -427,6 +575,10 @@ export function VisitorThread({ offlineTitle, offlineMessage }: VisitorThreadPro
           <VisitorComposer
             disabled={false}
             isMobile={isMobile}
+            isEmbed={isEmbed}
+            showSatisfactionButton={showComposerSatisfactionButton}
+            satisfactionLoading={satisfactionLoading}
+            onSatisfactionClick={handleComposerSatisfactionClick}
           />
         )
       )}

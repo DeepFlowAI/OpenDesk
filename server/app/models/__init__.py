@@ -7,6 +7,9 @@ from app.models.employee_group import EmployeeGroup, EmployeeGroupMember  # noqa
 from app.models.voice_flow import VoiceFlow  # noqa: F401
 from app.models.inbound_routing_rule import InboundRoutingRule  # noqa: F401
 from app.models.session_routing_rule import SessionRoutingRule  # noqa: F401
+from app.models.welcome_message_rule import WelcomeMessageRule  # noqa: F401
+from app.models.satisfaction_survey_config import SatisfactionSurveyConfig, SatisfactionSurveyConfigVersion  # noqa: F401
+from app.models.satisfaction_survey_record import SatisfactionSurveyRecord  # noqa: F401
 from app.models.channel import Channel  # noqa: F401
 from app.models.conversation import Conversation  # noqa: F401
 from app.models.message import Message  # noqa: F401

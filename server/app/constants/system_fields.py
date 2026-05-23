@@ -29,6 +29,16 @@ class SystemFieldDef:
 
 SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
     SystemFieldDef(
+        key="public_id",
+        name_zh="用户 ID",
+        name_en="User ID",
+        field_type="single_line_text",
+        type_config={"readonly": True, "max_length": 64},
+        description="OpenDesk 生成的终端用户公开标识",
+        help_text="用于分享链接、对外接口和排障检索；不可编辑",
+        default_sort_order=0,
+    ),
+    SystemFieldDef(
         key="nickname",
         name_zh="昵称",
         name_en="Nickname",
@@ -122,6 +132,16 @@ SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
 # ── Organization domain ──
 
 SYSTEM_ORG_FIELDS: tuple[SystemFieldDef, ...] = (
+    SystemFieldDef(
+        key="public_id",
+        name_zh="组织 ID",
+        name_en="Organization ID",
+        field_type="single_line_text",
+        type_config={"readonly": True, "max_length": 64},
+        description="OpenDesk 生成的组织公开标识",
+        help_text="用于组织链接、对外接口和排障检索；不可编辑",
+        default_sort_order=0,
+    ),
     SystemFieldDef(
         key="name",
         name_zh="名称",

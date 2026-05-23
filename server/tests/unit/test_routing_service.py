@@ -27,19 +27,19 @@ def _service_hours(**overrides):
 
 
 @pytest.mark.asyncio
-async def test_rule_matches_channel_eq_url():
+async def test_rule_matches_channel_eq_web_sdk():
     ch = _channel(3, access_mode="url")
     ok = await RoutingService._rule_matches(
         AsyncMock(),
         7,
         ch,
-        [{"condition_type": "channel", "operator": "eq", "value": "web"}],
+        [{"condition_type": "channel", "operator": "eq", "value": "websdk"}],
     )
     assert ok is True
 
 
 @pytest.mark.asyncio
-async def test_rule_matches_channel_eq_sdk_embed():
+async def test_rule_matches_channel_eq_sdk_legacy_alias():
     ch = _channel(3, access_mode="embed")
     ok = await RoutingService._rule_matches(
         AsyncMock(),
@@ -116,7 +116,7 @@ async def test_rule_matches_current_time_in_schedule(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rule_matches_combined_and_semantics():
-    ch = _channel(10, access_mode="embed")
+    ch = _channel(10, access_mode="url")
     ok = await RoutingService._rule_matches(
         AsyncMock(),
         7,

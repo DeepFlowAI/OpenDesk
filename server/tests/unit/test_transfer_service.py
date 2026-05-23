@@ -51,10 +51,18 @@ def _make_conversation(
     agent_id: int | None = 11,
     status: str = ConversationStatus.ACTIVE.value,
 ):
-    visitor = SimpleNamespace(id=900, external_id="ext-900", name="访客 900", avatar_color="#abc")
+    visitor = SimpleNamespace(
+        id=900,
+        public_id="usr_test_900",
+        external_id="ext-900",
+        name="访客 900",
+        avatar_color="#abc",
+    )
     channel = SimpleNamespace(id=5, name="Web", channel_type="web")
     return SimpleNamespace(
         id=id,
+        public_id=f"cv_test_{id}",
+        share_code=f"CV-T{id:06d}",
         tenant_id=tenant_id,
         agent_id=agent_id,
         status=status,
@@ -374,6 +382,8 @@ class TestTransferConversation:
 
         # 5) Returned dict matches the ConversationResponse shape
         assert result["id"] == conversation.id
+        assert result["public_id"] == conversation.public_id
+        assert result["share_code"] == conversation.share_code
         assert "started_at" in result
         assert "last_message_preview" in result
         # REST response is also JSON-safe (kept on the same shape as the

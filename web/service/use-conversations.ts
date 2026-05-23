@@ -7,6 +7,7 @@ import type {
   WorkspaceConversationHistoryResponse,
   AgentStatus,
   AgentStats,
+  VisitorWebStatusResponse,
 } from '@/models/conversation'
 
 const NS = 'conversations'
@@ -17,6 +18,7 @@ export const conversationKeys = {
   detail: (id: number) => [...conversationKeys.all, 'detail', id] as const,
   messages: (id: number) => [...conversationKeys.all, 'messages', id] as const,
   history: (id: number) => [...conversationKeys.all, 'history', id] as const,
+  visitorWebStatus: (id: number) => [...conversationKeys.all, 'visitor-web-status', id] as const,
 }
 
 // Patch the cached conversation list so the snapshot a remounted hook
@@ -68,6 +70,21 @@ export const useMessages = (conversationId: number, beforeId?: number) =>
         searchParams: beforeId ? { before_id: beforeId, limit: 20 } : { limit: 20 },
       }),
     enabled: !!conversationId,
+  })
+
+export const useVisitorWebStatus = (
+  conversationId: number,
+  options?: { enabled?: boolean },
+) =>
+  useQuery({
+    queryKey: conversationKeys.visitorWebStatus(conversationId),
+    queryFn: () =>
+      get<VisitorWebStatusResponse>(
+        `v1/conversations/${conversationId}/visitor-web-status`,
+      ),
+    enabled: !!conversationId && (options?.enabled ?? true),
+    staleTime: 10_000,
+    retry: 1,
   })
 
 export const fetchConversationHistory = (params: {

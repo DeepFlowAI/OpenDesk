@@ -69,3 +69,14 @@ async def delete_channel(
     tenant_id = current_user["tenant_id"]
     await ChannelService.delete(db, channel_id, tenant_id)
     return {"message": "Deleted successfully"}
+
+
+@router.post("/{channel_id}/rotate-key", response_model=ChannelResponse)
+async def rotate_channel_key(
+    channel_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rotate a channel's public access key."""
+    tenant_id = current_user["tenant_id"]
+    return await ChannelService.rotate_key(db, channel_id, tenant_id)

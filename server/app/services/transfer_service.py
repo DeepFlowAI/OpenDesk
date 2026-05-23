@@ -79,10 +79,13 @@ def _serialize_conversation(
     """
     return {
         "id": conversation.id,
+        "public_id": conversation.public_id,
+        "share_code": conversation.share_code,
         "tenant_id": conversation.tenant_id,
         "visitor": (
             {
                 "id": conversation.visitor.id,
+                "public_id": conversation.visitor.public_id,
                 "external_id": conversation.visitor.external_id,
                 "name": conversation.visitor.name,
                 "avatar_color": conversation.visitor.avatar_color,

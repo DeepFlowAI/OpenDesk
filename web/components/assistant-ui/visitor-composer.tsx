@@ -10,7 +10,7 @@ import {
 } from 'react'
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useVisitorChatConfig } from './visitor-chat-runtime'
-import { IconArrowUp, IconLoader2, IconPaperclip } from '@tabler/icons-react'
+import { IconArrowUp, IconLoader2, IconPaperclip, IconStar } from '@tabler/icons-react'
 
 const MAX_ROWS = 3
 const LINE_HEIGHT = 22
@@ -38,9 +38,20 @@ function focusComposerTextarea(e: ReactPointerEvent<HTMLElement>) {
 type VisitorComposerProps = {
   disabled: boolean
   isMobile: boolean
+  isEmbed?: boolean
+  showSatisfactionButton?: boolean
+  satisfactionLoading?: boolean
+  onSatisfactionClick?: () => void
 }
 
-export function VisitorComposer({ disabled, isMobile }: VisitorComposerProps) {
+export function VisitorComposer({
+  disabled,
+  isMobile,
+  isEmbed = false,
+  showSatisfactionButton = false,
+  satisfactionLoading = false,
+  onSatisfactionClick,
+}: VisitorComposerProps) {
   const { locale, config, onTyping, onFileSend } = useVisitorChatConfig()
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
@@ -92,7 +103,7 @@ export function VisitorComposer({ disabled, isMobile }: VisitorComposerProps) {
         <ComposerPrimitive.Input
           placeholder={disabled ? disabledText : placeholder}
           disabled={disabled}
-          submitMode={isMobile ? 'none' : 'enter'}
+          submitMode={isMobile && !isEmbed ? 'none' : 'enter'}
           rows={1}
           maxRows={MAX_ROWS}
           onChange={handleTypingDebounce}
@@ -112,6 +123,22 @@ export function VisitorComposer({ disabled, isMobile }: VisitorComposerProps) {
             >
               {uploading ? <IconLoader2 size={18} className="animate-spin" /> : <IconPaperclip size={18} />}
             </button>
+            {showSatisfactionButton && (
+              <button
+                type="button"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                onClick={onSatisfactionClick}
+                disabled={disabled || satisfactionLoading}
+                aria-label={locale === 'zh' ? '满意度评价' : 'Rate this conversation'}
+                title={locale === 'zh' ? '满意度评价' : 'Rate this conversation'}
+              >
+                {satisfactionLoading ? (
+                  <IconLoader2 size={18} className="animate-spin" />
+                ) : (
+                  <IconStar size={18} stroke={1.5} />
+                )}
+              </button>
+            )}
             <input
               ref={fileInputRef}
               type="file"

@@ -1,12 +1,13 @@
 'use client'
 
 import { useState, useCallback } from 'react'
-import { IconSearch, IconLoader2, IconCalendar } from '@tabler/icons-react'
+import { IconSearch, IconLoader2, IconCalendar, IconChevronDown, IconChevronRight } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useSessionRecords } from '@/service/use-session-records'
 import { useEmployees } from '@/service/use-employees'
+import { useSatisfactionFilterOptions } from '@/service/use-satisfaction-survey'
 import { useAuthStore } from '@/context/auth-store'
 import { DateInput } from '@/components/ui/time-input'
 import type { SessionRecord, SessionRecordFilters } from '@/models/session-record'
@@ -28,6 +29,40 @@ function formatDuration(startStr: string | null, endStr: string | null): string 
   const mm = String(m).padStart(2, '0')
   const ss = String(s).padStart(2, '0')
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
+function satisfactionLabel(status: string, locale: string) {
+  if (status === 'none') return locale === 'zh' ? '未评价' : 'Not rated'
+  if (status === 'invited') return locale === 'zh' ? '已邀请' : 'Invited'
+  if (status === 'submitted') return locale === 'zh' ? '已评价' : 'Rated'
+  return status
+}
+
+function SatisfactionSummaryCell({ record, locale }: { record: SessionRecord; locale: string }) {
+  const summary = record.satisfaction
+  if (!summary || summary.status === 'none') {
+    return <span className="text-sm text-muted-foreground">{satisfactionLabel('none', locale)}</span>
+  }
+  if (summary.status === 'invited') {
+    return (
+      <span className="inline-flex items-center rounded-full bg-[#FEF3C7] px-2 py-0.5 text-xs font-medium text-[#92400E]">
+        {satisfactionLabel('invited', locale)}
+      </span>
+    )
+  }
+  return (
+    <div className="flex max-w-[220px] flex-wrap gap-1">
+      {summary.labels.length > 0 ? summary.labels.map((label) => (
+        <span key={label} className="inline-flex rounded-full bg-muted px-2 py-0.5 text-xs text-foreground">
+          {label}
+        </span>
+      )) : (
+        <span className="inline-flex rounded-full bg-muted px-2 py-0.5 text-xs text-foreground">
+          {satisfactionLabel(summary.status, locale)}
+        </span>
+      )}
+    </div>
+  )
 }
 
 type Props = {
@@ -54,8 +89,25 @@ export function SessionTable({ onSelectRecord }: Props) {
   const [draftStartDate, setDraftStartDate] = useState(sevenDaysAgo.toISOString().slice(0, 10))
   const [draftEndDate, setDraftEndDate] = useState(now.toISOString().slice(0, 10))
   const [draftAgentId, setDraftAgentId] = useState<number | undefined>(undefined)
+  const [draftSatisfactionStatus, setDraftSatisfactionStatus] = useState('')
+  const [draftResolved, setDraftResolved] = useState('')
+  const [draftServiceOption, setDraftServiceOption] = useState('')
+  const [draftServiceLabel, setDraftServiceLabel] = useState('')
+  const [draftProductOption, setDraftProductOption] = useState('')
+  const [draftProductLabel, setDraftProductLabel] = useState('')
+  const [satisfactionFiltersExpanded, setSatisfactionFiltersExpanded] = useState(false)
 
   const { data, isLoading } = useSessionRecords(filters)
+  const { data: satisfactionOptions } = useSatisfactionFilterOptions()
+  const hasSatisfactionFilters = satisfactionOptions?.configured === true
+  const satisfactionFilterActiveCount = [
+    draftSatisfactionStatus,
+    draftResolved,
+    draftServiceOption,
+    draftServiceLabel,
+    draftProductOption,
+    draftProductLabel,
+  ].filter(Boolean).length
   // All active employees who may appear as 接待 (agent or admin; role=agent alone omits admin-only staff)
   const { data: employeesData } = useEmployees(
     { per_page: 200, status: 'active' },
@@ -70,8 +122,14 @@ export function SessionTable({ onSelectRecord }: Props) {
       end_date: draftEndDate ? new Date(draftEndDate + 'T23:59:59').toISOString() : undefined,
       agent_id: draftAgentId,
       keyword: draftKeyword || undefined,
+      satisfaction_status: draftSatisfactionStatus || undefined,
+      satisfaction_resolved: draftResolved || undefined,
+      satisfaction_service_option: draftServiceOption || undefined,
+      satisfaction_service_label: draftServiceLabel || undefined,
+      satisfaction_product_option: draftProductOption || undefined,
+      satisfaction_product_label: draftProductLabel || undefined,
     })
-  }, [filters, draftStartDate, draftEndDate, draftAgentId, draftKeyword])
+  }, [filters, draftStartDate, draftEndDate, draftAgentId, draftKeyword, draftSatisfactionStatus, draftResolved, draftServiceOption, draftServiceLabel, draftProductOption, draftProductLabel])
 
   const handleReset = useCallback(() => {
     const resetStart = sevenDaysAgo.toISOString().slice(0, 10)
@@ -80,6 +138,13 @@ export function SessionTable({ onSelectRecord }: Props) {
     setDraftStartDate(resetStart)
     setDraftEndDate(resetEnd)
     setDraftAgentId(undefined)
+    setDraftSatisfactionStatus('')
+    setDraftResolved('')
+    setDraftServiceOption('')
+    setDraftServiceLabel('')
+    setDraftProductOption('')
+    setDraftProductLabel('')
+    setSatisfactionFiltersExpanded(false)
     setFilters({
       page: 1,
       per_page: 20,
@@ -167,6 +232,139 @@ export function SessionTable({ onSelectRecord }: Props) {
           </div>
         </div>
 
+        {/* Satisfaction filters */}
+        {hasSatisfactionFilters && (
+          <div className="flex flex-col gap-1">
+            <label className="text-xs text-muted-foreground">&nbsp;</label>
+            <button
+              type="button"
+              onClick={() => setSatisfactionFiltersExpanded((expanded) => !expanded)}
+              aria-expanded={satisfactionFiltersExpanded}
+              aria-controls="session-records-satisfaction-filters"
+              className="inline-flex h-9 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-sm text-foreground transition-colors hover:bg-accent"
+            >
+              {satisfactionFiltersExpanded
+                ? <IconChevronDown size={16} className="shrink-0 text-muted-foreground" />
+                : <IconChevronRight size={16} className="shrink-0 text-muted-foreground" />}
+              <span>{t('ws.records.sessions.filter.satisfactionGroup', locale)}</span>
+              {satisfactionFilterActiveCount > 0 && (
+                <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-primary/10 px-1.5 text-xs font-medium text-primary">
+                  {satisfactionFilterActiveCount}
+                </span>
+              )}
+            </button>
+          </div>
+        )}
+
+        {hasSatisfactionFilters && satisfactionFiltersExpanded && (
+          <div id="session-records-satisfaction-filters" className="contents">
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-muted-foreground">
+                {t('ws.records.sessions.filter.satisfactionStatus', locale)}
+              </label>
+              <select
+                value={draftSatisfactionStatus}
+                onChange={(e) => setDraftSatisfactionStatus(e.target.value)}
+                className="h-9 min-w-[130px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="">{t('ws.records.sessions.filter.all', locale)}</option>
+                <option value="none">{t('ws.records.sessions.satisfaction.none', locale)}</option>
+                <option value="invited">{t('ws.records.sessions.satisfaction.invited', locale)}</option>
+                <option value="submitted">{t('ws.records.sessions.satisfaction.submitted', locale)}</option>
+              </select>
+            </div>
+
+            {satisfactionOptions.show_resolution && (
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-muted-foreground">
+                  {t('ws.records.sessions.filter.resolved', locale)}
+                </label>
+                <select
+                  value={draftResolved}
+                  onChange={(e) => setDraftResolved(e.target.value)}
+                  className="h-9 min-w-[120px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+                >
+                  <option value="">{t('ws.records.sessions.filter.all', locale)}</option>
+                  <option value="resolved">{t('ws.records.sessions.satisfaction.resolved', locale)}</option>
+                  <option value="unresolved">{t('ws.records.sessions.satisfaction.unresolved', locale)}</option>
+                </select>
+              </div>
+            )}
+
+            {satisfactionOptions.service_options?.length ? (
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-muted-foreground">
+                  {t('ws.records.sessions.filter.serviceRating', locale)}
+                </label>
+                <select
+                  value={draftServiceOption}
+                  onChange={(e) => setDraftServiceOption(e.target.value)}
+                  className="h-9 min-w-[150px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+                >
+                  <option value="">{t('ws.records.sessions.filter.all', locale)}</option>
+                  {satisfactionOptions.service_options.map((option) => (
+                    <option key={option.key} value={option.key}>{option.label}</option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+
+            {satisfactionOptions.service_labels?.length ? (
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-muted-foreground">
+                  {t('ws.records.sessions.filter.serviceLabel', locale)}
+                </label>
+                <select
+                  value={draftServiceLabel}
+                  onChange={(e) => setDraftServiceLabel(e.target.value)}
+                  className="h-9 min-w-[150px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+                >
+                  <option value="">{t('ws.records.sessions.filter.all', locale)}</option>
+                  {satisfactionOptions.service_labels.map((option) => (
+                    <option key={option.key} value={option.key}>{option.label}</option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+
+            {satisfactionOptions.product_options?.length ? (
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-muted-foreground">
+                  {t('ws.records.sessions.filter.productRating', locale)}
+                </label>
+                <select
+                  value={draftProductOption}
+                  onChange={(e) => setDraftProductOption(e.target.value)}
+                  className="h-9 min-w-[150px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+                >
+                  <option value="">{t('ws.records.sessions.filter.all', locale)}</option>
+                  {satisfactionOptions.product_options.map((option) => (
+                    <option key={option.key} value={option.key}>{option.label}</option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+
+            {satisfactionOptions.product_labels?.length ? (
+              <div className="flex flex-col gap-1">
+                <label className="text-xs text-muted-foreground">
+                  {t('ws.records.sessions.filter.productLabel', locale)}
+                </label>
+                <select
+                  value={draftProductLabel}
+                  onChange={(e) => setDraftProductLabel(e.target.value)}
+                  className="h-9 min-w-[150px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+                >
+                  <option value="">{t('ws.records.sessions.filter.all', locale)}</option>
+                  {satisfactionOptions.product_labels.map((option) => (
+                    <option key={option.key} value={option.key}>{option.label}</option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+          </div>
+        )}
+
         {/* Buttons */}
         <div className="flex gap-2">
           <button
@@ -204,25 +402,31 @@ export function SessionTable({ onSelectRecord }: Props) {
               <table className="w-max min-w-full border-separate border-spacing-0 table-auto">
                 <thead>
                   <tr>
-                <th className="sticky top-0 z-10 rounded-tl-lg border-b border-border bg-muted/50 py-3 pl-4 pr-3 text-left text-xs font-semibold text-muted-foreground">
+                <th className="sticky top-0 z-10 rounded-tl-lg border-b border-border bg-muted py-3 pl-4 pr-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.visitor', locale)}
                 </th>
-                <th className="sticky top-0 z-10 w-[100px] border-b border-border bg-muted/50 px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                <th className="sticky top-0 z-10 w-[120px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                  {t('ws.records.sessions.col.shareCode', locale)}
+                </th>
+                <th className="sticky top-0 z-10 w-[100px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.channelType', locale)}
                 </th>
-                <th className="sticky top-0 z-10 w-[150px] border-b border-border bg-muted/50 px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                <th className="sticky top-0 z-10 w-[150px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.channelName', locale)}
                 </th>
-                <th className="sticky top-0 z-10 w-[120px] border-b border-border bg-muted/50 px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                <th className="sticky top-0 z-10 w-[120px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.agent', locale)}
                 </th>
-                <th className="sticky top-0 z-10 min-w-[170px] whitespace-nowrap border-b border-border bg-muted/50 px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                <th className="sticky top-0 z-10 w-[180px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                  {t('ws.records.sessions.col.satisfaction', locale)}
+                </th>
+                <th className="sticky top-0 z-10 min-w-[170px] whitespace-nowrap border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.startTime', locale)}
                 </th>
-                <th className="sticky top-0 z-10 min-w-[170px] whitespace-nowrap border-b border-border bg-muted/50 px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                <th className="sticky top-0 z-10 min-w-[170px] whitespace-nowrap border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.endTime', locale)}
                 </th>
-                <th className="sticky top-0 z-10 w-[100px] rounded-tr-lg border-b border-border bg-muted/50 py-3 pl-3 pr-4 text-left text-xs font-semibold text-muted-foreground">
+                <th className="sticky top-0 z-10 w-[100px] rounded-tr-lg border-b border-border bg-muted py-3 pl-3 pr-4 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.duration', locale)}
                 </th>
               </tr>
@@ -237,6 +441,9 @@ export function SessionTable({ onSelectRecord }: Props) {
                   <td className="border-b border-border py-3 pl-4 pr-3 text-sm text-foreground">
                     {record.visitor?.name || '-'}
                   </td>
+                  <td className="border-b border-border px-3 py-3 font-mono text-sm text-muted-foreground">
+                    {record.share_code || record.public_id || '-'}
+                  </td>
                   <td className="border-b border-border px-3 py-3 text-sm text-muted-foreground">
                     {record.channel?.channel_type || '-'}
                   </td>
@@ -245,6 +452,9 @@ export function SessionTable({ onSelectRecord }: Props) {
                   </td>
                   <td className="border-b border-border px-3 py-3 text-sm text-muted-foreground">
                     {record.agent?.display_name || record.agent?.name || '-'}
+                  </td>
+                  <td className="border-b border-border px-3 py-3">
+                    <SatisfactionSummaryCell record={record} locale={locale} />
                   </td>
                   <td className="min-w-[170px] whitespace-nowrap border-b border-border px-3 py-3 text-sm text-muted-foreground">
                     {formatDateTime(record.started_at)}

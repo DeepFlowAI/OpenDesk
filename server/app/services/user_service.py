@@ -160,6 +160,19 @@ class UserService:
         return UserService._enrich_user_response(item, slot_to_key)
 
     @staticmethod
+    async def get_by_ref(db: AsyncSession, tenant_id: int, user_ref: str):
+        """Get a user by public ID, with short-term numeric ID compatibility."""
+        item = None
+        if user_ref.isdigit():
+            item = await UserRepository.get_by_id(db, int(user_ref))
+        else:
+            item = await UserRepository.get_by_public_id(db, user_ref)
+        if not item or item.tenant_id != tenant_id:
+            raise NotFoundError("User not found")
+        slot_to_key = await UserService._get_field_key_slot_map(db, tenant_id)
+        return UserService._enrich_user_response(item, slot_to_key)
+
+    @staticmethod
     async def create_user(
         db: AsyncSession,
         tenant_id: int,

@@ -586,7 +586,7 @@ export default function WorkspaceUsersPage() {
                   <tr
                     key={user.id}
                     className="border-b border-border transition-colors hover:bg-accent/50 cursor-pointer"
-                    onClick={() => router.push(`/workspace/users/${user.id}?from=list`)}
+                    onClick={() => router.push(`/workspace/users/${user.public_id || user.id}?from=list`)}
                   >
                     {displayColumns.map((col, idx) => {
                       const val = getCellValue(user, col, fieldLookup, locale)
@@ -688,7 +688,7 @@ function buildUsersUrl(
 }
 
 const SYSTEM_KEYS = new Set([
-  'name', 'nickname', 'external_id', 'avatar_color', 'channel_id', 'organization_id',
+  'public_id', 'name', 'nickname', 'external_id', 'avatar_color', 'channel_id', 'organization_id',
   'email', 'phone', 'web_id', 'gender', 'address', 'remark',
   'created_by', 'updated_by', 'created_at', 'updated_at',
 ])
@@ -808,6 +808,7 @@ function getCellValue(
 function getColumnMinWidth(fieldType: string, fieldKey: string | null): number {
   if (fieldKey === 'created_at' || fieldKey === 'updated_at') return 160
   if (fieldKey === 'created_by' || fieldKey === 'updated_by') return 160
+  if (fieldKey === 'public_id') return 220
   if (fieldKey === 'email') return 180
   if (fieldKey === 'phone') return 130
   if (fieldKey === 'address' || fieldKey === 'remark') return 160

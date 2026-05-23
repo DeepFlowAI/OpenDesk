@@ -26,7 +26,7 @@ type Props = {
 
 const SYSTEM_KEY_ALIAS: Record<string, keyof User> = { nickname: 'name' }
 const EDITABLE_SYSTEM_KEYS = new Set(['name', 'email', 'phone', 'gender', 'address', 'remark', 'web_id', 'organization_id'])
-const READONLY_FIELD_KEYS = new Set(['id', 'external_id', 'created_at', 'updated_at', 'channel_id'])
+const READONLY_FIELD_KEYS = new Set(['id', 'public_id', 'external_id', 'created_at', 'updated_at', 'channel_id'])
 const INSTANT_SAVE_FIELD_TYPES = new Set<FieldType>([
   FieldType.SINGLE_SELECT,
   FieldType.MULTI_SELECT,
@@ -50,6 +50,9 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
   const [summaryDirty, setSummaryDirty] = useState(false)
   const [ticketNotice, setTicketNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const visitorId = conversation?.visitor?.id ?? 0
+  const visitorPublicId = conversation?.visitor?.public_id ?? ''
+  const visitorDetailRef = visitorPublicId || (visitorId > 0 ? String(visitorId) : '')
+  const conversationShareCode = conversation?.share_code || conversation?.public_id || ''
   const showTicketTab = !!conversation && (ticketDraftOpen || hasTicketDraft(conversation.id))
 
   const userQuery = useUser(visitorId)
@@ -142,14 +145,20 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
             {activeTab === 'basic' ? (
               <>
                 <section className="flex flex-col gap-[14px]">
-                  <InfoRow label={t('ws.chat.visitorId', locale)} value={String(conversation.visitor?.id || '-')} />
+                  <InfoRow
+                    label={t('ws.chat.visitorId', locale)}
+                    value={visitorPublicId || '-'}
+                    copyable={!!visitorPublicId}
+                    onCopy={(v) => handleCopy(v, 'visitorId')}
+                    copied={copiedField === 'visitorId'}
+                  />
                   <InfoRow label={t('ws.chat.sourceChannel', locale)} value={conversation.channel?.channel_type || 'Web'} />
                   <InfoRow
-                    label={t('ws.chat.convId', locale)}
-                    value={String(conversation.id)}
-                    copyable
-                    onCopy={(v) => handleCopy(v, 'convId')}
-                    copied={copiedField === 'convId'}
+                    label={t('ws.chat.shareCode', locale)}
+                    value={conversationShareCode}
+                    copyable={!!conversationShareCode}
+                    onCopy={(v) => handleCopy(v, 'shareCode')}
+                    copied={copiedField === 'shareCode'}
                   />
                   <InfoRow label={t('ws.chat.startTime', locale)} value={formatDateTime(conversation.started_at || conversation.created_at)} />
                   <InfoRow label={t('ws.chat.channelName', locale)} value={conversation.channel?.name || '-'} />
@@ -159,10 +168,10 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
                 <section className="mt-5 border-t border-border pt-4">
                   <div className="mb-3 flex items-center justify-between gap-3">
                     <h3 className="text-sm font-semibold text-[#1a1a1a]">{t('ws.chat.userInfo', locale)}</h3>
-                    {visitorId > 0 && (
+                    {visitorDetailRef && (
                       <button
                         type="button"
-                        onClick={() => router.push(`/workspace/users/${visitorId}`)}
+                        onClick={() => router.push(`/workspace/users/${visitorDetailRef}`)}
                         className="shrink-0 text-xs font-medium text-primary underline-offset-2 hover:underline"
                       >
                         {t('ws.chat.viewUser', locale)}
@@ -492,8 +501,8 @@ function InfoRow({
   return (
     <div className="flex flex-col gap-1">
       <span className="text-[12px] text-[#999999]">{label}</span>
-      <div className="flex items-center gap-1.5">
-        <span className="text-[13px] text-[#1a1a1a]">{value}</span>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="min-w-0 break-all text-[13px] text-[#1a1a1a]">{value}</span>
         {copyable && (
           <button
             type="button"

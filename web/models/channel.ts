@@ -1,3 +1,5 @@
+import type { WelcomeMessagePublic } from '@/models/welcome-message-rule'
+
 export type ChannelConfig = {
   title: string | null
   document_title: string | null
@@ -35,6 +37,10 @@ export type ChannelAvailability = {
 
 export type Channel = {
   id: number
+  channel_key: string
+  channel_key_version: number
+  public_access_enabled: boolean
+  key_rotated_at: string | null
   name: string
   channel_type: string
   access_mode: string
@@ -47,11 +53,11 @@ export type Channel = {
 
 export type ChannelPublic = Pick<
   Channel,
-  'id' | 'name' | 'channel_type' | 'access_mode' | 'logo_url' | 'favicon_url' | 'config'
+  'channel_key' | 'name' | 'channel_type' | 'access_mode' | 'logo_url' | 'favicon_url' | 'config'
 > & {
-  tenant_id: number
   availability: ChannelAvailability | null
   has_conversation_history: boolean
+  welcome_message: WelcomeMessagePublic | null
 }
 
 export type CreateChannelPayload = {

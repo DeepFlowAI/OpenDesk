@@ -25,6 +25,13 @@ const AUDIO_UNLOCK_EVENTS = ['pointerdown', 'keydown', 'touchstart'] as const
 
 function buildMessagePreview(msg: Message): string {
   if (msg.content_type === 'text' || msg.content_type === 'system') return msg.content
+  if (msg.content_type === 'welcome') {
+    return msg.content
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim() || '欢迎语'
+  }
   if (msg.content_type === 'image') return '[图片]'
   if (msg.content_type === 'file') {
     try {
@@ -216,6 +223,15 @@ export default function ChatPage() {
       })
     }
 
+    const handleSatisfactionEvent = (data: { message?: Message; conversation_id: number }) => {
+      if (data.message) {
+        addMessage(data.conversation_id, data.message)
+      }
+      queryClient.invalidateQueries({
+        queryKey: ['satisfaction-survey', 'conversation', data.conversation_id],
+      })
+    }
+
     const handleConversationEnded = (data: { conversation_id: number }) => {
       removeConversation(data.conversation_id)
     }
@@ -302,6 +318,8 @@ export default function ChatPage() {
     socket.on('visitor_typing', handleVisitorTyping)
     socket.on('conversation_updated', handleConversationUpdated)
     socket.on('agent_stats_updated', handleAgentStatsUpdated)
+    socket.on('satisfaction_invitation_sent', handleSatisfactionEvent)
+    socket.on('satisfaction_feedback_submitted', handleSatisfactionEvent)
 
     return () => {
       socket.off('new_conversation', handleNewConversation)
@@ -311,6 +329,8 @@ export default function ChatPage() {
       socket.off('visitor_typing', handleVisitorTyping)
       socket.off('conversation_updated', handleConversationUpdated)
       socket.off('agent_stats_updated', handleAgentStatsUpdated)
+      socket.off('satisfaction_invitation_sent', handleSatisfactionEvent)
+      socket.off('satisfaction_feedback_submitted', handleSatisfactionEvent)
     }
   }, [socket, token, queryClient, addConversation, addMessage, updateConversation, removeConversation, setVisitorTyping, playBackgroundMessageAlert])
 

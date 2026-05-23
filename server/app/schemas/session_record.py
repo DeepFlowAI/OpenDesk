@@ -3,13 +3,16 @@ Session record schemas — read-only views of historical conversations
 """
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.satisfaction_survey_record import SatisfactionSummaryResponse
 
 
 class SessionRecordVisitor(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    public_id: str
     external_id: str
     name: str
     avatar_color: str | None = None
@@ -36,6 +39,8 @@ class SessionRecordResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    public_id: str
+    share_code: str
     visitor: SessionRecordVisitor | None = None
     agent: SessionRecordAgent | None = None
     channel: SessionRecordChannel | None = None
@@ -44,6 +49,7 @@ class SessionRecordResponse(BaseModel):
     ended_at: datetime | None = None
     ended_by: str | None = None
     created_at: datetime | None = None
+    satisfaction: SatisfactionSummaryResponse | None = None
 
 
 class SessionRecordListResponse(BaseModel):
@@ -70,7 +76,11 @@ class SessionRecordMessageResponse(BaseModel):
     sender_avatar: str | None = None
     content_type: str
     content: str
+    metadata: dict = Field(default_factory=dict)
     created_at: datetime
+    event_type: str | None = None
+    satisfaction_record_id: int | None = None
+    config_version: int | None = None
 
 
 class SessionRecordMessageListResponse(BaseModel):

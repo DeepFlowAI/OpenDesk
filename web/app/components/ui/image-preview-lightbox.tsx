@@ -239,7 +239,7 @@ function WindowedImagePreview({
 
   return (
     <div
-      className="fixed z-[9999] overflow-hidden rounded-lg border border-white/20 bg-black shadow-2xl"
+      className="fixed z-[9999] overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-2xl"
       style={{
         left: position.x,
         top: position.y,
@@ -248,7 +248,7 @@ function WindowedImagePreview({
       }}
     >
       <div
-        className="flex h-10 cursor-move items-center justify-between bg-neutral-900/95 px-3 text-xs text-white"
+        className="flex h-10 cursor-move items-center justify-between border-b border-zinc-200 bg-white px-3 text-xs text-zinc-700"
         onPointerDown={handleDragStart}
         onPointerMove={handleDragMove}
         onPointerUp={handleDragEnd}
@@ -258,7 +258,7 @@ function WindowedImagePreview({
         <div className="flex items-center gap-1">
           <button
             type="button"
-            className="inline-flex h-7 w-7 items-center justify-center rounded text-white/80 hover:bg-white/10 hover:text-white"
+            className="inline-flex h-7 w-7 items-center justify-center rounded text-zinc-600 hover:bg-zinc-100 hover:text-zinc-950"
             title="还原预览"
             aria-label="还原预览"
             onPointerDown={(event) => event.stopPropagation()}
@@ -268,7 +268,7 @@ function WindowedImagePreview({
           </button>
           <button
             type="button"
-            className="inline-flex h-7 w-7 items-center justify-center rounded text-white/80 hover:bg-white/10 hover:text-white"
+            className="inline-flex h-7 w-7 items-center justify-center rounded text-zinc-600 hover:bg-zinc-100 hover:text-zinc-950"
             title="关闭预览"
             aria-label="关闭预览"
             onPointerDown={(event) => event.stopPropagation()}
@@ -279,11 +279,11 @@ function WindowedImagePreview({
         </div>
       </div>
 
-      <div className="relative flex h-[calc(100%-2.5rem)] items-center justify-center bg-black">
+      <div className="relative flex h-[calc(100%-2.5rem)] items-center justify-center bg-white">
         {canGoPrev && (
           <button
             type="button"
-            className="absolute left-2 top-1/2 z-10 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-white/80 hover:bg-black/70 hover:text-white"
+            className="absolute left-2 top-1/2 z-10 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full border border-zinc-200 bg-white/90 text-zinc-700 shadow-sm hover:bg-zinc-100 hover:text-zinc-950"
             aria-label="上一张"
             onClick={() => onIndexChange(index - 1)}
           >
@@ -294,7 +294,7 @@ function WindowedImagePreview({
         {canGoNext && (
           <button
             type="button"
-            className="absolute right-2 top-1/2 z-10 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-white/80 hover:bg-black/70 hover:text-white"
+            className="absolute right-2 top-1/2 z-10 inline-flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full border border-zinc-200 bg-white/90 text-zinc-700 shadow-sm hover:bg-zinc-100 hover:text-zinc-950"
             aria-label="下一张"
             onClick={() => onIndexChange(index + 1)}
           >
@@ -330,6 +330,7 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
     toolbar: userToolbar,
     zoom: userZoom,
     thumbnails: userThumbnails,
+    styles: userStyles,
     on: userOn,
     open,
     close,
@@ -378,6 +379,36 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
     [bumpRotation, userToolbar],
   )
 
+  const styles = useMemo(
+    () => ({
+      ...userStyles,
+      root: {
+        '--yarl__color_backdrop': '#ffffff',
+        '--yarl__color_button': 'rgba(24, 24, 27, 0.72)',
+        '--yarl__color_button_active': '#18181b',
+        '--yarl__color_button_disabled': 'rgba(24, 24, 27, 0.28)',
+        '--yarl__button_filter': 'none',
+        '--yarl__container_background_color': '#ffffff',
+        '--yarl__slide_icon_loading_color': 'rgba(24, 24, 27, 0.48)',
+        '--yarl__thumbnails_container_background_color': '#ffffff',
+        '--yarl__thumbnails_thumbnail_background': '#ffffff',
+        '--yarl__thumbnails_thumbnail_border_color': '#d4d4d8',
+        '--yarl__thumbnails_thumbnail_active_border_color': '#18181b',
+        '--yarl__thumbnails_thumbnail_focus_box_shadow': '#ffffff 0 0 0 2px, #18181b 0 0 0 4px',
+        ...userStyles?.root,
+      },
+      container: {
+        backgroundColor: '#ffffff',
+        ...userStyles?.container,
+      },
+      button: {
+        filter: 'none',
+        ...userStyles?.button,
+      },
+    }),
+    [userStyles],
+  )
+
   const on = useMemo(
     () => ({
       ...userOn,
@@ -424,6 +455,7 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
       thumbnails={{ showToggle: true, ...userThumbnails }}
       render={render}
       toolbar={toolbar}
+      styles={styles}
       on={on}
     />
   )

@@ -57,7 +57,7 @@ class TestSessionRoutingRulesAPI:
             json={
                 "name": f"SR Rule 1 {uuid.uuid4().hex[:8]}",
                 "enabled": True,
-                "conditions": [{"condition_type": "channel", "operator": "eq", "value": "web"}],
+                "conditions": [{"condition_type": "channel", "operator": "eq", "value": "websdk"}],
                 "target_group_id": group_id,
             },
         )
@@ -175,7 +175,7 @@ class TestSessionRoutingRulesAPI:
                 "name": "Channel eq web",
                 "target_group_id": group_id,
                 "conditions": [
-                    {"condition_type": "channel", "operator": "eq", "value": "web"}
+                    {"condition_type": "channel", "operator": "eq", "value": "websdk"}
                 ],
             },
         )

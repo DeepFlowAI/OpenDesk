@@ -41,6 +41,13 @@ const NAV_ITEMS: NavItem[] = [
 
 function buildMessagePreview(msg: Message): string {
   if (msg.content_type === 'text' || msg.content_type === 'system') return msg.content
+  if (msg.content_type === 'welcome') {
+    return msg.content
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim() || '欢迎语'
+  }
   if (msg.content_type === 'image') return '[图片]'
   if (msg.content_type === 'file') {
     try {

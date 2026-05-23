@@ -1,6 +1,7 @@
 """
 Conversation repository
 """
+import secrets
 from datetime import datetime, timezone
 
 from sqlalchemy import select, func, update, and_, or_
@@ -9,6 +10,14 @@ from sqlalchemy.orm import selectinload
 
 from app.enums import ConversationStatus
 from app.models.conversation import Conversation
+
+CONVERSATION_PUBLIC_ID_PREFIX = "cv_"
+CONVERSATION_PUBLIC_ID_RANDOM_BYTES = 24
+CONVERSATION_SHARE_CODE_PREFIX = "CV-"
+CONVERSATION_SHARE_CODE_RANDOM_LENGTH = 8
+CONVERSATION_SHARE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+MAX_PUBLIC_ID_GENERATION_ATTEMPTS = 10
+MAX_SHARE_CODE_GENERATION_ATTEMPTS = 20
 
 
 class ConversationRepository:
@@ -26,6 +35,56 @@ class ConversationRepository:
             .where(Conversation.id == conversation_id)
         )
         return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_public_id(db: AsyncSession, public_id: str) -> Conversation | None:
+        result = await db.execute(
+            select(Conversation)
+            .options(
+                selectinload(Conversation.visitor),
+                selectinload(Conversation.agent),
+                selectinload(Conversation.channel),
+                selectinload(Conversation.group),
+            )
+            .where(Conversation.public_id == public_id)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_share_code(db: AsyncSession, share_code: str) -> Conversation | None:
+        result = await db.execute(
+            select(Conversation)
+            .where(Conversation.share_code == share_code)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def generate_public_id() -> str:
+        return f"{CONVERSATION_PUBLIC_ID_PREFIX}{secrets.token_urlsafe(CONVERSATION_PUBLIC_ID_RANDOM_BYTES)}"
+
+    @staticmethod
+    def generate_share_code() -> str:
+        suffix = "".join(
+            secrets.choice(CONVERSATION_SHARE_CODE_ALPHABET)
+            for _ in range(CONVERSATION_SHARE_CODE_RANDOM_LENGTH)
+        )
+        return f"{CONVERSATION_SHARE_CODE_PREFIX}{suffix}"
+
+    @staticmethod
+    async def generate_unique_public_id(db: AsyncSession) -> str:
+        for _ in range(MAX_PUBLIC_ID_GENERATION_ATTEMPTS):
+            public_id = ConversationRepository.generate_public_id()
+            if not await ConversationRepository.get_by_public_id(db, public_id):
+                return public_id
+        raise RuntimeError("Failed to generate a unique conversation public ID")
+
+    @staticmethod
+    async def generate_unique_share_code(db: AsyncSession) -> str:
+        for _ in range(MAX_SHARE_CODE_GENERATION_ATTEMPTS):
+            share_code = ConversationRepository.generate_share_code()
+            if not await ConversationRepository.get_by_share_code(db, share_code):
+                return share_code
+        raise RuntimeError("Failed to generate a unique conversation share code")
 
     @staticmethod
     async def get_active_by_agent(
@@ -64,6 +123,10 @@ class ConversationRepository:
 
     @staticmethod
     async def create(db: AsyncSession, data: dict) -> Conversation:
+        if not data.get("public_id"):
+            data = {**data, "public_id": await ConversationRepository.generate_unique_public_id(db)}
+        if not data.get("share_code"):
+            data = {**data, "share_code": await ConversationRepository.generate_unique_share_code(db)}
         item = Conversation(**data)
         db.add(item)
         await db.commit()
@@ -156,9 +219,12 @@ class ConversationRepository:
 
     @staticmethod
     async def get_active_visitor_conversation(
-        db: AsyncSession, tenant_id: int, visitor_id: int
+        db: AsyncSession,
+        tenant_id: int,
+        visitor_id: int,
+        channel_id: int,
     ) -> Conversation | None:
-        """Check if visitor already has an active conversation."""
+        """Check if visitor already has an active conversation in the channel."""
         result = await db.execute(
             select(Conversation)
             .options(
@@ -170,6 +236,7 @@ class ConversationRepository:
             .where(
                 Conversation.tenant_id == tenant_id,
                 Conversation.visitor_id == visitor_id,
+                Conversation.channel_id == channel_id,
                 Conversation.status.in_([ConversationStatus.ACTIVE.value, ConversationStatus.QUEUED.value]),
             )
         )

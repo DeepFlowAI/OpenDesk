@@ -6,6 +6,7 @@ import { IconMessageCircle } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { useChatStore } from '@/context/chat-store'
 import { useMessages, conversationKeys, fetchConversationHistory } from '@/service/use-conversations'
+import { useConversationSatisfaction, useSendSatisfactionInvitation } from '@/service/use-satisfaction-survey'
 import { AgentChatRuntimeProvider } from '@/components/assistant-ui/agent-chat-runtime'
 import { AgentThread } from '@/components/assistant-ui/agent-thread'
 import { t } from '@/utils/i18n'
@@ -75,6 +76,25 @@ export function MessagePanel({
 
   // Fetch initial messages
   const { data: msgData } = useMessages(convId)
+  const { data: satisfactionState, isLoading: satisfactionLoading } = useConversationSatisfaction(convId)
+  const sendSatisfaction = useSendSatisfactionInvitation(convId)
+
+  const handleSendSatisfaction = useCallback(async () => {
+    if (!convId || sendSatisfaction.isPending) return false
+    try {
+      const state = await sendSatisfaction.mutateAsync({ force: false })
+      if (state.needs_confirmation) {
+        const confirmed = window.confirm(t('ws.chat.satisfactionResendConfirm', locale))
+        if (!confirmed) return false
+        await sendSatisfaction.mutateAsync({ force: true })
+      }
+      queryClient.invalidateQueries({ queryKey: conversationKeys.messages(convId) })
+      return true
+    } catch {
+      window.alert(t('ws.chat.satisfactionSendFailed', locale))
+      return false
+    }
+  }, [convId, locale, queryClient, sendSatisfaction])
 
   useEffect(() => {
     if (msgData && convId) {
@@ -209,6 +229,10 @@ export function MessagePanel({
         }}
         onCreateTicket={() => onCreateTicket?.(convId)}
         onTransferred={(toName) => onTransferred?.(toName)}
+        satisfactionState={satisfactionState ?? null}
+        satisfactionLoading={satisfactionLoading}
+        satisfactionSending={sendSatisfaction.isPending}
+        onSendSatisfaction={handleSendSatisfaction}
       >
         <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
           <AgentThread socket={socket} />

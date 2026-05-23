@@ -52,3 +52,14 @@ export const useDeleteChannel = () => {
     onSuccess: () => qc.invalidateQueries({ queryKey: channelKeys.lists() }),
   })
 }
+
+export const useRotateChannelKey = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => post<Channel>(`v1/channels/${id}/rotate-key`),
+    onSuccess: (channel) => {
+      qc.invalidateQueries({ queryKey: channelKeys.detail(channel.id) })
+      qc.invalidateQueries({ queryKey: channelKeys.lists() })
+    },
+  })
+}

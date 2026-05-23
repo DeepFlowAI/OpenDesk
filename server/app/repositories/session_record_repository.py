@@ -3,13 +3,15 @@ Session record repository — read-only queries for historical conversation data
 """
 from datetime import datetime
 
-from sqlalchemy import select, func, or_, cast, String
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.conversation import Conversation
 from app.models.user import User
 from app.models.message import Message
+from app.models.satisfaction_survey_record import SatisfactionSurveyRecord
+from app.repositories.satisfaction_survey_record_repository import SatisfactionSurveyRecordRepository
 
 
 class SessionRecordRepository:
@@ -25,6 +27,13 @@ class SessionRecordRepository:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         keyword: str | None = None,
+        satisfaction_statuses: list[str] | None = None,
+        current_satisfaction_version: int | None = None,
+        satisfaction_resolved: list[str] | None = None,
+        service_rating_options: list[str] | None = None,
+        service_labels: list[str] | None = None,
+        product_rating_options: list[str] | None = None,
+        product_labels: list[str] | None = None,
     ) -> tuple[list[Conversation], int]:
         """Paginated list of conversations with optional filters."""
         base_filter = [Conversation.tenant_id == tenant_id]
@@ -45,23 +54,42 @@ class SessionRecordRepository:
             kw = f"%{keyword}%"
             base_filter.append(
                 or_(
+                    Conversation.visitor.has(User.public_id.ilike(kw)),
                     Conversation.visitor.has(User.name.ilike(kw)),
-                    cast(Conversation.id, String).ilike(kw),
+                    Conversation.share_code.ilike(kw),
+                    Conversation.public_id.ilike(kw),
                 )
             )
 
-        count_q = select(func.count()).select_from(Conversation).where(*base_filter)
+        filters = SatisfactionSurveyRecordRepository.apply_filters(
+            base_filter,
+            statuses=satisfaction_statuses,
+            current_version=current_satisfaction_version,
+            resolved=satisfaction_resolved,
+            service_options=service_rating_options,
+            service_labels=service_labels,
+            product_options=product_rating_options,
+            product_labels=product_labels,
+        )
+
+        count_q = (
+            select(func.count())
+            .select_from(Conversation)
+            .outerjoin(SatisfactionSurveyRecord, SatisfactionSurveyRecord.conversation_id == Conversation.id)
+            .where(*filters)
+        )
         total = (await db.execute(count_q)).scalar_one()
 
         offset = (page - 1) * per_page
         data_q = (
             select(Conversation)
+            .outerjoin(SatisfactionSurveyRecord, SatisfactionSurveyRecord.conversation_id == Conversation.id)
             .options(
                 selectinload(Conversation.visitor),
                 selectinload(Conversation.agent),
                 selectinload(Conversation.channel),
             )
-            .where(*base_filter)
+            .where(*filters)
             .order_by(func.coalesce(Conversation.started_at, Conversation.created_at).desc().nullslast())
             .offset(offset)
             .limit(per_page)
@@ -90,7 +118,7 @@ class SessionRecordRepository:
         after_id: int | None = None,
         limit: int = 20,
     ) -> list[Message]:
-        """Fetch messages in chronological order with forward cursor pagination."""
+        """Fetch messages in chronological order with forward ID pagination."""
         query = select(Message).where(Message.conversation_id == conversation_id)
         if after_id is not None:
             query = query.where(Message.id > after_id)

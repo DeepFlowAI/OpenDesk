@@ -4,6 +4,7 @@ import type { Message } from '@/models/conversation'
 import type { ChannelConfig } from '@/models/channel'
 import { useMemo } from 'react'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
+import { useVisitorChatConfig } from '@/components/assistant-ui/visitor-chat-runtime'
 
 const DEFAULT_AGENT_AVATAR_SRC = '/default-avatar.jpg'
 
@@ -69,6 +70,7 @@ export function MessageBubble({
 }: MessageBubbleProps) {
   const isUser = message.sender_type === 'visitor'
   const isAgent = message.sender_type === 'agent'
+  const visitorChat = useVisitorChatConfig()
   const statusText = isUser ? statusLabel(messageStatus || message.status, locale) : null
 
   const bubbleStyle = useMemo(() => {
@@ -115,6 +117,8 @@ export function MessageBubble({
         {attachmentContentType ? (
           <MessageAttachment
             conversationId={message.conversation_id}
+            conversationPublicId={message.conversation_public_id}
+            visitorSessionToken={visitorChat.visitorSessionToken}
             contentType={attachmentContentType}
             content={message.content}
           />

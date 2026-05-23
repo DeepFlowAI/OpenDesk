@@ -186,7 +186,8 @@ export function OrgFormModal({ mode, organization, onClose, onSuccess }: OrgForm
         {isEdit && organization && (
           <div className="px-6 pt-3">
             <p className="text-xs text-muted-foreground">
-              {isZh ? '组织 ID' : 'Organization ID'}: {organization.id}
+              {isZh ? '组织 ID' : 'Organization ID'}:{' '}
+              <span className="font-mono">{organization.public_id || '—'}</span>
             </p>
           </div>
         )}

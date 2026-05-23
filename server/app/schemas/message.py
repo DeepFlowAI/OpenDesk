@@ -35,7 +35,11 @@ class MessageResponse(BaseModel):
     sender_avatar: str | None = None
     content_type: str
     content: str
+    metadata: dict = Field(default_factory=dict)
     created_at: datetime
+    event_type: str | None = None
+    satisfaction_record_id: int | None = None
+    config_version: int | None = None
 
 
 class MessageListResponse(BaseModel):
@@ -43,8 +47,29 @@ class MessageListResponse(BaseModel):
     has_more: bool
 
 
-class VisitorConversationHistoryItem(BaseModel):
+class PublicMessageResponse(BaseModel):
     id: int
+    conversation_public_id: str
+    sender_type: str
+    sender_id: int | None = None
+    sender_name: str | None = None
+    sender_avatar: str | None = None
+    content_type: str
+    content: str
+    metadata: dict = Field(default_factory=dict)
+    created_at: datetime
+    event_type: str | None = None
+    satisfaction_record_id: int | None = None
+    config_version: int | None = None
+
+
+class PublicMessageListResponse(BaseModel):
+    items: list[PublicMessageResponse]
+    has_more: bool
+
+
+class VisitorConversationHistoryItem(BaseModel):
+    conversation_public_id: str
     status: str
     started_at: datetime | None = None
     ended_at: datetime | None = None
@@ -52,7 +77,7 @@ class VisitorConversationHistoryItem(BaseModel):
     created_at: datetime | None = None
     agent_name: str | None = None
     agent_avatar: str | None = None
-    messages: list[MessageResponse]
+    messages: list[PublicMessageResponse]
     messages_truncated: bool = False
 
 

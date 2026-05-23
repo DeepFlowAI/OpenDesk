@@ -15,6 +15,7 @@ class UserResponse(TimestampSchema):
     model_config = ConfigDict(from_attributes=True)
     id: int
     tenant_id: int
+    public_id: str
     external_id: str
     name: str                      # also serves as "nickname" system field
     email: str | None = None

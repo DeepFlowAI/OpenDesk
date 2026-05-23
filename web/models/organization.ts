@@ -6,6 +6,7 @@ export type { CustomFieldValue } from '@/types/custom-field-value'
 export type Organization = {
   id: number
   tenant_id: number
+  public_id: string
   name: string
   description: string | null
   created_by: AuditActorRef | null

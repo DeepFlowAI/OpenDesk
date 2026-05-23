@@ -35,6 +35,9 @@ function normalizeConditionValue(
   operator: string,
   value: unknown
 ): string | string[] {
+  if (conditionType === 'channel') {
+    return value === 'web' || value === 'sdk' || value === 'websdk' ? 'websdk' : String(value ?? '')
+  }
   if (conditionType === 'web_sdk' && (operator === 'any_eq' || operator === 'any_ne')) {
     if (!Array.isArray(value)) return []
     return value.map((v) => String(v))
@@ -89,12 +92,8 @@ function isMultiSelect(op: string): boolean {
   return op === 'any_eq' || op === 'any_ne'
 }
 
-function channelRoutingLabel(ch: Channel, locale: Locale): string {
-  const mode =
-    ch.access_mode === 'embed'
-      ? t('ch.accessMode.embed', locale)
-      : t('ch.accessMode.url', locale)
-  return `${ch.name} (${mode})`
+function channelRoutingLabel(ch: Channel): string {
+  return ch.name
 }
 
 type SessionRoutingFormProps = { ruleId?: number }
@@ -140,7 +139,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
         _key: newKey(),
         condition_type: c.condition_type,
         operator: c.operator,
-        value: c.value,
+        value: normalizeConditionValue(c.condition_type, c.operator, c.value),
       }))
     )
     setInitialized(true)
@@ -367,8 +366,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                           className="h-9 w-full appearance-none rounded-lg border border-border bg-white px-2.5 pr-7 text-[13px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
                         >
                           <option value="">{t('sr.cond.value.channel.placeholder', locale)}</option>
-                          <option value="web">Web</option>
-                          <option value="sdk">SDK</option>
+                          <option value="websdk">{t('sr.cond.value.channel.webSdk', locale)}</option>
                         </select>
                         <IconChevronDown size={14} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
                       </>
@@ -386,7 +384,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                           >
                             {sdkChannelOptions.map((ch) => (
                               <option key={ch.id} value={String(ch.id)}>
-                                {channelRoutingLabel(ch, locale)}
+                                {channelRoutingLabel(ch)}
                               </option>
                             ))}
                           </select>
@@ -401,7 +399,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                             <option value="">{t('sr.cond.value.sdk.placeholder', locale)}</option>
                             {sdkChannelOptions.map((ch) => (
                               <option key={ch.id} value={String(ch.id)}>
-                                {channelRoutingLabel(ch, locale)}
+                                {channelRoutingLabel(ch)}
                               </option>
                             ))}
                           </select>

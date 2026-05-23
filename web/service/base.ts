@@ -29,6 +29,11 @@ const client = ky.create({
 export const get = <T>(url: string, options?: Parameters<typeof client.get>[1]) =>
   client.get(url, options).json<T>()
 
+export const getBlob = async (url: string, options?: Parameters<typeof client.get>[1]) => {
+  const response = await client.get(url, options)
+  return { blob: await response.blob(), headers: response.headers }
+}
+
 export const post = <T>(url: string, options?: Parameters<typeof client.post>[1]) =>
   client.post(url, options).json<T>()
 

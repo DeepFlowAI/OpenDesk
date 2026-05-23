@@ -16,7 +16,7 @@ export const userKeys = {
   queries: () => [...userKeys.all, 'query'] as const,
   query: (params: UserQueryPayload) => [...userKeys.queries(), params] as const,
   details: () => [...userKeys.all, 'detail'] as const,
-  detail: (id: number) => [...userKeys.details(), id] as const,
+  detail: (ref: string | number) => [...userKeys.details(), ref] as const,
   changes: (id: number, params: Record<string, unknown>) =>
     [...userKeys.detail(id), 'changes', params] as const,
   enabledViews: () => [...userKeys.all, 'enabledViews'] as const,
@@ -32,12 +32,14 @@ export const useQueryUsers = (payload: UserQueryPayload) =>
     queryFn: () => post<PaginatedResponse<User>>('v1/users/query', { json: payload }),
   })
 
-export const useUser = (id: number) =>
-  useQuery({
-    queryKey: userKeys.detail(id),
-    queryFn: () => get<User>(`v1/users/${id}`),
-    enabled: !!id,
+export const useUser = (ref: string | number | null | undefined) => {
+  const userRef = String(ref ?? '')
+  return useQuery({
+    queryKey: userKeys.detail(userRef),
+    queryFn: () => get<User>(`v1/users/${encodeURIComponent(userRef)}`),
+    enabled: userRef.length > 0 && userRef !== '0',
   })
+}
 
 export const useUserChanges = (
   id: number,
@@ -77,6 +79,7 @@ export const useUpdateUser = () => {
       put<User>(`v1/users/${id}`, { json: data }),
     onSuccess: (updated, v) => {
       qc.setQueryData(userKeys.detail(v.id), updated)
+      qc.setQueryData(userKeys.detail(updated.public_id), updated)
       qc.invalidateQueries({ queryKey: [...userKeys.detail(v.id), 'changes'] })
       qc.invalidateQueries({ queryKey: userKeys.queries() })
       qc.invalidateQueries({ queryKey: userKeys.viewCounts() })

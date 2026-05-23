@@ -4,6 +4,8 @@ User repository — data access for end users (formerly visitors)
 from __future__ import annotations
 
 import logging
+import re
+import secrets
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -15,7 +17,14 @@ from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
+USER_PUBLIC_ID_PREFIX = "usr_"
+USER_PUBLIC_ID_RANDOM_LENGTH = 16
+USER_PUBLIC_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+USER_PUBLIC_ID_PATTERN = re.compile(r"^usr_[A-Za-z0-9_-]{16}$")
+MAX_PUBLIC_ID_GENERATION_ATTEMPTS = 10
+
 SYSTEM_FIELD_MAP: dict[str, str] = {
+    "public_id": "public_id",
     "name": "name",
     "nickname": "name",          # system field "nickname" → column "name"
     "external_id": "external_id",
@@ -42,6 +51,10 @@ def _resolve_column(field_key: str | None, slot_column: str | None):
     if slot_column and hasattr(User, slot_column):
         return getattr(User, slot_column)
     return None
+
+
+def is_valid_user_public_id(value: str | None) -> bool:
+    return bool(value and USER_PUBLIC_ID_PATTERN.fullmatch(value))
 
 
 def _coerce_filter_value(col, value):
@@ -125,6 +138,24 @@ class UserRepository:
         return await db.get(User, user_id)
 
     @staticmethod
+    async def get_by_public_id(db: AsyncSession, public_id: str) -> User | None:
+        result = await db.execute(select(User).where(User.public_id == public_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def generate_public_id() -> str:
+        suffix = "".join(secrets.choice(USER_PUBLIC_ID_ALPHABET) for _ in range(USER_PUBLIC_ID_RANDOM_LENGTH))
+        return f"{USER_PUBLIC_ID_PREFIX}{suffix}"
+
+    @staticmethod
+    async def generate_unique_public_id(db: AsyncSession) -> str:
+        for _ in range(MAX_PUBLIC_ID_GENERATION_ATTEMPTS):
+            public_id = UserRepository.generate_public_id()
+            if not await UserRepository.get_by_public_id(db, public_id):
+                return public_id
+        raise RuntimeError("Failed to generate a unique user public ID")
+
+    @staticmethod
     async def get_by_external_id(
         db: AsyncSession, tenant_id: int, external_id: str
     ) -> User | None:
@@ -138,6 +169,9 @@ class UserRepository:
 
     @staticmethod
     async def create(db: AsyncSession, data: dict, commit: bool = True) -> User:
+        public_id = data.get("public_id")
+        if not is_valid_user_public_id(public_id if isinstance(public_id, str) else None):
+            data = {**data, "public_id": await UserRepository.generate_unique_public_id(db)}
         item = User(**data)
         db.add(item)
         if commit:
@@ -230,6 +264,7 @@ class UserRepository:
         if search:
             base_where.append(
                 or_(
+                    User.public_id.ilike(f"%{search}%"),
                     User.name.ilike(f"%{search}%"),
                     User.external_id.ilike(f"%{search}%"),
                 )
@@ -323,6 +358,7 @@ class UserRepository:
         if search:
             base_where.append(
                 or_(
+                    User.public_id.ilike(f"%{search}%"),
                     User.name.ilike(f"%{search}%"),
                     User.external_id.ilike(f"%{search}%"),
                 )

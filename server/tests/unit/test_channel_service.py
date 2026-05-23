@@ -8,8 +8,10 @@ from unittest.mock import AsyncMock
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 
-from app.core.exceptions import ValidationError
+from app.core.exceptions import UnauthorizedError, ValidationError
+from app.core.security import create_visitor_session_token, decode_access_token
 from app.schemas.channel import ChannelConfig, DEFAULT_OFFLINE_MESSAGE, DEFAULT_OFFLINE_TITLE
+from app.schemas.visitor_session import VisitorSessionRequest
 from app.services.channel_service import ChannelService
 
 
@@ -95,12 +97,12 @@ async def test_check_channel_availability_returns_no_agent(monkeypatch):
         AsyncMock(return_value=channel),
     )
     monkeypatch.setattr(
-        "app.services.channel_service.RoutingService.route_conversation",
+        "app.services.routing_service.RoutingService.route_conversation",
         AsyncMock(return_value=(None, [1], {1: 1})),
     )
     monkeypatch.setattr(
-        "app.services.channel_service.AgentStatusService.find_available_agent",
-        AsyncMock(return_value=None),
+        "app.services.channel_service.AgentStatusService.get_status",
+        AsyncMock(return_value={"status": "offline", "current_count": 0, "max_concurrent": 1}),
     )
 
     result = await ChannelService.check_channel_availability(AsyncMock(), AsyncMock(), 10)
@@ -109,3 +111,138 @@ async def test_check_channel_availability_returns_no_agent(monkeypatch):
     assert result["reason"] == "no_available_agent"
     assert result["offline_title"] == DEFAULT_OFFLINE_TITLE
     assert result["offline_message"] == DEFAULT_OFFLINE_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_create_visitor_session_binds_channel_context(monkeypatch):
+    channel = SimpleNamespace(
+        id=10,
+        tenant_id=7,
+        channel_key="ch_abcdefghijklmnopqrstuvwxyzabcdef",
+        channel_key_version=3,
+        public_access_enabled=True,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.get_public_channel_by_key",
+        AsyncMock(return_value=channel),
+    )
+
+    result = await ChannelService.create_visitor_session(
+        AsyncMock(),
+        channel.channel_key,
+        VisitorSessionRequest(visitor_name="Ada"),
+    )
+
+    payload = decode_access_token(result["visitor_session_token"])
+    assert result["visitor_external_id"].startswith("v_")
+    assert result["visitor_secret"].startswith("vs_")
+    assert result["expires_in"] > 0
+    assert payload["typ"] == "visitor_session"
+    assert payload["tenant_id"] == 7
+    assert payload["channel_id"] == 10
+    assert payload["channel_key"] == channel.channel_key
+    assert payload["channel_key_version"] == 3
+    assert payload["visitor_external_id"] == result["visitor_external_id"]
+
+
+@pytest.mark.asyncio
+async def test_create_visitor_session_renews_only_with_server_minted_secret(monkeypatch):
+    channel = SimpleNamespace(
+        id=10,
+        tenant_id=7,
+        channel_key="ch_abcdefghijklmnopqrstuvwxyzabcdef",
+        channel_key_version=3,
+        public_access_enabled=True,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.get_public_channel_by_key",
+        AsyncMock(return_value=channel),
+    )
+    issued = await ChannelService.create_visitor_session(
+        AsyncMock(),
+        channel.channel_key,
+        VisitorSessionRequest(),
+    )
+
+    renewed = await ChannelService.create_visitor_session(
+        AsyncMock(),
+        channel.channel_key,
+        VisitorSessionRequest(
+            visitor_external_id=issued["visitor_external_id"],
+            visitor_secret=issued["visitor_secret"],
+        ),
+    )
+
+    assert renewed["visitor_external_id"] == issued["visitor_external_id"]
+    assert renewed["visitor_secret"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_visitor_session_rejects_client_supplied_id_without_secret(monkeypatch):
+    channel = SimpleNamespace(
+        id=10,
+        tenant_id=7,
+        channel_key="ch_abcdefghijklmnopqrstuvwxyzabcdef",
+        channel_key_version=3,
+        public_access_enabled=True,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.get_public_channel_by_key",
+        AsyncMock(return_value=channel),
+    )
+
+    with pytest.raises(UnauthorizedError):
+        await ChannelService.create_visitor_session(
+            AsyncMock(),
+            channel.channel_key,
+            VisitorSessionRequest(visitor_external_id="visitor-1"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_visitor_session_rejects_invalid_visitor_secret(monkeypatch):
+    channel = SimpleNamespace(
+        id=10,
+        tenant_id=7,
+        channel_key="ch_abcdefghijklmnopqrstuvwxyzabcdef",
+        channel_key_version=3,
+        public_access_enabled=True,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.get_public_channel_by_key",
+        AsyncMock(return_value=channel),
+    )
+
+    with pytest.raises(UnauthorizedError):
+        await ChannelService.create_visitor_session(
+            AsyncMock(),
+            channel.channel_key,
+            VisitorSessionRequest(
+                visitor_external_id="visitor-1",
+                visitor_secret="vs_invalid",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_visitor_session_rejects_rotated_key(monkeypatch):
+    token = create_visitor_session_token({
+        "tenant_id": 7,
+        "channel_id": 10,
+        "channel_key": "ch_abcdefghijklmnopqrstuvwxyzabcdef",
+        "channel_key_version": 1,
+        "visitor_external_id": "visitor-1",
+    })
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=SimpleNamespace(
+            id=10,
+            tenant_id=7,
+            channel_key="ch_abcdefghijklmnopqrstuvwxyzabcdef",
+            channel_key_version=2,
+            public_access_enabled=True,
+        )),
+    )
+
+    with pytest.raises(UnauthorizedError):
+        await ChannelService.validate_visitor_session_token(AsyncMock(), token)

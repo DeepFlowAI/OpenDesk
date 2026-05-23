@@ -15,6 +15,7 @@ class OrganizationResponse(TimestampSchema):
     model_config = ConfigDict(from_attributes=True)
     id: int
     tenant_id: int
+    public_id: str
     name: str
     description: str | None = None
     created_by: dict | None = None

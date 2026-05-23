@@ -86,15 +86,15 @@ async def create_user(
     )
 
 
-@router.get("/{user_id}", response_model=UserResponse)
+@router.get("/{user_ref}", response_model=UserResponse)
 async def get_user(
-    user_id: int,
+    user_ref: str,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a single user by ID."""
+    """Get a single user by public ID, with numeric ID compatibility."""
     tenant_id = current_user["tenant_id"]
-    return await UserService.get_by_id(db, tenant_id, user_id)
+    return await UserService.get_by_ref(db, tenant_id, user_ref)
 
 
 @router.get("/{user_id}/changes", response_model=EntityChangeListResponse)

@@ -17,6 +17,7 @@ import { useChatStore } from '@/context/chat-store'
 import { useAuthStore } from '@/context/auth-store'
 import { uploadAgentConversationFile } from '@/service/use-conversation-files'
 import type { Message, Conversation, WorkspaceConversationHistoryItem } from '@/models/conversation'
+import type { SatisfactionConversationState } from '@/models/satisfaction-survey'
 import type { Socket } from 'socket.io-client'
 
 // ─── Config context ──────────────────────────────────────────────
@@ -41,6 +42,10 @@ export type AgentChatConfigValue = {
   onEndConversation: () => void
   onCreateTicket: () => void
   onTransferred: (toName: string) => void
+  satisfactionState: SatisfactionConversationState | null
+  satisfactionLoading: boolean
+  satisfactionSending: boolean
+  onSendSatisfaction: () => Promise<boolean>
 }
 
 export type AgentImageMessage = {
@@ -71,6 +76,9 @@ export type AgentMessageMeta = {
   contentType: string
   conversationId: number
   isOwn: boolean
+  eventType?: string
+  satisfactionRecordId?: number
+  configVersion?: number
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
@@ -142,6 +150,9 @@ export function AgentChatRuntimeProvider({
         contentType: msg.content_type,
         conversationId: msg.conversation_id,
         isOwn: msg.sender_type === 'agent' && msg.sender_id === userId,
+        eventType: msg.event_type,
+        satisfactionRecordId: msg.satisfaction_record_id,
+        configVersion: msg.config_version,
       }
 
       return {

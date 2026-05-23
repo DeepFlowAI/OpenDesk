@@ -7,6 +7,7 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useSessionRecordMessages } from '@/service/use-session-records'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
+import { WelcomeMessage } from '@/app/components/features/visitor-chat/welcome-message'
 import type { SessionRecordMessage } from '@/models/session-record'
 
 function formatTime(dateStr: string): string {
@@ -21,9 +22,10 @@ function formatFullTime(dateStr: string): string {
 
 type Props = {
   recordId: number
+  onSatisfactionEventClick?: () => void
 }
 
-export function MessageList({ recordId }: Props) {
+export function MessageList({ recordId, onSatisfactionEventClick }: Props) {
   const { locale } = useLocaleStore()
   const [allMessages, setAllMessages] = useState<SessionRecordMessage[]>([])
   const [afterId, setAfterId] = useState<number | undefined>(undefined)
@@ -77,7 +79,7 @@ export function MessageList({ recordId }: Props) {
       ) : (
         <>
           {allMessages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} />
+            <MessageBubble key={msg.id} message={msg} onSatisfactionEventClick={onSatisfactionEventClick} />
           ))}
 
           {/* Load more / all loaded */}
@@ -106,11 +108,37 @@ export function MessageList({ recordId }: Props) {
   )
 }
 
-function MessageBubble({ message }: { message: SessionRecordMessage }) {
+function MessageBubble({ message, onSatisfactionEventClick }: { message: SessionRecordMessage; onSatisfactionEventClick?: () => void }) {
   const [showFullTime, setShowFullTime] = useState(false)
   const isSystem = message.sender_type === 'system' || message.content_type === 'system'
   const isAgent = message.sender_type === 'agent'
   const isOwn = isAgent
+
+  if (message.content_type === 'welcome') {
+    return (
+      <div className="my-3">
+        <WelcomeMessage content={message.content} />
+      </div>
+    )
+  }
+
+  if (message.content_type === 'satisfaction_event') {
+    const submitted = message.event_type === 'feedback_submitted'
+    return (
+      <div className="my-3 text-center">
+        <button
+          type="button"
+          onClick={onSatisfactionEventClick}
+          className={cn(
+            'rounded-full px-3 py-1.5 text-xs font-medium transition-opacity hover:opacity-80',
+            submitted ? 'bg-[#F0FDF4] text-[#16A34A]' : 'bg-[#EFF6FF] text-[#3B82F6]',
+          )}
+        >
+          {message.content}
+        </button>
+      </div>
+    )
+  }
 
   if (isSystem) {
     return (

@@ -6,6 +6,8 @@ import re
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from app.schemas.welcome_message_rule import WelcomeMessagePublic
+
 
 DEFAULT_OFFLINE_TITLE = "当前客服不在线"
 DEFAULT_OFFLINE_MESSAGE = "您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。"
@@ -148,6 +150,10 @@ class ChannelResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    channel_key: str
+    channel_key_version: int = 1
+    public_access_enabled: bool = True
+    key_rotated_at: datetime | None = None
     name: str
     channel_type: str
     access_mode: str = "url"
@@ -162,8 +168,7 @@ class ChannelPublicResponse(BaseModel):
     """Public channel info for visitor-facing chat widget (no auth required)."""
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    tenant_id: int
+    channel_key: str
     name: str
     channel_type: str
     access_mode: str = "url"
@@ -172,3 +177,4 @@ class ChannelPublicResponse(BaseModel):
     config: ChannelConfig = ChannelConfig()
     availability: ChannelAvailability | None = None
     has_conversation_history: bool = False
+    welcome_message: WelcomeMessagePublic | None = None

@@ -207,7 +207,7 @@ function OrganizationChangeValue({
 
   return (
     <Link
-      href={`/workspace/organizations/${orgValue}`}
+      href={`/workspace/organizations/${org?.public_id || orgValue}`}
       className="rounded-md bg-muted px-1.5 py-0.5 font-medium text-primary underline-offset-2 hover:underline"
     >
       {label}

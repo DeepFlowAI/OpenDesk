@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { io, Socket } from 'socket.io-client'
 import type { Message } from '@/models/conversation'
+import type { SatisfactionSurveyRecord } from '@/models/satisfaction-survey'
 
 const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:5001'
 
@@ -11,27 +12,29 @@ type VisitorChatState = {
   connected: boolean
   connecting: boolean
 
-  conversationId: number | null
+  conversationPublicId: string | null
   messages: Message[]
   hasMore: boolean
   agentTyping: boolean
   activeAgent: { id: number; name: string; avatar: string | null } | null
+  satisfactionInvitation: SatisfactionSurveyRecord | null
 
   visitorId: string | null
 
-  connect: (tenantId: number, visitorExternalId: string, channelId: number, visitorName?: string) => void
+  connect: (visitorSessionToken: string, visitorExternalId: string) => void
   disconnect: () => void
 
-  setConversationId: (id: number | null) => void
+  setConversationPublicId: (id: string | null) => void
   setMessages: (msgs: Message[]) => void
   prependMessages: (msgs: Message[]) => void
   addMessage: (msg: Message) => void
-  addOptimisticMessage: (conversationId: number, content: string, contentType?: string) => number
+  addOptimisticMessage: (conversationPublicId: string, content: string, contentType?: string) => number
   confirmOptimisticMessage: (tempId: number, serverMsg: Message) => void
-  markVisitorMessagesRead: (conversationId: number) => void
+  markVisitorMessagesRead: (conversationPublicId: string) => void
   setHasMore: (v: boolean) => void
   setAgentTyping: (v: boolean) => void
   setVisitorId: (id: string) => void
+  setSatisfactionInvitation: (record: SatisfactionSurveyRecord | null) => void
 }
 
 export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
@@ -39,23 +42,21 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
   connected: false,
   connecting: false,
 
-  conversationId: null,
+  conversationPublicId: null,
   messages: [],
   hasMore: false,
   agentTyping: false,
   activeAgent: null,
+  satisfactionInvitation: null,
   visitorId: null,
 
-  connect: (tenantId, visitorExternalId, channelId, visitorName) => {
+  connect: (visitorSessionToken, visitorExternalId) => {
     const existing = get().socket
     if (existing) {
       if (existing.connected) return
 
       existing.auth = {
-        tenant_id: tenantId,
-        visitor_external_id: visitorExternalId,
-        channel_id: channelId,
-        visitor_name: visitorName,
+        visitor_session_token: visitorSessionToken,
       }
       set({ connecting: true, visitorId: visitorExternalId })
       existing.connect()
@@ -66,10 +67,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
 
     const socket = io(`${SOCKET_URL}/visitor`, {
       auth: {
-        tenant_id: tenantId,
-        visitor_external_id: visitorExternalId,
-        channel_id: channelId,
-        visitor_name: visitorName,
+        visitor_session_token: visitorSessionToken,
       },
       transports: ['websocket', 'polling'],
       reconnection: true,
@@ -135,10 +133,12 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     })
 
     socket.on('conversation_ended', () => {
-      set({ conversationId: null })
+      // Keep the conversation public id after closure so post-chat flows, such
+      // as satisfaction survey submission, can still address the ended session.
+      set({ agentTyping: false })
     })
 
-    socket.on('conversation_assigned', (data: { conversation_id: number; agent?: { id: number; name: string; avatar?: string } }) => {
+    socket.on('conversation_assigned', (data: { conversation_public_id?: string; agent?: { id: number; name: string; avatar?: string } }) => {
       const state = get()
       const agentLabel = data.agent?.name || '客服'
       const activeAgent = data.agent
@@ -159,7 +159,8 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       // Fallback: append a system message
       const sysMsg: Message = {
         id: Date.now(),
-        conversation_id: data.conversation_id,
+        conversation_id: 0,
+        conversation_public_id: data.conversation_public_id,
         sender_type: 'system',
         content_type: 'system',
         content: `${agentLabel} 已接入会话`,
@@ -168,8 +169,12 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       set({ messages: [...state.messages, sysMsg], activeAgent })
     })
 
-    socket.on('messages_read', (data: { conversation_id: number }) => {
-      get().markVisitorMessagesRead(data.conversation_id)
+    socket.on('messages_read', (data: { conversation_public_id?: string }) => {
+      if (data.conversation_public_id) get().markVisitorMessagesRead(data.conversation_public_id)
+    })
+
+    socket.on('satisfaction_invitation_sent', (data: { record?: SatisfactionSurveyRecord }) => {
+      if (data.record) set({ satisfactionInvitation: data.record })
     })
 
     set({ socket })
@@ -179,11 +184,11 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     const { socket } = get()
     if (socket) {
       socket.disconnect()
-      set({ socket: null, connected: false, connecting: false, activeAgent: null })
+      set({ socket: null, connected: false, connecting: false, activeAgent: null, satisfactionInvitation: null })
     }
   },
 
-  setConversationId: (id) => set({ conversationId: id }),
+  setConversationPublicId: (id) => set({ conversationPublicId: id }),
   setMessages: (msgs) => set({ messages: msgs }),
   prependMessages: (msgs) => set({ messages: [...msgs, ...get().messages] }),
 
@@ -195,12 +200,13 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     }
   },
 
-  addOptimisticMessage: (conversationId, content, contentType = 'text') => {
+  addOptimisticMessage: (conversationPublicId, content, contentType = 'text') => {
     optimisticSeq -= 1
     const tempId = optimisticSeq
     const msg: Message = {
       id: tempId,
-      conversation_id: conversationId,
+      conversation_id: 0,
+      conversation_public_id: conversationPublicId,
       sender_type: 'visitor',
       sender_id: null,
       sender_name: null,
@@ -222,10 +228,10 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     set({ messages: updated })
   },
 
-  markVisitorMessagesRead: (conversationId) => {
+  markVisitorMessagesRead: (conversationPublicId) => {
     const state = get()
     const updated = state.messages.map((m) =>
-      m.conversation_id === conversationId && m.sender_type === 'visitor' && m.status !== 'read'
+      m.conversation_public_id === conversationPublicId && m.sender_type === 'visitor' && m.status !== 'read'
         ? { ...m, status: 'read' as const }
         : m,
     )
@@ -235,4 +241,5 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
   setHasMore: (v) => set({ hasMore: v }),
   setAgentTyping: (v) => set({ agentTyping: v }),
   setVisitorId: (id) => set({ visitorId: id }),
+  setSatisfactionInvitation: (record) => set({ satisfactionInvitation: record }),
 }))

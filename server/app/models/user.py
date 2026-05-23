@@ -16,12 +16,14 @@ class User(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
     __tablename__ = "users"
     __table_args__ = (
         UniqueConstraint("tenant_id", "external_id", name="uq_users_tenant_external"),
+        UniqueConstraint("public_id", name="uq_users_public_id"),
         Index("ix_users_tenant_id", "tenant_id"),
     )
 
     # ── Core identity ──
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tenant_id: Mapped[int] = mapped_column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    public_id: Mapped[str] = mapped_column(String(64), nullable=False)
     external_id: Mapped[str] = mapped_column(String(128), nullable=False)
 
     # ── System default fields (§4 of 用户字段模型) ──

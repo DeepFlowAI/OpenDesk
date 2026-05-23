@@ -23,7 +23,9 @@ const PDFViewer = dynamic(
 const attachmentCardClassName = 'rounded-[18px] border border-border bg-background p-3 text-foreground'
 
 type MessageAttachmentProps = {
-  conversationId: number
+  conversationId?: number
+  conversationPublicId?: string
+  visitorSessionToken?: string
   contentType: 'image' | 'file'
   content: string
   className?: string
@@ -188,6 +190,8 @@ function JitDocumentViewer({ url, filename }: { url: string; filename: string })
 
 export function MessageAttachment({
   conversationId,
+  conversationPublicId,
+  visitorSessionToken,
   contentType,
   content,
   className,
@@ -215,6 +219,8 @@ export function MessageAttachment({
     setError(false)
     getConversationFileUrl({
       conversationId,
+      conversationPublicId,
+      visitorSessionToken,
       fileId: payload.file_id,
       downloadName: payload.name,
     })
@@ -231,7 +237,7 @@ export function MessageAttachment({
     return () => {
       alive = false
     }
-  }, [conversationId, payload])
+  }, [conversationId, conversationPublicId, payload, visitorSessionToken])
 
   const handleDownload = useCallback(async () => {
     if (!payload) {
@@ -240,12 +246,14 @@ export function MessageAttachment({
     }
     const res = await getConversationFileUrl({
       conversationId,
+      conversationPublicId,
+      visitorSessionToken,
       fileId: payload.file_id,
       downloadName: payload.name,
       download: true,
     })
     window.open(res.url, '_blank', 'noopener,noreferrer')
-  }, [conversationId, payload, url])
+  }, [conversationId, conversationPublicId, payload, url, visitorSessionToken])
 
   const handleImagePreview = useCallback(async () => {
     if (!url) return
@@ -267,6 +275,8 @@ export function MessageAttachment({
           }
           const res = await getConversationFileUrl({
             conversationId,
+            conversationPublicId,
+            visitorSessionToken,
             fileId: itemPayload.file_id,
             downloadName: itemPayload.name,
           })
@@ -285,7 +295,7 @@ export function MessageAttachment({
       setPreviewOpen(true)
     }
     setPreviewLoading(false)
-  }, [content, conversationId, currentImageId, imageGallery, url])
+  }, [content, conversationId, conversationPublicId, currentImageId, imageGallery, url, visitorSessionToken])
 
   if (isImage) {
     if (loading) {

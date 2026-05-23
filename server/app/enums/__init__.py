@@ -21,6 +21,8 @@ class MessageContentType(str, enum.Enum):
     IMAGE = "image"
     FILE = "file"
     SYSTEM = "system"
+    WELCOME = "welcome"
+    SATISFACTION_EVENT = "satisfaction_event"
 
 
 class AgentOnlineStatus(str, enum.Enum):

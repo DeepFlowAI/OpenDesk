@@ -4,6 +4,7 @@ Message model — individual messages within a conversation
 from datetime import datetime
 
 from sqlalchemy import String, Text, Integer, DateTime, ForeignKey, Index, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -25,7 +26,8 @@ class Message(Base):
     sender_type: Mapped[str] = mapped_column(String(16), nullable=False)
     sender_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     content_type: Mapped[str] = mapped_column(
-        String(16), nullable=False, default=MessageContentType.TEXT.value, server_default="text"
+        String(32), nullable=False, default=MessageContentType.TEXT.value, server_default="text"
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

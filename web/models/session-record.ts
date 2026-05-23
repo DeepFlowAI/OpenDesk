@@ -1,5 +1,8 @@
+import type { SatisfactionSummary } from './satisfaction-survey'
+
 export type SessionRecordVisitor = {
   id: number
+  public_id: string
   external_id: string
   name: string
   avatar_color: string | null
@@ -20,6 +23,8 @@ export type SessionRecordChannel = {
 
 export type SessionRecord = {
   id: number
+  public_id: string
+  share_code: string
   visitor: SessionRecordVisitor | null
   agent: SessionRecordAgent | null
   channel: SessionRecordChannel | null
@@ -28,6 +33,7 @@ export type SessionRecord = {
   ended_at: string | null
   ended_by: string | null
   created_at: string | null
+  satisfaction: SatisfactionSummary | null
 }
 
 export type SessionRecordListResponse = {
@@ -49,9 +55,13 @@ export type SessionRecordMessage = {
   sender_id: number | null
   sender_name: string | null
   sender_avatar: string | null
-  content_type: 'text' | 'image' | 'file' | 'system'
+  content_type: 'text' | 'image' | 'file' | 'system' | 'welcome' | 'satisfaction_event'
   content: string
+  metadata?: Record<string, unknown>
   created_at: string
+  event_type?: 'invitation_sent' | 'feedback_submitted'
+  satisfaction_record_id?: number
+  config_version?: number
 }
 
 export type SessionRecordMessageListResponse = {
@@ -67,4 +77,10 @@ export type SessionRecordFilters = {
   agent_id?: number
   visitor_id?: number
   keyword?: string
+  satisfaction_status?: string
+  satisfaction_resolved?: string
+  satisfaction_service_option?: string
+  satisfaction_service_label?: string
+  satisfaction_product_option?: string
+  satisfaction_product_label?: string
 }

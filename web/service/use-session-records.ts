@@ -30,6 +30,12 @@ export const useSessionRecords = (filters: SessionRecordFilters) =>
       if (filters.agent_id) params.agent_id = filters.agent_id
       if (filters.visitor_id) params.visitor_id = filters.visitor_id
       if (filters.keyword) params.keyword = filters.keyword
+      if (filters.satisfaction_status) params.satisfaction_status = filters.satisfaction_status
+      if (filters.satisfaction_resolved) params.satisfaction_resolved = filters.satisfaction_resolved
+      if (filters.satisfaction_service_option) params.satisfaction_service_option = filters.satisfaction_service_option
+      if (filters.satisfaction_service_label) params.satisfaction_service_label = filters.satisfaction_service_label
+      if (filters.satisfaction_product_option) params.satisfaction_product_option = filters.satisfaction_product_option
+      if (filters.satisfaction_product_label) params.satisfaction_product_label = filters.satisfaction_product_label
       return get<SessionRecordListResponse>('v1/session-records', { searchParams: params })
     },
   })

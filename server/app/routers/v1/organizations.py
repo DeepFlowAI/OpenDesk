@@ -82,15 +82,15 @@ async def create_organization(
     )
 
 
-@router.get("/{org_id}", response_model=OrganizationResponse)
+@router.get("/{org_ref}", response_model=OrganizationResponse)
 async def get_organization(
-    org_id: int,
+    org_ref: str,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a single organization by ID."""
+    """Get a single organization by public ID, with numeric ID compatibility."""
     tenant_id = current_user["tenant_id"]
-    return await OrganizationService.get_by_id(db, tenant_id, org_id)
+    return await OrganizationService.get_by_ref(db, tenant_id, org_ref)
 
 
 @router.get("/{org_id}/changes", response_model=EntityChangeListResponse)
@@ -142,9 +142,9 @@ async def delete_organization(
     await OrganizationService.delete_organization(db, tenant_id, org_id)
 
 
-@router.get("/{org_id}/users", response_model=dict)
+@router.get("/{org_ref}/users", response_model=dict)
 async def list_organization_users(
-    org_id: int,
+    org_ref: str,
     page: int = 1,
     per_page: int = 20,
     search: str | None = None,
@@ -156,11 +156,12 @@ async def list_organization_users(
     from app.schemas.user import UserQueryRequest
 
     tenant_id = current_user["tenant_id"]
-    # Verify organization exists
-    org = await OrganizationService.get_by_id(db, tenant_id, org_id)
+    # Verify organization exists and resolve public ID to the internal FK.
+    org = await OrganizationService.get_by_ref(db, tenant_id, org_ref)
     if not org:
         from app.core.exceptions import NotFoundError
         raise NotFoundError("Organization not found")
+    org_id = org["id"]
 
     req = UserQueryRequest(
         search=search,

@@ -122,8 +122,8 @@ async def _create_active_conversation(*, agent_id: int | None = None) -> int:
     aid = agent_id if agent_id is not None else _STATE["owner_id"]
     async with AsyncSessionLocal() as db:
         result = await db.execute(text("""
-            INSERT INTO conversations (tenant_id, visitor_id, agent_id, status, started_at)
-            VALUES (:tid, :vid, :aid, 'active', NOW())
+            INSERT INTO conversations (public_id, share_code, tenant_id, visitor_id, agent_id, status, started_at)
+            VALUES ('cv_xfer_' || substr(md5(random()::text || clock_timestamp()::text), 1, 24), 'CV-' || upper(substr(md5(random()::text || clock_timestamp()::text), 1, 8)), :tid, :vid, :aid, 'active', NOW())
             RETURNING id
         """), {
             "tid": _STATE["tenant_pk"],
@@ -138,8 +138,8 @@ async def _create_closed_conversation(*, agent_id: int | None = None) -> int:
     aid = agent_id if agent_id is not None else _STATE["owner_id"]
     async with AsyncSessionLocal() as db:
         result = await db.execute(text("""
-            INSERT INTO conversations (tenant_id, visitor_id, agent_id, status, started_at, ended_at, ended_by)
-            VALUES (:tid, :vid, :aid, 'closed', NOW() - interval '2 hour', NOW() - interval '1 hour', 'agent')
+            INSERT INTO conversations (public_id, share_code, tenant_id, visitor_id, agent_id, status, started_at, ended_at, ended_by)
+            VALUES ('cv_xfer_' || substr(md5(random()::text || clock_timestamp()::text), 1, 24), 'CV-' || upper(substr(md5(random()::text || clock_timestamp()::text), 1, 8)), :tid, :vid, :aid, 'closed', NOW() - interval '2 hour', NOW() - interval '1 hour', 'agent')
             RETURNING id
         """), {
             "tid": _STATE["tenant_pk"],

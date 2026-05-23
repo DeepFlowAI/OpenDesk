@@ -49,6 +49,17 @@ def test_validate_unsupported_message_type_raises_error():
         ConversationService.validate_message_content("html", "<b>bad</b>")
 
 
+def test_validate_welcome_message_type_is_server_only():
+    with pytest.raises(ValidationError):
+        ConversationService.validate_message_content("welcome", "<p>Hello</p>")
+
+
+def test_build_welcome_preview_strips_html():
+    preview = ConversationService.build_message_preview("welcome", "<p>Hello&nbsp;<strong>there</strong></p>")
+
+    assert preview == "Hello there"
+
+
 def test_build_file_preview_uses_file_name():
     payload = {
         "schema_version": 1,

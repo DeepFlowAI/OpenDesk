@@ -17,6 +17,7 @@ import type { Message, VisitorConversationHistoryItem } from '@/models/conversat
 import type { ChannelConfig } from '@/models/channel'
 import type { ChannelPublicConfig } from '@/service/use-visitor-chat'
 import { uploadVisitorConversationFile } from '@/service/use-conversation-files'
+import type { SatisfactionSurveyRecord } from '@/models/satisfaction-survey'
 import type { Socket } from 'socket.io-client'
 
 // ─── Config context ──────────────────────────────────────────────
@@ -27,7 +28,8 @@ export type VisitorChatConfigValue = {
   locale: string
   isMobile: boolean
   ended: boolean
-  conversationId: number | null
+  conversationPublicId: string | null
+  visitorSessionToken: string
   hasMore: boolean
   loadingMore: boolean
   historyAvailable: boolean
@@ -37,10 +39,15 @@ export type VisitorChatConfigValue = {
   historyLoaded: boolean
   historyError: boolean
   historyLimitReached: boolean
+  initializing: boolean
+  satisfactionCanInitiate: boolean
+  satisfactionLoading: boolean
   onLoadMore: () => void
-  onLoadHistory: (beforeId?: number) => Promise<void>
+  onLoadHistory: (beforeId?: string) => Promise<void>
   onTyping: (content: string) => void
   onRestartConversation: () => Promise<void>
+  onSatisfactionInitiate: () => Promise<SatisfactionSurveyRecord | null>
+  onSatisfactionSubmitted: () => void
   onFileSend: (file: File) => Promise<void>
 }
 
@@ -60,7 +67,7 @@ export type VisitorMessageMeta = {
   senderType: string
   senderId: number | null
   contentType: string
-  conversationId: number
+  conversationPublicId: string
   messageStatus?: string
   showTimestamp: boolean
   showName: boolean
@@ -103,7 +110,7 @@ export function VisitorChatRuntimeProvider({
   ...chatConfig
 }: ProviderProps) {
   const messages = useVisitorChatStore((s) => s.messages)
-  const { conversationId } = chatConfig
+  const { conversationPublicId, visitorSessionToken } = chatConfig
 
   const convertMessage = useCallback(
     (msg: Message, idx: number): ThreadMessageLike => {
@@ -120,7 +127,7 @@ export function VisitorChatRuntimeProvider({
         senderType: msg.sender_type,
         senderId: msg.sender_id,
         contentType: msg.content_type,
-        conversationId: msg.conversation_id,
+        conversationPublicId: msg.conversation_public_id || conversationPublicId || '',
         messageStatus: msg.status,
         showTimestamp: shouldShowTimestamp(msg, prev),
         showName: shouldShowName(msg, prev),
@@ -144,12 +151,11 @@ export function VisitorChatRuntimeProvider({
 
   const onFileSend = useCallback(
     async (file: File) => {
-      if (!socket || !conversationId || !visitorExternalId) return
+      if (!socket || !conversationPublicId || !visitorExternalId) return
 
       const uploaded = await uploadVisitorConversationFile({
-        conversationId,
-        tenantId: chatConfig.channel.tenant_id,
-        visitorExternalId,
+        conversationPublicId,
+        visitorSessionToken,
         file,
       })
       const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
@@ -160,10 +166,10 @@ export function VisitorChatRuntimeProvider({
         size: uploaded.size,
         mime_type: uploaded.mime_type,
       })
-      const tempId = addOptimistic(conversationId, content, contentType)
+      const tempId = addOptimistic(conversationPublicId, content, contentType)
 
       socket.emit('send_message', {
-        conversation_id: conversationId,
+        conversation_public_id: conversationPublicId,
         content,
         content_type: contentType,
       }, (res: { ok?: boolean; message?: Message }) => {
@@ -172,19 +178,19 @@ export function VisitorChatRuntimeProvider({
         }
       })
     },
-    [socket, conversationId, visitorExternalId, chatConfig.channel.tenant_id, addOptimistic, confirmOptimistic],
+    [socket, conversationPublicId, visitorExternalId, visitorSessionToken, addOptimistic, confirmOptimistic],
   )
 
   const onNew = useCallback(
     async (message: AppendMessage) => {
       const textPart = message.content.find((p) => p.type === 'text')
       if (!textPart || textPart.type !== 'text') return
-      if (!socket || !conversationId) return
+      if (!socket || !conversationPublicId) return
 
-      const tempId = addOptimistic(conversationId, textPart.text, 'text')
+      const tempId = addOptimistic(conversationPublicId, textPart.text, 'text')
 
       socket.emit('send_message', {
-        conversation_id: conversationId,
+        conversation_public_id: conversationPublicId,
         content: textPart.text,
         content_type: 'text',
       }, (res: { ok?: boolean; message?: Message }) => {
@@ -193,7 +199,7 @@ export function VisitorChatRuntimeProvider({
         }
       })
     },
-    [socket, conversationId, addOptimistic, confirmOptimistic],
+    [socket, conversationPublicId, addOptimistic, confirmOptimistic],
   )
 
   const runtime = useExternalStoreRuntime({

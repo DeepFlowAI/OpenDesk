@@ -168,3 +168,12 @@ body {
     @apply font-sans;
   }
 }
+
+/* Web SDK iframe: fill host panel and clip rounded corners inside the frame */
+html.od-embed,
+html.od-embed body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}

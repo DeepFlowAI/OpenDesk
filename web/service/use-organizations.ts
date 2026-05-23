@@ -23,14 +23,14 @@ export const orgKeys = {
   queries: () => [...orgKeys.all, 'query'] as const,
   query: (params: OrganizationQueryPayload) => [...orgKeys.queries(), params] as const,
   details: () => [...orgKeys.all, 'detail'] as const,
-  detail: (id: number) => [...orgKeys.details(), id] as const,
+  detail: (ref: string | number) => [...orgKeys.details(), String(ref)] as const,
   enabledViews: () => [...orgKeys.all, 'enabledViews'] as const,
   viewCounts: () => [...orgKeys.all, 'viewCounts'] as const,
   viewGroupsRoot: () => [...orgKeys.all, 'viewGroups'] as const,
   viewGroups: (viewId: number, payload: ViewGroupRequestPayload) =>
     [...orgKeys.viewGroupsRoot(), viewId, payload] as const,
-  users: (orgId: number, params: Record<string, unknown>) =>
-    [...orgKeys.all, 'users', orgId, params] as const,
+  users: (orgRef: string | number, params: Record<string, unknown>) =>
+    [...orgKeys.all, 'users', String(orgRef), params] as const,
   changes: (id: number, params: Record<string, unknown>) =>
     [...orgKeys.detail(id), 'changes', params] as const,
 }
@@ -43,12 +43,17 @@ export const useQueryOrganizations = (payload: OrganizationQueryPayload, enabled
     enabled,
   })
 
-export const useOrganization = (id: number, enabled = true) =>
-  useQuery({
-    queryKey: orgKeys.detail(id),
-    queryFn: () => get<Organization>(`v1/organizations/${id}`),
-    enabled: enabled && !!id,
+export const useOrganization = (
+  ref: string | number | null | undefined,
+  enabled = true,
+) => {
+  const orgRef = String(ref ?? '')
+  return useQuery({
+    queryKey: orgKeys.detail(orgRef),
+    queryFn: () => get<Organization>(`v1/organizations/${encodeURIComponent(orgRef)}`),
+    enabled: enabled && orgRef.length > 0 && orgRef !== '0',
   })
+}
 
 export const useOrganizationChanges = (
   id: number,
@@ -87,8 +92,9 @@ export const useUpdateOrganization = () => {
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: UpdateOrganizationPayload }) =>
       put<Organization>(`v1/organizations/${id}`, { json: data }),
-    onSuccess: (_, v) => {
-      qc.invalidateQueries({ queryKey: orgKeys.detail(v.id) })
+    onSuccess: (updated, v) => {
+      qc.setQueryData(orgKeys.detail(v.id), updated)
+      qc.setQueryData(orgKeys.detail(updated.public_id), updated)
       qc.invalidateQueries({ queryKey: [...orgKeys.detail(v.id), 'changes'] })
       qc.invalidateQueries({ queryKey: orgKeys.queries() })
       qc.invalidateQueries({ queryKey: orgKeys.viewCounts() })
@@ -147,20 +153,22 @@ export const useOrgViewGroups = (
   })
 
 export const useOrgUsers = (
-  orgId: number,
+  orgRef: string | number | null | undefined,
   params: { page?: number; per_page?: number; search?: string },
+  enabled = true,
 ) =>
   useQuery({
-    queryKey: orgKeys.users(orgId, params),
+    queryKey: orgKeys.users(String(orgRef ?? ''), params),
     queryFn: () => {
+      const organizationRef = String(orgRef ?? '')
       const searchParams = new URLSearchParams()
       if (params.page) searchParams.set('page', String(params.page))
       if (params.per_page) searchParams.set('per_page', String(params.per_page))
       if (params.search) searchParams.set('search', params.search)
       const qs = searchParams.toString()
       return get<PaginatedResponse<User>>(
-        `v1/organizations/${orgId}/users${qs ? `?${qs}` : ''}`,
+        `v1/organizations/${encodeURIComponent(organizationRef)}/users${qs ? `?${qs}` : ''}`,
       )
     },
-    enabled: !!orgId,
+    enabled: enabled && String(orgRef ?? '').length > 0 && String(orgRef ?? '') !== '0',
   })

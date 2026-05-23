@@ -2,6 +2,7 @@
 Conversation Pydantic schemas
 """
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -10,6 +11,7 @@ class VisitorBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    public_id: str
     external_id: str
     name: str
     avatar_color: str | None = None
@@ -43,6 +45,8 @@ class ConversationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    public_id: str
+    share_code: str
     tenant_id: int
     visitor: VisitorBrief | None = None
     agent: AgentBrief | None = None
@@ -62,6 +66,13 @@ class ConversationResponse(BaseModel):
 class ConversationListResponse(BaseModel):
     items: list[ConversationResponse]
     total: int
+
+
+class VisitorWebStatusResponse(BaseModel):
+    conversation_id: int
+    status: Literal["online", "offline", "unknown"]
+    can_display: bool
+    checked_at: datetime
 
 
 class EndConversationRequest(BaseModel):

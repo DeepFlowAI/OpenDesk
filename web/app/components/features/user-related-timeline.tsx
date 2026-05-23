@@ -286,6 +286,7 @@ function SessionTimelineCard({
   const eventTime = session.started_at ?? session.created_at
   const agentName = session.agent?.display_name || session.agent?.name || '-'
   const channelName = session.channel?.channel_type || '-'
+  const sessionCode = session.share_code || session.public_id
 
   return (
     <div className="rounded-lg bg-white px-4 py-3.5">
@@ -300,9 +301,10 @@ function SessionTimelineCard({
               <button
                 type="button"
                 onClick={onOpen}
-                className="font-medium text-primary underline-offset-2 hover:underline"
+                className="max-w-[220px] truncate align-bottom font-medium text-primary underline-offset-2 hover:underline"
+                title={sessionCode}
               >
-                #{session.id}
+                {sessionCode}
               </button>
             </div>
             <p className="mt-1 truncate text-xs text-muted-foreground">

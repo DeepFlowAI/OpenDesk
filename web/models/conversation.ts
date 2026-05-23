@@ -1,5 +1,6 @@
 export type VisitorBrief = {
   id: number
+  public_id: string
   external_id: string
   name: string
   avatar_color: string | null
@@ -25,6 +26,8 @@ export type GroupBrief = {
 
 export type Conversation = {
   id: number
+  public_id: string
+  share_code: string
   tenant_id: number
   visitor: VisitorBrief | null
   agent: AgentBrief | null
@@ -46,19 +49,38 @@ export type ConversationListResponse = {
   total: number
 }
 
+export type VisitorWebStatus = 'online' | 'offline' | 'unknown'
+
+export type VisitorWebStatusResponse = {
+  conversation_id: number
+  status: VisitorWebStatus
+  can_display: boolean
+  checked_at: string
+}
+
 export type MessageStatus = 'sending' | 'delivered' | 'read'
 
 export type Message = {
   id: number
   conversation_id: number
+  conversation_public_id?: string
   sender_type: 'visitor' | 'agent' | 'system'
   sender_id: number | null
   sender_name: string | null
   sender_avatar: string | null
-  content_type: 'text' | 'image' | 'file' | 'system'
+  content_type: 'text' | 'image' | 'file' | 'system' | 'welcome' | 'satisfaction_event'
   content: string
+  metadata?: Record<string, unknown>
   created_at: string
   status?: MessageStatus
+  event_type?: 'invitation_sent' | 'feedback_submitted'
+  satisfaction_record_id?: number
+  config_version?: number
+}
+
+export type VisitorPublicMessage = Omit<Message, 'conversation_id'> & {
+  conversation_id?: number
+  conversation_public_id: string
 }
 
 export type MessageListResponse = {
@@ -67,7 +89,7 @@ export type MessageListResponse = {
 }
 
 export type VisitorConversationHistoryItem = {
-  id: number
+  conversation_public_id: string
   status: 'queued' | 'active' | 'closed'
   started_at: string | null
   ended_at: string | null

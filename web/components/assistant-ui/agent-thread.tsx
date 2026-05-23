@@ -1,7 +1,8 @@
 'use client'
 
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { ThreadPrimitive, type MessageState } from '@assistant-ui/react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   useAgentChatConfig,
   type AgentMessageMeta,
@@ -9,13 +10,21 @@ import {
 import { AgentComposer } from './agent-composer'
 import { IconArrowsExchange2, IconTicket, IconX, IconLoader2 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
-import { useLocaleStore } from '@/context/locale-store'
+import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
 import { EndConversationModal } from '@/app/components/features/chat/end-conversation-modal'
 import { TransferConversationModal } from '@/app/components/features/chat/transfer-conversation-modal'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
-import type { Message, WorkspaceConversationHistoryItem } from '@/models/conversation'
+import { conversationKeys, useVisitorWebStatus } from '@/service/use-conversations'
+import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
+import type {
+  Conversation,
+  Message,
+  VisitorWebStatus,
+  VisitorWebStatusResponse,
+  WorkspaceConversationHistoryItem,
+} from '@/models/conversation'
 import type { Socket } from 'socket.io-client'
 
 // ─── Timestamp formatting ────────────────────────────────────────
@@ -40,6 +49,53 @@ function formatHistoryTime(dateStr: string | null, locale: string): string {
   return `${date} ${time}`
 }
 
+function SystemAgentAvatar({
+  className,
+  muted = false,
+}: {
+  className?: string
+  muted?: boolean
+}) {
+  return (
+    <div
+      className={cn(
+        'flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-medium',
+        muted ? 'bg-[#E8E8E8] text-[#737373]' : 'bg-[#D6E6F9] text-[#4A80B5]',
+        className,
+      )}
+    >
+      s
+    </div>
+  )
+}
+
+function AgentSideWelcomeBubble({
+  content,
+  time,
+  muted = false,
+}: {
+  content: string
+  time: string
+  muted?: boolean
+}) {
+  return (
+    <div className="mb-4 flex flex-row-reverse gap-2.5">
+      <SystemAgentAvatar muted={muted} />
+      <div className="flex max-w-[70%] flex-col items-end">
+        <div
+          className={cn(
+            'rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words whitespace-pre-wrap text-[#1a1a1a]',
+            muted ? 'bg-[#E8E8E8]' : 'bg-[#DBEAFE]',
+            richTextListStyleClass,
+          )}
+          dangerouslySetInnerHTML={{ __html: content }}
+        />
+        <span className="mt-1 text-right text-[11px] text-[#999999]">{time}</span>
+      </div>
+    </div>
+  )
+}
+
 // ─── Agent-side message bubble ───────────────────────────────────
 
 function AgentMessageBubble({ message }: { message: MessageState }) {
@@ -58,6 +114,31 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
   }
   const attachmentContentType =
     meta?.contentType === 'image' ? 'image' : meta?.contentType === 'file' ? 'file' : null
+
+  if (meta?.contentType === 'welcome') {
+    return (
+      <AgentSideWelcomeBubble
+        content={content}
+        time={message.createdAt ? formatMessageTime(message.createdAt.toISOString()) : ''}
+      />
+    )
+  }
+
+  if (meta?.contentType === 'satisfaction_event') {
+    const submitted = meta.eventType === 'feedback_submitted'
+    return (
+      <div className="mb-4 flex justify-center py-1">
+        <span
+          className={cn(
+            'rounded-full px-3 py-1.5 text-center text-[12px] font-medium leading-normal',
+            submitted ? 'bg-[#F0FDF4] text-[#16A34A]' : 'bg-[#EFF6FF] text-[#3B82F6]',
+          )}
+        >
+          {content}
+        </span>
+      </div>
+    )
+  }
 
   if (isSystem) {
     return (
@@ -159,6 +240,32 @@ function AgentHistoryMessageBubble({
   const attachmentContentType =
     message.content_type === 'image' ? 'image' : message.content_type === 'file' ? 'file' : null
 
+  if (message.content_type === 'welcome') {
+    return (
+      <AgentSideWelcomeBubble
+        content={message.content}
+        time={formatMessageTime(message.created_at)}
+        muted
+      />
+    )
+  }
+
+  if (message.content_type === 'satisfaction_event') {
+    const submitted = message.event_type === 'feedback_submitted'
+    return (
+      <div className="mb-4 flex justify-center py-1">
+        <span
+          className={cn(
+            'rounded-full px-3 py-1.5 text-center text-[12px] font-medium leading-normal',
+            submitted ? 'bg-[#F0FDF4] text-[#16A34A]' : 'bg-[#EFF6FF] text-[#3B82F6]',
+          )}
+        >
+          {message.content}
+        </span>
+      </div>
+    )
+  }
+
   if (isSystem) {
     return (
       <div className="mb-4 flex justify-center py-1">
@@ -259,6 +366,109 @@ function HistoryConversationBlock({
   )
 }
 
+function visitorWebStatusLabel(status: VisitorWebStatus, locale: Locale): string {
+  if (status === 'online') return t('ws.chat.visitorWebStatusOnline', locale)
+  if (status === 'offline') return t('ws.chat.visitorWebStatusOffline', locale)
+  return t('ws.chat.visitorWebStatusUnknown', locale)
+}
+
+function visitorWebStatusTooltip(status: VisitorWebStatus, locale: Locale): string {
+  if (status === 'unknown') return t('ws.chat.visitorWebStatusUnavailable', locale)
+  return t('ws.chat.visitorWebStatusTooltip', locale, {
+    status: visitorWebStatusLabel(status, locale),
+  })
+}
+
+function shouldShowVisitorWebStatus(conversation: Conversation): boolean {
+  return (
+    String(conversation.channel?.channel_type || '').toLowerCase() === 'web'
+    && Boolean(conversation.visitor?.external_id)
+  )
+}
+
+function VisitorWebStatusBadge({
+  conversation,
+  socket,
+}: {
+  conversation: Conversation
+  socket: Socket | null
+}) {
+  const { locale } = useLocaleStore()
+  const queryClient = useQueryClient()
+  const visible = shouldShowVisitorWebStatus(conversation)
+  const statusQuery = useVisitorWebStatus(conversation.id, { enabled: visible })
+
+  useEffect(() => {
+    if (!socket || !visible) return
+
+    const handleStatusUpdated = (payload: VisitorWebStatusResponse) => {
+      if (payload.conversation_id !== conversation.id) return
+      queryClient.setQueryData(
+        conversationKeys.visitorWebStatus(conversation.id),
+        payload,
+      )
+    }
+
+    const handleConnect = () => {
+      queryClient.invalidateQueries({
+        queryKey: conversationKeys.visitorWebStatus(conversation.id),
+      })
+    }
+
+    socket.on('visitor_web_status_updated', handleStatusUpdated)
+    socket.on('connect', handleConnect)
+    return () => {
+      socket.off('visitor_web_status_updated', handleStatusUpdated)
+      socket.off('connect', handleConnect)
+    }
+  }, [conversation.id, queryClient, socket, visible])
+
+  if (!visible) return null
+
+  if (statusQuery.isLoading && !statusQuery.data) {
+    const label = t('ws.chat.visitorWebStatusChecking', locale)
+    return (
+      <span
+        aria-label={label}
+        className="inline-flex h-[22px] w-14 shrink-0 items-center rounded-full bg-muted px-2"
+        title={label}
+      >
+        <span className="h-2 w-full animate-pulse rounded-full bg-muted-foreground/20" />
+      </span>
+    )
+  }
+
+  if (statusQuery.data && !statusQuery.data.can_display) return null
+
+  const status: VisitorWebStatus = statusQuery.isError
+    ? 'unknown'
+    : statusQuery.data?.status ?? 'unknown'
+  const label = visitorWebStatusLabel(status, locale)
+  const tooltip = visitorWebStatusTooltip(status, locale)
+  const online = status === 'online'
+
+  return (
+    <span
+      aria-label={tooltip}
+      className={cn(
+        'inline-flex h-[22px] max-w-24 shrink-0 items-center gap-1.5 rounded-full border px-2 text-[12px] font-medium',
+        online
+          ? 'border-success/20 bg-success/10 text-success'
+          : 'border-border bg-muted text-muted-foreground',
+      )}
+      title={tooltip}
+    >
+      <span
+        className={cn(
+          'h-1.5 w-1.5 shrink-0 rounded-full',
+          online ? 'bg-success' : 'bg-muted-foreground/70',
+        )}
+      />
+      <span className="min-w-0 truncate">{label}</span>
+    </span>
+  )
+}
+
 // ─── Main Thread ─────────────────────────────────────────────────
 
 type AgentThreadProps = {
@@ -340,6 +550,7 @@ export function AgentThread({ socket }: AgentThreadProps) {
               {conversation.channel.channel_type}
             </span>
           )}
+          <VisitorWebStatusBadge conversation={conversation} socket={socket} />
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <button

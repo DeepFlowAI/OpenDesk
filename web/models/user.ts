@@ -6,6 +6,7 @@ export type { CustomFieldValue } from '@/types/custom-field-value'
 export type User = {
   id: number
   tenant_id: number
+  public_id: string
   external_id: string
   name: string
   email: string | null

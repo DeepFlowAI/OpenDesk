@@ -4,6 +4,8 @@ Organization repository — data access for organizations
 from __future__ import annotations
 
 import logging
+import re
+import secrets
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -16,7 +18,14 @@ from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
+ORGANIZATION_PUBLIC_ID_PREFIX = "org_"
+ORGANIZATION_PUBLIC_ID_RANDOM_LENGTH = 16
+ORGANIZATION_PUBLIC_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+ORGANIZATION_PUBLIC_ID_PATTERN = re.compile(r"^org_[A-Za-z0-9_-]{16}$")
+MAX_PUBLIC_ID_GENERATION_ATTEMPTS = 10
+
 SYSTEM_FIELD_MAP: dict[str, str] = {
+    "public_id": "public_id",
     "name": "name",
     "description": "description",
     "created_by": "created_by_actor_name",
@@ -33,6 +42,10 @@ def _resolve_column(field_key: str | None, slot_column: str | None):
     if slot_column and hasattr(Organization, slot_column):
         return getattr(Organization, slot_column)
     return None
+
+
+def is_valid_organization_public_id(value: str | None) -> bool:
+    return bool(value and ORGANIZATION_PUBLIC_ID_PATTERN.fullmatch(value))
 
 
 def _coerce_filter_value(col, value):
@@ -116,7 +129,31 @@ class OrganizationRepository:
         return await db.get(Organization, org_id)
 
     @staticmethod
+    async def get_by_public_id(db: AsyncSession, public_id: str) -> Organization | None:
+        result = await db.execute(select(Organization).where(Organization.public_id == public_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def generate_public_id() -> str:
+        suffix = "".join(
+            secrets.choice(ORGANIZATION_PUBLIC_ID_ALPHABET)
+            for _ in range(ORGANIZATION_PUBLIC_ID_RANDOM_LENGTH)
+        )
+        return f"{ORGANIZATION_PUBLIC_ID_PREFIX}{suffix}"
+
+    @staticmethod
+    async def generate_unique_public_id(db: AsyncSession) -> str:
+        for _ in range(MAX_PUBLIC_ID_GENERATION_ATTEMPTS):
+            public_id = OrganizationRepository.generate_public_id()
+            if not await OrganizationRepository.get_by_public_id(db, public_id):
+                return public_id
+        raise RuntimeError("Failed to generate a unique organization public ID")
+
+    @staticmethod
     async def create(db: AsyncSession, data: dict, commit: bool = True) -> Organization:
+        public_id = data.get("public_id")
+        if not is_valid_organization_public_id(public_id if isinstance(public_id, str) else None):
+            data = {**data, "public_id": await OrganizationRepository.generate_unique_public_id(db)}
         item = Organization(**data)
         db.add(item)
         if commit:
@@ -204,6 +241,7 @@ class OrganizationRepository:
         if search:
             base_where.append(
                 or_(
+                    Organization.public_id.ilike(f"%{search}%"),
                     Organization.name.ilike(f"%{search}%"),
                     Organization.description.ilike(f"%{search}%"),
                 )

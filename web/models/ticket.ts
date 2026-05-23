@@ -9,6 +9,7 @@ export type Ticket = {
   ticket_number: string | null
   layout_id: number | null
   conversation_id: number | null
+  conversation_public_id: string | null
   user_id: number | null
   agent_id: number | null
   assignee_group_id: number | null
