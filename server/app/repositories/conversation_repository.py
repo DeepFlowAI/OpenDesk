@@ -157,6 +157,118 @@ class ConversationRepository:
         return conversation
 
     @staticmethod
+    async def update_status(
+        db: AsyncSession,
+        conversation: Conversation,
+        status: str,
+    ) -> Conversation:
+        conversation.status = status
+        await db.commit()
+        await db.refresh(conversation, attribute_names=["visitor", "agent", "channel", "group"])
+        return conversation
+
+    @staticmethod
+    async def update_open_agent_state(
+        db: AsyncSession,
+        conversation: Conversation,
+        data: dict,
+    ) -> Conversation:
+        allowed = {
+            "open_agent_agent_id",
+            "open_agent_agent_name",
+            "open_agent_conversation_id",
+            "open_agent_conversation_external_id",
+            "open_agent_last_request_id",
+            "open_agent_last_event_id",
+            "open_agent_handoff_state",
+            "open_agent_handoff_payload",
+        }
+        for key, value in data.items():
+            if key in allowed:
+                setattr(conversation, key, value)
+        await db.commit()
+        await db.refresh(conversation, attribute_names=["visitor", "agent", "channel", "group"])
+        return conversation
+
+    @staticmethod
+    async def update_handoff_state_if_unassigned(
+        db: AsyncSession,
+        conversation: Conversation,
+        *,
+        state: str,
+        payload: dict | None,
+        status: str | None = None,
+        allowed_previous_states: tuple[str | None, ...] | None = None,
+    ) -> tuple[Conversation, bool]:
+        conditions = [
+            Conversation.id == conversation.id,
+            Conversation.agent_id.is_(None),
+            Conversation.status.in_([
+                ConversationStatus.BOT.value,
+                ConversationStatus.HANDOFF_PENDING.value,
+            ]),
+        ]
+        if allowed_previous_states is not None:
+            state_conditions = []
+            non_null_states = [
+                item for item in allowed_previous_states
+                if item is not None
+            ]
+            if None in allowed_previous_states:
+                state_conditions.append(Conversation.open_agent_handoff_state.is_(None))
+            if non_null_states:
+                state_conditions.append(Conversation.open_agent_handoff_state.in_(non_null_states))
+            if state_conditions:
+                conditions.append(or_(*state_conditions))
+
+        values = {
+            "open_agent_handoff_state": state,
+            "open_agent_handoff_payload": payload or {},
+        }
+        if status is not None:
+            values["status"] = status
+
+        result = await db.execute(
+            update(Conversation)
+            .where(*conditions)
+            .values(**values)
+        )
+        await db.commit()
+        refreshed = await ConversationRepository.get_by_id(db, conversation.id)
+        return refreshed or conversation, bool(getattr(result, "rowcount", 0))
+
+    @staticmethod
+    async def assign_agent_if_unassigned(
+        db: AsyncSession,
+        conversation: Conversation,
+        agent_id: int,
+        group_id: int | None,
+        *,
+        allowed_statuses: tuple[str, ...] = (
+            ConversationStatus.BOT.value,
+            ConversationStatus.HANDOFF_PENDING.value,
+        ),
+    ) -> tuple[Conversation, bool]:
+        now = datetime.now(timezone.utc)
+        result = await db.execute(
+            update(Conversation)
+            .where(
+                Conversation.id == conversation.id,
+                Conversation.agent_id.is_(None),
+                Conversation.status.in_(list(allowed_statuses)),
+            )
+            .values(
+                agent_id=agent_id,
+                group_id=group_id,
+                status=ConversationStatus.ACTIVE.value,
+                started_at=now,
+            )
+        )
+        await db.commit()
+        refreshed = await ConversationRepository.get_by_id(db, conversation.id)
+        return refreshed or conversation, bool(getattr(result, "rowcount", 0))
+
+    @staticmethod
     async def update_last_message(
         db: AsyncSession,
         conversation_id: int,
@@ -237,7 +349,12 @@ class ConversationRepository:
                 Conversation.tenant_id == tenant_id,
                 Conversation.visitor_id == visitor_id,
                 Conversation.channel_id == channel_id,
-                Conversation.status.in_([ConversationStatus.ACTIVE.value, ConversationStatus.QUEUED.value]),
+                Conversation.status.in_([
+                    ConversationStatus.ACTIVE.value,
+                    ConversationStatus.QUEUED.value,
+                    ConversationStatus.BOT.value,
+                    ConversationStatus.HANDOFF_PENDING.value,
+                ]),
             )
         )
         return result.scalar_one_or_none()

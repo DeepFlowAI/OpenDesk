@@ -75,6 +75,7 @@ export type AgentMessageMeta = {
   senderId: number | null
   contentType: string
   conversationId: number
+  metadata?: Record<string, unknown>
   isOwn: boolean
   eventType?: string
   satisfactionRecordId?: number
@@ -85,7 +86,7 @@ export type AgentMessageMeta = {
 
 function mapRole(senderType: string): 'user' | 'assistant' | 'system' {
   if (senderType === 'visitor') return 'user'
-  if (senderType === 'agent') return 'assistant'
+  if (senderType === 'agent' || senderType === 'bot') return 'assistant'
   return 'system'
 }
 
@@ -149,6 +150,7 @@ export function AgentChatRuntimeProvider({
         senderId: msg.sender_id,
         contentType: msg.content_type,
         conversationId: msg.conversation_id,
+        metadata: msg.metadata,
         isOwn: msg.sender_type === 'agent' && msg.sender_id === userId,
         eventType: msg.event_type,
         satisfactionRecordId: msg.satisfaction_record_id,

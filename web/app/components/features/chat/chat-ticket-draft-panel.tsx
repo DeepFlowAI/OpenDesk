@@ -4,13 +4,14 @@ import { useEffect, useMemo, useState } from 'react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { Conversation } from '@/models/conversation'
+import type { Ticket } from '@/models/ticket'
 import { useSessionSummaryUsage } from '@/service/use-session-summary'
 import { TicketCreateForm } from '@/app/workspace/tickets/ticket-form-modal'
 
 type Props = {
   conversation: Conversation
   onClose: () => void
-  onNotice?: (type: 'success' | 'error', text: string) => void
+  onNotice?: (type: 'success' | 'error', text: string, payload?: { ticket?: Ticket }) => void
 }
 
 type StoredDraft = {
@@ -151,8 +152,8 @@ export function ChatTicketDraftPanel({ conversation, onClose, onNotice }: Props)
         initialValues={initialValues}
         columnsPerRowOverride={1}
         labelPositionOverride="top"
-        bodyClassName="pb-4"
-        footerClassName="sticky bottom-0 -mx-5 mt-auto flex justify-end gap-2 border-t border-border bg-[#F5F5F5] px-5 py-3"
+        bodyClassName="pb-20"
+        footerClassName="sticky -bottom-5 z-20 -mx-5 -mb-5 mt-auto flex justify-end gap-2 border-t border-border bg-[#F5F5F5] px-5 pb-8 pt-3"
         submitLabel={t('ws.chatTicket.save', locale)}
         submittingLabel={t('ws.chatTicket.saving', locale)}
         cancelLabel={t('ws.chatTicket.cancel', locale)}
@@ -166,9 +167,11 @@ export function ChatTicketDraftPanel({ conversation, onClose, onNotice }: Props)
           setSaveError(true)
           onNotice?.('error', text)
         }}
-        onSuccess={() => {
+        onSuccess={(ticket) => {
+          const ticketNumber = ticket.ticket_number || `#${ticket.id}`
+          const text = `${t('ws.chatTicket.createSucceeded', locale)}${locale === 'zh' ? '：' : ': '}${ticketNumber}`
           clearDraft(conversation.id)
-          onNotice?.('success', t('ws.chatTicket.createSucceeded', locale))
+          onNotice?.('success', text, { ticket })
           onClose()
         }}
       />

@@ -25,6 +25,16 @@ export type ChannelConfig = {
   service_hours_id: number | null
   offline_title: string
   offline_message: string
+  open_agent_enabled: boolean
+  open_agent_agent_id: number | null
+  open_agent_agent_name: string | null
+  open_agent_bot_strategy: 'always' | 'service_hours'
+  open_agent_bot_service_hours_id: number | null
+  open_agent_input_placeholder: string | null
+  open_agent_handoff_enabled: boolean
+  open_agent_handoff_label: string
+  open_agent_handoff_after_messages: number
+  open_agent_handoff_behavior: 'confirm' | 'auto'
 }
 
 export type ChannelAvailability = {

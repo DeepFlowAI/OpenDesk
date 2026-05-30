@@ -42,6 +42,7 @@ import { formatDatetimeForDisplay } from '@/lib/datetime-display'
 // ── localStorage helpers for column config persistence ──
 
 const COL_STORAGE_PREFIX = 'ws_user_cols_'
+const PER_PAGE_OPTIONS = [20, 50, 100]
 
 function getColStorageKey(viewId: number | null): string {
   return `${COL_STORAGE_PREFIX}${viewId ?? 'default'}`
@@ -125,7 +126,7 @@ export default function WorkspaceUsersPage() {
 
   // Pagination
   const [page, setPage] = useState(1)
-  const perPage = 20
+  const [perPage, setPerPage] = useState(20)
 
   // Search
   const [search, setSearch] = useState('')
@@ -612,29 +613,53 @@ export default function WorkspaceUsersPage() {
           <>
             <div className="mx-5 h-px shrink-0 bg-border" aria-hidden />
             <div className="flex items-center justify-between px-5 py-3">
-            <span className="text-xs text-muted-foreground">
-              {locale === 'zh' ? `共 ${total} 条` : `${total} total`}
-            </span>
-            <div className="flex items-center gap-1.5">
-              <button
-                disabled={page <= 1}
-                onClick={() => setPage(page - 1)}
-                className="h-8 rounded-md border border-border px-3 text-xs text-foreground/80 transition-colors hover:bg-accent disabled:opacity-40"
-              >
-                {locale === 'zh' ? '上一页' : 'Prev'}
-              </button>
               <span className="text-xs text-muted-foreground">
-                {page} / {totalPages}
+                {locale === 'zh' ? `共 ${total} 条` : `${total} total`}
               </span>
-              <button
-                disabled={page >= totalPages}
-                onClick={() => setPage(page + 1)}
-                className="h-8 rounded-md border border-border px-3 text-xs text-foreground/80 transition-colors hover:bg-accent disabled:opacity-40"
-              >
-                {locale === 'zh' ? '下一页' : 'Next'}
-              </button>
+              <div className="flex items-center gap-2">
+                <select
+                  value={perPage}
+                  onChange={(e) => {
+                    setPage(1)
+                    setPerPage(Number(e.target.value))
+                  }}
+                  className="h-8 rounded-md border border-border bg-background px-2 text-xs outline-none"
+                >
+                  {PER_PAGE_OPTIONS.map((n) => (
+                    <option key={n} value={n}>{n} / page</option>
+                  ))}
+                </select>
+                <div className="flex gap-1">
+                  {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
+                    let pageNum: number
+                    if (totalPages <= 7) {
+                      pageNum = i + 1
+                    } else if (page <= 4) {
+                      pageNum = i + 1
+                    } else if (page >= totalPages - 3) {
+                      pageNum = totalPages - 6 + i
+                    } else {
+                      pageNum = page - 3 + i
+                    }
+                    return (
+                      <button
+                        key={pageNum}
+                        type="button"
+                        onClick={() => setPage(pageNum)}
+                        className={cn(
+                          'flex h-8 min-w-8 items-center justify-center rounded-md px-2 text-xs transition-colors',
+                          page === pageNum
+                            ? 'bg-primary text-primary-foreground'
+                            : 'border border-border text-foreground hover:bg-accent',
+                        )}
+                      >
+                        {pageNum}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
             </div>
-          </div>
           </>
         )}
       </div>

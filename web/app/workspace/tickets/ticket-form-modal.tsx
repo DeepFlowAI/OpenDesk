@@ -9,7 +9,7 @@ import { useUnifiedFields } from '@/service/use-field-definitions'
 import type { FdFormLayoutTab, FdFormLayoutSection, FdFormLayoutField } from '@/models/form-layout'
 import type { FdInteractionRule, InteractionRuleCondition } from '@/models/interaction-rule'
 import type { UnifiedField } from '@/models/field-definition'
-import type { CustomFieldValue } from '@/models/ticket'
+import type { CustomFieldValue, Ticket } from '@/models/ticket'
 import { FieldType } from '@/types/field-enums'
 import {
   FieldValueEditor,
@@ -30,7 +30,7 @@ type FieldState = 'hidden' | 'required' | 'optional' | 'readonly'
 
 type Props = {
   onClose: () => void
-  onSuccess: () => void
+  onSuccess: (ticket: Ticket) => void
 }
 
 type TicketCreateFormProps = {
@@ -45,7 +45,7 @@ type TicketCreateFormProps = {
   submittingLabel?: string
   cancelLabel?: string
   onCancel: () => void
-  onSuccess: () => void
+  onSuccess: (ticket: Ticket) => void
   onError?: () => void
   onValuesChange?: (values: Record<string, unknown>) => void
 }
@@ -70,8 +70,8 @@ export function TicketFormModal({ onClose, onSuccess }: Props) {
         </DialogHeader>
         <TicketCreateForm
           onCancel={onClose}
-          onSuccess={() => {
-            onSuccess()
+          onSuccess={(ticket) => {
+            onSuccess(ticket)
             onClose()
           }}
           bodyClassName="px-6 py-4"
@@ -225,7 +225,7 @@ export function TicketCreateForm({
   }, [tabs, rules, formValues, getFieldKey])
 
   const allowedFormKeys = useMemo(() => {
-    const keys = new Set(['title', 'description', 'status', 'priority', 'conversation_id', 'user_id', 'agent_id', 'assignee_group_id'])
+    const keys = new Set(['title', 'description', 'status', 'priority', 'conversation_id', 'call_record_id', 'user_id', 'agent_id', 'assignee_group_id'])
     for (const tab of tabs) {
       for (const section of (tab.sections ?? [])) {
         for (const field of (section.fields ?? [])) {
@@ -241,7 +241,7 @@ export function TicketCreateForm({
     setSubmitting(true)
 
     try {
-      const systemFields = ['title', 'description', 'status', 'priority', 'conversation_id', 'user_id', 'agent_id', 'assignee_group_id']
+      const systemFields = ['title', 'description', 'status', 'priority', 'conversation_id', 'call_record_id', 'user_id', 'agent_id', 'assignee_group_id']
       const payload: Record<string, unknown> = {}
       const customFields: Record<string, unknown> = {}
 
@@ -266,19 +266,20 @@ export function TicketCreateForm({
         payload.layout_id = layout.id
       }
 
-      await createTicket.mutateAsync({
+      const ticket = await createTicket.mutateAsync({
         title: String(payload.title),
         description: payload.description as string | undefined,
         status: (payload.status as string) || 'open',
         priority: (payload.priority as string) || 'medium',
         layout_id: payload.layout_id as number | undefined,
         conversation_id: payload.conversation_id as number | undefined,
+        call_record_id: payload.call_record_id as number | undefined,
         user_id: payload.user_id as number | undefined,
         agent_id: payload.agent_id as number | undefined,
         assignee_group_id: payload.assignee_group_id as number | undefined,
         custom_fields: customFields as Record<string, CustomFieldValue>,
       })
-      onSuccess()
+      onSuccess(ticket)
     } catch {
       onError?.()
     } finally {

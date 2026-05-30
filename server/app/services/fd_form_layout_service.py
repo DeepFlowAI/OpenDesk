@@ -12,7 +12,7 @@ from app.services.tenant_init_service import init_tenant_data
 RESTRICTED_SOURCES_FOR_NEW_TICKET = {"ticket_metadata", "user", "organization"}
 # Post-create metadata / audit fields — not configurable on the new-ticket layout.
 DISALLOWED_TICKET_KEYS_FOR_NEW_TICKET = frozenset(
-    {"conversation_id", "created_by", "updated_by"},
+    {"conversation_id", "call_record_id", "created_by", "updated_by"},
 )
 REFERENCE_FIELD_SOURCES = {"ticket_metadata", "user", "organization"}
 REFERENCE_FIELD_ALLOWED_STATES = {"readonly", "hidden"}

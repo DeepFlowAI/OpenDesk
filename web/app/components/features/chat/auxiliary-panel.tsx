@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { Conversation } from '@/models/conversation'
+import type { Ticket } from '@/models/ticket'
 import type { UnifiedField } from '@/models/field-definition'
 import type { CustomFieldValue, UpdateUserPayload, User } from '@/models/user'
 import { useUnifiedFields } from '@/service/use-field-definitions'
@@ -48,7 +49,7 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'basic' | 'summary' | 'ticket'>('basic')
   const [summaryDirty, setSummaryDirty] = useState(false)
-  const [ticketNotice, setTicketNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [ticketNotice, setTicketNotice] = useState<{ type: 'success' | 'error'; text: string; ticket?: Ticket } | null>(null)
   const visitorId = conversation?.visitor?.id ?? 0
   const visitorPublicId = conversation?.visitor?.public_id ?? ''
   const visitorDetailRef = visitorPublicId || (visitorId > 0 ? String(visitorId) : '')
@@ -100,18 +101,38 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
     setActiveTab(nextTab)
   }
 
+  const noticeTicketHref = ticketNotice?.type === 'success' && ticketNotice.ticket
+    ? `/workspace/tickets/${ticketNotice.ticket.id}?from=list`
+    : null
+
   return (
     <div className="relative flex w-[300px] shrink-0 flex-col border-l border-[#E5E5E5] bg-[#F5F5F5]">
       {ticketNotice && (
         <div
           className={cn(
-            'absolute left-5 right-5 top-4 z-20 rounded-md border px-3 py-2 text-xs shadow-sm',
+            'absolute left-5 right-5 top-4 z-20 rounded-md border px-3 py-2 text-left text-xs shadow-sm transition-colors',
             ticketNotice.type === 'success'
               ? 'border-green-200 bg-green-50 text-green-700'
               : 'border-destructive/30 bg-destructive/10 text-destructive',
+            noticeTicketHref ? 'cursor-pointer hover:bg-green-100' : 'cursor-default',
           )}
+          role="status"
+          aria-live="polite"
         >
-          {ticketNotice.text}
+          {noticeTicketHref ? (
+            <button
+              type="button"
+              onClick={() => {
+                setTicketNotice(null)
+                router.push(noticeTicketHref)
+              }}
+              className="block w-full cursor-pointer text-left"
+            >
+              {ticketNotice.text}
+            </button>
+          ) : (
+            ticketNotice.text
+          )}
         </div>
       )}
       {conversation ? (
@@ -199,7 +220,7 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
             ) : (
               <ChatTicketDraftPanel
                 conversation={conversation}
-                onNotice={(type, text) => setTicketNotice({ type, text })}
+                onNotice={(type, text, payload) => setTicketNotice({ type, text, ticket: payload?.ticket })}
                 onClose={() => {
                   onCloseTicketDraft?.(conversation.id)
                   setActiveTab('basic')

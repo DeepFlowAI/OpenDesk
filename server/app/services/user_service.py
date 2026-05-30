@@ -294,6 +294,14 @@ class UserService:
         return UserService._enrich_user_response(item, slot_to_key)
 
     @staticmethod
+    async def delete_user(db: AsyncSession, tenant_id: int, user_id: int) -> None:
+        """Delete an existing end user."""
+        item = await UserRepository.get_by_id(db, user_id)
+        if not item or item.tenant_id != tenant_id:
+            raise NotFoundError("User not found")
+        await UserRepository.delete(db, item)
+
+    @staticmethod
     async def query_users(db: AsyncSession, tenant_id: int, req: UserQueryRequest) -> dict:
         """Query users with view-based + temp filters."""
         slot_map = await UserService._get_slot_map(db, tenant_id)

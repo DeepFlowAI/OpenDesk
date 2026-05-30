@@ -1,7 +1,8 @@
 'use client'
 
 import { useState } from 'react'
-import { useRouter } from 'next/navigation'
+import Link from 'next/link'
+import { IconPencil, IconTrash } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { FlowStudioTabs } from '@/app/components/features/flow-studio-tabs'
@@ -49,8 +50,19 @@ function DeleteModal({
   )
 }
 
+function formatDate(iso: string | null): string {
+  if (!iso) return '—'
+  try {
+    return new Date(iso).toLocaleString('zh-CN', {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit',
+    })
+  } catch {
+    return iso
+  }
+}
+
 export default function VoiceFlowsListPage() {
-  const router = useRouter()
   const { locale } = useLocaleStore()
   const [page, setPage] = useState(1)
   const perPage = 20
@@ -91,13 +103,14 @@ export default function VoiceFlowsListPage() {
       <FlowStudioTabs active="voice-flows" />
 
       <div className="flex justify-end">
-        <button
-          type="button"
-          onClick={() => router.push('/flow-studio/voice-flows/new')}
-          className="h-9 rounded-lg bg-primary px-4 text-sm font-medium text-white hover:bg-primary/80"
+        <Link
+          href="/flow-studio/voice-flows/new"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex h-9 items-center rounded-lg bg-primary px-4 text-sm font-medium text-white hover:bg-primary/80"
         >
           {t('vf.new', locale)}
-        </button>
+        </Link>
       </div>
 
       {isLoading ? (
@@ -105,21 +118,24 @@ export default function VoiceFlowsListPage() {
       ) : items.length === 0 ? (
         <div className="flex flex-col items-center justify-center gap-4 py-20">
           <p className="text-sm text-muted-foreground">{t('vf.empty', locale)}</p>
-          <button
-            type="button"
-            onClick={() => router.push('/flow-studio/voice-flows/new')}
-            className="h-9 rounded-lg bg-primary px-4 text-sm font-medium text-white"
+          <Link
+            href="/flow-studio/voice-flows/new"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex h-9 items-center rounded-lg bg-primary px-4 text-sm font-medium text-white"
           >
             {t('vf.new', locale)}
-          </button>
+          </Link>
         </div>
       ) : (
         <>
           <div className="overflow-hidden rounded-lg border border-border">
             <div className="flex h-12 items-center gap-4 border-b border-border bg-muted px-4 text-sm font-semibold text-foreground/80">
               <div className="flex-1">{t('vf.col.name', locale)}</div>
+              <div className="w-[240px] truncate">描述</div>
+              <div className="w-[180px]">最后更新</div>
               <div className="w-24 text-center">{t('vf.col.enabled', locale)}</div>
-              <div className="w-28 text-right">{t('vf.col.actions', locale)}</div>
+              <div className="w-[90px] text-center">{t('vf.col.actions', locale)}</div>
             </div>
             {items.map((row) => (
               <div
@@ -127,23 +143,32 @@ export default function VoiceFlowsListPage() {
                 className="flex h-14 items-center gap-4 border-t border-border px-4 first:border-t-0"
               >
                 <div className="flex-1 truncate text-sm text-foreground">{row.name}</div>
+                <div className="w-[240px] truncate text-sm text-muted-foreground">
+                  {row.description || '—'}
+                </div>
+                <div className="w-[180px] text-sm text-muted-foreground">
+                  {formatDate(row.updated_at)}
+                </div>
                 <div className="w-24 text-center text-sm text-muted-foreground">
                   {row.enabled ? (locale === 'zh' ? '是' : 'Yes') : locale === 'zh' ? '否' : 'No'}
                 </div>
-                <div className="flex w-28 justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => router.push(`/flow-studio/voice-flows/${row.id}`)}
-                    className="text-sm text-foreground/80 hover:text-foreground"
+                <div className="flex w-[90px] items-center justify-center gap-3">
+                  <Link
+                    href={`/flow-studio/voice-flows/${row.id}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-foreground/80 transition-colors hover:text-foreground"
+                    aria-label={t('vf.action.edit', locale)}
                   >
-                    {t('vf.action.edit', locale)}
-                  </button>
+                    <IconPencil size={18} />
+                  </Link>
                   <button
                     type="button"
                     onClick={() => setDeleteTarget(row)}
-                    className="text-sm text-foreground/80 hover:text-red-600"
+                    className="text-foreground/80 transition-colors hover:text-red-600"
+                    aria-label={t('vf.action.delete', locale)}
                   >
-                    {t('vf.action.delete', locale)}
+                    <IconTrash size={18} />
                   </button>
                 </div>
               </div>

@@ -17,6 +17,7 @@ class Ticket(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
         Index("ix_tickets_agent", "agent_id"),
         Index("ix_tickets_assignee_group", "assignee_group_id"),
         Index("ix_tickets_conversation", "conversation_id"),
+        Index("ix_tickets_call_record", "call_record_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -24,6 +25,7 @@ class Ticket(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
     ticket_number: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     layout_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("fd_form_layouts.id", ondelete="SET NULL"), nullable=True)
     conversation_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True)
+    call_record_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("call_records.id", ondelete="SET NULL"), nullable=True)
     user_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     agent_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
     assignee_group_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employee_groups.id", ondelete="SET NULL"), nullable=True)

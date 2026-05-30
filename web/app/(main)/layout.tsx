@@ -10,8 +10,10 @@ import {
   IconMessageCircle,
   IconMessageCircleCog,
   IconGitBranch,
+  IconSitemap,
   IconSettings,
   IconClock,
+  IconPlugConnected,
   IconAddressBook,
   IconBuilding,
   IconBuildingCog,
@@ -19,6 +21,8 @@ import {
   IconLayoutDashboard,
   IconNotes,
   IconListSearch,
+  IconPhone,
+  IconFilePhone,
 } from '@tabler/icons-react'
 import { useAuthStore } from '@/context/auth-store'
 import { UserDropdown } from '@/app/components/features/user-dropdown'
@@ -43,6 +47,14 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { labelKey: 'nav.employees', href: '/employees', icon: IconUser },
       { labelKey: 'nav.employeeGroups', href: '/employee-groups', icon: IconUsers },
+    ],
+  },
+  {
+    labelKey: 'nav.group.callCenter',
+    items: [
+      { labelKey: 'nav.flowStudio', href: '/flow-studio', icon: IconSitemap },
+      { labelKey: 'nav.phoneNumbers', href: '/call-center/phone-numbers', icon: IconPhone },
+      { labelKey: 'nav.callSummary', href: '/call-summary', icon: IconFilePhone },
     ],
   },
   {
@@ -77,8 +89,26 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { labelKey: 'nav.systemSettings', href: '/system-settings', icon: IconSettings },
       { labelKey: 'nav.serviceHours', href: '/service-hours', icon: IconClock },
+      { labelKey: 'nav.openAgent', href: '/open-agent-settings', icon: IconPlugConnected },
     ],
   },
+]
+
+const PREFIX_ROUTES = [
+  '/flow-studio',
+  '/call-center',
+  '/online-service/conversation-settings',
+  '/session-routing',
+  '/channels',
+  '/user-fields',
+  '/organization-fields',
+  '/shared-fields',
+  '/form-layouts',
+  '/session-summary',
+  '/call-summary',
+  '/user-views',
+  '/ticket-views',
+  '/organization-views',
 ]
 
 export default function MainLayout({ children }: { children: React.ReactNode }) {
@@ -130,8 +160,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
                 {t(group.labelKey, locale)}
               </span>
               {group.items.map((item) => {
-                const prefixRoutes = ['/online-service/conversation-settings', '/session-routing', '/channels', '/user-fields', '/organization-fields', '/shared-fields', '/form-layouts', '/session-summary', '/user-views', '/ticket-views', '/organization-views']
-                const active = prefixRoutes.includes(item.href)
+                const active = PREFIX_ROUTES.includes(item.href)
                   ? pathname.startsWith(item.href)
                   : pathname === item.href
                 const Icon = item.icon

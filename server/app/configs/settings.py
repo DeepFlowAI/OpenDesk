@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     # Message Queue
     MESSAGE_QUEUE_PROVIDER: str = Field(default="redis_streams")
 
+    # OpenAgent integration
+    OPEN_AGENT_PROVIDER: str = Field(default="http")
+
     # Realtime Transport
     REALTIME_PROVIDER: str = Field(default="socketio")
     # Socket.IO heartbeat: server pings every PING_INTERVAL seconds; if no pong
@@ -82,6 +85,44 @@ class Settings(BaseSettings):
 
     # Storage / OSS
     STORAGE_PROVIDER: str = Field(default="aliyun_oss")
+
+    # ── Telephony / VoIP (call center) ────────────────────────────────────
+    # Provider that drives the call-center media plane. "mock" is the safe
+    # in-process default for OSS builds — it records RPC calls without
+    # touching any external service. Switch to "flowkit" once you have a
+    # FlowKit kernel reachable and set TELEPHONY_WS_URL in your env file.
+    TELEPHONY_PROVIDER: str = Field(default="mock")
+    # WebSocket URL to the FlowKit kernel. MUST be supplied via env when
+    # TELEPHONY_PROVIDER=flowkit; we deliberately do not bake in a default
+    # so OSS builds never accidentally connect to an upstream address.
+    TELEPHONY_WS_URL: str = Field(default="")
+    TELEPHONY_SDK_NAME: str = Field(default="opendesk-cc")
+    TELEPHONY_SDK_VERSION: str = Field(default="1.0.0")
+    TELEPHONY_RPC_TIMEOUT: float = Field(default=30.0)
+
+    # Call center orchestrator startup. Default OFF so OSS deployments without
+    # a FlowKit kernel boot cleanly; flip to true once telephony is configured.
+    CALL_CENTER_ENABLED: bool = Field(default=False)
+    # Tenant slug that owns inbound SIP calls (matched against
+    # `tenants.tenant_id`). Empty falls back to DEFAULT_TENANT_ID, then to the
+    # first tenant in DB. Multi-tenant deployments should switch to DID-based
+    # routing instead.
+    CALL_CENTER_DEFAULT_TENANT_SLUG: str = Field(default="")
+
+    # ── FlowKit Telecom Catalog (multi-trunk) ─────────────────────────────
+    # Optional: when set, OpenDesk acts as a "Provider" pushing its SipTrunk
+    # table to FlowKit's Catalog. When empty, FlowKit falls back to its
+    # static `system` Provider (single-trunk env). Multi-trunk deployments
+    # MUST set both URL and key. Provider ID identifies this OpenDesk
+    # instance to FlowKit and is the {id} in /registrars/{id}/snapshot.
+    FLOWKIT_TELECOM_API_URL: str = Field(default="")
+    FLOWKIT_TELECOM_API_KEY: str = Field(default="")
+    FLOWKIT_TELECOM_PROVIDER_ID: str = Field(default="opendesk")
+    # Lease (seconds). Heartbeat interval is lease/3, clamped to [10, 60].
+    FLOWKIT_TELECOM_LEASE_SEC: int = Field(default=90)
+    # Grace window after lease expiry where inbound stays accepted (covers
+    # OpenDesk restarts). 0 = old behavior (instant drop on heartbeat stop).
+    FLOWKIT_TELECOM_STALE_ACCEPTABLE_SEC: int = Field(default=30)
     OSS_ACCESS_KEY: str = Field(default="")
     OSS_SECRET_KEY: str = Field(default="")
     OSS_ADDR: str = Field(default="", description="Public access URL prefix, e.g. https://bucket.oss-cn-beijing.aliyuncs.com")

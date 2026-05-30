@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models.conversation import Conversation
+from app.models.call_record import CallRecord
 from app.models.ticket import Ticket
 from app.models.ticket_view import TicketView
 from app.models.fd_field_definition import FdFieldDefinition
@@ -40,7 +41,8 @@ SYSTEM_FIELD_LABELS: dict[str, str] = {
     "status": "状态",
     "priority": "优先级",
     "user_id": "关联用户",
-    "conversation_id": "关联会话",
+    "conversation_id": "关联会话/通话",
+    "call_record_id": "关联通话",
     "agent_id": "负责人",
     "assignee_group_id": "负责组",
     "layout_id": "布局",
@@ -65,6 +67,12 @@ class TicketService:
         conversation = await ConversationRepository.get_by_id(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
+
+    @staticmethod
+    async def _validate_call_record(db: AsyncSession, tenant_id: int, call_record_id: int) -> None:
+        call_record = await db.get(CallRecord, call_record_id)
+        if not call_record or call_record.tenant_id != tenant_id:
+            raise NotFoundError("Call record not found")
 
     @staticmethod
     async def _validate_assignee_values(
@@ -375,15 +383,35 @@ class TicketService:
         return {row.id: row.public_id for row in result.all()}
 
     @staticmethod
+    async def _get_call_record_call_id_map(
+        db: AsyncSession,
+        tenant_id: int,
+        call_record_ids: list[int],
+    ) -> dict[int, str]:
+        ids = sorted(set(call_record_ids))
+        if not ids:
+            return {}
+        result = await db.execute(
+            select(CallRecord.id, CallRecord.call_id)
+            .where(CallRecord.tenant_id == tenant_id)
+            .where(CallRecord.id.in_(ids))
+        )
+        return {row.id: row.call_id for row in result.all()}
+
+    @staticmethod
     def _enrich_response(
         ticket: Ticket,
         slot_to_key: dict[str, str],
         conversation_public_ids: dict[int, str] | None = None,
+        call_record_call_ids: dict[int, str] | None = None,
     ) -> dict:
         resp = TicketResponse.model_validate(ticket).model_dump()
         conversation_id = getattr(ticket, "conversation_id", None)
         if conversation_id is not None:
             resp["conversation_public_id"] = (conversation_public_ids or {}).get(conversation_id)
+        call_record_id = getattr(ticket, "call_record_id", None)
+        if call_record_id is not None:
+            resp["call_record_call_id"] = (call_record_call_ids or {}).get(call_record_id)
         custom_fields: dict[str, object] = {}
         for slot_col, field_key in slot_to_key.items():
             val = getattr(ticket, slot_col, None)
@@ -403,7 +431,12 @@ class TicketService:
             tenant_id,
             [item.conversation_id] if item.conversation_id is not None else [],
         )
-        return TicketService._enrich_response(item, slot_to_key, conversation_public_ids)
+        call_record_call_ids = await TicketService._get_call_record_call_id_map(
+            db,
+            tenant_id,
+            [item.call_record_id] if item.call_record_id is not None else [],
+        )
+        return TicketService._enrich_response(item, slot_to_key, conversation_public_ids, call_record_call_ids)
 
     @staticmethod
     async def create_ticket(
@@ -427,6 +460,7 @@ class TicketService:
             "priority",
             "layout_id",
             "conversation_id",
+            "call_record_id",
             "user_id",
             "agent_id",
             "assignee_group_id",
@@ -435,6 +469,8 @@ class TicketService:
             if val is not None:
                 if field == "conversation_id":
                     await TicketService._validate_conversation(db, tenant_id, val)
+                if field == "call_record_id":
+                    await TicketService._validate_call_record(db, tenant_id, val)
                 model_data[field] = val
                 created_field_keys.append(field)
 
@@ -491,7 +527,13 @@ class TicketService:
             tenant_id,
             [conversation_id] if conversation_id is not None else [],
         )
-        return TicketService._enrich_response(ticket, slot_to_key, conversation_public_ids)
+        call_record_id = getattr(ticket, "call_record_id", None)
+        call_record_call_ids = await TicketService._get_call_record_call_id_map(
+            db,
+            tenant_id,
+            [call_record_id] if call_record_id is not None else [],
+        )
+        return TicketService._enrich_response(ticket, slot_to_key, conversation_public_ids, call_record_call_ids)
 
     @staticmethod
     async def update_ticket(
@@ -508,11 +550,13 @@ class TicketService:
         update_data: dict = {}
         field_labels: dict[str, str] = dict(SYSTEM_FIELD_LABELS)
         explicit_fields = set(data.model_fields_set)
-        for field in ("title", "description", "status", "priority", "conversation_id", "user_id"):
+        for field in ("title", "description", "status", "priority", "conversation_id", "call_record_id", "user_id"):
             val = getattr(data, field, None)
             if val is not None:
                 if field == "conversation_id":
                     await TicketService._validate_conversation(db, tenant_id, val)
+                if field == "call_record_id":
+                    await TicketService._validate_call_record(db, tenant_id, val)
                 update_data[field] = val
 
         for field in ("agent_id", "assignee_group_id"):
@@ -572,7 +616,12 @@ class TicketService:
             tenant_id,
             [item.conversation_id] if item.conversation_id is not None else [],
         )
-        return TicketService._enrich_response(item, slot_to_key, conversation_public_ids)
+        call_record_call_ids = await TicketService._get_call_record_call_id_map(
+            db,
+            tenant_id,
+            [item.call_record_id] if item.call_record_id is not None else [],
+        )
+        return TicketService._enrich_response(item, slot_to_key, conversation_public_ids, call_record_call_ids)
 
     @staticmethod
     async def delete_ticket(db: AsyncSession, tenant_id: int, ticket_id: int) -> None:
@@ -622,7 +671,15 @@ class TicketService:
             tenant_id,
             [t.conversation_id for t in items if t.conversation_id is not None],
         )
-        enriched = [TicketService._enrich_response(t, slot_to_key, conversation_public_ids) for t in items]
+        call_record_call_ids = await TicketService._get_call_record_call_id_map(
+            db,
+            tenant_id,
+            [t.call_record_id for t in items if t.call_record_id is not None],
+        )
+        enriched = [
+            TicketService._enrich_response(t, slot_to_key, conversation_public_ids, call_record_call_ids)
+            for t in items
+        ]
         pages = (total + req.per_page - 1) // req.per_page if req.per_page > 0 else 0
         return {
             "items": enriched,

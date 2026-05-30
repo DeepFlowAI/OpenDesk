@@ -10,6 +10,13 @@ import { useVisitorChatStore } from '@/context/visitor-chat-store'
 import { ChatHeader } from '@/app/components/features/visitor-chat/chat-header'
 import { MessageBubble } from '@/app/components/features/visitor-chat/message-bubble'
 import { SystemMessage } from '@/app/components/features/visitor-chat/system-message'
+import {
+  HumanHandoffEventMessage,
+  collectConfirmedHandoffToolCallIds,
+  isOpenAgentHandoffEventMessage,
+  resolveHandoffConfirmCardState,
+  resolveHandoffEventType,
+} from '@/app/components/features/visitor-chat/human-handoff-event-message'
 import { WelcomeMessage } from '@/app/components/features/visitor-chat/welcome-message'
 import { TypingIndicator } from '@/app/components/features/visitor-chat/typing-indicator'
 import { VisitorComposer } from './visitor-composer'
@@ -65,12 +72,24 @@ function toOriginalMessage(
   message: MessageState,
   meta: VisitorMessageMeta | undefined,
 ): Message {
-  const firstPart = message.content?.[0]
-  let content = ''
-  if (firstPart) {
-    if ('text' in firstPart) content = firstPart.text as string
-    else if ('image' in firstPart) content = firstPart.image as string
-  }
+  const content = message.content
+    ?.map((part) => {
+      if (part.type === 'text' && 'text' in part) return part.text as string
+      if (part.type === 'image' && 'image' in part) return part.image as string
+      return ''
+    })
+    .join('') || ''
+
+  const metadata: Record<string, unknown> = { ...(meta?.metadata || {}) }
+  if (meta?.streaming) metadata.streaming = true
+  if (meta?.eventType) metadata.event_type = meta.eventType
+  if (meta?.handoffPayload) metadata.handoff_payload = meta.handoffPayload
+  const thinkingBlocks = meta?.openAgentThinkingBlocks || []
+  if (thinkingBlocks.length > 0) metadata.open_agent_thinking_blocks = thinkingBlocks
+  const toolBlocks = meta?.openAgentToolBlocks || []
+  if (toolBlocks.length > 0) metadata.open_agent_tool_blocks = toolBlocks
+  const textBlocks = meta?.openAgentTextBlocks || []
+  if (textBlocks.length > 0) metadata.open_agent_text_blocks = textBlocks
 
   return {
     id: Number(message.id) || 0,
@@ -82,6 +101,7 @@ function toOriginalMessage(
     sender_avatar: meta?.senderAvatar ?? null,
     content_type: (meta?.contentType || 'text') as Message['content_type'],
     content,
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
     created_at: message.createdAt?.toISOString() || new Date().toISOString(),
   }
 }
@@ -147,11 +167,22 @@ function HistoryConversationBlock({
       {conversation.messages.map((msg, idx) => {
         const prev = idx > 0 ? conversation.messages[idx - 1] : null
         const next = idx < conversation.messages.length - 1 ? conversation.messages[idx + 1] : null
-        const showAvatar = msg.sender_type === 'agent'
+        const showAvatar = msg.sender_type === 'agent' || msg.sender_type === 'bot'
           ? config.use_agent_avatar === true
           : shouldShowAvatar(msg, next)
 
         if (msg.sender_type === 'system') {
+          if (isOpenAgentHandoffEventMessage(msg)) {
+            return (
+              <HumanHandoffEventMessage
+                key={msg.id}
+                content={msg.content}
+                config={config}
+                locale={locale}
+                handoffEventType={resolveHandoffEventType(msg.metadata)}
+              />
+            )
+          }
           return msg.content_type === 'welcome' ? (
             <WelcomeMessage
               key={msg.id}
@@ -218,6 +249,8 @@ export function VisitorThread({
     historyError,
     historyLimitReached,
     initializing,
+    botMode,
+    pendingHumanHandoff,
     satisfactionCanInitiate,
     satisfactionLoading,
     conversationPublicId,
@@ -225,12 +258,20 @@ export function VisitorThread({
     onLoadMore,
     onLoadHistory,
     onRestartConversation,
+    onRequestHumanHandoff,
+    onDismissHumanHandoff,
     onSatisfactionInitiate,
     onSatisfactionSubmitted,
   } = useVisitorChatConfig()
   const agentTyping = useVisitorChatStore((s) => s.agentTyping)
   const msgCount = useVisitorChatStore((s) => s.messages.length)
   const messages = useVisitorChatStore((s) => s.messages)
+  const dismissedHandoffToolCallIds = useVisitorChatStore((s) => s.dismissedHandoffToolCallIds)
+  const confirmingHandoffToolCallIds = useVisitorChatStore((s) => s.confirmingHandoffToolCallIds)
+  const confirmedHandoffToolCallIds = useMemo(
+    () => collectConfirmedHandoffToolCallIds(messages),
+    [messages],
+  )
   const activeAgent = useVisitorChatStore((s) => s.activeAgent)
   const satisfactionInvitation = useVisitorChatStore((s) => s.satisfactionInvitation)
   const setSatisfactionInvitation = useVisitorChatStore((s) => s.setSatisfactionInvitation)
@@ -245,6 +286,7 @@ export function VisitorThread({
   const defaultWelcomeMessage =
     locale === 'zh' ? '您好，有什么可以帮您？' : 'Hi, how can we help?'
   const welcomeMessage = channel.welcome_message?.content || ''
+  const initialWelcomeMessage = welcomeMessage || (botMode ? '' : defaultWelcomeMessage)
   const hasConversationMessages = messages.some(
     (msg) =>
       msg.sender_type !== 'system'
@@ -278,7 +320,7 @@ export function VisitorThread({
   const showFloatingInvitation =
     satisfactionInvitation && (ended || satisfactionInvitation.invitation_source !== 'visitor')
   const showComposerSatisfactionButton =
-    satisfactionCanInitiate || satisfactionInvitation?.invitation_source === 'visitor'
+    !botMode && (satisfactionCanInitiate || satisfactionInvitation?.invitation_source === 'visitor')
 
   const handleComposerSatisfactionClick = useCallback(() => {
     if (satisfactionInvitation) {
@@ -435,10 +477,10 @@ export function VisitorThread({
         ) : (
           <>
             {/* ── Initial welcome ── */}
-            {!hasConversationMessages && !hasWelcomeMessage && !loadingMore && (
+            {initialWelcomeMessage && !hasConversationMessages && !hasWelcomeMessage && !loadingMore && (
               <div className={msgCount === 0 ? 'py-2' : 'py-1'}>
                 <WelcomeMessage
-                  content={welcomeMessage || defaultWelcomeMessage}
+                  content={initialWelcomeMessage}
                   config={config}
                   showAvatar={config.use_agent_avatar === true}
                 />
@@ -484,7 +526,38 @@ export function VisitorThread({
                           showAvatar={config.use_agent_avatar === true}
                         />
                       ) : message.role === 'system' ? (
-                        <SystemMessage content={original.content} />
+                        isOpenAgentHandoffEventMessage(original) ? (
+                          (() => {
+                            const confirmCardState = resolveHandoffConfirmCardState(
+                              original,
+                              pendingHumanHandoff,
+                              dismissedHandoffToolCallIds,
+                              confirmingHandoffToolCallIds,
+                              confirmedHandoffToolCallIds,
+                            )
+                            return (
+                              <HumanHandoffEventMessage
+                                content={original.content}
+                                config={config}
+                                locale={locale}
+                                handoffEventType={resolveHandoffEventType(original.metadata)}
+                                confirmCardState={confirmCardState}
+                                onConfirmHandoff={
+                                  confirmCardState === 'active' && pendingHumanHandoff
+                                    ? () => void onRequestHumanHandoff(pendingHumanHandoff.payload)
+                                    : undefined
+                                }
+                                onDismissHandoff={
+                                  confirmCardState === 'active'
+                                    ? onDismissHumanHandoff
+                                    : undefined
+                                }
+                              />
+                            )
+                          })()
+                        ) : (
+                          <SystemMessage content={original.content} />
+                        )
                       ) : (
                         <MessageBubble
                           message={original}
@@ -494,6 +567,7 @@ export function VisitorThread({
                           locale={locale}
                           messageStatus={meta?.messageStatus}
                           showTime={false}
+                          renderAssistantParts
                         />
                       )}
                     </div>
@@ -503,7 +577,7 @@ export function VisitorThread({
             )}
 
             {/* ── Typing indicator ── */}
-            {agentTyping && (
+            {agentTyping && !botMode && (
               <TypingIndicator
                 agentBubbleBg={config.agent_bubble_bg_color || undefined}
                 agentBubbleTextColor={config.agent_bubble_text_color || undefined}
@@ -572,7 +646,7 @@ export function VisitorThread({
             onRestartConversation={onRestartConversation}
           />
         ) : (
-          <VisitorComposer
+              <VisitorComposer
             disabled={false}
             isMobile={isMobile}
             isEmbed={isEmbed}

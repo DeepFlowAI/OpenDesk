@@ -18,12 +18,14 @@ from app.core.security import (
     verify_visitor_identity_secret,
 )
 from app.repositories.channel_repository import ChannelRepository
+from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.service_hours_repository import ServiceHoursRepository
 from app.models.service_hours import ServiceHours
 from app.schemas.channel import ChannelCreate, ChannelUpdate
 from app.schemas.channel import ChannelConfig, DEFAULT_OFFLINE_MESSAGE, DEFAULT_OFFLINE_TITLE
 from app.schemas.visitor_session import VisitorSessionRequest
 from app.services.agent_status_service import AgentStatusService
+from app.services.open_agent_settings_service import OpenAgentSettingsService
 
 CHANNEL_KEY_RE = re.compile(r"^ch_[A-Za-z0-9_-]{24,}$")
 VISITOR_EXTERNAL_ID_PREFIX = "v_"
@@ -104,21 +106,72 @@ class ChannelService:
         payload = config.model_dump()
         payload["offline_title"] = (payload.get("offline_title") or DEFAULT_OFFLINE_TITLE).strip()
         payload["offline_message"] = payload.get("offline_message") or DEFAULT_OFFLINE_MESSAGE
+        payload["open_agent_input_placeholder"] = (
+            payload.get("open_agent_input_placeholder") or None
+        )
+        payload["open_agent_handoff_label"] = (
+            payload.get("open_agent_handoff_label") or "转人工"
+        ).strip()
 
         if not payload.get("service_hours_enabled"):
             payload["service_hours_enabled"] = False
             payload["service_hours_id"] = None
-            return payload
+        else:
+            await ChannelService._ensure_service_hours(
+                db,
+                tenant_id,
+                payload.get("service_hours_id"),
+                "Service hours is required when enabled",
+            )
 
-        service_hours_id = payload.get("service_hours_id")
+        if payload.get("open_agent_enabled"):
+            await ChannelService._normalize_open_agent_config(db, tenant_id, payload)
+        elif payload.get("open_agent_bot_strategy") != "service_hours":
+            payload["open_agent_bot_service_hours_id"] = None
+
+        return payload
+
+    @staticmethod
+    async def _ensure_service_hours(
+        db: AsyncSession,
+        tenant_id: int,
+        service_hours_id: int | None,
+        required_message: str,
+    ) -> ServiceHours:
         if not service_hours_id:
-            raise ValidationError("Service hours is required when enabled")
+            raise ValidationError(required_message)
 
         service_hours = await ServiceHoursRepository.get_by_id(db, int(service_hours_id))
         if not service_hours or service_hours.tenant_id != tenant_id:
             raise ValidationError("Service hours not found for current tenant")
 
-        return payload
+        return service_hours
+
+    @staticmethod
+    async def _normalize_open_agent_config(
+        db: AsyncSession,
+        tenant_id: int,
+        payload: dict,
+    ) -> None:
+        agent_id = payload.get("open_agent_agent_id")
+        if not agent_id:
+            raise ValidationError("OpenAgent agent is required when bot is enabled")
+
+        if payload.get("open_agent_bot_strategy") == "service_hours":
+            await ChannelService._ensure_service_hours(
+                db,
+                tenant_id,
+                payload.get("open_agent_bot_service_hours_id"),
+                "OpenAgent bot service hours is required for service-hours strategy",
+            )
+        else:
+            payload["open_agent_bot_service_hours_id"] = None
+
+        agents = await OpenAgentSettingsService.list_active_agents(db, tenant_id)
+        selected_agent = next((item for item in agents.items if item.id == int(agent_id)), None)
+        if not selected_agent:
+            raise ValidationError("OpenAgent agent is not active or unavailable")
+        payload["open_agent_agent_name"] = payload.get("open_agent_agent_name") or selected_agent.name
 
     @staticmethod
     async def list_by_tenant(db: AsyncSession, tenant_id: int):
@@ -193,12 +246,34 @@ class ChannelService:
             raise NotFoundError("Channel not found")
 
         config = ChannelConfig.model_validate(item.config or {})
+        if config.open_agent_enabled:
+            return await ChannelService.check_open_agent_bot_availability(db, item, config)
+
+        return await ChannelService.check_human_availability(db, r, item, config)
+
+    @staticmethod
+    async def check_open_agent_bot_availability(
+        db: AsyncSession,
+        item,
+        config: ChannelConfig,
+    ) -> dict:
+        """Check whether the OpenAgent bot can receive the visitor first."""
         offline_title = config.offline_title or DEFAULT_OFFLINE_TITLE
         offline_message = config.offline_message or DEFAULT_OFFLINE_MESSAGE
         checked_at = datetime.now(timezone.utc)
 
-        if config.service_hours_enabled:
-            if not config.service_hours_id:
+        credentials = await OpenAgentSettingsService.get_credentials(db, item.tenant_id)
+        if not credentials or not credentials[1] or not config.open_agent_agent_id:
+            return {
+                "can_start_conversation": False,
+                "reason": "no_available_agent",
+                "offline_title": offline_title,
+                "offline_message": offline_message,
+                "checked_at": checked_at,
+            }
+
+        if config.open_agent_bot_strategy == "service_hours":
+            if not config.open_agent_bot_service_hours_id:
                 return {
                     "can_start_conversation": False,
                     "reason": "outside_service_hours",
@@ -206,7 +281,7 @@ class ChannelService:
                     "offline_message": offline_message,
                     "checked_at": checked_at,
                 }
-            service_hours = await ServiceHoursRepository.get_by_id(db, config.service_hours_id)
+            service_hours = await ServiceHoursRepository.get_by_id(db, config.open_agent_bot_service_hours_id)
             if (
                 not service_hours
                 or service_hours.tenant_id != item.tenant_id
@@ -219,6 +294,31 @@ class ChannelService:
                     "offline_message": offline_message,
                     "checked_at": checked_at,
                 }
+
+        return {
+            "can_start_conversation": True,
+            "reason": "available",
+            "offline_title": offline_title,
+            "offline_message": offline_message,
+            "checked_at": checked_at,
+        }
+
+    @staticmethod
+    async def check_human_availability(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        item,
+        config: ChannelConfig | None = None,
+    ) -> dict:
+        """Check whether a human agent can receive a visitor conversation."""
+        config = config or ChannelConfig.model_validate(item.config or {})
+        gate = await ChannelService.check_human_service_gate(db, item, config)
+        if not gate["can_start_conversation"]:
+            return gate
+
+        offline_title = gate["offline_title"]
+        offline_message = gate["offline_message"]
+        checked_at = gate["checked_at"]
 
         # Lazy import to avoid circular dependency with routing_service
         from app.services.routing_service import RoutingService
@@ -256,6 +356,169 @@ class ChannelService:
         }
 
     @staticmethod
+    async def check_human_service_gate(
+        db: AsyncSession,
+        item,
+        config: ChannelConfig,
+    ) -> dict:
+        """Check human service-hours gate without resolving a target agent."""
+        offline_title = config.offline_title or DEFAULT_OFFLINE_TITLE
+        offline_message = config.offline_message or DEFAULT_OFFLINE_MESSAGE
+        checked_at = datetime.now(timezone.utc)
+
+        if config.service_hours_enabled:
+            if not config.service_hours_id:
+                return {
+                    "can_start_conversation": False,
+                    "reason": "outside_service_hours",
+                    "offline_title": offline_title,
+                    "offline_message": offline_message,
+                    "checked_at": checked_at,
+                }
+            service_hours = await ServiceHoursRepository.get_by_id(db, config.service_hours_id)
+            if (
+                not service_hours
+                or service_hours.tenant_id != item.tenant_id
+                or not ChannelService.is_within_service_hours(service_hours, checked_at)
+            ):
+                return {
+                    "can_start_conversation": False,
+                    "reason": "outside_service_hours",
+                    "offline_title": offline_title,
+                    "offline_message": offline_message,
+                    "checked_at": checked_at,
+                }
+
+        return {
+            "can_start_conversation": True,
+            "reason": "available",
+            "offline_title": offline_title,
+            "offline_message": offline_message,
+            "checked_at": checked_at,
+        }
+
+    @staticmethod
+    async def _agent_can_receive(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        tenant_id: int,
+        agent_id: int,
+    ) -> tuple[bool, int]:
+        employee = await EmployeeRepository.get_by_id(db, agent_id)
+        if (
+            not employee
+            or employee.tenant_id != tenant_id
+            or not employee.is_active
+            or "agent" not in (employee.roles or [])
+        ):
+            return False, 10
+
+        max_concurrent = employee.max_concurrent or 10
+        status_data = await AgentStatusService.get_status(r, tenant_id, agent_id, max_concurrent)
+        can_receive = (
+            status_data["status"] == "online"
+            and status_data["current_count"] < status_data["max_concurrent"]
+        )
+        return can_receive, max_concurrent
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    async def resolve_human_handoff_target(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        channel_id: int,
+        handoff_payload: dict | None = None,
+    ) -> dict:
+        """Resolve the human target for a bot-to-human handoff."""
+        item = await ChannelRepository.get_by_id(db, channel_id)
+        if not item:
+            raise NotFoundError("Channel not found")
+
+        config = ChannelConfig.model_validate(item.config or {})
+        availability = await ChannelService.check_human_service_gate(db, item, config)
+        if not availability["can_start_conversation"]:
+            return {**availability, "agent_id": None, "group_id": None}
+
+        handoff = handoff_payload.get("handoff") if isinstance(handoff_payload, dict) else None
+        handoff = handoff if isinstance(handoff, dict) else {}
+        requested_agent_id = ChannelService._safe_int(handoff.get("agent_id"))
+        requested_group_id = ChannelService._safe_int(handoff.get("agent_group_id"))
+
+        if requested_agent_id is not None:
+            can_receive, _ = await ChannelService._agent_can_receive(
+                db, r, item.tenant_id, requested_agent_id
+            )
+            if can_receive:
+                return {**availability, "agent_id": requested_agent_id, "group_id": requested_group_id}
+            if requested_group_id is None:
+                return {
+                    **availability,
+                    "can_start_conversation": False,
+                    "reason": "no_available_agent",
+                    "agent_id": None,
+                    "group_id": None,
+                }
+
+        if requested_group_id is not None:
+            from app.repositories.employee_group_repository import EmployeeGroupRepository
+
+            group = await EmployeeGroupRepository.get_by_id(db, requested_group_id)
+            if not group or group.tenant_id != item.tenant_id:
+                return {
+                    **availability,
+                    "can_start_conversation": False,
+                    "reason": "no_available_agent",
+                    "agent_id": None,
+                    "group_id": None,
+                }
+            member_ids = [
+                member.employee_id
+                for member in group.members
+                if member.employee and member.employee.is_active
+            ]
+            max_concurrent_map = {
+                member.employee_id: member.employee.max_concurrent
+                for member in group.members
+                if member.employee and member.employee.is_active
+            }
+            agent_id = await AgentStatusService.find_available_agent(
+                r, item.tenant_id, member_ids, max_concurrent_map
+            )
+            if agent_id:
+                return {**availability, "agent_id": agent_id, "group_id": requested_group_id}
+            return {
+                **availability,
+                "can_start_conversation": False,
+                "reason": "no_available_agent",
+                "agent_id": None,
+                "group_id": requested_group_id,
+            }
+
+        from app.services.routing_service import RoutingService
+
+        group_id, group_member_ids, max_concurrent_map = await RoutingService.route_conversation(
+            db, item.tenant_id, item.id
+        )
+        agent_id = await AgentStatusService.find_available_agent(
+            r, item.tenant_id, group_member_ids, max_concurrent_map
+        )
+        if not agent_id:
+            return {
+                **availability,
+                "can_start_conversation": False,
+                "reason": "no_available_agent",
+                "agent_id": None,
+                "group_id": group_id,
+            }
+        return {**availability, "agent_id": agent_id, "group_id": group_id}
+
+    @staticmethod
     async def get_public_config_with_availability(
         db: AsyncSession,
         r: aioredis.Redis,
@@ -279,7 +542,9 @@ class ChannelService:
                 current_conversation_id=current_conversation_id,
             )
         from app.services.welcome_message_rule_service import WelcomeMessageRuleService
-        welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
+        welcome_message = None
+        if not config.get("open_agent_enabled"):
+            welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
         return {
             "id": item.id,
             "tenant_id": item.tenant_id,
@@ -317,7 +582,9 @@ class ChannelService:
                 current_conversation_public_id=current_conversation_public_id,
             )
         from app.services.welcome_message_rule_service import WelcomeMessageRuleService
-        welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
+        welcome_message = None
+        if not config.get("open_agent_enabled"):
+            welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
         return {
             "channel_key": item.channel_key,
             "name": item.name,

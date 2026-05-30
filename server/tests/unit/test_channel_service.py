@@ -10,7 +10,13 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.core.exceptions import UnauthorizedError, ValidationError
 from app.core.security import create_visitor_session_token, decode_access_token
-from app.schemas.channel import ChannelConfig, DEFAULT_OFFLINE_MESSAGE, DEFAULT_OFFLINE_TITLE
+from app.schemas.channel import (
+    ChannelConfig,
+    DEFAULT_OFFLINE_MESSAGE,
+    DEFAULT_OFFLINE_TITLE,
+    DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
+)
+from app.schemas.open_agent_settings import OpenAgentAgentListResponse, OpenAgentAgentSummary
 from app.schemas.visitor_session import VisitorSessionRequest
 from app.services.channel_service import ChannelService
 
@@ -38,6 +44,11 @@ def test_channel_config_uses_default_offline_message():
     assert config.service_hours_id is None
     assert config.use_agent_avatar is False
     assert config.send_button_bg_color is None
+    assert config.open_agent_enabled is False
+    assert config.open_agent_bot_strategy == "always"
+    assert config.open_agent_handoff_label == DEFAULT_OPEN_AGENT_HANDOFF_LABEL
+    assert config.open_agent_handoff_after_messages == 2
+    assert config.open_agent_handoff_behavior == "confirm"
 
 
 def test_channel_config_rejects_empty_offline_title():
@@ -48,6 +59,20 @@ def test_channel_config_rejects_empty_offline_title():
 def test_channel_config_rejects_empty_rich_text_offline_message():
     with pytest.raises(PydanticValidationError):
         ChannelConfig(offline_message="<p>&nbsp;</p>")
+
+
+def test_channel_config_requires_agent_when_open_agent_enabled():
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(open_agent_enabled=True)
+
+
+def test_channel_config_rejects_invalid_handoff_threshold():
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(
+            open_agent_enabled=True,
+            open_agent_agent_id=1,
+            open_agent_handoff_after_messages=100,
+        )
 
 
 def test_is_within_service_hours_uses_weekly_schedule():
@@ -82,6 +107,73 @@ async def test_normalize_config_requires_service_hours_when_enabled():
             AsyncMock(),
             7,
             ChannelConfig(service_hours_enabled=True, service_hours_id=None),
+        )
+
+
+@pytest.mark.asyncio
+async def test_normalize_config_requires_bot_service_hours(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.channel_service.OpenAgentSettingsService.list_active_agents",
+        AsyncMock(return_value=OpenAgentAgentListResponse(
+            items=[OpenAgentAgentSummary(id=1, name="Support Agent", status="active")],
+            total=1,
+            page=1,
+            per_page=100,
+            pages=1,
+        )),
+    )
+
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(
+            open_agent_enabled=True,
+            open_agent_agent_id=1,
+            open_agent_bot_strategy="service_hours",
+        )
+
+
+@pytest.mark.asyncio
+async def test_normalize_config_saves_active_open_agent(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.channel_service.OpenAgentSettingsService.list_active_agents",
+        AsyncMock(return_value=OpenAgentAgentListResponse(
+            items=[OpenAgentAgentSummary(id=1, name="Support Agent", status="active")],
+            total=1,
+            page=1,
+            per_page=100,
+            pages=1,
+        )),
+    )
+
+    result = await ChannelService._normalize_config(
+        AsyncMock(),
+        7,
+        ChannelConfig(open_agent_enabled=True, open_agent_agent_id=1),
+    )
+
+    assert result["open_agent_enabled"] is True
+    assert result["open_agent_agent_id"] == 1
+    assert result["open_agent_agent_name"] == "Support Agent"
+    assert result["open_agent_bot_service_hours_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_normalize_config_rejects_unavailable_open_agent(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.channel_service.OpenAgentSettingsService.list_active_agents",
+        AsyncMock(return_value=OpenAgentAgentListResponse(
+            items=[OpenAgentAgentSummary(id=2, name="Other Agent", status="active")],
+            total=1,
+            page=1,
+            per_page=100,
+            pages=1,
+        )),
+    )
+
+    with pytest.raises(ValidationError):
+        await ChannelService._normalize_config(
+            AsyncMock(),
+            7,
+            ChannelConfig(open_agent_enabled=True, open_agent_agent_id=1),
         )
 
 

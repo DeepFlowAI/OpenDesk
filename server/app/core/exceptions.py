@@ -3,10 +3,17 @@ from fastapi.responses import JSONResponse
 
 
 class BusinessError(Exception):
-    def __init__(self, message: str, status_code: int = 400, code: str = "BUSINESS_ERROR"):
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 400,
+        code: str = "BUSINESS_ERROR",
+        details: dict | None = None,
+    ):
         self.message = message
         self.status_code = status_code
         self.code = code
+        self.details = details
 
 
 class NotFoundError(BusinessError):
@@ -15,8 +22,8 @@ class NotFoundError(BusinessError):
 
 
 class ValidationError(BusinessError):
-    def __init__(self, message: str = "Validation failed"):
-        super().__init__(message, status_code=400, code="VALIDATION_ERROR")
+    def __init__(self, message: str = "Validation failed", details: dict | None = None):
+        super().__init__(message, status_code=400, code="VALIDATION_ERROR", details=details)
 
 
 class UnauthorizedError(BusinessError):
@@ -47,7 +54,7 @@ class InvalidCodeError(BusinessError):
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(BusinessError)
     async def business_error_handler(request: Request, exc: BusinessError):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"code": exc.code, "message": exc.message, "status": exc.status_code},
-        )
+        body = {"code": exc.code, "message": exc.message, "status": exc.status_code}
+        if exc.details is not None:
+            body["details"] = exc.details
+        return JSONResponse(status_code=exc.status_code, content=body)

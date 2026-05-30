@@ -2,11 +2,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconArrowLeft, IconCopy, IconCheck, IconLoader2, IconUpload, IconTrash } from '@tabler/icons-react'
+import { IconAlertCircle, IconArrowLeft, IconCheck, IconCopy, IconLoader2, IconRefresh, IconTrash, IconUpload } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { ChannelConfig, CreateChannelPayload } from '@/models/channel'
 import { useChannel, useCreateChannel, useUpdateChannel } from '@/service/use-channels'
+import { useOpenAgentAgents, useOpenAgentSettings } from '@/service/use-open-agent-settings'
 import { useServiceHours } from '@/service/use-service-hours'
 import { useUploadChannelLogo, useUploadChannelFavicon } from '@/service/use-upload'
 import { CHANNEL_COLOR_PREVIEW, channelColorPreview } from '@/utils/channel-config-display'
@@ -16,6 +17,8 @@ import { RichTextFieldEditor } from '@/app/components/features/field-system/rich
 
 const DEFAULT_OFFLINE_TITLE = '当前客服不在线'
 const DEFAULT_OFFLINE_MESSAGE = '您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。'
+const DEFAULT_OPEN_AGENT_INPUT_PLACEHOLDER = '输入消息...'
+const DEFAULT_OPEN_AGENT_HANDOFF_LABEL = '转人工'
 
 const DEFAULT_CONFIG: ChannelConfig = {
   title: null,
@@ -42,6 +45,16 @@ const DEFAULT_CONFIG: ChannelConfig = {
   service_hours_id: null,
   offline_title: DEFAULT_OFFLINE_TITLE,
   offline_message: DEFAULT_OFFLINE_MESSAGE,
+  open_agent_enabled: false,
+  open_agent_agent_id: null,
+  open_agent_agent_name: null,
+  open_agent_bot_strategy: 'always',
+  open_agent_bot_service_hours_id: null,
+  open_agent_input_placeholder: null,
+  open_agent_handoff_enabled: true,
+  open_agent_handoff_label: DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
+  open_agent_handoff_after_messages: 2,
+  open_agent_handoff_behavior: 'confirm',
 }
 
 /* ── Primitives ── */
@@ -300,6 +313,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const { locale } = useLocaleStore()
   const { data: channel, isLoading } = useChannel(channelId ?? 0)
   const { data: serviceHours = [], isLoading: serviceHoursLoading } = useServiceHours()
+  const { data: openAgentSettings, isLoading: openAgentSettingsLoading } = useOpenAgentSettings()
   const createMut = useCreateChannel()
   const updateMut = useUpdateChannel()
   const logoUploadMut = useUploadChannelLogo()
@@ -319,8 +333,24 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [savedChannelKey, setSavedChannelKey] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'interface' | 'service'>('interface')
   const [serviceConfigError, setServiceConfigError] = useState('')
+  const [openAgentConfigError, setOpenAgentConfigError] = useState('')
+  const [openAgentAgentError, setOpenAgentAgentError] = useState('')
+  const [openAgentBotServiceHoursError, setOpenAgentBotServiceHoursError] = useState('')
+  const [openAgentInputPlaceholderError, setOpenAgentInputPlaceholderError] = useState('')
+  const [openAgentHandoffLabelError, setOpenAgentHandoffLabelError] = useState('')
+  const [openAgentHandoffThresholdError, setOpenAgentHandoffThresholdError] = useState('')
   const [offlineTitleError, setOfflineTitleError] = useState('')
   const [offlineMessageError, setOfflineMessageError] = useState('')
+
+  const openAgentConfigured = Boolean(openAgentSettings?.base_url && openAgentSettings?.has_api_key)
+  const {
+    data: openAgentAgents,
+    isFetching: openAgentAgentsFetching,
+    isError: openAgentAgentsIsError,
+    refetch: refetchOpenAgentAgents,
+  } = useOpenAgentAgents(activeTab === 'service' && config.open_agent_enabled && openAgentConfigured)
+  const openAgentAgentItems = openAgentAgents?.items ?? []
+  const selectedOpenAgent = openAgentAgentItems.find((item) => item.id === config.open_agent_agent_id)
 
   useEffect(() => {
     if (isNew) { if (!initialized) setInitialized(true); return }
@@ -416,12 +446,62 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     const trimmed = name.trim()
     if (!trimmed || trimmed.length > 64) return
     setServiceConfigError('')
+    setOpenAgentConfigError('')
+    setOpenAgentAgentError('')
+    setOpenAgentBotServiceHoursError('')
+    setOpenAgentInputPlaceholderError('')
+    setOpenAgentHandoffLabelError('')
+    setOpenAgentHandoffThresholdError('')
     setOfflineTitleError('')
     setOfflineMessageError('')
     if (config.service_hours_enabled && !config.service_hours_id) {
       setActiveTab('service')
       setServiceConfigError(t('ch.form.serviceHours.required', locale))
       return
+    }
+    if (config.open_agent_enabled) {
+      if (!openAgentConfigured) {
+        setActiveTab('service')
+        setOpenAgentConfigError(t('ch.form.openAgent.configRequired', locale))
+        return
+      }
+      if (!config.open_agent_agent_id) {
+        setActiveTab('service')
+        setOpenAgentAgentError(t('ch.form.openAgent.agent.required', locale))
+        return
+      }
+      if (config.open_agent_bot_strategy === 'service_hours' && !config.open_agent_bot_service_hours_id) {
+        setActiveTab('service')
+        setOpenAgentBotServiceHoursError(t('ch.form.openAgent.botServiceHours.required', locale))
+        return
+      }
+      if ((config.open_agent_input_placeholder ?? '').trim().length > 50) {
+        setActiveTab('service')
+        setOpenAgentInputPlaceholderError(t('ch.form.openAgent.inputPlaceholder.max', locale))
+        return
+      }
+      if (config.open_agent_handoff_enabled) {
+        const handoffLabel = config.open_agent_handoff_label.trim()
+        if (!handoffLabel) {
+          setActiveTab('service')
+          setOpenAgentHandoffLabelError(t('ch.form.openAgent.handoffLabel.required', locale))
+          return
+        }
+        if (handoffLabel.length > 16) {
+          setActiveTab('service')
+          setOpenAgentHandoffLabelError(t('ch.form.openAgent.handoffLabel.max', locale))
+          return
+        }
+        if (
+          !Number.isInteger(config.open_agent_handoff_after_messages)
+          || config.open_agent_handoff_after_messages < 1
+          || config.open_agent_handoff_after_messages > 99
+        ) {
+          setActiveTab('service')
+          setOpenAgentHandoffThresholdError(t('ch.form.openAgent.handoffThreshold.invalid', locale))
+          return
+        }
+      }
     }
     if (!config.offline_title.trim()) {
       setActiveTab('service')
@@ -433,7 +513,15 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       setOfflineMessageError(t('ch.form.offlineMessage.required', locale))
       return
     }
-    const nextConfig = { ...config, offline_title: config.offline_title.trim() }
+    const nextConfig = {
+      ...config,
+      offline_title: config.offline_title.trim(),
+      open_agent_agent_name: selectedOpenAgent?.name ?? config.open_agent_agent_name,
+      open_agent_bot_service_hours_id:
+        config.open_agent_bot_strategy === 'service_hours' ? config.open_agent_bot_service_hours_id : null,
+      open_agent_input_placeholder: config.open_agent_input_placeholder?.trim() || null,
+      open_agent_handoff_label: config.open_agent_handoff_label.trim() || DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
+    }
     const body: CreateChannelPayload = {
       name: trimmed,
       channel_type: 'web',
@@ -467,6 +555,10 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const title = isNew
     ? t('ch.new.title', locale)
     : t('ch.edit.title', locale, { name: channel?.name ?? '' })
+  const showSavedOpenAgentOption = Boolean(
+    config.open_agent_agent_id
+    && !openAgentAgentItems.some((item) => item.id === config.open_agent_agent_id),
+  )
 
   return (
     <div className="-m-8 flex flex-col">
@@ -822,6 +914,225 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                       <p className="text-xs text-muted-foreground">{t('ch.form.serviceHours.empty', locale)}</p>
                     )}
                     {serviceConfigError && <p className="text-xs text-destructive">{serviceConfigError}</p>}
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-lg border border-border bg-card p-5">
+                <div className="flex items-start justify-between gap-6">
+                  <div className="flex flex-col gap-1">
+                    <FieldLabel label={t('ch.form.openAgent.enabled', locale)} />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {t('ch.form.openAgent.enabled.hint', locale)}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={config.open_agent_enabled}
+                    disabled={openAgentSettingsLoading}
+                    onCheckedChange={(v) => {
+                      setOpenAgentConfigError('')
+                      if (v && !openAgentConfigured) {
+                        setOpenAgentConfigError(t('ch.form.openAgent.configRequired', locale))
+                        return
+                      }
+                      updateConfig('open_agent_enabled', v)
+                    }}
+                  />
+                </div>
+
+                {!openAgentConfigured && (
+                  <div className="mt-4 flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3">
+                    <IconAlertCircle size={18} className="mt-0.5 shrink-0 text-warning" />
+                    <div className="flex flex-1 flex-col gap-2">
+                      <p className="text-xs leading-5 text-foreground">
+                        {t('ch.form.openAgent.configRequired', locale)}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => router.push('/open-agent-settings')}
+                        className="w-fit rounded-md border border-border bg-white px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-accent"
+                      >
+                        {t('ch.form.openAgent.goSettings', locale)}
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {openAgentConfigError && <p className="mt-3 text-xs text-destructive">{openAgentConfigError}</p>}
+
+                {config.open_agent_enabled && (
+                  <div className="mt-5 flex flex-col gap-5">
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <FieldLabel label={t('ch.form.openAgent.agent', locale)} required />
+                        <button
+                          type="button"
+                          onClick={() => void refetchOpenAgentAgents()}
+                          disabled={!openAgentConfigured || openAgentAgentsFetching}
+                          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border px-3 text-xs font-medium text-foreground/80 transition-colors hover:bg-accent disabled:opacity-50"
+                        >
+                          <IconRefresh size={14} className={openAgentAgentsFetching ? 'animate-spin' : ''} />
+                          {t('ch.form.openAgent.refreshAgents', locale)}
+                        </button>
+                      </div>
+                      <select
+                        value={config.open_agent_agent_id ?? ''}
+                        disabled={!openAgentConfigured || openAgentAgentsFetching}
+                        onChange={(e) => {
+                          const agentId = e.target.value ? Number(e.target.value) : null
+                          const agent = openAgentAgentItems.find((item) => item.id === agentId)
+                          updateConfig('open_agent_agent_id', agentId)
+                          updateConfig('open_agent_agent_name', agent?.name ?? null)
+                          setOpenAgentAgentError('')
+                        }}
+                        className="h-10 w-full rounded-lg border border-border bg-white px-3.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"
+                      >
+                        <option value="">
+                          {openAgentAgentsFetching
+                            ? t('ch.form.openAgent.agent.loading', locale)
+                            : t('ch.form.openAgent.agent.placeholder', locale)}
+                        </option>
+                        {showSavedOpenAgentOption && (
+                          <option value={config.open_agent_agent_id ?? ''}>
+                            {t('ch.form.openAgent.agent.pending', locale, {
+                              name: config.open_agent_agent_name ?? `#${config.open_agent_agent_id}`,
+                            })}
+                          </option>
+                        )}
+                        {openAgentAgentItems.map((item) => (
+                          <option key={item.id} value={item.id}>
+                            {item.name}
+                          </option>
+                        ))}
+                      </select>
+                      {openAgentAgentsIsError && (
+                        <p className="text-xs text-destructive">{t('ch.form.openAgent.agent.loadFailed', locale)}</p>
+                      )}
+                      {openAgentAgentItems.length === 0 && !openAgentAgentsFetching && !openAgentAgentsIsError && (
+                        <p className="text-xs text-muted-foreground">{t('ch.form.openAgent.agent.empty', locale)}</p>
+                      )}
+                      {openAgentAgentError && <p className="text-xs text-destructive">{openAgentAgentError}</p>}
+                    </div>
+
+                    <div className="flex flex-col gap-2">
+                      <FieldLabel label={t('ch.form.openAgent.strategy', locale)} required />
+                      <SegmentedControl
+                        options={[
+                          { value: 'always' as const, label: t('ch.form.openAgent.strategy.always', locale) },
+                          { value: 'service_hours' as const, label: t('ch.form.openAgent.strategy.serviceHours', locale) },
+                        ]}
+                        value={config.open_agent_bot_strategy}
+                        onChange={(v) => {
+                          updateConfig('open_agent_bot_strategy', v)
+                          if (v !== 'service_hours') updateConfig('open_agent_bot_service_hours_id', null)
+                          setOpenAgentBotServiceHoursError('')
+                        }}
+                      />
+                      <p className="text-xs leading-5 text-muted-foreground">
+                        {t('ch.form.openAgent.strategy.hint', locale)}
+                      </p>
+                    </div>
+
+                    {config.open_agent_bot_strategy === 'service_hours' && (
+                      <div className="flex flex-col gap-2">
+                        <FieldLabel label={t('ch.form.openAgent.botServiceHours', locale)} required />
+                        <select
+                          value={config.open_agent_bot_service_hours_id ?? ''}
+                          disabled={serviceHoursLoading}
+                          onChange={(e) => {
+                            updateConfig('open_agent_bot_service_hours_id', e.target.value ? Number(e.target.value) : null)
+                            setOpenAgentBotServiceHoursError('')
+                          }}
+                          className="h-10 w-full rounded-lg border border-border bg-white px-3.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"
+                        >
+                          <option value="">
+                            {serviceHoursLoading
+                              ? t('ch.form.serviceHours.loading', locale)
+                              : t('ch.form.openAgent.botServiceHours.placeholder', locale)}
+                          </option>
+                          {serviceHours.map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.description ? `${item.name} - ${item.description}` : item.name}
+                            </option>
+                          ))}
+                        </select>
+                        {serviceHours.length === 0 && !serviceHoursLoading && (
+                          <p className="text-xs text-muted-foreground">{t('ch.form.serviceHours.empty', locale)}</p>
+                        )}
+                        {openAgentBotServiceHoursError && <p className="text-xs text-destructive">{openAgentBotServiceHoursError}</p>}
+                      </div>
+                    )}
+
+                    <div className="flex flex-col gap-2">
+                      <FieldLabel label={t('ch.form.openAgent.inputPlaceholder', locale)} />
+                      <TextInput
+                        value={config.open_agent_input_placeholder ?? ''}
+                        onChange={(v) => {
+                          updateConfig('open_agent_input_placeholder', v || null)
+                          setOpenAgentInputPlaceholderError('')
+                        }}
+                        placeholder={DEFAULT_OPEN_AGENT_INPUT_PLACEHOLDER}
+                      />
+                      {openAgentInputPlaceholderError && <p className="text-xs text-destructive">{openAgentInputPlaceholderError}</p>}
+                    </div>
+
+                    <div className="rounded-lg border border-border bg-white p-4">
+                      <div className="flex items-start justify-between gap-6">
+                        <div className="flex flex-col gap-1">
+                          <FieldLabel label={t('ch.form.openAgent.handoffEnabled', locale)} />
+                          <p className="text-xs leading-5 text-muted-foreground">
+                            {t('ch.form.openAgent.handoffEnabled.hint', locale)}
+                          </p>
+                        </div>
+                        <Switch
+                          checked={config.open_agent_handoff_enabled}
+                          onCheckedChange={(v) => updateConfig('open_agent_handoff_enabled', v)}
+                        />
+                      </div>
+
+                      {config.open_agent_handoff_enabled && (
+                        <div className="mt-4 grid grid-cols-[1fr_180px] gap-4">
+                          <div className="flex flex-col gap-2">
+                            <FieldLabel label={t('ch.form.openAgent.handoffLabel', locale)} required />
+                            <TextInput
+                              value={config.open_agent_handoff_label}
+                              onChange={(v) => {
+                                updateConfig('open_agent_handoff_label', v)
+                                setOpenAgentHandoffLabelError('')
+                              }}
+                              placeholder={DEFAULT_OPEN_AGENT_HANDOFF_LABEL}
+                            />
+                            {openAgentHandoffLabelError && <p className="text-xs text-destructive">{openAgentHandoffLabelError}</p>}
+                          </div>
+                          <div className="flex flex-col gap-2">
+                            <FieldLabel label={t('ch.form.openAgent.handoffThreshold', locale)} required />
+                            <input
+                              type="number"
+                              min={1}
+                              max={99}
+                              value={config.open_agent_handoff_after_messages}
+                              onChange={(e) => {
+                                updateConfig('open_agent_handoff_after_messages', Number(e.target.value))
+                                setOpenAgentHandoffThresholdError('')
+                              }}
+                              className="h-10 w-full rounded-lg border border-border bg-white px-3.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                            />
+                            {openAgentHandoffThresholdError && <p className="text-xs text-destructive">{openAgentHandoffThresholdError}</p>}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex flex-col gap-2">
+                      <FieldLabel label={t('ch.form.openAgent.handoffBehavior', locale)} required />
+                      <SegmentedControl
+                        options={[
+                          { value: 'confirm' as const, label: t('ch.form.openAgent.handoffBehavior.confirm', locale) },
+                          { value: 'auto' as const, label: t('ch.form.openAgent.handoffBehavior.auto', locale) },
+                        ]}
+                        value={config.open_agent_handoff_behavior}
+                        onChange={(v) => updateConfig('open_agent_handoff_behavior', v)}
+                      />
+                    </div>
                   </div>
                 )}
               </div>

@@ -14,6 +14,7 @@ import {
   createPublicSatisfactionInvitation,
   fetchPublicSatisfactionInvitation,
 } from '@/service/use-satisfaction-survey'
+import type { HumanHandoffEventPayload } from '@/service/use-open-agent-conversation'
 import { useVisitorChatStore } from '@/context/visitor-chat-store'
 import { VisitorChatRuntimeProvider } from '@/components/assistant-ui/visitor-chat-runtime'
 import { VisitorThread } from '@/components/assistant-ui/visitor-thread'
@@ -141,6 +142,58 @@ function mapPublicHistoryItem(item: VisitorConversationHistoryItem): VisitorConv
   }
 }
 
+function isHumanHandoffEventPayload(value: unknown): value is HumanHandoffEventPayload {
+  return Boolean(
+    isPlainRecord(value)
+      && value.event_kind === 'human_handoff'
+      && value.schema_version === 1
+      && isPlainRecord(value.handoff),
+  )
+}
+
+function restorePendingHumanHandoff(messages: Message[]) {
+  const confirmedToolCallIds = new Set<string>()
+  for (const message of messages) {
+    const metadata = message.metadata
+    if (
+      (
+        metadata?.handoff_event_type === 'confirmed_by_visitor'
+        || metadata?.handoff_event_type === 'auto_triggered'
+      )
+      && typeof metadata.tool_call_id === 'string'
+    ) {
+      confirmedToolCallIds.add(metadata.tool_call_id)
+    }
+  }
+
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    const metadata = message.metadata
+    if (!metadata || metadata.event_type !== 'open_agent_handoff_event') continue
+
+    const eventType = metadata.handoff_event_type
+    if (eventType === 'confirmed_by_visitor' || eventType === 'auto_triggered') continue
+
+    const toolCallId = typeof metadata.tool_call_id === 'string' ? metadata.tool_call_id : null
+    if (toolCallId && confirmedToolCallIds.has(toolCallId)) continue
+
+    const payload = metadata.handoff_payload
+    if (!isHumanHandoffEventPayload(payload)) continue
+
+    const brief =
+      typeof payload.handoff.brief === 'string' && payload.handoff.brief.trim()
+        ? payload.handoff.brief.trim()
+        : message.content || '这个问题需要人工客服进一步处理。'
+    return {
+      payload,
+      brief,
+      messageId: message.id,
+      toolCallId: toolCallId ?? undefined,
+    }
+  }
+  return null
+}
+
 function getLocale(preferredLocale?: string | null): string {
   if (preferredLocale === 'zh' || preferredLocale === 'en') return preferredLocale
   if (typeof navigator === 'undefined') return 'en'
@@ -199,6 +252,16 @@ const defaultConfig: ChannelConfig = {
   service_hours_id: null,
   offline_title: '当前客服不在线',
   offline_message: '您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。',
+  open_agent_enabled: false,
+  open_agent_agent_id: null,
+  open_agent_agent_name: null,
+  open_agent_bot_strategy: 'always',
+  open_agent_bot_service_hours_id: null,
+  open_agent_input_placeholder: null,
+  open_agent_handoff_enabled: true,
+  open_agent_handoff_label: '转人工',
+  open_agent_handoff_after_messages: 2,
+  open_agent_handoff_behavior: 'confirm',
 }
 
 function VisitorChatBootShell({
@@ -280,12 +343,14 @@ export default function VisitorChatPage() {
     messages,
     hasMore,
     satisfactionInvitation,
+    pendingHumanHandoff,
     connect,
     setConversationPublicId,
     setMessages,
     prependMessages,
     setHasMore,
     setSatisfactionInvitation,
+    setPendingHumanHandoff,
   } = useVisitorChatStore()
 
   const {
@@ -301,6 +366,7 @@ export default function VisitorChatPage() {
   const [historyError, setHistoryError] = useState(false)
   const [historyLimitReached, setHistoryLimitReached] = useState(false)
   const [ended, setEnded] = useState(false)
+  const [conversationStatus, setConversationStatus] = useState<string | null>(null)
   const [satisfactionCanInitiate, setSatisfactionCanInitiate] = useState(false)
   const [satisfactionLoading, setSatisfactionLoading] = useState(false)
   const [socketOfflineTitle, setSocketOfflineTitle] = useState('')
@@ -395,7 +461,9 @@ export default function VisitorChatPage() {
     setHasMore(false)
     setSatisfactionInvitation(null)
     setSatisfactionCanInitiate(false)
+    setPendingHumanHandoff(null)
     setEnded(false)
+    setConversationStatus(null)
     setSocketOfflineTitle('')
     setSocketOfflineMessage('')
     setConversationInitializing(true)
@@ -490,6 +558,7 @@ export default function VisitorChatPage() {
     setHasMore,
     setMessages,
     setSatisfactionInvitation,
+    setPendingHumanHandoff,
   ])
 
   const startConversation = useCallback(async () => {
@@ -527,6 +596,7 @@ export default function VisitorChatPage() {
             setSocketOfflineTitle('')
             setSocketOfflineMessage('')
             setConversationPublicId(res.conversation.conversation_public_id)
+            setConversationStatus(res.conversation.status || null)
             setEnded(res.conversation.status === 'closed')
             try {
               const data = await fetchPublicMessages({
@@ -534,8 +604,17 @@ export default function VisitorChatPage() {
                 visitorSessionToken,
                 limit: 50,
               })
-              setMessages(data.items.map(mapPublicMessage))
+              const currentMessages = data.items.map(mapPublicMessage)
+              setMessages(currentMessages)
               setHasMore(data.has_more)
+              if (
+                res.conversation.status === 'handoff_pending'
+                && channel?.config.open_agent_handoff_behavior === 'confirm'
+              ) {
+                setPendingHumanHandoff(restorePendingHumanHandoff(currentMessages))
+              } else {
+                setPendingHumanHandoff(null)
+              }
               fetchPublicSatisfactionInvitation({
                 conversationPublicId: res.conversation.conversation_public_id,
                 visitorSessionToken,
@@ -551,6 +630,7 @@ export default function VisitorChatPage() {
             } catch {
               setMessages([])
               setHasMore(false)
+              setPendingHumanHandoff(null)
               setSatisfactionCanInitiate(false)
             }
           } else if (res.error === 'OFFLINE') {
@@ -560,6 +640,7 @@ export default function VisitorChatPage() {
             setSatisfactionInvitation(null)
             setSatisfactionCanInitiate(false)
             setEnded(false)
+            setConversationStatus(null)
             setSocketOfflineTitle(res.offline_title || '')
             setSocketOfflineMessage(res.offline_message || '')
           }
@@ -570,6 +651,7 @@ export default function VisitorChatPage() {
       )
     })
   }, [
+    channel?.config.open_agent_handoff_behavior,
     socket,
     connected,
     conversationPublicId,
@@ -577,6 +659,7 @@ export default function VisitorChatPage() {
     setMessages,
     setHasMore,
     setSatisfactionInvitation,
+    setPendingHumanHandoff,
     socketOfflineMessage,
     visitorSessionToken,
   ])
@@ -652,6 +735,19 @@ export default function VisitorChatPage() {
       socket.off('disconnect', handleDisconnect)
     }
   }, [socket])
+
+  useEffect(() => {
+    if (!socket) return
+    const handler = (data: { conversation_public_id?: string }) => {
+      if (!data.conversation_public_id || data.conversation_public_id === conversationPublicId) {
+        setConversationStatus('active')
+      }
+    }
+    socket.on('conversation_assigned', handler)
+    return () => {
+      socket.off('conversation_assigned', handler)
+    }
+  }, [conversationPublicId, socket])
 
   // ── Conversation ended listener ──
   useEffect(() => {
@@ -748,6 +844,9 @@ export default function VisitorChatPage() {
 
   // ── Derived values ──
   const config = channel?.config || defaultConfig
+  const botMode =
+    config.open_agent_enabled
+    && (conversationStatus === 'bot' || conversationStatus === 'handoff_pending')
   const pageBg = config.page_bg_color || 'var(--color-muted)'
   const offlineTitle = socketOfflineTitle || channel?.availability?.offline_title || config.offline_title
   const offlineMessage = socketOfflineMessage || channel?.availability?.offline_message || config.offline_message
@@ -877,12 +976,16 @@ export default function VisitorChatPage() {
           historyError={historyError}
           historyLimitReached={historyLimitReached}
           initializing={conversationInitializing}
+          botMode={botMode}
+          visitorMessageCount={messages.filter((msg) => msg.sender_type === 'visitor').length}
+          pendingHumanHandoff={pendingHumanHandoff}
           satisfactionCanInitiate={satisfactionCanInitiate}
           satisfactionLoading={satisfactionLoading}
           onLoadMore={handleLoadMore}
           onLoadHistory={handleLoadHistory}
           onTyping={handleTyping}
           onRestartConversation={startConversation}
+          onConversationStatusChange={setConversationStatus}
           onSatisfactionInitiate={handleSatisfactionInitiate}
           onSatisfactionSubmitted={handleSatisfactionSubmitted}
         >

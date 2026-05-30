@@ -323,12 +323,12 @@ SYSTEM_TICKET_FIELDS: tuple[SystemFieldDef, ...] = (
     ),
     SystemFieldDef(
         key="conversation_id",
-        name_zh="关联会话",
-        name_en="Linked Session",
+        name_zh="关联会话/通话",
+        name_en="Linked Session / Call",
         field_type="single_line_text",
         type_config={"max_length": 64, "readonly": True},
-        description="工单关联的在线客服会话",
-        help_text="基于会话创建工单时自动关联",
+        description="工单关联的在线客服会话或呼叫中心通话",
+        help_text="基于会话或通话创建工单时自动关联",
         default_sort_order=9,
     ),
     SystemFieldDef(

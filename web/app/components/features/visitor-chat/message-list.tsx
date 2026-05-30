@@ -5,6 +5,11 @@ import type { Message } from '@/models/conversation'
 import type { ChannelConfig } from '@/models/channel'
 import { MessageBubble } from './message-bubble'
 import { SystemMessage } from './system-message'
+import {
+  HumanHandoffEventMessage,
+  isOpenAgentHandoffEventMessage,
+  resolveHandoffEventType,
+} from './human-handoff-event-message'
 import { WelcomeMessage } from './welcome-message'
 import { TypingIndicator } from './typing-indicator'
 import { IconLoader2 } from '@tabler/icons-react'
@@ -174,12 +179,21 @@ export function MessageList({
                   {formatTimestamp(msg.created_at, locale)}
                 </div>
               )}
-              <SystemMessage content={msg.content} />
+              {isOpenAgentHandoffEventMessage(msg) ? (
+                <HumanHandoffEventMessage
+                  content={msg.content}
+                  config={config}
+                  locale={locale}
+                  handoffEventType={resolveHandoffEventType(msg.metadata)}
+                />
+              ) : (
+                <SystemMessage content={msg.content} />
+              )}
             </div>
           )
         }
 
-        const showAvatar = msg.sender_type === 'agent'
+        const showAvatar = msg.sender_type === 'agent' || msg.sender_type === 'bot'
           ? config.use_agent_avatar === true
           : shouldShowAvatar(msg, next)
 

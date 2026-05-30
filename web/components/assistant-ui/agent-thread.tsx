@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { ThreadPrimitive, type MessageState } from '@assistant-ui/react'
+import { MessagePrimitive, ThreadPrimitive, type MessageState } from '@assistant-ui/react'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   useAgentChatConfig,
@@ -17,7 +17,9 @@ import { EndConversationModal } from '@/app/components/features/chat/end-convers
 import { TransferConversationModal } from '@/app/components/features/chat/transfer-conversation-modal'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
 import { conversationKeys, useVisitorWebStatus } from '@/service/use-conversations'
+import { AssistantMarkdownText, MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
+import { resolveOpenAgentHandoffEventLabel } from '@/lib/open-agent-handoff-event'
 import type {
   Conversation,
   Message,
@@ -99,9 +101,11 @@ function AgentSideWelcomeBubble({
 // ─── Agent-side message bubble ───────────────────────────────────
 
 function AgentMessageBubble({ message }: { message: MessageState }) {
-  const { conversation, imageMessages } = useAgentChatConfig()
+  const { conversation, imageMessages, locale: cfgLocale } = useAgentChatConfig()
   const meta = message.metadata?.custom as AgentMessageMeta | undefined
   const isOwn = meta?.isOwn ?? false
+  const isBot = meta?.senderType === 'bot'
+  const isAssistantSide = isOwn || isBot
   const isSystem = message.role === 'system' || meta?.senderType === 'system'
   const visitorAvatarBg = conversation.visitor?.avatar_color || '#4A8C5C'
   const visitorAvatarChar = (conversation.visitor?.name || '访').charAt(0)
@@ -141,19 +145,22 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
   }
 
   if (isSystem) {
+    const handoffEventLabel = resolveOpenAgentHandoffEventLabel(meta?.metadata, cfgLocale)
     return (
       <div className="mb-4 flex justify-center py-1">
-        <span className="text-center text-[12px] leading-normal text-[#999999]">{content}</span>
+        <span className="text-center text-[12px] leading-normal text-[#999999]">
+          {handoffEventLabel || content}
+        </span>
       </div>
     )
   }
 
   // 2.1 pen: visitor left (#F0F0F0 + border), agent (own) right (#DBEAFE)
   return (
-    <div className={cn('mb-4 flex gap-2.5', isOwn ? 'flex-row-reverse' : 'flex-row')}>
-      {isOwn ? (
+    <div className={cn('mb-4 flex gap-2.5', isAssistantSide ? 'flex-row-reverse' : 'flex-row')}>
+      {isAssistantSide ? (
         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#D6E6F9] text-sm font-medium text-[#4A80B5]">
-          {(meta?.senderName || 'A').charAt(0)}
+          {(meta?.senderName || (isBot ? '智' : 'A')).charAt(0)}
         </div>
       ) : (
         <div
@@ -163,7 +170,10 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
           {visitorAvatarChar}
         </div>
       )}
-      <div className={cn('flex max-w-[70%] flex-col', isOwn ? 'items-end' : 'items-start')}>
+      <div className={cn('flex max-w-[70%] flex-col', isAssistantSide ? 'items-end' : 'items-start')}>
+        {isBot && meta?.senderName && (
+          <span className="mb-1 text-[11px] text-[#737373]">{meta.senderName}</span>
+        )}
         {attachmentContentType ? (
           <MessageAttachment
             conversationId={meta?.conversationId ?? conversation.id}
@@ -175,14 +185,23 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
         ) : (
           <div
             className={cn(
-              'rounded-[18px] px-3.5 py-2.5 text-sm leading-normal whitespace-pre-wrap text-[#1a1a1a]',
-              isOwn ? 'bg-[#DBEAFE]' : 'border border-[#E0E0E0] bg-[#F0F0F0]',
+              'rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words text-[#1a1a1a]',
+              isAssistantSide ? 'bg-[#DBEAFE]' : 'border border-[#E0E0E0] bg-[#F0F0F0]',
+              isBot ? [markdownTextRootClass, richTextListStyleClass] : 'whitespace-pre-wrap',
             )}
           >
-            {content}
+            {isBot ? (
+              <MessagePrimitive.Parts>
+                {({ part }) => (
+                  part.type === 'text' || part.type === 'reasoning'
+                    ? <AssistantMarkdownText />
+                    : null
+                )}
+              </MessagePrimitive.Parts>
+            ) : content}
           </div>
         )}
-        <span className={cn('mt-1 text-[11px] text-[#999999]', isOwn && 'text-right')}>
+        <span className={cn('mt-1 text-[11px] text-[#999999]', isAssistantSide && 'text-right')}>
           {message.createdAt ? formatMessageTime(message.createdAt.toISOString()) : ''}
         </span>
       </div>
@@ -226,16 +245,19 @@ function HistoryActionButton({
 
 function AgentHistoryMessageBubble({
   message,
+  locale,
   visitorAvatarBg,
   visitorAvatarChar,
   imageMessages,
 }: {
   message: Message
+  locale: string
   visitorAvatarBg: string
   visitorAvatarChar: string
   imageMessages: { id: string; content: string }[]
 }) {
-  const isAgent = message.sender_type === 'agent'
+  const isAgent = message.sender_type === 'agent' || message.sender_type === 'bot'
+  const isBot = message.sender_type === 'bot'
   const isSystem = message.sender_type === 'system'
   const attachmentContentType =
     message.content_type === 'image' ? 'image' : message.content_type === 'file' ? 'file' : null
@@ -267,9 +289,12 @@ function AgentHistoryMessageBubble({
   }
 
   if (isSystem) {
+    const handoffEventLabel = resolveOpenAgentHandoffEventLabel(message.metadata, locale)
     return (
       <div className="mb-4 flex justify-center py-1">
-        <span className="text-center text-[12px] leading-normal text-[#999999]">{message.content}</span>
+        <span className="text-center text-[12px] leading-normal text-[#999999]">
+          {handoffEventLabel || message.content}
+        </span>
       </div>
     )
   }
@@ -278,7 +303,7 @@ function AgentHistoryMessageBubble({
     <div className={cn('mb-4 flex gap-2.5 opacity-90', isAgent ? 'flex-row-reverse' : 'flex-row')}>
       {isAgent ? (
         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#E8E8E8] text-sm font-medium text-[#737373]">
-          {(message.sender_name || 'A').charAt(0)}
+          {(message.sender_name || (isBot ? '智' : 'A')).charAt(0)}
         </div>
       ) : (
         <div
@@ -289,6 +314,9 @@ function AgentHistoryMessageBubble({
         </div>
       )}
       <div className={cn('flex max-w-[70%] flex-col', isAgent ? 'items-end' : 'items-start')}>
+        {isBot && message.sender_name && (
+          <span className="mb-1 text-[11px] text-[#737373]">{message.sender_name}</span>
+        )}
         {attachmentContentType ? (
           <MessageAttachment
             conversationId={message.conversation_id}
@@ -300,11 +328,12 @@ function AgentHistoryMessageBubble({
         ) : (
           <div
             className={cn(
-              'rounded-[18px] px-3.5 py-2.5 text-sm leading-normal whitespace-pre-wrap text-[#1a1a1a]',
+              'rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words text-[#1a1a1a]',
               isAgent ? 'bg-[#E8E8E8]' : 'border border-[#E0E0E0] bg-white',
+              isBot ? [markdownTextRootClass, richTextListStyleClass] : 'whitespace-pre-wrap',
             )}
           >
-            {message.content}
+            {isBot ? <MarkdownText>{message.content}</MarkdownText> : message.content}
           </div>
         )}
         <span className={cn('mt-1 text-[11px] text-[#999999]', isAgent && 'text-right')}>
@@ -357,6 +386,7 @@ function HistoryConversationBlock({
         <AgentHistoryMessageBubble
           key={message.id}
           message={message}
+          locale={locale}
           visitorAvatarBg={visitorAvatarBg}
           visitorAvatarChar={visitorAvatarChar}
           imageMessages={imageMessages}

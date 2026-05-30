@@ -7,6 +7,7 @@ def register_routers(app: FastAPI) -> None:
         system_info,
         auth,
         system_settings,
+        open_agent_settings,
         service_hours,
         employees,
         upload,
@@ -23,6 +24,7 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(system_info.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(system_settings.router, prefix="/api/v1")
+    app.include_router(open_agent_settings.router, prefix="/api/v1")
     app.include_router(service_hours.router, prefix="/api/v1")
     app.include_router(employees.router, prefix="/api/v1")
     app.include_router(upload.router, prefix="/api/v1")
@@ -45,10 +47,12 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(field_definitions.router, prefix="/api/v1")
     app.include_router(transfer.router, prefix="/api/v1")
 
-    from app.routers.v1 import form_layouts, interaction_rules, session_summary, user_views, ticket_views, organization_views, users, organizations, tickets
+    from app.routers.v1 import form_layouts, interaction_rules, session_summary, call_summary, user_views, ticket_views, organization_views, users, organizations, tickets, call_center
+    app.include_router(call_center.router, prefix="/api/v1")
     app.include_router(form_layouts.router, prefix="/api/v1")
     app.include_router(interaction_rules.router, prefix="/api/v1")
     app.include_router(session_summary.router, prefix="/api/v1")
+    app.include_router(call_summary.router, prefix="/api/v1")
     app.include_router(user_views.router, prefix="/api/v1")
     app.include_router(ticket_views.router, prefix="/api/v1")
     app.include_router(organization_views.router, prefix="/api/v1")

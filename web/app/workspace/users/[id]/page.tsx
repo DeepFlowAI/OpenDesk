@@ -5,9 +5,11 @@ import { useParams, useSearchParams, useRouter } from 'next/navigation'
 import {
   IconArrowLeft,
   IconEdit,
+  IconTrash,
 } from '@tabler/icons-react'
+import { toast } from 'sonner'
 import { useLocaleStore } from '@/context/locale-store'
-import { useUser } from '@/service/use-users'
+import { useDeleteUser, useUser } from '@/service/use-users'
 import { useOrganization } from '@/service/use-organizations'
 import { useSystemSettings } from '@/service/use-system-settings'
 import { useUnifiedFields } from '@/service/use-field-definitions'
@@ -20,6 +22,7 @@ import {
 } from '@/app/components/features/field-system/field-value-display'
 import { UserRelatedTimeline } from '@/app/components/features/user-related-timeline'
 import { UserFormModal } from '../user-form-modal'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 
 const SYSTEM_KEY_ALIAS: Record<string, string> = { nickname: 'name' }
 const DATETIME_KEYS = new Set(['created_at', 'updated_at'])
@@ -99,6 +102,8 @@ export default function UserDetailPage() {
   )
 
   const [editModalOpen, setEditModalOpen] = useState(false)
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
+  const deleteMutation = useDeleteUser()
 
   useEffect(() => {
     if (!user?.public_id || !userRef || !/^\d+$/.test(userRef)) return
@@ -109,6 +114,17 @@ export default function UserDetailPage() {
   const handleEditSuccess = useCallback(() => {
     setEditModalOpen(false)
   }, [])
+
+  const handleDelete = useCallback(async () => {
+    if (!user) return
+    try {
+      await deleteMutation.mutateAsync(user.id)
+      toast.success(isZh ? '删除成功' : 'Deleted successfully')
+      router.push('/workspace/users')
+    } catch {
+      toast.error(isZh ? '删除失败，请重试' : 'Delete failed. Please try again.')
+    }
+  }, [deleteMutation, isZh, router, user])
 
   const getFieldRaw = useCallback(
     (field: UnifiedField): unknown => {
@@ -215,6 +231,14 @@ export default function UserDetailPage() {
         >
           <IconEdit size={16} />
           {isZh ? '编辑用户' : 'Edit User'}
+        </button>
+        <button
+          onClick={() => setDeleteConfirmOpen(true)}
+          disabled={deleteMutation.isPending}
+          className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+        >
+          <IconTrash size={16} />
+          {isZh ? '删除' : 'Delete'}
         </button>
       </div>
 
@@ -376,6 +400,23 @@ export default function UserDetailPage() {
           onSuccess={handleEditSuccess}
         />
       )}
+
+      <ConfirmDialog
+        open={deleteConfirmOpen}
+        title={isZh ? '删除用户' : 'Delete user'}
+        message={
+          isZh
+            ? '确定要删除以下用户吗？此操作不可撤销。'
+            : 'Are you sure you want to delete this user? This action cannot be undone.'
+        }
+        itemName={user.name}
+        confirmLabel={isZh ? '确定删除' : 'Delete'}
+        cancelLabel={isZh ? '取消' : 'Cancel'}
+        variant="destructive"
+        loading={deleteMutation.isPending}
+        onCancel={() => setDeleteConfirmOpen(false)}
+        onConfirm={handleDelete}
+      />
     </div>
   )
 }

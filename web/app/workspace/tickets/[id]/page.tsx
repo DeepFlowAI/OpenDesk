@@ -51,6 +51,7 @@ import { formatDatetimeForDisplay } from '@/lib/datetime-display'
 import { useEmployee } from '@/service/use-employees'
 import { useEmployeeGroup } from '@/service/use-employee-groups'
 import { SessionDetailDrawer } from '@/app/components/features/session-records/session-detail-drawer'
+import { CallRecordDetailDrawer } from '@/app/components/features/call-center/call-record-detail-drawer'
 
 type FieldState = 'hidden' | 'required' | 'optional' | 'readonly'
 const TICKET_CHANGE_CREATE_FIELD_KEY = '__create__'
@@ -140,6 +141,7 @@ export default function TicketDetailPage() {
       'priority',
       'ticket_number',
       'conversation_id',
+      'call_record_id',
       'user_id',
       'agent_id',
       'assignee_group_id',
@@ -197,6 +199,7 @@ export default function TicketDetailPage() {
   const [rightTab, setRightTab] = useState<'comments' | 'changes' | 'all'>('comments')
   const [editingFieldId, setEditingFieldId] = useState<number | null>(null)
   const [selectedSessionRecordId, setSelectedSessionRecordId] = useState<number | null>(null)
+  const [selectedCallRecordId, setSelectedCallRecordId] = useState<number | null>(null)
   const shouldLoadChanges = rightTab === 'changes' || rightTab === 'all'
   const changeQueryParams = useMemo(() => ({ page: 1, per_page: 50 }), [])
   const {
@@ -208,7 +211,7 @@ export default function TicketDetailPage() {
   useEffect(() => {
     if (!ticket) return
     const vals: Record<string, unknown> = {}
-    for (const k of ['title', 'description', 'status', 'priority', 'conversation_id', 'user_id', 'agent_id', 'assignee_group_id', 'created_by', 'updated_by']) {
+    for (const k of ['title', 'description', 'status', 'priority', 'conversation_id', 'call_record_id', 'user_id', 'agent_id', 'assignee_group_id', 'created_by', 'updated_by']) {
       const v = (ticket as Record<string, unknown>)[k]
       if (v != null) vals[k] = v
     }
@@ -304,7 +307,7 @@ export default function TicketDetailPage() {
     if (saving) return
     setSaving(true)
     try {
-      const systemFields = ['title', 'description', 'status', 'priority', 'conversation_id', 'user_id', 'agent_id', 'assignee_group_id']
+      const systemFields = ['title', 'description', 'status', 'priority', 'conversation_id', 'call_record_id', 'user_id', 'agent_id', 'assignee_group_id']
       const payload: Record<string, unknown> = {}
       const customFields: Record<string, CustomFieldValue> = {}
 
@@ -327,6 +330,7 @@ export default function TicketDetailPage() {
           status: payload.status as string | undefined,
           priority: payload.priority as string | undefined,
           conversation_id: payload.conversation_id as number | undefined,
+          call_record_id: payload.call_record_id as number | undefined,
           user_id: payload.user_id as number | undefined,
           agent_id: payload.agent_id as number | undefined,
           assignee_group_id: payload.assignee_group_id as number | undefined,
@@ -438,7 +442,9 @@ export default function TicketDetailPage() {
                     editingFieldId={editingFieldId}
                     onStartEdit={setEditingFieldId}
                     onOpenSessionDrawer={setSelectedSessionRecordId}
-                    conversationPublicId={ticket.conversation_public_id ?? undefined}
+                    onOpenCallDrawer={setSelectedCallRecordId}
+                    conversationPublicId={ticket.conversation_public_id ?? ticket.call_record_call_id ?? undefined}
+                    callRecordId={ticket.call_record_id ?? undefined}
                     isZh={isZh}
                   />
                 ))}
@@ -512,6 +518,12 @@ export default function TicketDetailPage() {
         <SessionDetailDrawer
           recordId={selectedSessionRecordId}
           onClose={() => setSelectedSessionRecordId(null)}
+        />
+      )}
+      {selectedCallRecordId != null && (
+        <CallRecordDetailDrawer
+          recordId={selectedCallRecordId}
+          onClose={() => setSelectedCallRecordId(null)}
         />
       )}
     </div>
@@ -969,7 +981,9 @@ function TabBlock({
   editingFieldId,
   onStartEdit,
   onOpenSessionDrawer,
+  onOpenCallDrawer,
   conversationPublicId,
+  callRecordId,
   isZh,
 }: {
   tab: FdFormLayoutTab
@@ -988,7 +1002,9 @@ function TabBlock({
   editingFieldId: number | null
   onStartEdit: (id: number | null) => void
   onOpenSessionDrawer: (recordId: number) => void
+  onOpenCallDrawer: (recordId: number) => void
   conversationPublicId?: string
+  callRecordId?: number
   isZh: boolean
 }) {
   const sections = useMemo(
@@ -1041,7 +1057,9 @@ function TabBlock({
               editingFieldId={editingFieldId}
               onStartEdit={onStartEdit}
               onOpenSessionDrawer={onOpenSessionDrawer}
+              onOpenCallDrawer={onOpenCallDrawer}
               conversationPublicId={conversationPublicId}
+              callRecordId={callRecordId}
               isZh={isZh}
             />
           ))}
@@ -1068,7 +1086,9 @@ function SectionBlock({
   editingFieldId,
   onStartEdit,
   onOpenSessionDrawer,
+  onOpenCallDrawer,
   conversationPublicId,
+  callRecordId,
   isZh,
 }: {
   section: FdFormLayoutSection
@@ -1085,7 +1105,9 @@ function SectionBlock({
   editingFieldId: number | null
   onStartEdit: (id: number | null) => void
   onOpenSessionDrawer: (recordId: number) => void
+  onOpenCallDrawer: (recordId: number) => void
   conversationPublicId?: string
+  callRecordId?: number
   isZh: boolean
 }) {
   const fields = useMemo(
@@ -1147,6 +1169,8 @@ function SectionBlock({
                     onStartEdit={() => onStartEdit(field.id)}
                     onStopEdit={() => onStartEdit(null)}
                     onOpenSessionDrawer={onOpenSessionDrawer}
+                    onOpenCallDrawer={onOpenCallDrawer}
+                    callRecordId={callRecordId}
                     isZh={isZh}
                   />
                 </div>
@@ -1187,6 +1211,8 @@ function FieldDisplay({
   onStartEdit,
   onStopEdit,
   onOpenSessionDrawer,
+  onOpenCallDrawer,
+  callRecordId,
   isZh,
 }: {
   field: FdFormLayoutField
@@ -1202,6 +1228,8 @@ function FieldDisplay({
   onStartEdit: () => void
   onStopEdit: () => void
   onOpenSessionDrawer: (recordId: number) => void
+  onOpenCallDrawer: (recordId: number) => void
+  callRecordId?: number
   isZh: boolean
 }) {
   const label = fieldDef?.name ?? fieldKey
@@ -1540,6 +1568,17 @@ function FieldDisplay({
                 onClick={(event) => {
                   event.stopPropagation()
                   onOpenSessionDrawer(entityId)
+                }}
+                className="font-medium text-primary hover:underline"
+              >
+                {displayValue}
+              </button>
+            ) : isConversationField && callRecordId ? (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onOpenCallDrawer(callRecordId)
                 }}
                 className="font-medium text-primary hover:underline"
               >

@@ -143,6 +143,27 @@ class UserRepository:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def list_by_ids(db: AsyncSession, tenant_id: int, user_ids: list[int]) -> list[User]:
+        ids = sorted({user_id for user_id in user_ids if user_id is not None})
+        if not ids:
+            return []
+        result = await db.execute(
+            select(User).where(User.tenant_id == tenant_id, User.id.in_(ids))
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def list_with_phone(db: AsyncSession, tenant_id: int) -> list[User]:
+        result = await db.execute(
+            select(User).where(
+                User.tenant_id == tenant_id,
+                User.phone.isnot(None),
+                User.phone != "",
+            )
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
     def generate_public_id() -> str:
         suffix = "".join(secrets.choice(USER_PUBLIC_ID_ALPHABET) for _ in range(USER_PUBLIC_ID_RANDOM_LENGTH))
         return f"{USER_PUBLIC_ID_PREFIX}{suffix}"
@@ -205,6 +226,11 @@ class UserRepository:
         else:
             await db.flush()
         return user
+
+    @staticmethod
+    async def delete(db: AsyncSession, user: User) -> None:
+        await db.delete(user)
+        await db.commit()
 
     @staticmethod
     def _build_conditions_filters(

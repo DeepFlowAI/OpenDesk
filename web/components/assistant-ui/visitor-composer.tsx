@@ -10,7 +10,7 @@ import {
 } from 'react'
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useVisitorChatConfig } from './visitor-chat-runtime'
-import { IconArrowUp, IconLoader2, IconPaperclip, IconStar } from '@tabler/icons-react'
+import { IconArrowUp, IconLoader2, IconPaperclip, IconPlayerStop, IconStar } from '@tabler/icons-react'
 
 const MAX_ROWS = 3
 const LINE_HEIGHT = 22
@@ -52,14 +52,24 @@ export function VisitorComposer({
   satisfactionLoading = false,
   onSatisfactionClick,
 }: VisitorComposerProps) {
-  const { locale, config, onTyping, onFileSend } = useVisitorChatConfig()
+  const {
+    locale,
+    config,
+    botMode,
+    botRunning,
+    handoffRouting,
+    visitorMessageCount,
+    onTyping,
+    onFileSend,
+    onRequestHumanHandoff,
+  } = useVisitorChatConfig()
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const placeholder =
-    config.input_placeholder ||
+    (botMode ? config.open_agent_input_placeholder : config.input_placeholder) ||
     (locale === 'zh' ? '输入消息...' : 'Type a message...')
   const disabledText =
     locale === 'zh' ? '会话已结束' : 'Conversation ended'
@@ -96,8 +106,30 @@ export function VisitorComposer({
     [locale, onFileSend],
   )
 
+  const showHandoffButton =
+    botMode
+    && config.open_agent_handoff_enabled
+    && visitorMessageCount >= config.open_agent_handoff_after_messages
+
   return (
     <div className="shrink-0 bg-background px-3 py-2 sm:px-4 sm:py-3">
+      {handoffRouting && (
+        <div className="mb-2 rounded-lg bg-primary/10 px-3 py-2 text-center text-xs font-medium text-primary">
+          {locale === 'zh' ? '正在为您转接人工客服' : 'Connecting you to a human agent…'}
+        </div>
+      )}
+      {showHandoffButton && (
+        <div className="mb-2 flex justify-start">
+          <button
+            type="button"
+            className="rounded-full border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={() => void onRequestHumanHandoff(null)}
+            disabled={disabled || botRunning || handoffRouting}
+          >
+            {config.open_agent_handoff_label || (locale === 'zh' ? '转人工' : 'Human support')}
+          </button>
+        </div>
+      )}
       <ComposerPrimitive.Root className="rounded-[14px] border border-border bg-background sm:rounded-2xl">
         {/* Text input */}
         <ComposerPrimitive.Input
@@ -115,15 +147,17 @@ export function VisitorComposer({
         <div className="flex items-center justify-between px-2 pb-2 sm:px-3 sm:pb-2.5">
           {/* Left: attachment button */}
           <div className="flex items-center gap-1">
-            <button
-              type="button"
-              className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40"
-              onClick={handleImageSelect}
-              disabled={disabled || uploading}
-            >
-              {uploading ? <IconLoader2 size={18} className="animate-spin" /> : <IconPaperclip size={18} />}
-            </button>
-            {showSatisfactionButton && (
+            {!botMode && (
+              <button
+                type="button"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                onClick={handleImageSelect}
+                disabled={disabled || uploading}
+              >
+                {uploading ? <IconLoader2 size={18} className="animate-spin" /> : <IconPaperclip size={18} />}
+              </button>
+            )}
+            {!botMode && showSatisfactionButton && (
               <button
                 type="button"
                 className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
@@ -157,14 +191,22 @@ export function VisitorComposer({
             }}
           />
 
-          {/* Right: send button — circular; idle (empty) uses light fill per design */}
-          <ComposerPrimitive.Send
-            disabled={disabled}
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#F4F4F5] text-[#9CA3AF] transition-colors enabled:cursor-pointer enabled:bg-[var(--opendesk-send-button-bg)] enabled:text-primary-foreground enabled:hover:opacity-90 disabled:cursor-not-allowed sm:h-9 sm:w-9"
-            style={sendButtonStyle}
-          >
-            <IconArrowUp size={isMobile ? 16 : 18} />
-          </ComposerPrimitive.Send>
+          {botRunning ? (
+            <ComposerPrimitive.Cancel
+              className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full bg-[var(--opendesk-send-button-bg)] text-primary-foreground transition-opacity hover:opacity-90 sm:h-9 sm:w-9"
+              style={sendButtonStyle}
+            >
+              <IconPlayerStop size={isMobile ? 16 : 18} />
+            </ComposerPrimitive.Cancel>
+          ) : (
+            <ComposerPrimitive.Send
+              disabled={disabled}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#F4F4F5] text-[#9CA3AF] transition-colors enabled:cursor-pointer enabled:bg-[var(--opendesk-send-button-bg)] enabled:text-primary-foreground enabled:hover:opacity-90 disabled:cursor-not-allowed sm:h-9 sm:w-9"
+              style={sendButtonStyle}
+            >
+              <IconArrowUp size={isMobile ? 16 : 18} />
+            </ComposerPrimitive.Send>
+          )}
         </div>
         {uploadError && (
           <div className="px-3 pb-2 text-xs text-destructive sm:px-4">

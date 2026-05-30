@@ -9,10 +9,19 @@ from app.core.exceptions import NotFoundError
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.session_record_repository import SessionRecordRepository
 from app.repositories.satisfaction_survey_record_repository import SatisfactionSurveyRecordRepository
+from app.repositories.ticket_repository import TicketRepository
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
 
 class SessionRecordService:
+    @staticmethod
+    def _bot_sender_name(conversation, metadata: dict) -> str:
+        return (
+            metadata.get("sender_name")
+            or metadata.get("open_agent_agent_name")
+            or getattr(conversation, "open_agent_agent_name", None)
+            or "智能助手"
+        )
 
     @staticmethod
     async def get_paginated(
@@ -71,7 +80,17 @@ class SessionRecordService:
         }
 
     @staticmethod
-    def _conversation_to_response(conversation, satisfaction_record=None) -> dict:
+    def _ticket_briefs(tickets) -> list[dict]:
+        return [
+            {
+                "id": ticket.id,
+                "ticket_number": ticket.ticket_number,
+            }
+            for ticket in tickets
+        ]
+
+    @staticmethod
+    def _conversation_to_response(conversation, satisfaction_record=None, related_tickets=None) -> dict:
         return {
             "id": conversation.id,
             "public_id": conversation.public_id,
@@ -86,15 +105,21 @@ class SessionRecordService:
             "created_at": conversation.created_at,
             "last_message_preview": getattr(conversation, "last_message_preview", None),
             "satisfaction": SatisfactionSurveyRecordService.record_summary(satisfaction_record),
+            "related_tickets": SessionRecordService._ticket_briefs(related_tickets or []),
         }
 
     @staticmethod
-    async def get_by_id(db: AsyncSession, conversation_id: int):
-        item = await SessionRecordRepository.get_by_id(db, conversation_id)
+    async def get_by_id(db: AsyncSession, tenant_id: int, conversation_id: int):
+        item = await SessionRecordRepository.get_by_id(db, conversation_id, tenant_id)
         if not item:
             raise NotFoundError("Session record not found")
         satisfaction = await SatisfactionSurveyRecordRepository.get_by_conversation(db, conversation_id)
-        return SessionRecordService._conversation_to_response(item, satisfaction)
+        related_tickets = await TicketRepository.list_by_conversation_id(
+            db,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+        )
+        return SessionRecordService._conversation_to_response(item, satisfaction, related_tickets)
 
     @staticmethod
     async def get_messages(
@@ -146,6 +171,8 @@ class SessionRecordService:
                 agent = agents.get(msg.sender_id) if msg.sender_id is not None else item.agent
                 entry["sender_name"] = (agent.display_name or agent.name) if agent else (item.agent.display_name or item.agent.name)
                 entry["sender_avatar"] = agent.avatar if agent and hasattr(agent, "avatar") else None
+            elif msg.sender_type == "bot":
+                entry["sender_name"] = SessionRecordService._bot_sender_name(item, metadata)
             enriched.append(entry)
 
         return {"items": enriched, "has_more": has_more}

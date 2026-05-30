@@ -6,6 +6,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.satisfaction_survey_record import SatisfactionSummaryResponse
+from app.schemas.ticket import RelatedTicketResponse
 
 
 class SessionRecordVisitor(BaseModel):
@@ -63,6 +64,7 @@ class SessionRecordListResponse(BaseModel):
 class SessionRecordDetailResponse(SessionRecordResponse):
     """Extended detail with group info."""
     last_message_preview: str | None = None
+    related_tickets: list[RelatedTicketResponse] = Field(default_factory=list)
 
 
 class SessionRecordMessageResponse(BaseModel):

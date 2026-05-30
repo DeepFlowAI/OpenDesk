@@ -1,6 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
+import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { cn } from '@/lib/utils'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
@@ -38,10 +40,12 @@ type Props = {
 }
 
 export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: controlledActiveTab, onActiveTabChange }: Props) {
+  const router = useRouter()
   const { locale } = useLocaleStore()
   const [internalActiveTab, setInternalActiveTab] = useState<SessionInfoTab>('basic')
   const [summaryDirty, setSummaryDirty] = useState(false)
   const activeTab = controlledActiveTab ?? internalActiveTab
+  const visitorDetailRef = record.visitor?.public_id || (record.visitor?.id ? String(record.visitor.id) : '')
 
   const handleSummaryDirtyChange = (dirty: boolean) => {
     setSummaryDirty(dirty)
@@ -86,7 +90,19 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
                 {t('ws.records.sessions.detail.userInfo', locale)}
               </h3>
               <div className="flex flex-col gap-3">
-                <InfoRow label={t('ws.records.sessions.detail.userName', locale)} value={record.visitor?.name || '-'} />
+                <InfoRow
+                  label={t('ws.records.sessions.detail.userName', locale)}
+                  value={record.visitor?.name || '-'}
+                  action={visitorDetailRef ? (
+                    <button
+                      type="button"
+                      onClick={() => router.push(`/workspace/users/${visitorDetailRef}`)}
+                      className="shrink-0 text-xs font-medium text-primary underline-offset-2 hover:underline"
+                    >
+                      {t('ws.records.sessions.detail.viewUser', locale)}
+                    </button>
+                  ) : null}
+                />
               </div>
             </div>
 
@@ -96,6 +112,10 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
               </h3>
               <div className="flex flex-col gap-3">
                 <InfoRow label={t('ws.records.sessions.detail.shareCode', locale)} value={record.share_code || record.public_id || '-'} />
+                <InfoRow
+                  label={t('ws.records.sessions.detail.relatedTickets', locale)}
+                  value={<RelatedTicketsLinks tickets={record.related_tickets ?? []} />}
+                />
                 <InfoRow label={t('ws.records.sessions.detail.channelType', locale)} value={record.channel?.channel_type || '-'} />
                 <InfoRow label={t('ws.records.sessions.detail.channelName', locale)} value={record.channel?.name || '-'} />
                 <InfoRow label={t('ws.records.sessions.detail.agent', locale)} value={record.agent?.display_name || record.agent?.name || '-'} />
@@ -220,16 +240,47 @@ function SatisfactionResultCard({
 function InfoRow({
   label,
   value,
+  action,
 }: {
   label: string
-  value: string
+  value: ReactNode
+  action?: ReactNode
 }) {
+  const valueNode = typeof value === 'string' || typeof value === 'number'
+    ? <span className="min-w-0 break-words text-sm text-foreground">{value}</span>
+    : <div className="min-w-0">{value}</div>
+
   return (
     <div className="flex flex-col gap-1">
       <span className="text-xs text-muted-foreground">{label}</span>
-      <div className="flex min-w-0 items-center gap-1.5">
-        <span className="break-words text-sm text-foreground">{value}</span>
+      <div className="flex min-w-0 items-center justify-between gap-3">
+        {valueNode}
+        {action}
       </div>
+    </div>
+  )
+}
+
+function RelatedTicketsLinks({
+  tickets,
+}: {
+  tickets: SessionRecordDetail['related_tickets']
+}) {
+  if (!tickets.length) {
+    return <span className="text-sm text-foreground">-</span>
+  }
+
+  return (
+    <div className="flex min-w-0 flex-wrap gap-x-2 gap-y-1">
+      {tickets.map((ticket) => (
+        <Link
+          key={ticket.id}
+          href={`/workspace/tickets/${ticket.id}?from=list`}
+          className="max-w-full truncate text-sm font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {ticket.ticket_number || `#${ticket.id}`}
+        </Link>
+      ))}
     </div>
   )
 }

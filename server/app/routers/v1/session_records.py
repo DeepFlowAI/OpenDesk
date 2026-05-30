@@ -83,7 +83,7 @@ async def get_session_record(
     user: dict = Depends(get_current_user),
 ):
     """Get a single session record by ID."""
-    return await SessionRecordService.get_by_id(db, record_id)
+    return await SessionRecordService.get_by_id(db, user["tenant_id"], record_id)
 
 
 @router.get("/{record_id}/satisfaction", response_model=SessionRecordSatisfactionResponse)

@@ -10,6 +10,8 @@ export type Ticket = {
   layout_id: number | null
   conversation_id: number | null
   conversation_public_id: string | null
+  call_record_id: number | null
+  call_record_call_id: string | null
   user_id: number | null
   agent_id: number | null
   assignee_group_id: number | null
@@ -22,6 +24,11 @@ export type Ticket = {
   custom_fields: Record<string, CustomFieldValue>
   created_at: string
   updated_at: string
+}
+
+export type RelatedTicket = {
+  id: number
+  ticket_number: string | null
 }
 
 export type AuditActorRef = {
@@ -69,6 +76,7 @@ export type CreateTicketPayload = {
   priority?: string | null
   layout_id?: number | null
   conversation_id?: number | null
+  call_record_id?: number | null
   user_id?: number | null
   agent_id?: number | null
   assignee_group_id?: number | null
@@ -81,6 +89,7 @@ export type UpdateTicketPayload = {
   status?: string | null
   priority?: string | null
   conversation_id?: number | null
+  call_record_id?: number | null
   user_id?: number | null
   agent_id?: number | null
   assignee_group_id?: number | null

@@ -1,4 +1,5 @@
 import type { SatisfactionSummary } from './satisfaction-survey'
+import type { RelatedTicket } from './ticket'
 
 export type SessionRecordVisitor = {
   id: number
@@ -28,7 +29,7 @@ export type SessionRecord = {
   visitor: SessionRecordVisitor | null
   agent: SessionRecordAgent | null
   channel: SessionRecordChannel | null
-  status: 'queued' | 'active' | 'closed'
+  status: 'queued' | 'active' | 'bot' | 'handoff_pending' | 'closed'
   started_at: string | null
   ended_at: string | null
   ended_by: string | null
@@ -46,12 +47,13 @@ export type SessionRecordListResponse = {
 
 export type SessionRecordDetail = SessionRecord & {
   last_message_preview: string | null
+  related_tickets: RelatedTicket[]
 }
 
 export type SessionRecordMessage = {
   id: number
   conversation_id: number
-  sender_type: 'visitor' | 'agent' | 'system'
+  sender_type: 'visitor' | 'agent' | 'bot' | 'system'
   sender_id: number | null
   sender_name: string | null
   sender_avatar: string | null
@@ -59,7 +61,7 @@ export type SessionRecordMessage = {
   content: string
   metadata?: Record<string, unknown>
   created_at: string
-  event_type?: 'invitation_sent' | 'feedback_submitted'
+  event_type?: string
   satisfaction_record_id?: number
   config_version?: number
 }

@@ -98,7 +98,15 @@ class SessionRecordRepository:
         return list(result.scalars().all()), total
 
     @staticmethod
-    async def get_by_id(db: AsyncSession, conversation_id: int) -> Conversation | None:
+    async def get_by_id(
+        db: AsyncSession,
+        conversation_id: int,
+        tenant_id: int | None = None,
+    ) -> Conversation | None:
+        filters = [Conversation.id == conversation_id]
+        if tenant_id is not None:
+            filters.append(Conversation.tenant_id == tenant_id)
+
         result = await db.execute(
             select(Conversation)
             .options(
@@ -107,7 +115,7 @@ class SessionRecordRepository:
                 selectinload(Conversation.channel),
                 selectinload(Conversation.group),
             )
-            .where(Conversation.id == conversation_id)
+            .where(*filters)
         )
         return result.scalar_one_or_none()
 

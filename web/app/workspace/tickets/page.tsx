@@ -43,6 +43,7 @@ import { colorForSelectValue, labelForSelectValue } from '@/lib/field-select-fro
 // ── localStorage helpers ──
 
 const COL_STORAGE_PREFIX = 'ws_ticket_cols_'
+const PER_PAGE_OPTIONS = [20, 50, 100]
 
 function getColStorageKey(viewId: number | null): string {
   return `${COL_STORAGE_PREFIX}${viewId ?? 'default'}`
@@ -124,7 +125,7 @@ export default function WorkspaceTicketsPage() {
   }, [views, selectedViewId])
 
   const [page, setPage] = useState(1)
-  const perPage = 20
+  const [perPage, setPerPage] = useState(20)
 
   const [search, setSearch] = useState('')
   const [searchInput, setSearchInput] = useState('')
@@ -576,29 +577,53 @@ export default function WorkspaceTicketsPage() {
           <>
             <div className="mx-5 h-px shrink-0 bg-border" aria-hidden />
             <div className="flex items-center justify-between px-5 py-3">
-            <span className="text-xs text-muted-foreground">
-              {locale === 'zh' ? `共 ${total} 条` : `${total} total`}
-            </span>
-            <div className="flex items-center gap-1.5">
-              <button
-                disabled={page <= 1}
-                onClick={() => setPage(page - 1)}
-                className="h-8 rounded-md border border-border px-3 text-xs text-foreground/80 transition-colors hover:bg-accent disabled:opacity-40"
-              >
-                {locale === 'zh' ? '上一页' : 'Prev'}
-              </button>
               <span className="text-xs text-muted-foreground">
-                {page} / {totalPages}
+                {locale === 'zh' ? `共 ${total} 条` : `${total} total`}
               </span>
-              <button
-                disabled={page >= totalPages}
-                onClick={() => setPage(page + 1)}
-                className="h-8 rounded-md border border-border px-3 text-xs text-foreground/80 transition-colors hover:bg-accent disabled:opacity-40"
-              >
-                {locale === 'zh' ? '下一页' : 'Next'}
-              </button>
+              <div className="flex items-center gap-2">
+                <select
+                  value={perPage}
+                  onChange={(e) => {
+                    setPage(1)
+                    setPerPage(Number(e.target.value))
+                  }}
+                  className="h-8 rounded-md border border-border bg-background px-2 text-xs outline-none"
+                >
+                  {PER_PAGE_OPTIONS.map((n) => (
+                    <option key={n} value={n}>{n} / page</option>
+                  ))}
+                </select>
+                <div className="flex gap-1">
+                  {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
+                    let pageNum: number
+                    if (totalPages <= 7) {
+                      pageNum = i + 1
+                    } else if (page <= 4) {
+                      pageNum = i + 1
+                    } else if (page >= totalPages - 3) {
+                      pageNum = totalPages - 6 + i
+                    } else {
+                      pageNum = page - 3 + i
+                    }
+                    return (
+                      <button
+                        key={pageNum}
+                        type="button"
+                        onClick={() => setPage(pageNum)}
+                        className={cn(
+                          'flex h-8 min-w-8 items-center justify-center rounded-md px-2 text-xs transition-colors',
+                          page === pageNum
+                            ? 'bg-primary text-primary-foreground'
+                            : 'border border-border text-foreground hover:bg-accent',
+                        )}
+                      >
+                        {pageNum}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
             </div>
-          </div>
           </>
         )}
       </div>
@@ -677,7 +702,7 @@ function buildTicketsUrl(
 
 const SYSTEM_KEYS = new Set([
   'ticket_number', 'title', 'description', 'status', 'priority',
-  'conversation_id', 'user_id', 'agent_id', 'assignee', 'assignee_group', 'assignee_group_id', 'layout_id',
+  'conversation_id', 'call_record_id', 'user_id', 'agent_id', 'assignee', 'assignee_group', 'assignee_group_id', 'layout_id',
   'created_by', 'updated_by', 'created_at', 'updated_at',
 ])
 
@@ -737,7 +762,7 @@ function getCellValue(
 
   if (field_key && SYSTEM_KEYS.has(field_key)) {
     if (field_key === 'conversation_id') {
-      return ticket.conversation_public_id ?? ''
+      return ticket.conversation_public_id ?? ticket.call_record_call_id ?? ''
     }
     const raw =
       field_key === 'assignee'

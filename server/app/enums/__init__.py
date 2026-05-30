@@ -7,12 +7,15 @@ import enum
 class ConversationStatus(str, enum.Enum):
     QUEUED = "queued"
     ACTIVE = "active"
+    BOT = "bot"
+    HANDOFF_PENDING = "handoff_pending"
     CLOSED = "closed"
 
 
 class MessageSenderType(str, enum.Enum):
     VISITOR = "visitor"
     AGENT = "agent"
+    BOT = "bot"
     SYSTEM = "system"
 
 

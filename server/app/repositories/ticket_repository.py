@@ -26,6 +26,7 @@ SYSTEM_FIELD_MAP: dict[str, str] = {
     "assignee_group": "assignee_group_id",
     "user_id": "user_id",
     "conversation_id": "conversation_id",
+    "call_record_id": "call_record_id",
     "agent_id": "agent_id",
     "layout_id": "layout_id",
     "created_by": "created_by_actor_name",
@@ -126,6 +127,34 @@ class TicketRepository:
     @staticmethod
     async def get_by_id(db: AsyncSession, ticket_id: int) -> Ticket | None:
         return await db.get(Ticket, ticket_id)
+
+    @staticmethod
+    async def list_by_conversation_id(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+    ) -> list[Ticket]:
+        result = await db.execute(
+            select(Ticket)
+            .where(Ticket.tenant_id == tenant_id)
+            .where(Ticket.conversation_id == conversation_id)
+            .order_by(Ticket.created_at.desc(), Ticket.id.desc())
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def list_by_call_record_id(
+        db: AsyncSession,
+        tenant_id: int,
+        call_record_id: int,
+    ) -> list[Ticket]:
+        result = await db.execute(
+            select(Ticket)
+            .where(Ticket.tenant_id == tenant_id)
+            .where(Ticket.call_record_id == call_record_id)
+            .order_by(Ticket.created_at.desc(), Ticket.id.desc())
+        )
+        return list(result.scalars().all())
 
     @staticmethod
     async def create(

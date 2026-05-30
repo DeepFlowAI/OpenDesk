@@ -6,6 +6,8 @@ import {
   IconAlertCircle,
   IconLoader2,
   IconMessageCircle,
+  IconPhoneIncoming,
+  IconPhoneOutgoing,
   IconRefresh,
   IconTicket,
 } from '@tabler/icons-react'
@@ -13,18 +15,26 @@ import { cn } from '@/lib/utils'
 import { useUserChanges } from '@/service/use-users'
 import { useSessionRecords } from '@/service/use-session-records'
 import { useUserRelatedTickets } from '@/service/use-tickets'
+import { useCallRecords } from '@/service/use-call-center'
 import { useEmployee } from '@/service/use-employees'
 import { useEmployeeGroup } from '@/service/use-employee-groups'
 import type { UnifiedField } from '@/models/field-definition'
 import type { EntityChange } from '@/models/entity-change'
 import type { SessionRecord } from '@/models/session-record'
 import type { Ticket } from '@/models/ticket'
+import type { CallRecordListItem } from '@/models/call-center'
 import { EntityChangeCard } from '@/app/components/features/activity/entity-change-timeline'
 import {
   ActivityTimeline,
   ActivityTimelineRow,
 } from '@/app/components/features/ticket/activity-timeline-row'
 import { SessionDetailDrawer } from '@/app/components/features/session-records/session-detail-drawer'
+import {
+  CallRecordDetailDrawer,
+  callRecordCustomerNumber,
+  callRecordServiceNumber,
+  formatCallRecordDuration,
+} from '@/app/components/features/call-center/call-record-detail-drawer'
 
 type TimelineTab = 'all' | 'related'
 
@@ -32,6 +42,7 @@ type TimelineEvent =
   | { type: 'change'; key: string; time: string | null; change: EntityChange }
   | { type: 'ticket'; key: string; time: string | null; ticket: Ticket }
   | { type: 'session'; key: string; time: string | null; session: SessionRecord }
+  | { type: 'call'; key: string; time: string | null; call: CallRecordListItem }
 
 type UserRelatedTimelineProps = {
   userId: number
@@ -46,10 +57,12 @@ export function UserRelatedTimeline({
 }: UserRelatedTimelineProps) {
   const [timelineTab, setTimelineTab] = useState<TimelineTab>('all')
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null)
+  const [selectedCallId, setSelectedCallId] = useState<number | null>(null)
 
   const changesQuery = useUserChanges(userId, { page: 1, per_page: 50 }, timelineTab === 'all')
   const sessionsQuery = useSessionRecords({ visitor_id: userId, page: 1, per_page: 50 })
   const ticketsQuery = useUserRelatedTickets(userId)
+  const callsQuery = useCallRecords({ user_id: userId, page: 1, per_page: 50 })
 
   const relatedEvents = useMemo<TimelineEvent[]>(() => {
     const tickets = (ticketsQuery.data?.items ?? []).map<TimelineEvent>((ticket) => ({
@@ -64,9 +77,15 @@ export function UserRelatedTimeline({
       time: session.started_at ?? session.created_at,
       session,
     }))
+    const calls = (callsQuery.data?.items ?? []).map<TimelineEvent>((call) => ({
+      type: 'call',
+      key: `call-${call.id}`,
+      time: call.started_at,
+      call,
+    }))
 
-    return sortTimelineEvents([...tickets, ...sessions])
-  }, [sessionsQuery.data?.items, ticketsQuery.data?.items])
+    return sortTimelineEvents([...tickets, ...sessions, ...calls])
+  }, [callsQuery.data?.items, sessionsQuery.data?.items, ticketsQuery.data?.items])
 
   const allEvents = useMemo<TimelineEvent[]>(() => {
     const changes = (changesQuery.data?.items ?? []).map<TimelineEvent>((change) => ({
@@ -83,15 +102,18 @@ export function UserRelatedTimeline({
   const isLoading =
     sessionsQuery.isLoading ||
     ticketsQuery.isLoading ||
+    callsQuery.isLoading ||
     (timelineTab === 'all' && changesQuery.isLoading)
   const isError =
     sessionsQuery.isError ||
     ticketsQuery.isError ||
+    callsQuery.isError ||
     (timelineTab === 'all' && changesQuery.isError)
 
   const retry = () => {
     void sessionsQuery.refetch()
     void ticketsQuery.refetch()
+    void callsQuery.refetch()
     if (timelineTab === 'all') void changesQuery.refetch()
   }
 
@@ -130,7 +152,7 @@ export function UserRelatedTimeline({
             icon={timelineTab === 'related' ? <IconTicket size={32} strokeWidth={1.5} /> : undefined}
             text={
               timelineTab === 'related'
-                ? isZh ? '暂无会话与工单记录' : 'No sessions or tickets yet'
+                ? isZh ? '暂无会话、工单与通话记录' : 'No sessions, tickets, or calls yet'
                 : isZh ? '暂无动态' : 'No activity yet'
             }
           />
@@ -150,6 +172,7 @@ export function UserRelatedTimeline({
                   isZh={isZh}
                   resolveFieldDef={resolveFieldDef}
                   onOpenSession={setSelectedSessionId}
+                  onOpenCall={setSelectedCallId}
                 />
               </ActivityTimelineRow>
             ))}
@@ -161,6 +184,12 @@ export function UserRelatedTimeline({
         <SessionDetailDrawer
           recordId={selectedSessionId}
           onClose={() => setSelectedSessionId(null)}
+        />
+      ) : null}
+      {selectedCallId != null ? (
+        <CallRecordDetailDrawer
+          recordId={selectedCallId}
+          onClose={() => setSelectedCallId(null)}
         />
       ) : null}
     </div>
@@ -198,11 +227,13 @@ function TimelineEventCard({
   isZh,
   resolveFieldDef,
   onOpenSession,
+  onOpenCall,
 }: {
   event: TimelineEvent
   isZh: boolean
   resolveFieldDef: (fieldKey: string) => UnifiedField | undefined
   onOpenSession: (sessionId: number) => void
+  onOpenCall: (callId: number) => void
 }) {
   if (event.type === 'change') {
     return (
@@ -218,12 +249,99 @@ function TimelineEventCard({
     return <TicketTimelineCard ticket={event.ticket} isZh={isZh} />
   }
 
+  if (event.type === 'call') {
+    return (
+      <CallTimelineCard
+        record={event.call}
+        isZh={isZh}
+        onOpen={() => onOpenCall(event.call.id)}
+      />
+    )
+  }
+
   return (
     <SessionTimelineCard
       session={event.session}
       isZh={isZh}
       onOpen={() => onOpenSession(event.session.id)}
     />
+  )
+}
+
+function CallTimelineCard({
+  record,
+  isZh,
+  onOpen,
+}: {
+  record: CallRecordListItem
+  isZh: boolean
+  onOpen: () => void
+}) {
+  const DirectionIcon = record.direction === 'inbound' ? IconPhoneIncoming : IconPhoneOutgoing
+  const directionLabel = record.direction === 'inbound'
+    ? (isZh ? '呼入' : 'Inbound')
+    : (isZh ? '呼出' : 'Outbound')
+  const customerNumber = callRecordCustomerNumber(record)
+  const serviceNumber = callRecordServiceNumber(record)
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="w-full rounded-lg bg-white px-4 py-3.5 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted text-foreground">
+            <DirectionIcon size={15} />
+          </span>
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-1.5 text-[13px] text-foreground">
+              <span>{isZh ? '通话' : 'Call'}</span>
+              <span className="max-w-[220px] truncate font-medium text-primary">
+                {record.call_id}
+              </span>
+            </div>
+            <p className="mt-1 truncate text-xs text-muted-foreground">
+              {isZh ? '用户号码' : 'User number'}: {customerNumber || (isZh ? '未知号码' : 'Unknown')}
+            </p>
+          </div>
+        </div>
+        <time className="shrink-0 text-xs text-muted-foreground" dateTime={record.started_at}>
+          {formatTimelineTime(record.started_at, isZh)}
+        </time>
+      </div>
+      <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
+        <TimelineMeta label={isZh ? '类型' : 'Type'}>
+          <span
+            className={cn(
+              'inline-flex items-center rounded px-1.5 py-0.5',
+              record.direction === 'inbound'
+                ? 'bg-blue-50 text-blue-700'
+                : 'bg-green-50 text-green-700',
+            )}
+          >
+            {directionLabel}
+          </span>
+        </TimelineMeta>
+        <TimelineMeta label={isZh ? '接待客服' : 'Agent'}>
+          <span className="text-foreground">{record.agent_name || '-'}</span>
+        </TimelineMeta>
+        <TimelineMeta label={isZh ? '时长' : 'Duration'}>
+          <span className="text-foreground">{formatCallRecordDuration(record.talk_duration_ms)}</span>
+        </TimelineMeta>
+      </div>
+      <div className="mt-2 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
+        <TimelineMeta label={isZh ? '服务号码' : 'Service number'}>
+          <span className="text-foreground">{serviceNumber || '-'}</span>
+        </TimelineMeta>
+        <TimelineMeta label={isZh ? '状态' : 'Status'}>
+          <span className="rounded-md bg-muted px-1.5 py-0.5 text-foreground">
+            {record.state || '-'}
+          </span>
+        </TimelineMeta>
+      </div>
+    </button>
   )
 }
 

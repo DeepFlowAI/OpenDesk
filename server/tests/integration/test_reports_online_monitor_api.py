@@ -66,8 +66,8 @@ async def seed():
 
         # One session today for agent A
         await db.execute(text("""
-            INSERT INTO users (tenant_id, external_id, name)
-            VALUES (:tid, 'mon_v', 'Mon Visitor')
+            INSERT INTO users (tenant_id, public_id, external_id, name)
+            VALUES (:tid, 'user_mon_v', 'mon_v', 'Mon Visitor')
             ON CONFLICT ON CONSTRAINT uq_users_tenant_external DO NOTHING
         """), {"tid": _TENANT_PK})
         await db.commit()

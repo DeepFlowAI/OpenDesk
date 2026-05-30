@@ -119,3 +119,49 @@ class TestUsersPublicIdAPI:
         detail_resp = await client.get(f"/api/v1/users/{public_id}", headers=headers_b)
 
         assert detail_resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_user_removes_detail_and_list_result(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        create_resp = await client.post(
+            "/api/v1/users",
+            headers=headers,
+            json={"name": "Deleted User"},
+        )
+        assert create_resp.status_code == 201
+        created = create_resp.json()
+
+        delete_resp = await client.delete(f"/api/v1/users/{created['id']}", headers=headers)
+
+        assert delete_resp.status_code == 200
+        assert delete_resp.json() == {"message": "Deleted successfully"}
+
+        detail_resp = await client.get(f"/api/v1/users/{created['public_id']}", headers=headers)
+        assert detail_resp.status_code == 404
+
+        query_resp = await client.post(
+            "/api/v1/users/query",
+            headers=headers,
+            json={"search": created["public_id"], "page": 1, "per_page": 20},
+        )
+        assert query_resp.status_code == 200
+        assert query_resp.json()["items"] == []
+
+    @pytest.mark.asyncio
+    async def test_delete_user_is_tenant_isolated(self, client: AsyncClient):
+        headers_a = await _setup_tenant_and_auth(client)
+        headers_b = await _setup_tenant_and_auth(client)
+        create_resp = await client.post(
+            "/api/v1/users",
+            headers=headers_a,
+            json={"name": "Tenant Owned User"},
+        )
+        assert create_resp.status_code == 201
+        created = create_resp.json()
+
+        delete_resp = await client.delete(f"/api/v1/users/{created['id']}", headers=headers_b)
+
+        assert delete_resp.status_code == 404
+
+        detail_resp = await client.get(f"/api/v1/users/{created['public_id']}", headers=headers_a)
+        assert detail_resp.status_code == 200

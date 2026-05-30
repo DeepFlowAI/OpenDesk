@@ -9,11 +9,18 @@ from app.core.exceptions import NotFoundError
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserUpdate
+from app.services.entity_change_service import EntityChangeService
 from app.services.user_service import UserService
 
 
 class _DummyDB:
     """Sentinel async session for repository-patched service tests."""
+
+    async def commit(self):
+        return None
+
+    async def refresh(self, _item):
+        return None
 
 
 class TestUserServiceOrganizationAssociation:
@@ -27,7 +34,8 @@ class TestUserServiceOrganizationAssociation:
             assert user_id == 1
             return user
 
-        async def fake_update(_db, _user, data: dict):
+        async def fake_update(_db, _user, data: dict, commit: bool = True):
+            assert commit is False
             captured["data"] = data
             return _user
 
@@ -43,6 +51,7 @@ class TestUserServiceOrganizationAssociation:
         monkeypatch.setattr(UserService, "_get_field_key_slot_map", fake_slot_map)
         monkeypatch.setattr(UserService, "_validate_organization", fake_validate)
         monkeypatch.setattr(UserService, "_enrich_user_response", lambda _user, _slot_map: {"id": 1})
+        monkeypatch.setattr(EntityChangeService, "build_change_rows", lambda **_kwargs: [])
 
         result = await UserService.update_user(
             _DummyDB(),

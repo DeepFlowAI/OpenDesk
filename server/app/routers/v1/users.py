@@ -133,3 +133,15 @@ async def update_user(
         body,
         actor_id=current_user.get("user_id"),
     )
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_200_OK)
+async def delete_user(
+    user_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an existing end user."""
+    tenant_id = current_user["tenant_id"]
+    await UserService.delete_user(db, tenant_id, user_id)
+    return {"message": "Deleted successfully"}

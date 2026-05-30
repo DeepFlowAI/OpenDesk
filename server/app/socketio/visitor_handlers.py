@@ -19,6 +19,7 @@ from app.core.exceptions import UnauthorizedError
 from app.libs.realtime.base import BaseRealtimeTransport
 from app.services.channel_service import ChannelService
 from app.services.conversation_service import ConversationService
+from app.services.open_agent_conversation_service import OpenAgentConversationService
 from app.schemas.satisfaction_survey_record import SatisfactionSubmissionPayload
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 from app.services.visitor_web_status_service import (
@@ -29,6 +30,19 @@ from app.services.visitor_web_status_service import (
 logger = logging.getLogger(__name__)
 
 NAMESPACE = "/visitor"
+
+
+def _open_desk_messages_from_sse_events(events: list[bytes]) -> list[dict]:
+    messages: list[dict] = []
+    buffer = ""
+    for chunk in events:
+        buffer += chunk.decode("utf-8", errors="replace")
+        while "\n\n" in buffer:
+            frame, buffer = buffer.split("\n\n", 1)
+            event, data, _event_id = OpenAgentConversationService._parse_sse_frame(frame)
+            if event == "open_desk_message_saved" and data:
+                messages.append(data)
+    return messages
 
 
 async def _finalize_visitor_disconnect_after_grace(
@@ -245,6 +259,140 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             }, room=agent_room, namespace="/chat")
 
         return {"ok": True, "message": msg_payload}
+
+    @rt.on("request_human_handoff", namespace=NAMESPACE)  # type: ignore
+    async def on_request_human_handoff(sid: str, data: dict):
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        tenant_id = session.get("tenant_id")
+        conversation_public_id = data.get("conversation_public_id") or data.get("conversation_id")
+        if not conversation_public_id:
+            return {"error": "conversation_public_id required"}
+
+        tool_result_messages: list[dict] = []
+        async with AsyncSessionLocal() as db:
+            result = await ConversationService.request_human_handoff_for_session(
+                db,
+                redis_client.client,
+                conversation_public_id=conversation_public_id,
+                visitor_context=session,
+                handoff_payload=data.get("handoff_payload"),
+                handoff_trigger=data.get("handoff_trigger") or "visitor",
+                tool_call_id=data.get("tool_call_id"),
+            )
+            tool_call_id = data.get("tool_call_id")
+            if data.get("handoff_trigger") == "bot_confirmed" and isinstance(tool_call_id, str) and tool_call_id:
+                status, message = OpenAgentConversationService._handoff_tool_result_from_route_result(result)
+                try:
+                    tool_events = await OpenAgentConversationService.submit_handoff_tool_result_for_session(
+                        db,
+                        conversation_public_id=conversation_public_id,
+                        visitor_context=session,
+                        tool_call_id=tool_call_id,
+                        status=status,
+                        message=message,
+                    )
+                    tool_result_messages = _open_desk_messages_from_sse_events(tool_events)
+                except Exception:
+                    logger.exception("Failed to submit OpenAgent handoff tool result")
+
+        conv = result["conversation"]
+        message_payloads = result.get("messages") or []
+        if not message_payloads and result.get("message"):
+            message_payloads = [result["message"]]
+        message_payloads = [*message_payloads, *tool_result_messages]
+        conv_room = f"conv:{conv.id}"
+        for msg_payload in message_payloads:
+            await rt.emit("new_message", msg_payload, room=conv_room, namespace=NAMESPACE)
+
+        msg_payload = message_payloads[-1] if message_payloads else None
+
+        if result.get("ok") and conv.agent_id:
+            agent_room = f"agent:{tenant_id}:{conv.agent_id}"
+            conv_payload = {
+                "conversation_id": conv.id,
+                "visitor": {
+                    "id": conv.visitor.id,
+                    "public_id": conv.visitor.public_id,
+                    "name": conv.visitor.name,
+                    "avatar_color": conv.visitor.avatar_color,
+                } if conv.visitor else None,
+                "channel": {"id": conv.channel_id} if conv.channel_id else None,
+            }
+            await rt.emit("new_conversation", conv_payload, room=agent_room, namespace="/chat")
+            if msg_payload:
+                agent_payload = {**msg_payload, "conversation_id": conv.id}
+                agent_payload.pop("conversation_public_id", None)
+                await rt.emit("new_message", agent_payload, room=agent_room, namespace="/chat")
+                await rt.emit("conversation_updated", {
+                    "conversation_id": conv.id,
+                    "last_message_preview": ConversationService.build_message_preview(
+                        msg_payload["content_type"],
+                        msg_payload["content"],
+                    ),
+                    "last_message_at": msg_payload["created_at"],
+                    "unread_count": conv.unread_count,
+                }, room=agent_room, namespace="/chat")
+
+            await rt.emit("conversation_assigned", {
+                "conversation_id": conv.id,
+                "conversation_public_id": conv.public_id,
+                "agent": {
+                    "id": conv.agent.id,
+                    "name": conv.agent.display_name or conv.agent.name,
+                    "avatar": conv.agent.avatar,
+                } if conv.agent else None,
+            }, room=f"conv:{conv.id}", namespace=NAMESPACE)
+
+        return jsonable_encoder({
+            "ok": result.get("ok", False),
+            "reason": result.get("reason"),
+            "status": conv.status,
+            "message": msg_payload,
+            "agent": {
+                "id": conv.agent.id,
+                "name": conv.agent.display_name or conv.agent.name,
+                "avatar": conv.agent.avatar,
+            } if conv.agent else None,
+        })
+
+    @rt.on("dismiss_human_handoff", namespace=NAMESPACE)  # type: ignore
+    async def on_dismiss_human_handoff(sid: str, data: dict):
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        conversation_public_id = data.get("conversation_public_id") or data.get("conversation_id")
+        if not conversation_public_id:
+            return {"error": "conversation_public_id required"}
+
+        async with AsyncSessionLocal() as db:
+            result = await ConversationService.dismiss_bot_handoff_for_session(
+                db,
+                conversation_public_id=conversation_public_id,
+                visitor_context=session,
+                tool_call_id=data.get("tool_call_id"),
+            )
+            tool_call_id = data.get("tool_call_id")
+            tool_result_messages: list[dict] = []
+            if isinstance(tool_call_id, str) and tool_call_id:
+                try:
+                    tool_events = await OpenAgentConversationService.submit_handoff_tool_result_for_session(
+                        db,
+                        conversation_public_id=conversation_public_id,
+                        visitor_context=session,
+                        tool_call_id=tool_call_id,
+                        status=OpenAgentConversationService._HANDOFF_TOOL_RESULT_FAILED,
+                        message="用户选择继续咨询智能助手。",
+                    )
+                    tool_result_messages = _open_desk_messages_from_sse_events(tool_events)
+                except Exception:
+                    logger.exception("Failed to submit OpenAgent dismissed handoff tool result")
+
+        conv = result["conversation"]
+        conv_room = f"conv:{conv.id}"
+        for msg_payload in tool_result_messages:
+            await rt.emit("new_message", msg_payload, room=conv_room, namespace=NAMESPACE)
+        return jsonable_encoder({
+            "ok": result.get("ok", False),
+            "status": conv.status,
+        })
 
     @rt.on("submit_satisfaction_feedback", namespace=NAMESPACE)  # type: ignore
     async def on_submit_satisfaction_feedback(sid: str, data: dict):

@@ -3,8 +3,10 @@ Integration tests for Channel API
 """
 import pytest
 from httpx import AsyncClient
+from unittest.mock import AsyncMock
 
 from app.core.security import create_access_token
+from app.schemas.open_agent_settings import OpenAgentAgentListResponse, OpenAgentAgentSummary
 
 
 def _make_token(tenant_id: int = 7, role: str = "admin") -> str:
@@ -136,6 +138,56 @@ class TestChannelAPI:
         assert data["config"]["use_agent_avatar"] is False
         assert data["config"]["send_button_bg_color"] is None
         assert data["config"]["input_placeholder"] is None
+
+    @pytest.mark.asyncio
+    async def test_create_with_open_agent_bot_config(self, client: AsyncClient, monkeypatch):
+        """Create should save OpenAgent bot config after active agent validation."""
+        monkeypatch.setattr(
+            "app.services.channel_service.OpenAgentSettingsService.list_active_agents",
+            AsyncMock(return_value=OpenAgentAgentListResponse(
+                items=[OpenAgentAgentSummary(id=10, name="Support Agent", status="active")],
+                total=1,
+                page=1,
+                per_page=100,
+                pages=1,
+            )),
+        )
+        headers = _auth_header()
+        payload = {
+            "name": "Bot Channel",
+            "config": {
+                "open_agent_enabled": True,
+                "open_agent_agent_id": 10,
+                "open_agent_bot_strategy": "always",
+                "open_agent_input_placeholder": "Ask anything",
+                "open_agent_handoff_enabled": True,
+                "open_agent_handoff_label": "Human",
+                "open_agent_handoff_after_messages": 3,
+                "open_agent_handoff_behavior": "auto",
+            },
+        }
+
+        resp = await client.post("/api/v1/channels", json=payload, headers=headers)
+
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["config"]["open_agent_enabled"] is True
+        assert data["config"]["open_agent_agent_id"] == 10
+        assert data["config"]["open_agent_agent_name"] == "Support Agent"
+        assert data["config"]["open_agent_handoff_after_messages"] == 3
+
+    @pytest.mark.asyncio
+    async def test_create_with_missing_open_agent_returns_422(self, client: AsyncClient):
+        """Pydantic validation should reject enabled bot without an agent."""
+        headers = _auth_header()
+        payload = {
+            "name": "Bad Bot Channel",
+            "config": {"open_agent_enabled": True},
+        }
+
+        resp = await client.post("/api/v1/channels", json=payload, headers=headers)
+
+        assert resp.status_code == 422
 
     @pytest.mark.asyncio
     async def test_tenant_isolation(self, client: AsyncClient):

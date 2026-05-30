@@ -33,7 +33,7 @@ export type Conversation = {
   agent: AgentBrief | null
   channel: ChannelBrief | null
   group: GroupBrief | null
-  status: 'queued' | 'active' | 'closed'
+  status: 'queued' | 'active' | 'bot' | 'handoff_pending' | 'closed'
   started_at: string | null
   ended_at: string | null
   ended_by: string | null
@@ -60,11 +60,39 @@ export type VisitorWebStatusResponse = {
 
 export type MessageStatus = 'sending' | 'delivered' | 'read'
 
+export type OpenAgentThinkingBlock = {
+  id: string
+  content: string
+  llmStepId: number | null
+  isStreaming: boolean
+  timelineIndex: number
+}
+
+export type OpenAgentToolBlock = {
+  id: string
+  toolName: string
+  brief: string
+  toolCallId: string
+  stepId: number | null
+  isExecuting: boolean
+  timelineIndex: number
+  arguments?: unknown
+  result?: unknown
+  usedForHandoff?: boolean
+}
+
+export type OpenAgentTextBlock = {
+  id: string
+  content: string
+  isStreaming: boolean
+  timelineIndex: number
+}
+
 export type Message = {
   id: number
   conversation_id: number
   conversation_public_id?: string
-  sender_type: 'visitor' | 'agent' | 'system'
+  sender_type: 'visitor' | 'agent' | 'bot' | 'system'
   sender_id: number | null
   sender_name: string | null
   sender_avatar: string | null
@@ -73,7 +101,7 @@ export type Message = {
   metadata?: Record<string, unknown>
   created_at: string
   status?: MessageStatus
-  event_type?: 'invitation_sent' | 'feedback_submitted'
+  event_type?: 'invitation_sent' | 'feedback_submitted' | 'open_agent_handoff_event'
   satisfaction_record_id?: number
   config_version?: number
 }
@@ -90,7 +118,7 @@ export type MessageListResponse = {
 
 export type VisitorConversationHistoryItem = {
   conversation_public_id: string
-  status: 'queued' | 'active' | 'closed'
+  status: 'queued' | 'active' | 'bot' | 'handoff_pending' | 'closed'
   started_at: string | null
   ended_at: string | null
   last_message_at: string | null
@@ -108,7 +136,7 @@ export type VisitorConversationHistoryResponse = {
 
 export type WorkspaceConversationHistoryItem = {
   id: number
-  status: 'queued' | 'active' | 'closed'
+  status: 'queued' | 'active' | 'bot' | 'handoff_pending' | 'closed'
   started_at: string | null
   ended_at: string | null
   last_message_at: string | null

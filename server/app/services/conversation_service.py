@@ -20,6 +20,7 @@ from app.repositories.channel_repository import ChannelRepository
 from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.message_repository import MessageRepository
+from app.schemas.channel import ChannelConfig
 from app.schemas.message import FileMessageContent
 from app.repositories.user_repository import UserRepository
 from app.services.agent_status_service import AgentStatusService
@@ -54,12 +55,13 @@ class ConversationService:
 
     @staticmethod
     def _public_message_item(msg, conversation_public_id: str) -> dict:
+        metadata = getattr(msg, "metadata_", None) or {}
         return {
             "id": msg.id,
             "conversation_public_id": conversation_public_id,
             "sender_type": msg.sender_type,
             "sender_id": msg.sender_id,
-            "sender_name": None,
+            "sender_name": ConversationService._metadata_sender_name(msg.sender_type, metadata),
             "sender_avatar": None,
             "content_type": msg.content_type,
             "content": msg.content,
@@ -76,6 +78,17 @@ class ConversationService:
             "satisfaction_record_id": metadata.get("satisfaction_record_id"),
             "config_version": metadata.get("config_version"),
         }
+
+    @staticmethod
+    def _metadata_sender_name(sender_type: str, metadata: dict | None) -> str | None:
+        if sender_type != MessageSenderType.BOT.value:
+            return None
+        metadata = metadata or {}
+        return (
+            metadata.get("sender_name")
+            or metadata.get("open_agent_agent_name")
+            or "智能助手"
+        )
 
     @staticmethod
     def validate_message_content(content_type: str, content: str) -> str:
@@ -214,11 +227,60 @@ class ConversationService:
             return {"conversation": existing, "is_new": False, "newly_assigned": newly_assigned}
 
         from app.services.channel_service import ChannelService
-        availability = await ChannelService.check_channel_availability(
-            db,
-            r,
-            channel_id,
-        )
+
+        channel = await ChannelRepository.get_by_id(db, channel_id)
+        if not channel:
+            raise NotFoundError("Channel not found")
+
+        raw_channel_config = getattr(channel, "config", None)
+        config = ChannelConfig.model_validate(raw_channel_config if isinstance(raw_channel_config, dict) else {})
+        if config.open_agent_enabled:
+            availability = await ChannelService.check_open_agent_bot_availability(db, channel, config)
+            if not availability["can_start_conversation"]:
+                return {
+                    "conversation": None,
+                    "is_new": False,
+                    "offline": True,
+                    "availability": availability,
+                }
+
+            now = datetime.now(timezone.utc)
+            bot_name = config.open_agent_agent_name or "智能助手"
+            conversation = await ConversationRepository.create(db, {
+                "public_id": await ConversationRepository.generate_unique_public_id(db),
+                "share_code": await ConversationRepository.generate_unique_share_code(db),
+                "tenant_id": tenant_id,
+                "visitor_id": user.id,
+                "channel_id": channel_id,
+                "group_id": None,
+                "agent_id": None,
+                "status": ConversationStatus.BOT.value,
+                "started_at": now,
+                "open_agent_agent_id": config.open_agent_agent_id,
+                "open_agent_agent_name": bot_name,
+            })
+            preview_message = await MessageRepository.create(db, {
+                "tenant_id": tenant_id,
+                "conversation_id": conversation.id,
+                "sender_type": MessageSenderType.SYSTEM.value,
+                "content_type": MessageContentType.SYSTEM.value,
+                "content": "智能助手开始接待",
+                "metadata_": {
+                    "event_type": "open_agent_bot_started",
+                    "open_agent_agent_id": config.open_agent_agent_id,
+                    "open_agent_agent_name": bot_name,
+                },
+            })
+            await ConversationRepository.update_last_message(
+                db,
+                conversation.id,
+                ConversationService.build_message_preview(preview_message.content_type, preview_message.content),
+                preview_message.created_at or now,
+            )
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            return {"conversation": conversation, "is_new": True}
+
+        availability = await ChannelService.check_channel_availability(db, r, channel_id)
         if not availability["can_start_conversation"]:
             return {
                 "conversation": None,
@@ -427,6 +489,7 @@ class ConversationService:
         content_type: str,
         content: str,
         tenant_id: int,
+        metadata: dict | None = None,
     ):
         conv = await ConversationRepository.get_by_id(db, conversation_id)
         if not conv:
@@ -445,6 +508,7 @@ class ConversationService:
             "sender_id": sender_id,
             "content_type": content_type,
             "content": normalized_content,
+            "metadata_": metadata or {},
         })
 
         preview = ConversationService.build_message_preview(content_type, normalized_content)
@@ -543,6 +607,357 @@ class ConversationService:
         return msg_payload, conversation.agent_id, conversation
 
     @staticmethod
+    def _public_message_payload(msg, conversation) -> dict:
+        metadata = getattr(msg, "metadata_", None) or {}
+        return {
+            "id": msg.id,
+            "conversation_public_id": conversation.public_id,
+            "sender_type": msg.sender_type,
+            "sender_id": msg.sender_id,
+            "sender_name": ConversationService._metadata_sender_name(msg.sender_type, metadata),
+            "sender_avatar": None,
+            "content_type": msg.content_type,
+            "content": msg.content,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            **ConversationService._message_event_overlay(msg),
+        }
+
+    @staticmethod
+    async def _save_confirmed_by_visitor_handoff_event(
+        db: AsyncSession,
+        conversation,
+        handoff_data: dict,
+        tool_call_id: str | None,
+        handoff_source: str = "bot_tool",
+    ) -> dict | None:
+        raw_tool_call_id = tool_call_id if isinstance(tool_call_id, str) else None
+        raw_payload_tool_call_id = handoff_data.get("tool_call_id") if isinstance(handoff_data, dict) else None
+        if not isinstance(raw_payload_tool_call_id, str):
+            raw_payload_tool_call_id = None
+        normalized_tool_call_id = (raw_tool_call_id or raw_payload_tool_call_id or "").strip() or None
+        content = "您已确认转接人工客服"
+        if normalized_tool_call_id:
+            existing = await MessageRepository.get_handoff_event_by_tool_call_id(
+                db,
+                conversation.tenant_id,
+                conversation.id,
+                normalized_tool_call_id,
+                "confirmed_by_visitor",
+            )
+            if existing:
+                conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                return ConversationService._public_message_payload(existing, conversation)
+
+        msg = await MessageRepository.create(db, {
+            "tenant_id": conversation.tenant_id,
+            "conversation_id": conversation.id,
+            "sender_type": MessageSenderType.SYSTEM.value,
+            "content_type": MessageContentType.SYSTEM.value,
+            "content": content,
+            "metadata_": {
+                "event_type": "open_agent_handoff_event",
+                "handoff_event_type": "confirmed_by_visitor",
+                "handoff_source": handoff_source,
+                "handoff_payload": handoff_data,
+                **({"tool_call_id": normalized_tool_call_id} if normalized_tool_call_id else {}),
+            },
+        })
+        await ConversationRepository.update_last_message(
+            db,
+            conversation.id,
+            content,
+            msg.created_at or datetime.now(timezone.utc),
+        )
+        conversation = await ConversationRepository.get_by_id(db, conversation.id)
+        return ConversationService._public_message_payload(msg, conversation)
+
+    @staticmethod
+    def _resolve_handoff_source(handoff_data: dict, handoff_trigger: str) -> str:
+        if handoff_trigger == "visitor":
+            return "visitor"
+        value = handoff_data.get("handoff_source") if isinstance(handoff_data, dict) else None
+        if value in {"bot_tool", "bot_event"}:
+            return value
+        return "bot_tool"
+
+    @staticmethod
+    async def request_human_handoff_for_session(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        conversation_public_id: str,
+        visitor_context: dict,
+        handoff_payload: dict | None = None,
+        *,
+        handoff_trigger: str = "visitor",
+        tool_call_id: str | None = None,
+    ) -> dict:
+        """Route a bot conversation to a human agent when possible."""
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        if conversation.status == ConversationStatus.CLOSED.value:
+            raise BusinessError("Cannot transfer a closed conversation")
+
+        if conversation.agent_id and conversation.status == ConversationStatus.ACTIVE.value:
+            return {
+                "ok": True,
+                "already_assigned": True,
+                "conversation": conversation,
+                "message": None,
+                "messages": [],
+                "agent": conversation.agent,
+            }
+
+        from app.services.channel_service import ChannelService
+
+        handoff_data = handoff_payload or conversation.open_agent_handoff_payload or {}
+        emitted_messages: list[dict] = []
+        handoff_source = ConversationService._resolve_handoff_source(
+            handoff_data,
+            handoff_trigger,
+        )
+
+        if handoff_trigger == "bot_confirmed":
+            confirmed_message = await ConversationService._save_confirmed_by_visitor_handoff_event(
+                db,
+                conversation,
+                handoff_data,
+                tool_call_id,
+                handoff_source,
+            )
+            if confirmed_message:
+                emitted_messages.append(confirmed_message)
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            if not conversation:
+                raise NotFoundError("Conversation not found")
+
+        conversation, request_marked = await ConversationRepository.update_handoff_state_if_unassigned(
+            db,
+            conversation,
+            state="requested",
+            payload=handoff_data,
+            status=ConversationStatus.HANDOFF_PENDING.value,
+            allowed_previous_states=(None, "pending", "failed"),
+        )
+        if not request_marked:
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            if not conversation:
+                raise NotFoundError("Conversation not found")
+            if conversation.status == ConversationStatus.CLOSED.value:
+                raise BusinessError("Cannot transfer a closed conversation")
+            if conversation.agent_id and conversation.status == ConversationStatus.ACTIVE.value:
+                return {
+                    "ok": True,
+                    "already_assigned": True,
+                    "conversation": conversation,
+                    "message": emitted_messages[-1] if emitted_messages else None,
+                    "messages": emitted_messages,
+                    "agent": conversation.agent,
+                }
+            return {
+                "ok": False,
+                "conversation": conversation,
+                "message": emitted_messages[-1] if emitted_messages else None,
+                "messages": emitted_messages,
+                "agent": None,
+                "reason": "handoff_in_progress",
+            }
+
+        target = await ChannelService.resolve_human_handoff_target(
+            db,
+            r,
+            conversation.channel_id,
+            handoff_payload=handoff_data,
+        )
+
+        if not target["can_start_conversation"] or not target.get("agent_id"):
+            reason = target.get("reason")
+            content = (
+                "当前人工客服不在线，您可以继续向智能助手咨询"
+                if reason == "outside_service_hours"
+                else "当前人工客服繁忙，您可以继续向智能助手咨询"
+            )
+            conversation, failed_marked = await ConversationRepository.update_handoff_state_if_unassigned(
+                db,
+                conversation,
+                state="failed",
+                payload=handoff_data,
+                status=ConversationStatus.BOT.value,
+                allowed_previous_states=("requested", "pending"),
+            )
+            if not failed_marked:
+                conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                if not conversation:
+                    raise NotFoundError("Conversation not found")
+                if conversation.agent_id and conversation.status == ConversationStatus.ACTIVE.value:
+                    return {
+                        "ok": True,
+                        "already_assigned": True,
+                        "conversation": conversation,
+                        "message": emitted_messages[-1] if emitted_messages else None,
+                        "messages": emitted_messages,
+                        "agent": conversation.agent,
+                    }
+                return {
+                    "ok": False,
+                    "conversation": conversation,
+                    "message": emitted_messages[-1] if emitted_messages else None,
+                    "messages": emitted_messages,
+                    "agent": None,
+                    "reason": "handoff_in_progress",
+                }
+            failed_message = await MessageRepository.create(db, {
+                "tenant_id": conversation.tenant_id,
+                "conversation_id": conversation.id,
+                "sender_type": MessageSenderType.SYSTEM.value,
+                "content_type": MessageContentType.SYSTEM.value,
+                "content": content,
+                "metadata_": {
+                    "event_type": "open_agent_handoff_failed",
+                    "reason": reason,
+                    "handoff_payload": handoff_data,
+                },
+            })
+            await ConversationRepository.update_last_message(
+                db,
+                conversation.id,
+                content,
+                failed_message.created_at or datetime.now(timezone.utc),
+            )
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            failed_payload = ConversationService._public_message_payload(failed_message, conversation)
+            emitted_messages.append(failed_payload)
+            return {
+                "ok": False,
+                "conversation": conversation,
+                "message": failed_payload,
+                "messages": emitted_messages,
+                "agent": None,
+                "reason": reason,
+            }
+
+        agent_id = int(target["agent_id"])
+        group_id = target.get("group_id")
+        conversation, assigned = await ConversationRepository.assign_agent_if_unassigned(
+            db,
+            conversation,
+            agent_id,
+            group_id,
+        )
+        if not assigned:
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            if not conversation:
+                raise NotFoundError("Conversation not found")
+            if conversation.agent_id and conversation.status == ConversationStatus.ACTIVE.value:
+                return {
+                    "ok": True,
+                    "already_assigned": True,
+                    "conversation": conversation,
+                    "message": emitted_messages[-1] if emitted_messages else None,
+                    "messages": emitted_messages,
+                    "agent": conversation.agent,
+                }
+            return {
+                "ok": False,
+                "conversation": conversation,
+                "message": emitted_messages[-1] if emitted_messages else None,
+                "messages": emitted_messages,
+                "agent": None,
+                "reason": "handoff_in_progress",
+            }
+        await AgentStatusService.increment_count(r, conversation.tenant_id, agent_id)
+        success_message = await MessageRepository.create(db, {
+            "tenant_id": conversation.tenant_id,
+            "conversation_id": conversation.id,
+            "sender_type": MessageSenderType.SYSTEM.value,
+            "content_type": MessageContentType.SYSTEM.value,
+            "content": "已为您转接人工客服",
+            "metadata_": {
+                "event_type": "open_agent_handoff_success",
+                "handoff_payload": handoff_data,
+                "handoff_source": handoff_source,
+            },
+        })
+        await ConversationRepository.update_open_agent_state(db, conversation, {
+            "open_agent_handoff_state": "success",
+            "open_agent_handoff_payload": handoff_data,
+        })
+        await ConversationRepository.update_last_message(
+            db,
+            conversation.id,
+            success_message.content,
+            success_message.created_at or datetime.now(timezone.utc),
+        )
+        conversation = await ConversationRepository.get_by_id(db, conversation.id)
+        success_payload = ConversationService._public_message_payload(success_message, conversation)
+        emitted_messages.append(success_payload)
+        return {
+            "ok": True,
+            "conversation": conversation,
+            "message": success_payload,
+            "messages": emitted_messages,
+            "agent": conversation.agent,
+        }
+
+    @staticmethod
+    async def dismiss_bot_handoff_for_session(
+        db: AsyncSession,
+        conversation_public_id: str,
+        visitor_context: dict,
+        tool_call_id: str | None = None,
+    ) -> dict:
+        """Visitor declined bot-initiated handoff; return conversation to bot mode."""
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        if conversation.status == ConversationStatus.CLOSED.value:
+            raise BusinessError("Cannot dismiss handoff on a closed conversation")
+
+        if conversation.agent_id and conversation.status == ConversationStatus.ACTIVE.value:
+            return {"ok": True, "conversation": conversation}
+
+        current_state = getattr(conversation, "open_agent_handoff_state", None)
+        if current_state == "dismissed":
+            return {"ok": True, "conversation": conversation}
+        if current_state not in {None, "pending", "failed"}:
+            return {"ok": True, "conversation": conversation}
+
+        handoff_payload = conversation.open_agent_handoff_payload or {}
+        if not isinstance(handoff_payload, dict):
+            handoff_payload = {}
+        raw_tool_call_id = tool_call_id if isinstance(tool_call_id, str) else None
+        raw_payload_tool_call_id = handoff_payload.get("tool_call_id")
+        if not isinstance(raw_payload_tool_call_id, str):
+            raw_payload_tool_call_id = None
+        normalized_tool_call_id = (raw_tool_call_id or raw_payload_tool_call_id or "").strip() or None
+        if normalized_tool_call_id:
+            handoff_payload = {
+                **handoff_payload,
+                "tool_call_id": normalized_tool_call_id,
+            }
+
+        conversation = await ConversationRepository.update_open_agent_state(db, conversation, {
+            "open_agent_handoff_state": "dismissed",
+            "open_agent_handoff_payload": handoff_payload,
+        })
+        if conversation.status == ConversationStatus.HANDOFF_PENDING.value:
+            conversation = await ConversationRepository.update_status(
+                db,
+                conversation,
+                ConversationStatus.BOT.value,
+            )
+        conversation = await ConversationRepository.get_by_id(db, conversation.id)
+        return {"ok": True, "conversation": conversation}
+
+    @staticmethod
     async def get_messages(
         db: AsyncSession,
         conversation_id: int,
@@ -566,6 +981,7 @@ class ConversationService:
 
         items = []
         for msg in messages:
+            metadata = getattr(msg, "metadata_", None) or {}
             sender_name = None
             sender_avatar = None
             if msg.sender_type == MessageSenderType.AGENT.value and msg.sender_id is not None:
@@ -573,6 +989,8 @@ class ConversationService:
                 if agent:
                     sender_name = agent.display_name or agent.name
                     sender_avatar = agent.avatar
+            elif msg.sender_type == MessageSenderType.BOT.value:
+                sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
             items.append({
                 "id": msg.id,
@@ -698,6 +1116,7 @@ class ConversationService:
 
             message_items = []
             for msg in messages:
+                metadata = getattr(msg, "metadata_", None) or {}
                 sender_name = None
                 sender_avatar = None
                 if (
@@ -710,6 +1129,8 @@ class ConversationService:
                         sender_avatar = agent.avatar
                 elif msg.sender_type == MessageSenderType.VISITOR.value:
                     sender_name = visitor.name
+                elif msg.sender_type == MessageSenderType.BOT.value:
+                    sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
                 message_items.append({
                     "id": msg.id,
@@ -821,6 +1242,7 @@ class ConversationService:
 
             message_items = []
             for msg in messages:
+                metadata = getattr(msg, "metadata_", None) or {}
                 sender_name = None
                 sender_avatar = None
                 if (
@@ -833,6 +1255,8 @@ class ConversationService:
                         sender_avatar = agent.avatar
                 elif msg.sender_type == MessageSenderType.VISITOR.value:
                     sender_name = visitor.name
+                elif msg.sender_type == MessageSenderType.BOT.value:
+                    sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
                 message_items.append({
                     "id": msg.id,
@@ -938,6 +1362,7 @@ class ConversationService:
 
             message_items = []
             for msg in messages:
+                metadata = getattr(msg, "metadata_", None) or {}
                 sender_name = None
                 sender_avatar = None
                 if (
@@ -950,6 +1375,8 @@ class ConversationService:
                         sender_avatar = agent.avatar
                 elif msg.sender_type == MessageSenderType.VISITOR.value:
                     sender_name = current.visitor.name
+                elif msg.sender_type == MessageSenderType.BOT.value:
+                    sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
                 message_items.append({
                     "id": msg.id,

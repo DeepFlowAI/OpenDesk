@@ -26,7 +26,30 @@ async def lifespan(app: FastAPI):
     if settings.REDIS_URL:
         from app.db.redis import redis_client
         await redis_client.initialize()
+
+    # Optional: call-center orchestrator. Off by default in OSS to avoid
+    # crashing the app when no telephony kernel is reachable.
+    orchestrator = None
+    if settings.CALL_CENTER_ENABLED:
+        try:
+            from app.services.call_center.orchestrator import get_orchestrator
+            orchestrator = get_orchestrator()
+            await orchestrator.start()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception(
+                "Call center orchestrator failed to start; continuing without it"
+            )
+            orchestrator = None
+
     yield
+
+    # Shutdown call center
+    if orchestrator is not None:
+        try:
+            await orchestrator.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
     # Shutdown realtime transport
     from app.libs.realtime.factory import _instance as rt_instance
     if rt_instance:

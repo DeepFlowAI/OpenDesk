@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { get, post, put } from './base'
+import { get, post, put, del } from './base'
 import type { EntityChange } from '@/models/entity-change'
 import type { User, CreateUserPayload, UpdateUserPayload, UserQueryPayload, ViewCountsResponse } from '@/models/user'
 import type { UserView } from '@/models/user-view'
@@ -81,6 +81,19 @@ export const useUpdateUser = () => {
       qc.setQueryData(userKeys.detail(v.id), updated)
       qc.setQueryData(userKeys.detail(updated.public_id), updated)
       qc.invalidateQueries({ queryKey: [...userKeys.detail(v.id), 'changes'] })
+      qc.invalidateQueries({ queryKey: userKeys.queries() })
+      qc.invalidateQueries({ queryKey: userKeys.viewCounts() })
+      qc.invalidateQueries({ queryKey: userKeys.viewGroupsRoot() })
+    },
+  })
+}
+
+export const useDeleteUser = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => del(`v1/users/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: userKeys.details() })
       qc.invalidateQueries({ queryKey: userKeys.queries() })
       qc.invalidateQueries({ queryKey: userKeys.viewCounts() })
       qc.invalidateQueries({ queryKey: userKeys.viewGroupsRoot() })

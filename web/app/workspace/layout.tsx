@@ -7,6 +7,7 @@ import Link from 'next/link'
 import {
   IconHeadset,
   IconMessageCircle,
+  IconPhone,
   IconHistory,
   IconSettings,
   IconAddressBook,
@@ -16,11 +17,13 @@ import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
 import { useChatStore } from '@/context/chat-store'
 import { useSocketStore } from '@/context/socket-store'
+import { CallCenterProvider } from '@/context/call-center-runtime'
 import {
   useConversations,
   conversationKeys,
   patchConversationListCache,
 } from '@/service/use-conversations'
+import { GlobalCallBar } from '@/app/components/features/call-center/global-call-bar'
 import { UserDropdown } from '@/app/components/features/user-dropdown'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
@@ -33,8 +36,9 @@ type NavItem = {
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { labelKey: 'ws.nav.chat', href: '/workspace/chat', icon: IconMessageCircle },
   { labelKey: 'ws.nav.tickets', href: '/workspace/tickets', icon: IconTicket },
+  { labelKey: 'ws.nav.chat', href: '/workspace/chat', icon: IconMessageCircle },
+  { labelKey: 'ws.nav.call', href: '/workspace/call', icon: IconPhone },
   { labelKey: 'ws.nav.records', href: '/workspace/records', icon: IconHistory },
   { labelKey: 'ws.nav.contacts', href: '/workspace/users', icon: IconAddressBook },
 ]
@@ -224,9 +228,10 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   if (!mounted || !token) return null
 
   return (
-    <div className="flex h-screen">
-      {/* Sidebar — full height icon navigation */}
-      <aside className="flex w-16 shrink-0 flex-col justify-between border-r border-[#E5E5E5] bg-[#F5F5F5] py-4">
+    <CallCenterProvider>
+      <div className="flex h-screen">
+        {/* Sidebar — full height icon navigation */}
+        <aside className="relative z-30 flex w-16 shrink-0 flex-col justify-between border-r border-[#E5E5E5] bg-[#F5F5F5] py-4">
         {/* Top: Logo + Nav — 2.1 pen: Sidebar 64px #F5F5F5 */}
         <div className="flex flex-col items-center gap-4">
           {/* Logo */}
@@ -284,20 +289,24 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
             </a>
           )}
         </div>
-      </aside>
+        </aside>
 
-      {/* Right Panel */}
-      <div className="flex flex-1 flex-col overflow-hidden">
-        {/* Top Bar */}
-        <header className="flex h-14 shrink-0 items-center justify-end border-b border-border bg-white px-6">
-          <UserDropdown />
-        </header>
+        {/* Right Panel */}
+        <div className="flex flex-1 flex-col overflow-hidden">
+          {/* Top Bar */}
+          <header className="relative flex h-14 shrink-0 items-center justify-end border-b border-border bg-white px-6">
+            <div className="absolute left-1/2 top-1/2 flex min-w-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+              <GlobalCallBar hidden={pathname.startsWith('/workspace/call')} />
+            </div>
+            <UserDropdown />
+          </header>
 
-        {/* Content Area */}
-        <main className="flex-1 overflow-y-auto bg-surface">
-          {children}
-        </main>
+          {/* Content Area */}
+          <main className="flex-1 overflow-y-auto bg-surface">
+            {children}
+          </main>
+        </div>
       </div>
-    </div>
+    </CallCenterProvider>
   )
 }

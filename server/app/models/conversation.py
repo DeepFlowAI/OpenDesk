@@ -4,6 +4,7 @@ Conversation model — a chat session between an end user and an agent
 from datetime import datetime
 
 from sqlalchemy import String, Integer, DateTime, ForeignKey, Index, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -43,6 +44,14 @@ class Conversation(Base, TimestampMixin):
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_message_preview: Mapped[str | None] = mapped_column(String(200), nullable=True)
     unread_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    open_agent_agent_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    open_agent_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    open_agent_conversation_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    open_agent_conversation_external_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    open_agent_last_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    open_agent_last_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    open_agent_handoff_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    open_agent_handoff_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
 
     visitor: Mapped["User"] = relationship("User", lazy="selectin")
     agent: Mapped["Employee | None"] = relationship("Employee", lazy="selectin")

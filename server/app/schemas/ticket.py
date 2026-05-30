@@ -11,6 +11,13 @@ from app.schemas.ticket_view import ConditionItem
 CustomFieldValue = str | int | float | bool | list | dict | None
 
 
+class RelatedTicketResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    ticket_number: str | None = None
+
+
 class TicketResponse(TimestampSchema):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -19,6 +26,8 @@ class TicketResponse(TimestampSchema):
     layout_id: int | None = None
     conversation_id: int | None = None
     conversation_public_id: str | None = None
+    call_record_id: int | None = None
+    call_record_call_id: str | None = None
     user_id: int | None = None
     agent_id: int | None = None
     assignee_group_id: int | None = None
@@ -39,6 +48,7 @@ class TicketCreate(BaseModel):
     priority: str | None = Field(default="medium", max_length=16)
     layout_id: int | None = None
     conversation_id: int | None = None
+    call_record_id: int | None = None
     user_id: int | None = None
     agent_id: int | None = None
     assignee_group_id: int | None = None
@@ -52,6 +62,7 @@ class TicketUpdate(BaseModel):
     status: str | None = Field(None, max_length=32)
     priority: str | None = Field(None, max_length=16)
     conversation_id: int | None = None
+    call_record_id: int | None = None
     user_id: int | None = None
     agent_id: int | None = None
     assignee_group_id: int | None = None

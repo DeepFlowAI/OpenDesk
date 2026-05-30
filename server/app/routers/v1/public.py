@@ -5,6 +5,7 @@ Used by the visitor-facing chat widget to fetch channel config, messages, and fi
 """
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi import Header
+from starlette.responses import StreamingResponse
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +13,7 @@ from app.db.deps import get_db, get_redis
 from app.schemas.channel import ChannelPublicResponse
 from app.schemas.conversation_file import ConversationFileAccessResponse, ConversationFileUploadResponse
 from app.schemas.message import PublicMessageListResponse, VisitorConversationHistoryResponse
+from app.schemas.open_agent_conversation import OpenAgentChatRequest
 from app.schemas.satisfaction_survey_record import (
     PublicSatisfactionInvitation,
     PublicSatisfactionSubmitResponse,
@@ -21,6 +23,7 @@ from app.schemas.visitor_session import VisitorSessionRequest, VisitorSessionRes
 from app.services.channel_service import ChannelService
 from app.services.conversation_file_service import ConversationFileService
 from app.services.conversation_service import ConversationService
+from app.services.open_agent_conversation_service import OpenAgentConversationService
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
 router = APIRouter(prefix="/public", tags=["Public"])
@@ -104,6 +107,32 @@ async def get_conversation_messages_public(
         visitor_context,
         before_id=before_id,
         limit=limit,
+    )
+
+
+@router.post("/conversations/{conversation_public_id}/open-agent/chat")
+async def chat_open_agent_public(
+    conversation_public_id: str,
+    body: OpenAgentChatRequest,
+    db: AsyncSession = Depends(get_db),
+    visitor_context: dict = Depends(get_visitor_context),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    """Proxy OpenAgent chat SSE for a visitor-owned bot conversation."""
+    stream = OpenAgentConversationService.stream_chat_for_session(
+        db,
+        conversation_public_id=conversation_public_id,
+        visitor_context=visitor_context,
+        body=body,
+        redis=redis,
+    )
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

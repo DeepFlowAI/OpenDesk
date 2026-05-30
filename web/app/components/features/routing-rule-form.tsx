@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { IconArrowLeft, IconPlus, IconTrash, IconChevronDown } from '@tabler/icons-react'
+import { toast } from 'sonner'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import { Switch } from '@/components/ui/switch'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type { RoutingCondition, RoutingConditionType } from '@/models/inbound-routing-rule'
 import { useServiceHours } from '@/service/use-service-hours'
 import { useVoiceFlowsSelect } from '@/service/use-voice-flows'
@@ -74,6 +76,7 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
   }, [isNew, rule, initialized])
 
   const [savedSnapshot, setSavedSnapshot] = useState('')
+  const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false)
   useEffect(() => {
     if (isNew) {
       setSavedSnapshot('')
@@ -106,7 +109,8 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
   const isDirty = isNew ? payloadForCompare !== emptyNewSnapshot : payloadForCompare !== savedSnapshot
 
   const goBack = () => {
-    if (isDirty && typeof window !== 'undefined' && !window.confirm(t('rr.form.leaveConfirm', locale))) {
+    if (isDirty) {
+      setLeaveConfirmOpen(true)
       return
     }
     router.push('/flow-studio/routing-rules')
@@ -132,11 +136,11 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
   const handleSave = async () => {
     const tn = name.trim()
     if (!tn || tn.length > 64) {
-      window.alert(t('rr.form.validation.name', locale))
+      toast.error(t('rr.form.validation.name', locale))
       return
     }
     if (targetFlowId === '') {
-      window.alert(t('rr.form.validation.flow', locale))
+      toast.error(t('rr.form.validation.flow', locale))
       return
     }
     const conditions: RoutingCondition[] = rows.map(({ _key: _, ...c }) => c)
@@ -144,15 +148,15 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
     try {
       if (isNew) {
         await createMut.mutateAsync(body)
-        if (typeof window !== 'undefined') window.alert(t('rr.form.saveSuccess', locale))
+        toast.success(t('rr.form.saveSuccess', locale))
         router.push('/flow-studio/routing-rules')
       } else if (ruleId != null) {
         await updateMut.mutateAsync({ id: ruleId, data: body })
-        if (typeof window !== 'undefined') window.alert(t('rr.form.saveSuccess', locale))
+        toast.success(t('rr.form.saveSuccess', locale))
         setSavedSnapshot(JSON.stringify({ name: tn, enabled, target: Number(targetFlowId), conditions }))
       }
     } catch {
-      window.alert(t('rr.form.saveFailed', locale))
+      toast.error(t('rr.form.saveFailed', locale))
     }
   }
 
@@ -339,6 +343,20 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={leaveConfirmOpen}
+        title={t('rr.form.leaveTitle', locale)}
+        message={t('rr.form.leaveConfirm', locale)}
+        confirmLabel={t('rr.form.leaveOk', locale)}
+        cancelLabel={t('rr.form.leaveCancel', locale)}
+        variant="destructive"
+        onCancel={() => setLeaveConfirmOpen(false)}
+        onConfirm={() => {
+          setLeaveConfirmOpen(false)
+          router.push('/flow-studio/routing-rules')
+        }}
+      />
     </div>
   )
 }

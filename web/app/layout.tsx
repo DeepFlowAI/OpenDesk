@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import { QueryProvider } from '@/context/query-client'
+import { Toaster } from '@/components/ui/sonner'
 import '@/styles/globals.css'
 import '@/styles/_variables.scss'
 import '@/styles/_keyframe-animations.scss'
@@ -18,9 +19,10 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN" className={cn("font-sans", geist.variable)}>
-      <body>
+    <html lang="zh-CN" className={cn("font-sans", geist.variable)} suppressHydrationWarning>
+      <body suppressHydrationWarning>
         <QueryProvider>{children}</QueryProvider>
+        <Toaster position="top-right" richColors closeButton />
       </body>
     </html>
   )

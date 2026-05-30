@@ -39,6 +39,47 @@ class MessageRepository:
         return item
 
     @staticmethod
+    async def get_by_client_message_id(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+        client_message_id: str,
+        sender_type: str = "visitor",
+    ) -> Message | None:
+        """Fetch an idempotent message by the client-provided turn key."""
+        result = await db.execute(
+            select(Message).where(
+                Message.tenant_id == tenant_id,
+                Message.conversation_id == conversation_id,
+                Message.sender_type == sender_type,
+                Message.metadata_["client_message_id"].astext == client_message_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_handoff_event_by_tool_call_id(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+        tool_call_id: str,
+        handoff_event_type: str,
+    ) -> Message | None:
+        """Fetch an OpenAgent handoff system event for idempotent event handling."""
+        result = await db.execute(
+            select(Message).where(
+                Message.tenant_id == tenant_id,
+                Message.conversation_id == conversation_id,
+                Message.sender_type == "system",
+                Message.content_type == "system",
+                Message.metadata_["event_type"].astext == "open_agent_handoff_event",
+                Message.metadata_["handoff_event_type"].astext == handoff_event_type,
+                Message.metadata_["tool_call_id"].astext == tool_call_id,
+            ).order_by(Message.id.desc())
+        )
+        return result.scalars().first()
+
+    @staticmethod
     async def count_by_conversation(db: AsyncSession, conversation_id: int) -> int:
         result = await db.execute(
             select(func.count()).select_from(Message).where(

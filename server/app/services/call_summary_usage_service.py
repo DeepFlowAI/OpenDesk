@@ -1,0 +1,245 @@
+"""
+CallSummaryUsage service - business logic for call summary values.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.exceptions import NotFoundError, ValidationError
+from app.models.call_summary_config_field import CallSummaryConfigField
+from app.repositories.call_summary_config_repository import CallSummaryConfigRepository
+from app.repositories.call_summary_usage_repository import CallSummaryUsageRepository
+from app.schemas.call_summary_usage import CallSummaryFieldValueUpdate
+
+
+class CallSummaryUsageService:
+
+    @staticmethod
+    def _value_key(field_definition_id: int | None, field_key: str | None) -> str:
+        return str(field_definition_id) if field_definition_id is not None else str(field_key)
+
+    @staticmethod
+    def _is_empty(value: Any) -> bool:
+        return value is None or value == "" or value == [] or value == {}
+
+    @staticmethod
+    def _matches_condition(actual: Any, operator: str, expected: Any) -> bool:
+        op = (operator or "eq").lower()
+        if op in ("eq", "equals", "="):
+            return actual == expected
+        if op in ("ne", "not_equals", "!="):
+            return actual != expected
+        if op in ("contains", "like"):
+            if isinstance(actual, list):
+                return expected in actual
+            return str(expected or "") in str(actual or "")
+        if op in ("not_contains", "not_like"):
+            if isinstance(actual, list):
+                return expected not in actual
+            return str(expected or "") not in str(actual or "")
+        if op in ("starts_with",):
+            return str(actual or "").startswith(str(expected or ""))
+        if op in ("ends_with",):
+            return str(actual or "").endswith(str(expected or ""))
+        if op in ("is_empty", "is_null"):
+            return CallSummaryUsageService._is_empty(actual)
+        if op in ("is_not_empty", "is_not_null"):
+            return not CallSummaryUsageService._is_empty(actual)
+        if op in ("in",):
+            return actual in expected if isinstance(expected, list) else False
+        if op in ("not_in",):
+            return actual not in expected if isinstance(expected, list) else True
+        try:
+            left = Decimal(str(actual))
+            right = Decimal(str(expected))
+        except (InvalidOperation, ValueError):
+            return False
+        if op in ("gt", ">"):
+            return left > right
+        if op in ("gte", ">="):
+            return left >= right
+        if op in ("lt", "<"):
+            return left < right
+        if op in ("lte", "<="):
+            return left <= right
+        return False
+
+    @staticmethod
+    def _field_matches(
+        field: CallSummaryConfigField,
+        field_definition_id: int | None,
+        field_key: str | None,
+    ) -> bool:
+        if field_definition_id is not None:
+            return field.field_definition_id == field_definition_id
+        return field.field_key == field_key
+
+    @staticmethod
+    def _find_field(
+        fields: list[CallSummaryConfigField],
+        field_definition_id: int | None,
+        field_key: str | None,
+    ) -> CallSummaryConfigField | None:
+        for field in fields:
+            if CallSummaryUsageService._field_matches(field, field_definition_id, field_key):
+                return field
+        return None
+
+    @staticmethod
+    def _calculate_states(fields: list[CallSummaryConfigField], rules: list, values: dict[str, Any]) -> dict[str, str]:
+        states = {
+            CallSummaryUsageService._value_key(field.field_definition_id, field.field_key): "optional"
+            for field in fields
+        }
+        for rule in rules:
+            conditions = rule.conditions or []
+            if conditions:
+                checks = []
+                for condition in conditions:
+                    key = CallSummaryUsageService._value_key(
+                        condition.get("field_id"),
+                        condition.get("field_key"),
+                    )
+                    checks.append(
+                        CallSummaryUsageService._matches_condition(
+                            values.get(key),
+                            condition.get("operator", "eq"),
+                            condition.get("value"),
+                        )
+                    )
+                matched = all(checks) if rule.condition_logic != "or" else any(checks)
+            else:
+                matched = True
+            if not matched:
+                continue
+            for action in rule.actions or []:
+                key = CallSummaryUsageService._value_key(
+                    action.get("target_field_id"),
+                    action.get("target_field_key"),
+                )
+                if key in states and action.get("state") in {"hidden", "required", "optional", "readonly"}:
+                    states[key] = action["state"]
+        return states
+
+    @staticmethod
+    def _normalize_value(field: CallSummaryConfigField, value: Any) -> Any:
+        definition = field.field_definition
+        if value == "":
+            return None
+        if definition is None:
+            return value
+        field_type = definition.field_type
+        if field_type == "number":
+            if value is None:
+                return None
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                raise ValidationError("Invalid number value")
+            return int(number) if number == number.to_integral_value() else float(number)
+        if field_type in {"multi_select", "multi_select_tree", "file"}:
+            if value is None:
+                return None
+            if not isinstance(value, list):
+                raise ValidationError("Invalid list value")
+            return value
+        if field_type in {
+            "single_line_text",
+            "multi_line_text",
+            "email",
+            "phone",
+            "url",
+            "time",
+            "single_select",
+            "single_select_tree",
+            "rich_text",
+        }:
+            if value is None:
+                return None
+            return str(value)
+        if field_type == "date":
+            if value is None:
+                return None
+            raw = str(value)
+            try:
+                datetime.fromisoformat(raw[:10])
+            except ValueError:
+                raise ValidationError("Invalid date value")
+            return raw[:10]
+        if field_type == "datetime":
+            if value is None:
+                return None
+            raw = str(value)
+            try:
+                datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValidationError("Invalid datetime value")
+            return raw
+        return value
+
+    @staticmethod
+    async def get_summary(db: AsyncSession, tenant_id: int, call_record_id: int) -> dict:
+        call_record = await CallSummaryUsageRepository.get_call_record(db, call_record_id)
+        if not call_record or call_record.tenant_id != tenant_id:
+            raise NotFoundError("Call record not found")
+
+        config = await CallSummaryConfigRepository.get_or_create(db, tenant_id)
+        fields = await CallSummaryUsageRepository.get_active_fields(db, config.id)
+        rules = await CallSummaryUsageRepository.get_enabled_rules(db, config.id)
+        value_rows = await CallSummaryUsageRepository.get_values(db, tenant_id, call_record_id)
+        values = {
+            CallSummaryUsageService._value_key(row.field_definition_id, row.field_key): row.value
+            for row in value_rows
+        }
+        return {
+            "call_record_id": call_record_id,
+            "fields": fields,
+            "rules": rules,
+            "values": values,
+        }
+
+    @staticmethod
+    async def update_field(
+        db: AsyncSession,
+        tenant_id: int,
+        call_record_id: int,
+        data: CallSummaryFieldValueUpdate,
+    ):
+        call_record = await CallSummaryUsageRepository.get_call_record(db, call_record_id)
+        if not call_record or call_record.tenant_id != tenant_id:
+            raise NotFoundError("Call record not found")
+
+        config = await CallSummaryConfigRepository.get_or_create(db, tenant_id)
+        fields = await CallSummaryUsageRepository.get_active_fields(db, config.id)
+        target_field = CallSummaryUsageService._find_field(fields, data.field_definition_id, data.field_key)
+        if target_field is None:
+            raise ValidationError("Field is not enabled in call summary")
+
+        normalized_value = CallSummaryUsageService._normalize_value(target_field, data.value)
+        value_rows = await CallSummaryUsageRepository.get_values(db, tenant_id, call_record_id)
+        values = {
+            CallSummaryUsageService._value_key(row.field_definition_id, row.field_key): row.value
+            for row in value_rows
+        }
+        target_key = CallSummaryUsageService._value_key(data.field_definition_id, data.field_key)
+        values[target_key] = normalized_value
+
+        rules = await CallSummaryUsageRepository.get_enabled_rules(db, config.id)
+        states = CallSummaryUsageService._calculate_states(fields, rules, values)
+        if states.get(target_key) == "required" and CallSummaryUsageService._is_empty(normalized_value):
+            raise ValidationError("This field is required")
+        if states.get(target_key) == "hidden":
+            raise ValidationError("Field is hidden")
+
+        return await CallSummaryUsageRepository.upsert_value(
+            db,
+            tenant_id=tenant_id,
+            call_record_id=call_record_id,
+            field_definition_id=data.field_definition_id,
+            field_key=data.field_key,
+            value=normalized_value,
+        )

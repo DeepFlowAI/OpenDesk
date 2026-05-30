@@ -1,0 +1,197 @@
+'use client'
+
+import { useEffect, useMemo, useState } from 'react'
+import { useLocaleStore } from '@/context/locale-store'
+import { useCallReportsTrend } from '@/service/use-call-reports'
+import type { CallMetricKey, CallTrendBucket, TrendType } from '@/models/call-report'
+import { formatDuration } from '@/utils/format-duration'
+import { cn } from '@/lib/utils'
+import { t } from '@/utils/i18n'
+import {
+  callMetricLabelKey,
+  CALL_METRIC_KEYS,
+  isDurationMetric,
+  trendTypeLabelKey,
+  TREND_TYPES,
+} from './types'
+import { CallTrendTable } from './trend-table'
+
+type Props = {
+  start: string
+  end: string
+  trend: TrendType
+  onTrendChange: (trend: TrendType) => void
+  employeeId?: number
+  onLoadingChange?: (loading: boolean) => void
+}
+
+function metricValue(bucket: CallTrendBucket, metric: CallMetricKey): number {
+  const value = bucket.metrics[metric]
+  return typeof value === 'number' ? value : 0
+}
+
+function niceMax(rawMax: number): number {
+  if (rawMax <= 0) return 40
+  const pow = Math.pow(10, Math.floor(Math.log10(rawMax)))
+  const norm = rawMax / pow
+  let nice: number
+  if (norm <= 1) nice = 1
+  else if (norm <= 2) nice = 2
+  else if (norm <= 5) nice = 5
+  else nice = 10
+  return nice * pow
+}
+
+export function CallTrendChartCard({
+  start,
+  end,
+  trend,
+  onTrendChange,
+  employeeId,
+  onLoadingChange,
+}: Props) {
+  const { locale } = useLocaleStore()
+  const [metric, setMetric] = useState<CallMetricKey>('total_calls')
+  const { data, isLoading, isFetching } = useCallReportsTrend({
+    start,
+    end,
+    trend,
+    employee_id: employeeId,
+  })
+
+  useEffect(() => {
+    onLoadingChange?.(isFetching)
+  }, [isFetching, onLoadingChange])
+
+  const buckets = data?.buckets ?? []
+  const isEmpty = !isLoading && buckets.every(
+    (bucket) => bucket.metrics.total_calls === 0
+  )
+
+  const maxValue = useMemo(() => {
+    const max = Math.max(0, ...buckets.map((bucket) => metricValue(bucket, metric)))
+    return niceMax(max)
+  }, [buckets, metric])
+
+  const yLabels = useMemo(() => {
+    return [1, 0.75, 0.5, 0.25, 0].map((p) => {
+      const value = maxValue * p
+      return isDurationMetric(metric) ? formatDuration(value) : Math.round(value).toLocaleString()
+    })
+  }, [maxValue, metric])
+
+  const xLabels = useMemo(() => buckets.map((bucket) => bucket.label), [buckets])
+
+  const chartTitle = t('ws.records.callReports.trend.chartTitle', locale)
+    .replace('{metric}', t(callMetricLabelKey[metric], locale))
+    .replace('{type}', t(trendTypeLabelKey[trend], locale))
+
+  return (
+    <div className="rounded-[10px] border border-border bg-background p-6">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-base font-semibold text-foreground">
+          {t('ws.records.callReports.trend.title', locale)}
+        </h2>
+        <div className="flex flex-wrap gap-1">
+          {TREND_TYPES.map((type) => {
+            const active = type === trend
+            return (
+              <button
+                key={type}
+                type="button"
+                onClick={() => onTrendChange(type)}
+                className={cn(
+                  'h-8 rounded-lg px-3 text-xs transition-colors',
+                  active
+                    ? 'bg-muted font-semibold text-foreground'
+                    : 'border border-border bg-background text-muted-foreground hover:text-foreground'
+                )}
+              >
+                {t(trendTypeLabelKey[type], locale)}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      <div className="mb-3 text-sm font-semibold text-foreground">{chartTitle}</div>
+
+      {isEmpty ? (
+        <div className="flex h-[236px] items-center justify-center text-sm text-muted-foreground">
+          {t('ws.records.callReports.trend.empty', locale)}
+        </div>
+      ) : (
+        <div className="flex h-[236px]">
+          <div className="flex h-full w-10 flex-col justify-between pb-5 text-right">
+            {yLabels.map((label, index) => (
+              <span key={`${label}-${index}`} className="text-[11px] text-[#999999]">{label}</span>
+            ))}
+          </div>
+          <div className="flex flex-1 flex-col">
+            <div className="flex h-[200px] items-end gap-1.5 px-2">
+              {buckets.map((bucket, index) => {
+                const value = metricValue(bucket, metric)
+                const height = maxValue > 0 ? (value / maxValue) * 100 : 0
+                return (
+                  <div
+                    key={`${bucket.label}-${index}`}
+                    className="group relative flex h-full flex-1 items-end"
+                    title={`${bucket.label} · ${
+                      isDurationMetric(metric) ? formatDuration(value) : value.toLocaleString()
+                    }`}
+                  >
+                    <div
+                      style={{ height: `${height}%` }}
+                      className="w-full rounded-sm bg-foreground transition-all"
+                    />
+                  </div>
+                )
+              })}
+            </div>
+            <div className="flex h-6 items-center justify-between px-2 pt-1 text-[11px] text-[#999999]">
+              {pickXLabels(xLabels).map((label, index) => (
+                <span key={`${label}-${index}`}>{label}</span>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-4 flex flex-wrap justify-center gap-1 border-t border-border pt-4">
+        {CALL_METRIC_KEYS.map((key) => {
+          const active = key === metric
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setMetric(key)}
+              className={cn(
+                'h-8 rounded-lg px-3.5 text-sm transition-colors',
+                active
+                  ? 'bg-foreground font-semibold text-background'
+                  : 'text-muted-foreground hover:text-foreground'
+              )}
+            >
+              {t(callMetricLabelKey[key], locale)}
+            </button>
+          )
+        })}
+      </div>
+
+      <div className="mt-6">
+        <div className="mb-3 text-sm font-semibold text-foreground">
+          {t('ws.records.callReports.trend.detail', locale)}
+        </div>
+        <CallTrendTable buckets={buckets} />
+      </div>
+    </div>
+  )
+}
+
+function pickXLabels(all: string[]): string[] {
+  if (all.length <= 12) return all
+  const step = Math.ceil(all.length / 7)
+  const picked: string[] = []
+  for (let i = 0; i < all.length; i += step) picked.push(all[i])
+  return picked
+}

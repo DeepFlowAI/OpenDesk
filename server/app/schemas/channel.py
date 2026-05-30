@@ -4,13 +4,20 @@ Channel Pydantic schemas
 from datetime import datetime
 import re
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from app.schemas.welcome_message_rule import WelcomeMessagePublic
 
 
 DEFAULT_OFFLINE_TITLE = "当前客服不在线"
 DEFAULT_OFFLINE_MESSAGE = "您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。"
+DEFAULT_OPEN_AGENT_BOT_STRATEGY = "always"
+DEFAULT_OPEN_AGENT_INPUT_PLACEHOLDER = "输入消息..."
+DEFAULT_OPEN_AGENT_HANDOFF_LABEL = "转人工"
+DEFAULT_OPEN_AGENT_HANDOFF_AFTER_MESSAGES = 2
+DEFAULT_OPEN_AGENT_HANDOFF_BEHAVIOR = "confirm"
+OPEN_AGENT_BOT_STRATEGIES = {"always", "service_hours"}
+OPEN_AGENT_HANDOFF_BEHAVIORS = {"confirm", "auto"}
 
 
 def strip_rich_text(value: str) -> str:
@@ -43,6 +50,16 @@ class ChannelConfig(BaseModel):
     service_hours_id: int | None = None
     offline_title: str = DEFAULT_OFFLINE_TITLE
     offline_message: str = DEFAULT_OFFLINE_MESSAGE
+    open_agent_enabled: bool = False
+    open_agent_agent_id: int | None = None
+    open_agent_agent_name: str | None = None
+    open_agent_bot_strategy: str = DEFAULT_OPEN_AGENT_BOT_STRATEGY
+    open_agent_bot_service_hours_id: int | None = None
+    open_agent_input_placeholder: str | None = None
+    open_agent_handoff_enabled: bool = True
+    open_agent_handoff_label: str = DEFAULT_OPEN_AGENT_HANDOFF_LABEL
+    open_agent_handoff_after_messages: int = DEFAULT_OPEN_AGENT_HANDOFF_AFTER_MESSAGES
+    open_agent_handoff_behavior: str = DEFAULT_OPEN_AGENT_HANDOFF_BEHAVIOR
 
     @field_validator("agent_bubble_radius", "user_bubble_radius")
     @classmethod
@@ -59,6 +76,70 @@ class ChannelConfig(BaseModel):
         if v and len(v) > 50:
             raise ValueError("Input placeholder must be at most 50 characters")
         return v
+
+    @field_validator("open_agent_agent_name", "open_agent_input_placeholder", mode="before")
+    @classmethod
+    def normalize_optional_open_agent_text(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        value = v.strip()
+        return value or None
+
+    @field_validator("open_agent_agent_name")
+    @classmethod
+    def validate_open_agent_agent_name(cls, v: str | None) -> str | None:
+        if v and len(v) > 128:
+            raise ValueError("OpenAgent agent name must be at most 128 characters")
+        return v
+
+    @field_validator("open_agent_input_placeholder")
+    @classmethod
+    def validate_open_agent_input_placeholder(cls, v: str | None) -> str | None:
+        if v and len(v) > 50:
+            raise ValueError("OpenAgent input placeholder must be at most 50 characters")
+        return v
+
+    @field_validator("open_agent_bot_strategy")
+    @classmethod
+    def validate_open_agent_bot_strategy(cls, v: str) -> str:
+        if v not in OPEN_AGENT_BOT_STRATEGIES:
+            raise ValueError("OpenAgent bot strategy is invalid")
+        return v
+
+    @field_validator("open_agent_handoff_behavior")
+    @classmethod
+    def validate_open_agent_handoff_behavior(cls, v: str) -> str:
+        if v not in OPEN_AGENT_HANDOFF_BEHAVIORS:
+            raise ValueError("OpenAgent handoff behavior is invalid")
+        return v
+
+    @field_validator("open_agent_handoff_label", mode="before")
+    @classmethod
+    def normalize_open_agent_handoff_label(cls, v: str | None) -> str:
+        if v is None:
+            return DEFAULT_OPEN_AGENT_HANDOFF_LABEL
+        return v.strip()
+
+    @model_validator(mode="after")
+    def validate_open_agent_config(self) -> "ChannelConfig":
+        if not self.open_agent_enabled:
+            return self
+
+        if self.open_agent_agent_id is None:
+            raise ValueError("OpenAgent agent is required when bot is enabled")
+
+        if self.open_agent_bot_strategy == "service_hours" and self.open_agent_bot_service_hours_id is None:
+            raise ValueError("OpenAgent bot service hours is required for service-hours strategy")
+
+        if self.open_agent_handoff_enabled:
+            if not self.open_agent_handoff_label:
+                raise ValueError("OpenAgent handoff label is required")
+            if len(self.open_agent_handoff_label) > 16:
+                raise ValueError("OpenAgent handoff label must be at most 16 characters")
+            if not 1 <= self.open_agent_handoff_after_messages <= 99:
+                raise ValueError("OpenAgent handoff threshold must be between 1 and 99")
+
+        return self
 
     @field_validator("title")
     @classmethod
