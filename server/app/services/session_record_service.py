@@ -6,10 +6,14 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError
+from app.enums import QueueChannel, QueueTaskType, QueueType
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.session_record_repository import SessionRecordRepository
 from app.repositories.satisfaction_survey_record_repository import SatisfactionSurveyRecordRepository
 from app.repositories.ticket_repository import TicketRepository
+from app.schemas.permission import EffectivePrincipal
+from app.services.data_scope_service import DataScopeService
+from app.services.queue_history_service import QueueHistoryService
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
 
@@ -40,14 +44,27 @@ class SessionRecordService:
         service_labels: list[str] | None = None,
         product_rating_options: list[str] | None = None,
         product_labels: list[str] | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
+        peer_ids: list[int] = []
+        scope_predicate = None
+        effective_agent_id = agent_id
+        if principal is not None:
+            peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            scope_predicate = DataScopeService.build_session_record_predicate(principal, peer_ids)
+            effective_agent_id = DataScopeService.resolve_agent_filter(
+                principal,
+                DataScopeService.RESOURCE_SESSION_RECORD,
+                agent_id,
+                peer_ids,
+            )
         filter_options = await SatisfactionSurveyRecordService.get_filter_options(db, tenant_id)
         items, total = await SessionRecordRepository.get_paginated(
             db,
             tenant_id=tenant_id,
             page=page,
             per_page=per_page,
-            agent_id=agent_id,
+            agent_id=effective_agent_id,
             visitor_id=visitor_id,
             start_date=start_date,
             end_date=end_date,
@@ -59,10 +76,18 @@ class SessionRecordService:
             service_labels=service_labels,
             product_rating_options=product_rating_options,
             product_labels=product_labels,
+            scope_predicate=scope_predicate,
         )
         satisfaction_by_conversation = await SatisfactionSurveyRecordRepository.get_by_conversation_ids(
             db,
             [item.id for item in items],
+        )
+        queue_summaries = await QueueHistoryService.summaries_for_refs(
+            db,
+            tenant_id,
+            channel=QueueChannel.ONLINE_CHAT.value,
+            task_types=[QueueTaskType.CONVERSATION.value, QueueTaskType.OPEN_AGENT_HANDOFF.value],
+            ref_ids=[str(item.id) for item in items],
         )
         pages = (total + per_page - 1) // per_page if total > 0 else 0
         return {
@@ -70,6 +95,7 @@ class SessionRecordService:
                 SessionRecordService._conversation_to_response(
                     item,
                     satisfaction_by_conversation.get(item.id),
+                    queue_summary=queue_summaries.get(str(item.id)),
                 )
                 for item in items
             ],
@@ -90,7 +116,13 @@ class SessionRecordService:
         ]
 
     @staticmethod
-    def _conversation_to_response(conversation, satisfaction_record=None, related_tickets=None) -> dict:
+    def _conversation_to_response(
+        conversation,
+        satisfaction_record=None,
+        related_tickets=None,
+        queue_summary: dict | None = None,
+    ) -> dict:
+        queue_summary = _effective_queue_summary(conversation, queue_summary)
         return {
             "id": conversation.id,
             "public_id": conversation.public_id,
@@ -106,20 +138,42 @@ class SessionRecordService:
             "last_message_preview": getattr(conversation, "last_message_preview", None),
             "satisfaction": SatisfactionSurveyRecordService.record_summary(satisfaction_record),
             "related_tickets": SessionRecordService._ticket_briefs(related_tickets or []),
+            "last_assigned_queue": queue_summary.get("last_assigned_queue"),
+            "queue_duration_seconds": queue_summary.get("queue_duration_seconds"),
         }
 
     @staticmethod
-    async def get_by_id(db: AsyncSession, tenant_id: int, conversation_id: int):
+    async def get_by_id(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+        principal: EffectivePrincipal | None = None,
+    ):
         item = await SessionRecordRepository.get_by_id(db, conversation_id, tenant_id)
         if not item:
             raise NotFoundError("Session record not found")
+        if principal is not None:
+            peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            DataScopeService.assert_conversation_in_scope(principal, item, peer_ids)
         satisfaction = await SatisfactionSurveyRecordRepository.get_by_conversation(db, conversation_id)
         related_tickets = await TicketRepository.list_by_conversation_id(
             db,
             tenant_id=tenant_id,
             conversation_id=conversation_id,
         )
-        return SessionRecordService._conversation_to_response(item, satisfaction, related_tickets)
+        queue_summaries = await QueueHistoryService.summaries_for_refs(
+            db,
+            tenant_id,
+            channel=QueueChannel.ONLINE_CHAT.value,
+            task_types=[QueueTaskType.CONVERSATION.value, QueueTaskType.OPEN_AGENT_HANDOFF.value],
+            ref_ids=[str(conversation_id)],
+        )
+        return SessionRecordService._conversation_to_response(
+            item,
+            satisfaction,
+            related_tickets,
+            queue_summary=queue_summaries.get(str(conversation_id)),
+        )
 
     @staticmethod
     async def get_messages(
@@ -127,11 +181,16 @@ class SessionRecordService:
         conversation_id: int,
         after_id: int | None = None,
         limit: int = 20,
+        tenant_id: int | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         """Get messages with forward cursor pagination and sender info enrichment."""
-        item = await SessionRecordRepository.get_by_id(db, conversation_id)
+        item = await SessionRecordRepository.get_by_id(db, conversation_id, tenant_id)
         if not item:
             raise NotFoundError("Session record not found")
+        if principal is not None:
+            peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            DataScopeService.assert_conversation_in_scope(principal, item, peer_ids)
 
         messages = await SessionRecordRepository.get_messages(
             db, conversation_id, after_id=after_id, limit=limit + 1
@@ -176,3 +235,53 @@ class SessionRecordService:
             enriched.append(entry)
 
         return {"items": enriched, "has_more": has_more}
+
+
+def _effective_queue_summary(conversation, queue_summary: dict | None) -> dict:
+    fallback = _queue_summary_from_conversation(conversation)
+    queue_summary = queue_summary or {}
+    return {
+        "last_assigned_queue": (
+            queue_summary.get("last_assigned_queue")
+            or fallback.get("last_assigned_queue")
+        ),
+        "queue_duration_seconds": (
+            queue_summary.get("queue_duration_seconds")
+            if queue_summary.get("queue_duration_seconds") is not None
+            else fallback.get("queue_duration_seconds")
+        ),
+    }
+
+
+def _queue_summary_from_conversation(conversation) -> dict:
+    queue = None
+    group = getattr(conversation, "group", None)
+    if group is not None and getattr(group, "name", None):
+        queue = {
+            "queue_type": QueueType.EMPLOYEE_GROUP.value,
+            "queue_id": group.id,
+            "name": group.name,
+        }
+    else:
+        agent = getattr(conversation, "agent", None)
+        if agent is not None:
+            name = (
+                getattr(agent, "display_name", None)
+                or getattr(agent, "nickname", None)
+                or getattr(agent, "name", None)
+                or getattr(agent, "username", None)
+            )
+            if name:
+                queue = {
+                    "queue_type": QueueType.EMPLOYEE.value,
+                    "queue_id": agent.id,
+                    "name": name,
+                }
+
+    if queue is None:
+        return {}
+
+    return {
+        "last_assigned_queue": queue,
+        "queue_duration_seconds": None,
+    }

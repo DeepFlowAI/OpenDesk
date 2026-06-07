@@ -9,6 +9,21 @@ import { useCallRecord } from '@/service/use-call-center'
 import type { CallRecordDetail, CallRecordListItem } from '@/models/call-center'
 import { t } from '@/utils/i18n'
 import { CallSummaryFields } from '@/app/components/features/call-summary/call-summary-fields'
+import {
+  callRecordCustomerNumber,
+  callRecordServiceNumber,
+  formatCallRecordDate,
+  formatCallRecordDuration,
+  formatQueueDurationSeconds,
+} from '@/app/components/features/call-center/call-record-utils'
+
+export {
+  callRecordCustomerNumber,
+  callRecordServiceNumber,
+  formatCallRecordDate,
+  formatCallRecordDuration,
+  formatQueueDurationSeconds,
+}
 
 type CallRecordDetailDrawerProps = {
   recordId: number
@@ -150,6 +165,12 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
                     <Dd>{callRecordCustomerNumber(data) || (isZh ? '未知号码' : 'Unknown')}</Dd>
                     <Dt>{isZh ? '服务号码' : 'Service Number'}</Dt>
                     <Dd>{callRecordServiceNumber(data) || '-'}</Dd>
+                    <Dt>{t('ws.records.calls.detail.lastAssignedQueue', locale)}</Dt>
+                    <Dd>
+                      <CallQueueName queue={data.last_assigned_queue} locale={locale} />
+                    </Dd>
+                    <Dt>{t('ws.records.calls.detail.queueDuration', locale)}</Dt>
+                    <Dd>{formatQueueDurationSeconds(data.queue_duration_seconds)}</Dd>
                     <Dt>{isZh ? '关联用户' : 'Linked User'}</Dt>
                     <Dd>
                       <AssociatedUserDetail record={data} isZh={isZh} />
@@ -188,45 +209,6 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
       </div>
     </div>
   )
-}
-
-export function callRecordCustomerNumber(
-  record: Pick<CallRecordListItem, 'direction' | 'from_number' | 'to_number'>,
-): string | null {
-  return record.direction === 'outbound' ? record.to_number : record.from_number
-}
-
-export function callRecordServiceNumber(
-  record: Pick<CallRecordListItem, 'direction' | 'from_number' | 'to_number'>,
-): string | null {
-  return record.direction === 'outbound' ? record.from_number : record.to_number
-}
-
-export function formatCallRecordDuration(ms: number | null): string {
-  if (ms == null) return '-'
-  const seconds = Math.floor(ms / 1000)
-  const hours = Math.floor(seconds / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-  const remainingSeconds = seconds % 60
-  if (hours > 0) {
-    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`
-  }
-  return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`
-}
-
-export function formatCallRecordDate(value: string | null, isZh = true): string {
-  if (!value) return '-'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString(isZh ? 'zh-CN' : 'en-US', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  })
 }
 
 function associatedUserLabel(
@@ -299,6 +281,26 @@ function AssociatedUserDetail({
     >
       <span className="truncate text-sm font-medium">{label}</span>
     </Link>
+  )
+}
+
+function CallQueueName({
+  queue,
+  locale,
+}: {
+  queue: CallRecordDetail['last_assigned_queue']
+  locale: 'zh' | 'en'
+}) {
+  if (!queue?.name) return <span />
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1.5">
+      <span className="min-w-0 break-words">{queue.name}</span>
+      {queue.queue_type === 'employee' && (
+        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] leading-4 text-muted-foreground">
+          {t('ws.records.queue.personalQueue', locale)}
+        </span>
+      )}
+    </span>
   )
 }
 

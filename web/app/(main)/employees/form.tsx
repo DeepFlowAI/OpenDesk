@@ -6,14 +6,25 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useUploadAvatar } from '@/service/use-upload'
 import { useEmployeeGroups } from '@/service/use-employee-groups'
+import { useRoleOptions } from '@/service/use-roles'
+import { ScopedQueueSettings } from '@/app/components/features/queue-settings/scoped-queue-settings'
 import type { Employee, CreateEmployeePayload, UpdateEmployeePayload } from '@/models/employee'
+import type { QueuePolicy, QueuePolicyUpsertPayload } from '@/models/queue-policy'
+import type { RoleOption } from '@/models/role'
 
 type FormErrors = Record<string, string>
 
 type Props = {
   initialData?: Employee
   isEdit?: boolean
-  onSubmit: (data: CreateEmployeePayload | UpdateEmployeePayload) => void
+  onSubmit: (
+    data: CreateEmployeePayload | UpdateEmployeePayload,
+    queuePolicies?: QueuePolicyUpsertPayload[]
+  ) => void
+  queueSettings?: {
+    defaultPolicies?: QueuePolicy[]
+    scopedPolicies?: QueuePolicy[]
+  }
 }
 
 function generateRandomPassword(): string {
@@ -68,7 +79,7 @@ function FormSelect({
   )
 }
 
-export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: Props) {
+export default function EmployeeForm({ initialData, isEdit = false, onSubmit, queueSettings }: Props) {
   const { locale } = useLocaleStore()
   const uploadMutation = useUploadAvatar()
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -81,16 +92,23 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: 
   const [email, setEmail] = useState(initialData?.email ?? '')
   const [phone, setPhone] = useState(initialData?.phone ?? '')
   const [password, setPassword] = useState('')
-  const [roles, setRoles] = useState<string[]>(initialData?.roles ?? ['agent'])
+  const [roleIds, setRoleIds] = useState<number[]>(initialData?.role_ids ?? [])
   const [groupIds, setGroupIds] = useState<number[]>(initialData?.group_ids ?? [])
   const [maxConcurrent, setMaxConcurrent] = useState(String(initialData?.max_concurrent ?? 10))
   const [defaultLanguage, setDefaultLanguage] = useState(initialData?.default_language ?? 'system')
   const [errors, setErrors] = useState<FormErrors>({})
+  const [queuePolicyPayloads, setQueuePolicyPayloads] = useState<QueuePolicyUpsertPayload[]>([])
+  const [queuePoliciesValid, setQueuePoliciesValid] = useState(true)
   const [groupDropdownOpen, setGroupDropdownOpen] = useState(false)
+  const [roleDropdownOpen, setRoleDropdownOpen] = useState(false)
 
   const { data: groupsData } = useEmployeeGroups({ per_page: 100 })
+  const { data: rolesData } = useRoleOptions()
   const allGroups = useMemo(() => groupsData?.items ?? [], [groupsData])
+  const availableRoles = useMemo(() => rolesData?.items ?? [], [rolesData])
   const groupDropdownRef = useRef<HTMLDivElement>(null)
+  const roleDropdownRef = useRef<HTMLDivElement>(null)
+  const rolesInitializedRef = useRef(false)
 
   useEffect(() => {
     if (!groupDropdownOpen) return
@@ -103,10 +121,53 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: 
     return () => document.removeEventListener('mousedown', handleClick)
   }, [groupDropdownOpen])
 
-  const roleOptions = useMemo(() => [
-    { value: 'agent', label: t('emp.role.agent', locale) },
-    { value: 'admin', label: t('emp.role.admin', locale) },
-  ], [locale])
+  useEffect(() => {
+    if (!roleDropdownOpen) return
+    const handleClick = (e: MouseEvent) => {
+      if (roleDropdownRef.current && !roleDropdownRef.current.contains(e.target as Node)) {
+        setRoleDropdownOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [roleDropdownOpen])
+
+  useEffect(() => {
+    if (rolesInitializedRef.current || availableRoles.length === 0) return
+    const existingIds = initialData?.role_ids ?? []
+    if (existingIds.length > 0) {
+      setRoleIds(existingIds)
+      rolesInitializedRef.current = true
+      return
+    }
+
+    const legacyRoles = initialData?.roles ?? ['agent']
+    const mappedIds = availableRoles
+      .filter((role) => role.key && legacyRoles.includes(role.key))
+      .map((role) => role.id)
+    setRoleIds(mappedIds.length > 0 ? mappedIds : [availableRoles[0].id])
+    rolesInitializedRef.current = true
+  }, [availableRoles, initialData?.role_ids, initialData?.roles])
+
+  const selectedRoles = useMemo<RoleOption[]>(() => (
+    roleIds
+      .map((roleId) => availableRoles.find((role) => role.id === roleId))
+      .filter((role): role is RoleOption => Boolean(role))
+  ), [availableRoles, roleIds])
+
+  const legacyRoles = useMemo(() => {
+    const keys = selectedRoles
+      .map((role) => role.key)
+      .filter((key): key is string => key === 'admin' || key === 'agent')
+    return keys.length > 0 ? Array.from(new Set(keys)).sort() : ['agent']
+  }, [selectedRoles])
+
+  const hasChannelEligibility = useMemo(() => {
+    if (selectedRoles.some((role) => role.permissions.includes('chat.workspace.use') || role.permissions.includes('call.workspace.use'))) {
+      return true
+    }
+    return legacyRoles.includes('agent')
+  }, [legacyRoles, selectedRoles])
 
   const langOptions = useMemo(() => [
     { value: 'system', label: t('emp.form.lang.system', locale) },
@@ -124,14 +185,15 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: 
     if (password && (password.length < 8 || password.length > 32)) {
       errs.password = t('emp.validation.password.format', locale)
     }
-    if (roles.length === 0) errs.roles = t('emp.validation.roles.required', locale)
+    if (roleIds.length === 0) errs.roles = t('emp.validation.roles.required', locale)
     return errs
-  }, [name, username, email, password, roles, isEdit, locale])
+  }, [name, username, email, password, roleIds, isEdit, locale])
 
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault()
       const errs = validate()
+      if (!queuePoliciesValid) errs.queue_settings = t('queue.validation.fixErrors', locale)
       setErrors(errs)
       if (Object.keys(errs).length > 0) return
 
@@ -145,13 +207,14 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: 
           email: email.trim(),
           phone: phone.trim() || null,
           avatar: avatar || null,
-          roles,
+          roles: legacyRoles,
+          role_ids: roleIds,
           max_concurrent: isNaN(mc) ? 10 : mc,
           default_language: defaultLanguage,
           group_ids: groupIds,
         }
         if (password) payload.password = password
-        onSubmit(payload)
+        onSubmit(payload, queuePolicyPayloads)
       } else {
         const payload: CreateEmployeePayload = {
           name: name.trim(),
@@ -162,16 +225,23 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: 
           phone: phone.trim() || null,
           password,
           avatar: avatar || null,
-          roles,
+          roles: legacyRoles,
+          role_ids: roleIds,
           max_concurrent: isNaN(mc) ? 10 : mc,
           default_language: defaultLanguage,
           group_ids: groupIds,
         }
-        onSubmit(payload)
+        onSubmit(payload, queuePolicyPayloads)
       }
     },
-    [name, nickname, jobNumber, username, email, phone, password, roles, groupIds, maxConcurrent, defaultLanguage, isEdit, validate, onSubmit, avatar]
+    [name, nickname, jobNumber, username, email, phone, password, legacyRoles, roleIds, groupIds, maxConcurrent, defaultLanguage, isEdit, validate, onSubmit, avatar, queuePoliciesValid, queuePolicyPayloads, locale]
   )
+
+  const handleQueueSettingsChange = useCallback((payloads: QueuePolicyUpsertPayload[], valid: boolean) => {
+    setQueuePolicyPayloads(payloads)
+    setQueuePoliciesValid(valid)
+    if (valid) setErrors((prev) => ({ ...prev, queue_settings: '' }))
+  }, [])
 
   const handleGeneratePassword = () => {
     const pwd = generateRandomPassword()
@@ -354,41 +424,81 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: 
           <label className="text-sm font-medium text-foreground/80">{t('emp.form.role', locale)}</label>
           <span className="text-sm text-destructive">*</span>
         </div>
-        <div className="flex items-center gap-4">
-          {roleOptions.map((opt) => (
-            <label key={opt.value} className="flex cursor-pointer items-center gap-2">
-              <span
-                className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
-                  roles.includes(opt.value)
-                    ? 'border-primary bg-primary text-primary-foreground'
-                    : 'border-border'
-                }`}
-                onClick={() => {
-                  setRoles((prev) =>
-                    prev.includes(opt.value)
-                      ? prev.filter((r) => r !== opt.value)
-                      : [...prev, opt.value]
+        <div className="relative w-[360px]" ref={roleDropdownRef}>
+          <button
+            type="button"
+            onClick={() => setRoleDropdownOpen(!roleDropdownOpen)}
+            className={`flex min-h-10 w-full items-center justify-between rounded-lg border px-3 py-1.5 text-sm ${
+              errors.roles ? 'border-destructive' : 'border-border'
+            }`}
+          >
+            {roleIds.length > 0 ? (
+              <div className="flex flex-1 flex-wrap items-center gap-1 overflow-hidden">
+                {roleIds.map((roleId) => {
+                  const role = availableRoles.find((item) => item.id === roleId)
+                  return (
+                    <span
+                      key={roleId}
+                      className="inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-xs"
+                    >
+                      {role?.name ?? `#${roleId}`}
+                      <IconX
+                        size={12}
+                        className="cursor-pointer text-muted-foreground hover:text-foreground"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setRoleIds((prev) => prev.filter((id) => id !== roleId))
+                        }}
+                      />
+                    </span>
                   )
-                  setErrors((p) => ({ ...p, roles: '' }))
-                }}
-              >
-                {roles.includes(opt.value) && <span className="text-[10px]">✓</span>}
-              </span>
-              <span
-                className="text-sm text-foreground/80"
-                onClick={() => {
-                  setRoles((prev) =>
-                    prev.includes(opt.value)
-                      ? prev.filter((r) => r !== opt.value)
-                      : [...prev, opt.value]
+                })}
+              </div>
+            ) : (
+              <span className="text-muted-foreground">{t('emp.form.role.placeholder', locale)}</span>
+            )}
+            <IconChevronDown size={16} className="shrink-0 text-muted-foreground" />
+          </button>
+          {roleDropdownOpen && (
+            <div className="absolute left-0 top-11 z-20 max-h-[240px] w-full overflow-y-auto rounded-lg border border-border bg-white py-1 shadow-lg">
+              {availableRoles.length === 0 ? (
+                <div className="px-3 py-2 text-sm text-muted-foreground">
+                  {t('role.empty', locale)}
+                </div>
+              ) : (
+                availableRoles.map((role) => {
+                  const selected = roleIds.includes(role.id)
+                  return (
+                    <button
+                      key={role.id}
+                      type="button"
+                      onClick={() => {
+                        setRoleIds((prev) =>
+                          selected ? prev.filter((id) => id !== role.id) : [...prev, role.id]
+                        )
+                        setErrors((p) => ({ ...p, roles: '' }))
+                      }}
+                      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${
+                        selected ? 'font-medium text-foreground' : 'text-foreground/80'
+                      }`}
+                    >
+                      <span className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
+                        selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border'
+                      }`}>
+                        {selected && <span className="text-[10px]">✓</span>}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate">{role.name}</span>
+                      {role.is_system && (
+                        <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                          {t('role.type.system', locale)}
+                        </span>
+                      )}
+                    </button>
                   )
-                  setErrors((p) => ({ ...p, roles: '' }))
-                }}
-              >
-                {opt.label}
-              </span>
-            </label>
-          ))}
+                })
+              )}
+            </div>
+          )}
         </div>
         {errors.roles && <span className="text-xs text-destructive">{errors.roles}</span>}
       </div>
@@ -467,7 +577,7 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: 
       </div>
 
       {/* Max Concurrent */}
-      {roles.includes('agent') && (
+      {hasChannelEligibility && (
         <div className="flex flex-col gap-1.5">
           <label className="text-sm font-medium text-foreground/80">{t('emp.form.maxConcurrent', locale)}</label>
           <div className="flex items-center gap-2">
@@ -482,6 +592,21 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit }: 
           </div>
         </div>
       )}
+
+      {queueSettings && initialData && (
+        <ScopedQueueSettings
+          title={t('queue.employeeSection.title', locale)}
+          scopeType="employee"
+          scopeId={initialData.id}
+          defaultPolicies={queueSettings.defaultPolicies}
+          scopedPolicies={queueSettings.scopedPolicies}
+          includeStrategy={false}
+          disabled={!hasChannelEligibility}
+          disabledHint={t('queue.employee.noChannelEligibility', locale)}
+          onChange={handleQueueSettingsChange}
+        />
+      )}
+      {errors.queue_settings && <span className="text-sm text-destructive">{errors.queue_settings}</span>}
 
       {/* Language */}
       <div className="flex flex-col gap-1.5">

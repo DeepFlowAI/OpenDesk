@@ -168,7 +168,7 @@ export default function SessionRoutingPage() {
             <div className="w-8 shrink-0" />
             <div className="w-[72px] shrink-0">{t('sr.col.priority', locale)}</div>
             <div className="min-w-0 flex-1">{t('sr.col.name', locale)}</div>
-            <div className="w-[160px] shrink-0">{t('sr.col.group', locale)}</div>
+            <div className="w-[280px] shrink-0">{t('sr.col.target', locale)}</div>
             <div className="w-[100px] shrink-0">{t('sr.col.enabled', locale)}</div>
             <div className="w-[80px] shrink-0 text-center">{t('sr.col.actions', locale)}</div>
           </div>
@@ -189,8 +189,8 @@ export default function SessionRoutingPage() {
               </div>
               <div className="w-[72px] shrink-0 text-sm text-foreground">{row.priority}</div>
               <div className="min-w-0 flex-1 truncate text-sm text-foreground">{row.name}</div>
-              <div className="w-[160px] shrink-0 truncate text-sm text-foreground">
-                {row.target_group_name || '—'}
+              <div className="w-[280px] shrink-0 truncate text-sm text-foreground">
+                {row.target_summary || row.target_group_name || '—'}
               </div>
               <div className="w-[100px] shrink-0">
                 <Switch

@@ -12,6 +12,7 @@ import {
 import { toast } from 'sonner'
 
 import { mapOutboundFailure } from '@/app/components/features/call-center/outbound-failure-message'
+import { callRecordCustomerNumber } from '@/app/components/features/call-center/call-record-utils'
 import { useMicrophone } from '@/app/components/features/call-center/use-microphone'
 import { useRingtone } from '@/app/components/features/call-center/use-ringtone'
 import { useWebRTCLeg } from '@/app/components/features/call-center/use-webrtc-leg'
@@ -381,7 +382,7 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
   }, [leg, mic, refetchRecords, ringtone])
 
   const screenPopNumber = selectedRecord
-    ? selectedRecord.from_number || selectedRecord.to_number || ''
+    ? callRecordCustomerNumber(selectedRecord) || ''
     : incoming?.direction === 'outbound'
       ? incoming.to || draftDialNumber.trim()
       : incoming?.from || draftDialNumber.trim()

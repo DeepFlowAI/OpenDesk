@@ -4,7 +4,9 @@ import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { IconPencil, IconTrash, IconPlus } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import { useEmployeeGroups, useDeleteEmployeeGroup } from '@/service/use-employee-groups'
 import type { EmployeeGroupListItem } from '@/models/employee-group'
 
@@ -58,6 +60,7 @@ function DeleteModal({
 export default function EmployeeGroupsPage() {
   const router = useRouter()
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const [page, setPage] = useState(1)
   const [keyword, setKeyword] = useState('')
   const [searchKeyword, setSearchKeyword] = useState('')
@@ -104,6 +107,7 @@ export default function EmployeeGroupsPage() {
   const items = data?.items ?? []
   const total = data?.total ?? 0
   const pages = data?.pages ?? 0
+  const canManage = hasPermission(user, 'org.group.manage')
 
   return (
     <div className="flex flex-col gap-6">
@@ -120,13 +124,15 @@ export default function EmployeeGroupsPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-foreground">{t('eg.title', locale)}</h1>
-        <button
-          onClick={() => router.push('/employee-groups/new')}
-          className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
-        >
-          <IconPlus size={18} />
-          {t('eg.new', locale)}
-        </button>
+        {canManage && (
+          <button
+            onClick={() => router.push('/employee-groups/new')}
+            className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
+          >
+            <IconPlus size={18} />
+            {t('eg.new', locale)}
+          </button>
+        )}
       </div>
 
       {/* Search bar */}
@@ -156,13 +162,15 @@ export default function EmployeeGroupsPage() {
       {items.length === 0 ? (
         <div className="flex flex-col items-center justify-center gap-4 py-20">
           <p className="text-sm text-muted-foreground">{t('eg.empty', locale)}</p>
-          <button
-            onClick={() => router.push('/employee-groups/new')}
-            className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white"
-          >
-            <IconPlus size={18} />
-            {t('eg.new', locale)}
-          </button>
+          {canManage && (
+            <button
+              onClick={() => router.push('/employee-groups/new')}
+              className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white"
+            >
+              <IconPlus size={18} />
+              {t('eg.new', locale)}
+            </button>
+          )}
         </div>
       ) : (
         <>
@@ -178,9 +186,11 @@ export default function EmployeeGroupsPage() {
               <div className="flex w-[80px] shrink-0 items-center">
                 <span className="text-sm font-semibold text-foreground/80">{t('eg.col.memberCount', locale)}</span>
               </div>
-              <div className="flex w-[70px] shrink-0 items-center">
-                <span className="text-sm font-semibold text-foreground/80">{t('eg.col.actions', locale)}</span>
-              </div>
+              {canManage && (
+                <div className="flex w-[70px] shrink-0 items-center">
+                  <span className="text-sm font-semibold text-foreground/80">{t('eg.col.actions', locale)}</span>
+                </div>
+              )}
             </div>
 
             {items.map((item) => (
@@ -201,20 +211,22 @@ export default function EmployeeGroupsPage() {
                 <div className="flex w-[80px] shrink-0 items-center">
                   <span className="text-sm text-muted-foreground">{item.member_count}</span>
                 </div>
-                <div className="flex w-[70px] shrink-0 items-center gap-3">
-                  <button
-                    onClick={() => router.push(`/employee-groups/${item.id}`)}
-                    className="text-foreground/80 transition-colors hover:text-foreground"
-                  >
-                    <IconPencil size={18} />
-                  </button>
-                  <button
-                    onClick={() => setDeleteTarget(item)}
-                    className="text-foreground/80 transition-colors hover:text-destructive"
-                  >
-                    <IconTrash size={18} />
-                  </button>
-                </div>
+                {canManage && (
+                  <div className="flex w-[70px] shrink-0 items-center gap-3">
+                    <button
+                      onClick={() => router.push(`/employee-groups/${item.id}`)}
+                      className="text-foreground/80 transition-colors hover:text-foreground"
+                    >
+                      <IconPencil size={18} />
+                    </button>
+                    <button
+                      onClick={() => setDeleteTarget(item)}
+                      className="text-foreground/80 transition-colors hover:text-destructive"
+                    >
+                      <IconTrash size={18} />
+                    </button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -247,7 +259,7 @@ export default function EmployeeGroupsPage() {
         </>
       )}
 
-      {deleteTarget && (
+      {canManage && deleteTarget && (
         <DeleteModal
           item={deleteTarget}
           onCancel={() => setDeleteTarget(null)}

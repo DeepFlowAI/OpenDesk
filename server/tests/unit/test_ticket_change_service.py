@@ -34,6 +34,7 @@ class TestTicketChangeDiff:
         assert len(rows) == 1
         assert rows[0]["field_key"] == "title"
         assert rows[0]["field_label"] == "标题"
+        assert rows[0]["field_source"] == "ticket"
         assert rows[0]["old_value"] == "Old title"
         assert rows[0]["new_value"] == "New title"
         assert rows[0]["actor_id"] == 9
@@ -68,6 +69,7 @@ class TestTicketChangeDiff:
             tenant_id=7,
             update_data={"title": "New", "priority": "high"},
             field_labels={"title": "标题", "priority": "优先级"},
+            field_sources={"priority": "ticket_workflow"},
             actor_id=1,
             actor_name="A",
         )
@@ -79,6 +81,7 @@ class TestTicketChangeDiff:
         assert len(entries) == 2
         assert entries[0]["field_key"] == "title"
         assert entries[1]["field_key"] == "priority"
+        assert entries[1]["field_source"] == "ticket_workflow"
 
     def test_build_create_change_row_uses_value_only_entries(self):
         ticket = Ticket(
@@ -99,6 +102,7 @@ class TestTicketChangeDiff:
                 "priority": "优先级",
             },
             created_fields=["title", "status", "priority"],
+            field_sources={"priority": "ticket_workflow"},
         )
         rows = TicketService._build_create_change_row(
             ticket=ticket,
@@ -114,3 +118,4 @@ class TestTicketChangeDiff:
         assert rows[0]["new_value"][0]["field_key"] == "ticket_number"
         assert rows[0]["new_value"][0]["old_value"] is None
         assert rows[0]["new_value"][0]["new_value"] == "TK001"
+        assert rows[0]["new_value"][3]["field_source"] == "ticket_workflow"

@@ -5,12 +5,14 @@ import { IconTrash, IconPlus } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useEmployeeSelect } from '@/service/use-employee-groups'
+import { ScopedQueueSettings } from '@/app/components/features/queue-settings/scoped-queue-settings'
 import type {
   EmployeeGroup,
   CreateEmployeeGroupPayload,
   EmployeeGroupMember,
   UserListItem,
 } from '@/models/employee-group'
+import type { QueuePolicy, QueuePolicyUpsertPayload } from '@/models/queue-policy'
 
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
@@ -159,11 +161,15 @@ function AddMemberModal({
 
 type Props = {
   initialData?: EmployeeGroup
-  onSubmit: (data: CreateEmployeeGroupPayload) => void
+  onSubmit: (data: CreateEmployeeGroupPayload, queuePolicies?: QueuePolicyUpsertPayload[]) => void
   saving?: boolean
+  queueSettings?: {
+    defaultPolicies?: QueuePolicy[]
+    scopedPolicies?: QueuePolicy[]
+  }
 }
 
-export default function EmployeeGroupForm({ initialData, onSubmit, saving }: Props) {
+export default function EmployeeGroupForm({ initialData, onSubmit, saving, queueSettings }: Props) {
   const { locale } = useLocaleStore()
 
   const [name, setName] = useState(initialData?.name ?? '')
@@ -176,6 +182,9 @@ export default function EmployeeGroupForm({ initialData, onSubmit, saving }: Pro
     })) ?? []
   )
   const [nameError, setNameError] = useState('')
+  const [queueError, setQueueError] = useState('')
+  const [queuePolicyPayloads, setQueuePolicyPayloads] = useState<QueuePolicyUpsertPayload[]>([])
+  const [queuePoliciesValid, setQueuePoliciesValid] = useState(true)
   const [showAddModal, setShowAddModal] = useState(false)
 
   const existingMemberIds = new Set(members.map((m) => m.employee_id))
@@ -188,15 +197,26 @@ export default function EmployeeGroupForm({ initialData, onSubmit, saving }: Pro
         setNameError(t('eg.form.name.required', locale))
         return
       }
+      if (!queuePoliciesValid) {
+        setQueueError(t('queue.validation.fixErrors', locale))
+        return
+      }
       setNameError('')
+      setQueueError('')
       onSubmit({
         name: trimmed,
         description: description || null,
         member_ids: members.map((m) => m.employee_id),
-      })
+      }, queuePolicyPayloads)
     },
-    [name, description, members, locale, onSubmit]
+    [name, description, members, locale, onSubmit, queuePoliciesValid, queuePolicyPayloads]
   )
+
+  const handleQueueSettingsChange = useCallback((payloads: QueuePolicyUpsertPayload[], valid: boolean) => {
+    setQueuePolicyPayloads(payloads)
+    setQueuePoliciesValid(valid)
+    if (valid) setQueueError('')
+  }, [])
 
   const handleAddMembers = (newMembers: MemberEntry[]) => {
     setMembers((prev) => [...prev, ...newMembers])
@@ -306,6 +326,19 @@ export default function EmployeeGroupForm({ initialData, onSubmit, saving }: Pro
             </div>
           )}
         </div>
+
+        {queueSettings && initialData && (
+          <ScopedQueueSettings
+            title={t('queue.groupSection.title', locale)}
+            scopeType="employee_group"
+            scopeId={initialData.id}
+            defaultPolicies={queueSettings.defaultPolicies}
+            scopedPolicies={queueSettings.scopedPolicies}
+            includeStrategy
+            onChange={handleQueueSettingsChange}
+          />
+        )}
+        {queueError && <div className="text-sm text-destructive">{queueError}</div>}
 
         {/* Hidden submit trigger for sticky bar */}
         <button type="submit" className="hidden" />

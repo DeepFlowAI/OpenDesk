@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuthStore } from '@/context/auth-store'
+import { getDefaultAccessiblePath, hasAllPermissions } from '@/utils/permissions'
 
 /** Full-viewport shell for canvas editors — auth guard only, no admin chrome. */
 export default function EditorLayout({ children }: { children: React.ReactNode }) {
@@ -21,13 +22,18 @@ export default function EditorLayout({ children }: { children: React.ReactNode }
   }, [mounted, token, router])
 
   useEffect(() => {
-    if (mounted && token && user?.roles && !user.roles.includes('admin')) {
-      router.replace('/workspace/chat')
+    if (
+      mounted &&
+      token &&
+      user &&
+      !hasAllPermissions(user, ['admin.access', 'call.admin.flow.manage'])
+    ) {
+      router.replace(getDefaultAccessiblePath(user))
     }
-  }, [mounted, token, user?.roles, router])
+  }, [mounted, token, user, router])
 
-  if (!mounted || !token) return null
-  if (user?.roles && !user.roles.includes('admin')) return null
+  if (!mounted || !token || !user) return null
+  if (!hasAllPermissions(user, ['admin.access', 'call.admin.flow.manage'])) return null
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-white">

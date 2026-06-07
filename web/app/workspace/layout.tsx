@@ -1,16 +1,16 @@
 'use client'
 
-import { useMemo, useState, useEffect } from 'react'
+import { useMemo, useState, useEffect, type ComponentType } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import {
+  IconAddressBook,
   IconHeadset,
+  IconHistory,
   IconMessageCircle,
   IconPhone,
-  IconHistory,
   IconSettings,
-  IconAddressBook,
   IconTicket,
 } from '@tabler/icons-react'
 import { useAuthStore } from '@/context/auth-store'
@@ -27,21 +27,33 @@ import { GlobalCallBar } from '@/app/components/features/call-center/global-call
 import { UserDropdown } from '@/app/components/features/user-dropdown'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
+import {
+  WORKSPACE_NAV_ITEMS,
+  getWorkspaceRouteRule,
+  type WorkspaceNavIconKey,
+} from '@/config/workspace-permissions'
+import {
+  getDefaultAccessiblePath,
+  getDefaultAdminPath,
+  hasAnyPermission,
+  hasPermission,
+} from '@/utils/permissions'
 import type { Conversation, Message } from '@/models/conversation'
 
 type NavItem = {
   labelKey: string
   href: string
-  icon: React.ComponentType<{ size?: number; className?: string }>
+  iconKey: WorkspaceNavIconKey
+  permissions: string[]
 }
 
-const NAV_ITEMS: NavItem[] = [
-  { labelKey: 'ws.nav.tickets', href: '/workspace/tickets', icon: IconTicket },
-  { labelKey: 'ws.nav.chat', href: '/workspace/chat', icon: IconMessageCircle },
-  { labelKey: 'ws.nav.call', href: '/workspace/call', icon: IconPhone },
-  { labelKey: 'ws.nav.records', href: '/workspace/records', icon: IconHistory },
-  { labelKey: 'ws.nav.contacts', href: '/workspace/users', icon: IconAddressBook },
-]
+const WORKSPACE_NAV_ICONS: Record<WorkspaceNavIconKey, ComponentType<{ size?: number; className?: string }>> = {
+  tickets: IconTicket,
+  chat: IconMessageCircle,
+  call: IconPhone,
+  records: IconHistory,
+  contacts: IconAddressBook,
+}
 
 function buildMessagePreview(msg: Message): string {
   if (msg.content_type === 'text' || msg.content_type === 'system') return msg.content
@@ -76,7 +88,8 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   const queryClient = useQueryClient()
   const [mounted, setMounted] = useState(false)
   const isChatPage = pathname.startsWith('/workspace/chat')
-  const syncChatNotifications = mounted && Boolean(token) && !isChatPage
+  const canUseChat = hasPermission(user, 'chat.workspace.use')
+  const syncChatNotifications = mounted && Boolean(token) && canUseChat && !isChatPage
   const { data: convData } = useConversations({ enabled: syncChatNotifications })
   const { socket, connected, connecting, connect } = useSocketStore()
   const {
@@ -91,6 +104,10 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     () => conversations.reduce((sum, conv) => sum + Math.max(0, conv.unread_count || 0), 0),
     [conversations],
   )
+  const visibleNavItems: NavItem[] = useMemo(
+    () => WORKSPACE_NAV_ITEMS.filter((item) => hasAnyPermission(user, item.permissions)),
+    [user],
+  )
 
   useEffect(() => {
     setMounted(true)
@@ -101,6 +118,14 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
       router.replace('/login')
     }
   }, [mounted, token, router])
+
+  useEffect(() => {
+    if (!mounted || !token || !user) return
+    const routeRule = getWorkspaceRouteRule(pathname)
+    if (routeRule && !hasAnyPermission(user, routeRule.permissions)) {
+      router.replace(getDefaultAccessiblePath(user))
+    }
+  }, [mounted, token, user, pathname, router])
 
   useEffect(() => {
     if (syncChatNotifications && token && !connected && !connecting) {
@@ -225,7 +250,10 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     queryClient,
   ])
 
-  if (!mounted || !token) return null
+  if (!mounted || !token || !user) return null
+  const routeRule = getWorkspaceRouteRule(pathname)
+  if (routeRule && !hasAnyPermission(user, routeRule.permissions)) return null
+  if (visibleNavItems.length === 0) return null
 
   return (
     <CallCenterProvider>
@@ -241,9 +269,9 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
 
           {/* Nav items */}
           <nav className="flex flex-col items-center gap-1">
-            {NAV_ITEMS.map((item) => {
+            {visibleNavItems.map((item) => {
               const active = pathname.startsWith(item.href)
-              const Icon = item.icon
+              const Icon = WORKSPACE_NAV_ICONS[item.iconKey]
               return (
                 <Link
                   key={item.href}
@@ -274,9 +302,9 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
 
         {/* Bottom: Management backend (admin only) — use /employees, not / (root redirects to /login) */}
         <div className="flex flex-col items-center gap-1">
-          {user?.roles?.includes('admin') && (
+          {hasPermission(user, 'admin.access') && (
             <a
-              href="/employees"
+              href={getDefaultAdminPath(user)}
               target="_blank"
               rel="noopener noreferrer"
               title={t('ws.nav.admin', locale)}

@@ -122,6 +122,46 @@ class TestVoiceFlowGraphSchema:
             data=AssignQueueData(employee_group_id=1, timeout_seconds=30),
         )
         assert n.data.employee_group_id == 1
+        assert n.data.queue_targets[0].queue_type == "employee_group"
+        assert n.data.queue_targets[0].queue_id == 1
+        assert n.data.target_strategy == "sequential_overflow"
+
+    def test_assign_queue_multi_queue_data(self):
+        n = AssignQueueNode(
+            id="q1",
+            type="assign_queue",
+            data=AssignQueueData(
+                target_strategy="least_waiting_count",
+                queue_targets=[
+                    {"queue_type": "employee_group", "queue_id": 1},
+                    {"queue_type": "employee", "queue_id": 2},
+                ],
+                queue_prompt_text="请稍候",
+                prompt_play_mode="loop",
+                prompt_loop_interval_seconds=10,
+                timeout_seconds=90,
+            ),
+        )
+        assert n.data.target_strategy == "least_waiting_count"
+        assert [target.queue_type for target in n.data.queue_targets] == ["employee_group", "employee"]
+
+    def test_assign_queue_user_field_target_data(self):
+        n = AssignQueueNode(
+            id="q1",
+            type="assign_queue",
+            data=AssignQueueData(
+                queue_targets=[
+                    {"queue_type": "user_field", "queue_id": 3},
+                    {"queue_type": "employee_group", "queue_id": 1},
+                ],
+            ),
+        )
+        assert [target.queue_type for target in n.data.queue_targets] == ["user_field", "employee_group"]
+        assert n.data.queue_targets[0].queue_id == 3
+
+    def test_assign_queue_requires_target(self):
+        with pytest.raises(Exception):
+            AssignQueueData(queue_targets=[], employee_group_id=None)
 
     def test_hangup_with_pre_play(self):
         n = HangupNode(

@@ -219,12 +219,55 @@ class TestVoiceFlowsAPI:
         assert "queue_not_found" in codes
 
     @pytest.mark.asyncio
+    async def test_validate_phantom_employee_queue_rejected(self, client: AsyncClient):
+        headers = _auth_header(tenant_id=7)
+        c = await client.post(
+            "/api/v1/voice-flows", headers=headers,
+            json={"name": f"VF {uuid.uuid4().hex[:6]}"},
+        )
+        fid = c.json()["id"]
+        graph = {
+            "version": 1,
+            "nodes": [
+                {"id": "start", "type": "start", "data": {}},
+                {
+                    "id": "q1",
+                    "type": "assign_queue",
+                    "data": {
+                        "target_strategy": "least_waiting_count",
+                        "queue_targets": [{"queue_type": "employee", "queue_id": 999999}],
+                        "timeout_seconds": 30,
+                    },
+                },
+                {"id": "h1", "type": "hangup", "data": {"pre_play": None}},
+            ],
+            "edges": [
+                {"id": "e1", "source": "start", "target": "q1", "source_handle": "next"},
+                {"id": "e2", "source": "q1", "target": "h1", "source_handle": "timeout"},
+            ],
+            "variables": [],
+        }
+        v = await client.post(
+            f"/api/v1/voice-flows/{fid}/validate",
+            headers=headers, json={"graph_json": graph},
+        )
+        assert v.status_code == 200
+        codes = {e["code"] for e in v.json()["errors"]}
+        assert "queue_not_found" in codes
+
+    @pytest.mark.asyncio
     async def test_system_variables_endpoint(self, client: AsyncClient):
         headers = _auth_header(tenant_id=7)
         r = await client.get("/api/v1/voice-flows/system-variables", headers=headers)
         assert r.status_code == 200
         names = {i["name"] for i in r.json()["items"]}
-        assert {"sys.caller_number", "sys.called_number", "sys.current_time"} <= names
+        assert {
+            "sys.caller_number",
+            "sys.called_number",
+            "sys.current_time",
+            "sys.assign_queue_status",
+            "sys.assign_queue_limit_reason",
+        } <= names
 
     @pytest.mark.asyncio
     async def test_soft_delete_removes_from_select(self, client: AsyncClient):

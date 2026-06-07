@@ -296,46 +296,42 @@ class ConditionExecutor(BaseNodeExecutor):
 
 class AssignQueueExecutor(BaseNodeExecutor):
     """
-    Ring-on-demand transfer to an agent.
-
-    Flow:
-      1. Pick the next `ready` agent in the group (no WebRTC leg required —
-         that's built on accept).
-      2. Push `cc.call_offer` (Socket.IO) carrying an `offer_id` the
-         browser must echo back.
-      3. Play a hold message to the customer so they hear something during
-         the negotiation.
-      4. Await the agent decision Future, bounded by `timeout_seconds`.
-         - accept: browser already POSTed `/current-call/accept` with its
-           SDP, which built the WebRTC leg + got a `webrtc_call_id`. We
-           proceed to `call.stop` + `call.bridge`.
-         - reject / timeout: tell the caller, exit via `timeout` outlet.
-      5. After `call.bridged`, end. Subsequent SIP `call.hangup` is handled
-         by the orchestrator (CDR + status cleanup + close webrtc session).
+    Ring-on-demand transfer to an agent selected from one or more queues.
     """
+
+    _FAILURE_PROMPT_FIELDS = {
+        "queue_limit_reached": "queue_limit_prompt_text",
+        "no_available_queue": "no_available_queue_prompt_text",
+        "queue_timeout": "queue_timeout_prompt_text",
+        "agent_no_answer": "agent_no_answer_prompt_text",
+    }
+
+    _DEFAULT_FAILURE_PROMPTS = {
+        "queue_limit_reached": "当前排队人数较多，请稍后再拨。",
+        "no_available_queue": "当前坐席繁忙，请稍后再拨。",
+        "queue_timeout": "暂时无法接通坐席，请稍后再拨。",
+        "agent_no_answer": "暂无坐席接听，请稍后再拨。",
+    }
 
     async def execute(self, ctx: ExecutionContext, node: dict) -> NextStep:
         import asyncio
         import logging
         import uuid
+        from contextlib import suppress
 
         log = logging.getLogger(__name__)
-        data = node["data"]
-        group_id = data["employee_group_id"]
-        if group_id is None:
-            return goto_or_end(ctx, node["id"], "timeout")
-
-        ctx.variables["sys._assigned_group_id"] = group_id
+        data = node.get("data") or {}
+        timeout_s = float(data.get("timeout_seconds") or 60)
 
         from app.db.session import AsyncSessionLocal
         from app.db.redis import redis_client
         from app.services.call_record_service import CallRecordService
         from app.services.cc_agent_resource_service import CcAgentResourceService
+        from app.services.call_center.assign_queue import AssignQueueSelector
 
         picker = get_queue_picker()
         pick: dict | None = None
         offer_id = uuid.uuid4().hex
-        timeout_s = float(data.get("timeout_seconds") or 30)
         try:
             redis = redis_client.client
         except RuntimeError as exc:
@@ -345,11 +341,32 @@ class AssignQueueExecutor(BaseNodeExecutor):
             raise RuntimeError(
                 "Call-center assign_queue requires Redis for agent resource reservation"
             ) from exc
+
         async with AsyncSessionLocal() as db:
-            pick = await picker.pick_ready_agent(
+            selection = await AssignQueueSelector.select(
+                db,
+                redis,
+                ctx.tenant_id,
+                data,
+                call_id=ctx.call_id,
+            )
+            selected = selection.candidate
+            if selected is None:
+                status = selection.failure_status or "no_available_queue"
+                self._set_failure_status(ctx, status, selection.limit_reason)
+                await self._say(ctx, self._failure_prompt(data, status))
+                return goto_or_end(ctx, node["id"], "timeout")
+
+            ctx.variables["sys._assigned_queue_type"] = selected.queue_type
+            ctx.variables["sys._assigned_queue_id"] = selected.queue_id
+            if selected.queue_type == "employee_group":
+                ctx.variables["sys._assigned_group_id"] = selected.queue_id
+
+            pick = await picker.pick_ready_agent_for_queue(
                 db,
                 ctx.tenant_id,
-                group_id,
+                selected.queue_type,
+                selected.queue_id,
                 redis,
                 call_id=ctx.call_id,
                 offer_id=offer_id,
@@ -357,20 +374,22 @@ class AssignQueueExecutor(BaseNodeExecutor):
             )
             if pick:
                 await CallRecordService.bind_queue(
-                    db, ctx.tenant_id, ctx.call_id, group_id,
+                    db,
+                    ctx.tenant_id,
+                    ctx.call_id,
+                    selected.queue_type,
+                    selected.queue_id,
                 )
 
         if pick is None:
             log.info(
-                "assign_queue: no ready agent group=%s call_id=%s",
-                group_id, ctx.call_id,
+                "assign_queue: no ready agent queue=%s/%s call_id=%s",
+                ctx.variables.get("sys._assigned_queue_type"),
+                ctx.variables.get("sys._assigned_queue_id"),
+                ctx.call_id,
             )
-            try:
-                await ctx.telephony.call_say(
-                    ctx.call_id, "当前坐席繁忙，请稍后再拨。",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            self._set_failure_status(ctx, "agent_no_answer")
+            await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
             return goto_or_end(ctx, node["id"], "timeout")
 
         orchestrator = ctx.variables.get("__orchestrator__")
@@ -384,9 +403,13 @@ class AssignQueueExecutor(BaseNodeExecutor):
                     reason="orchestrator_missing",
                     expected_offer_id=offer_id,
                 )
+            self._set_failure_status(ctx, "agent_no_answer")
+            await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
             return goto_or_end(ctx, node["id"], "timeout")
 
         future = orchestrator.register_offer(offer_id)
+        queue_type = ctx.variables.get("sys._assigned_queue_type")
+        queue_id = ctx.variables.get("sys._assigned_queue_id")
 
         try:
             pushed = await orchestrator.notify_agent_incoming(
@@ -397,7 +420,8 @@ class AssignQueueExecutor(BaseNodeExecutor):
                     "call_id": ctx.call_id,
                     "from": ctx.variables.get("sys.caller_number", ""),
                     "to": ctx.variables.get("sys.called_number", ""),
-                    "queue_id": group_id,
+                    "queue_type": queue_type,
+                    "queue_id": queue_id,
                 },
             )
         except Exception:  # noqa: BLE001
@@ -413,6 +437,8 @@ class AssignQueueExecutor(BaseNodeExecutor):
                     reason="offer_push_failed",
                     expected_offer_id=offer_id,
                 )
+            self._set_failure_status(ctx, "agent_no_answer")
+            await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
             return goto_or_end(ctx, node["id"], "timeout")
 
         if redis is not None:
@@ -435,14 +461,18 @@ class AssignQueueExecutor(BaseNodeExecutor):
                     reason="offer_push_failed",
                     expected_offer_id=offer_id,
                 )
+                self._set_failure_status(ctx, "agent_no_answer")
+                await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
                 return goto_or_end(ctx, node["id"], "timeout")
 
-        # Hold message so the caller hears something while the agent's
-        # browser ramps up its WebRTC leg.
-        try:
-            await ctx.telephony.call_say(ctx.call_id, "正在为您转接，请稍候。")
-        except Exception:  # noqa: BLE001
-            pass
+        prompt_task: asyncio.Task | None = None
+        if data.get("prompt_play_mode") == "loop":
+            prompt_task = asyncio.create_task(
+                self._play_waiting_prompt(ctx, data),
+                name=f"assign-queue-prompt:{ctx.call_id}",
+            )
+        else:
+            await self._say(ctx, data.get("queue_prompt_text") or "正在为您转接，请稍候。")
 
         log.info(
             "assign_queue: offered to agent=%s offer_id=%s timeout=%ss call_id=%s",
@@ -461,6 +491,11 @@ class AssignQueueExecutor(BaseNodeExecutor):
                     reason="offer_timeout",
                     expected_offer_id=offer_id,
                 )
+        finally:
+            if prompt_task is not None:
+                prompt_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await prompt_task
 
         if not decision or not decision.get("accept"):
             log.info(
@@ -475,12 +510,8 @@ class AssignQueueExecutor(BaseNodeExecutor):
                     reason=(decision or {}).get("reason") or "offer_timeout",
                     expected_offer_id=offer_id,
                 )
-            try:
-                await ctx.telephony.call_say(
-                    ctx.call_id, "暂无坐席接听，请稍后再拨。",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            self._set_failure_status(ctx, "agent_no_answer")
+            await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
             return goto_or_end(ctx, node["id"], "timeout")
 
         webrtc_call_id = decision["webrtc_call_id"]
@@ -504,6 +535,8 @@ class AssignQueueExecutor(BaseNodeExecutor):
 
         ctx.variables["sys._bridged_agent_id"] = pick["employee_id"]
         ctx.variables["sys._bridged_webrtc_call_id"] = webrtc_call_id
+        ctx.variables.pop("sys.assign_queue_status", None)
+        ctx.variables.pop("sys.assign_queue_limit_reason", None)
 
         log.info(
             "assign_queue: bridging sip=%s ↔ webrtc=%s",
@@ -516,6 +549,44 @@ class AssignQueueExecutor(BaseNodeExecutor):
             return End("bridged")
 
         return WaitForEvent(method="call.bridged", on_event=_on_bridged)
+
+    @classmethod
+    def _set_failure_status(
+        cls,
+        ctx: ExecutionContext,
+        status: str,
+        limit_reason: str | None = None,
+    ) -> None:
+        ctx.variables["sys.assign_queue_status"] = status
+        if limit_reason:
+            ctx.variables["sys.assign_queue_limit_reason"] = limit_reason
+        else:
+            ctx.variables.pop("sys.assign_queue_limit_reason", None)
+
+    @classmethod
+    def _failure_prompt(cls, data: dict, status: str) -> str:
+        field = cls._FAILURE_PROMPT_FIELDS.get(status)
+        if field:
+            value = data.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return cls._DEFAULT_FAILURE_PROMPTS.get(status, "当前坐席繁忙，请稍后再拨。")
+
+    @staticmethod
+    async def _say(ctx: ExecutionContext, text: str) -> None:
+        try:
+            await ctx.telephony.call_say(ctx.call_id, text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _play_waiting_prompt(self, ctx: ExecutionContext, data: dict) -> None:
+        import asyncio
+
+        interval = float(data.get("prompt_loop_interval_seconds") or 15)
+        prompt = data.get("queue_prompt_text") or "正在为您转接，请稍候。"
+        while True:
+            await self._say(ctx, prompt)
+            await asyncio.sleep(interval)
 
 
 class HangupExecutor(BaseNodeExecutor):

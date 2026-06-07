@@ -4,7 +4,7 @@ Users router — end-user (visitor/customer) CRUD, list & detail APIs
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, get_current_user
+from app.db.deps import get_db, get_current_user, require_permission
 from app.schemas.user import (
     UserResponse,
     UserCreate,
@@ -22,7 +22,11 @@ from app.services.user_service import UserService
 router = APIRouter(prefix="/users", tags=["Users"])
 
 
-@router.post("/query", response_model=UserListResponse)
+@router.post(
+    "/query",
+    response_model=UserListResponse,
+    dependencies=[Depends(require_permission("crm.workspace.user.view"))],
+)
 async def query_users(
     body: UserQueryRequest,
     current_user: dict = Depends(get_current_user),
@@ -37,7 +41,11 @@ async def query_users(
     return await UserService.query_users(db, tenant_id, body)
 
 
-@router.get("/views/enabled", response_model=list[UserViewResponse])
+@router.get(
+    "/views/enabled",
+    response_model=list[UserViewResponse],
+    dependencies=[Depends(require_permission("crm.workspace.user.view"))],
+)
 async def list_enabled_views(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -47,7 +55,11 @@ async def list_enabled_views(
     return await UserService.get_enabled_views(db, tenant_id)
 
 
-@router.get("/views/counts", response_model=ViewCountsResponse)
+@router.get(
+    "/views/counts",
+    response_model=ViewCountsResponse,
+    dependencies=[Depends(require_permission("crm.workspace.user.view"))],
+)
 async def get_view_counts(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -57,7 +69,11 @@ async def get_view_counts(
     return await UserService.get_view_counts(db, tenant_id)
 
 
-@router.post("/views/{view_id}/groups", response_model=ViewGroupResponse)
+@router.post(
+    "/views/{view_id}/groups",
+    response_model=ViewGroupResponse,
+    dependencies=[Depends(require_permission("crm.workspace.user.view"))],
+)
 async def get_view_groups(
     view_id: int,
     body: ViewGroupRequest | None = None,
@@ -70,7 +86,12 @@ async def get_view_groups(
     return await UserService.get_view_groups(db, tenant_id, view_id, payload)
 
 
-@router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("crm.workspace.user.create"))],
+)
 async def create_user(
     body: UserCreate,
     current_user: dict = Depends(get_current_user),
@@ -86,7 +107,11 @@ async def create_user(
     )
 
 
-@router.get("/{user_ref}", response_model=UserResponse)
+@router.get(
+    "/{user_ref}",
+    response_model=UserResponse,
+    dependencies=[Depends(require_permission("crm.workspace.user.view"))],
+)
 async def get_user(
     user_ref: str,
     current_user: dict = Depends(get_current_user),
@@ -97,7 +122,11 @@ async def get_user(
     return await UserService.get_by_ref(db, tenant_id, user_ref)
 
 
-@router.get("/{user_id}/changes", response_model=EntityChangeListResponse)
+@router.get(
+    "/{user_id}/changes",
+    response_model=EntityChangeListResponse,
+    dependencies=[Depends(require_permission("crm.workspace.user.view"))],
+)
 async def list_user_changes(
     user_id: int,
     page: int = 1,
@@ -117,7 +146,11 @@ async def list_user_changes(
     )
 
 
-@router.put("/{user_id}", response_model=UserResponse)
+@router.put(
+    "/{user_id}",
+    response_model=UserResponse,
+    dependencies=[Depends(require_permission("crm.workspace.user.edit"))],
+)
 async def update_user(
     user_id: int,
     body: UserUpdate,
@@ -135,7 +168,11 @@ async def update_user(
     )
 
 
-@router.delete("/{user_id}", status_code=status.HTTP_200_OK)
+@router.delete(
+    "/{user_id}",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(require_permission("crm.workspace.user.delete"))],
+)
 async def delete_user(
     user_id: int,
     current_user: dict = Depends(get_current_user),

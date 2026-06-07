@@ -14,6 +14,14 @@ def fake_redis():
 
 
 @pytest.mark.asyncio
+async def test_mark_connected_defaults_new_agent_to_offline(fake_redis):
+    await AgentStatusService.mark_connected(fake_redis, tenant_id=7, user_id=42, sid="sid-new")
+
+    status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
+    assert status["status"] == AgentOnlineStatus.OFFLINE.value
+
+
+@pytest.mark.asyncio
 async def test_mark_connected_preserves_manual_offline_status(fake_redis):
     await AgentStatusService.set_status(
         fake_redis,
@@ -52,6 +60,74 @@ async def test_mark_connected_restores_desired_status_after_transient_disconnect
 
     status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
     assert status["status"] == AgentOnlineStatus.BUSY.value
+
+
+@pytest.mark.asyncio
+async def test_mark_connected_treats_expired_pending_disconnect_as_offline(fake_redis):
+    await fake_redis.hset(
+        "agent:status:7:42",
+        mapping={
+            "status": AgentOnlineStatus.ONLINE.value,
+            "desired_status": AgentOnlineStatus.ONLINE.value,
+            "pending_offline_until": "1",
+        },
+    )
+
+    await AgentStatusService.mark_connected(fake_redis, tenant_id=7, user_id=42, sid="sid-late")
+
+    status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
+    assert status["status"] == AgentOnlineStatus.OFFLINE.value
+
+
+@pytest.mark.asyncio
+async def test_finalized_disconnect_resets_desired_status_to_offline(fake_redis, monkeypatch):
+    key = "agent:status:7:42"
+    await fake_redis.hset(
+        key,
+        mapping={
+            "connection_sid": "sid-online",
+            "pending_offline_until": "1",
+            "status": AgentOnlineStatus.ONLINE.value,
+            "desired_status": AgentOnlineStatus.ONLINE.value,
+            "current_count": 3,
+        },
+    )
+
+    async def fake_eval(
+        _script,
+        _numkeys,
+        key_arg,
+        connection_sid_field,
+        sid,
+        pending_offline_field,
+        offline_status,
+        desired_status_field,
+    ):
+        assert desired_status_field == "desired_status"
+        if (
+            await fake_redis.hget(key_arg, connection_sid_field) == sid
+            and await fake_redis.hexists(key_arg, pending_offline_field)
+        ):
+            await fake_redis.hdel(key_arg, connection_sid_field, pending_offline_field)
+            await fake_redis.hset(key_arg, "status", offline_status)
+            await fake_redis.hset(key_arg, desired_status_field, offline_status)
+            await fake_redis.hset(key_arg, "current_count", 0)
+            return 1
+        return 0
+
+    monkeypatch.setattr(fake_redis, "eval", fake_eval)
+
+    await AgentStatusService.finalize_disconnect_if_stale(
+        fake_redis,
+        tenant_id=7,
+        user_id=42,
+        sid="sid-online",
+    )
+
+    status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
+    assert status["status"] == AgentOnlineStatus.OFFLINE.value
+    assert await fake_redis.hget(key, "desired_status") == AgentOnlineStatus.OFFLINE.value
+    assert status["current_count"] == 0
 
 
 @pytest.mark.asyncio

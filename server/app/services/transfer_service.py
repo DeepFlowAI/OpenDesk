@@ -44,7 +44,10 @@ from app.models.employee import Employee
 from app.models.message import Message
 from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.employee_repository import EmployeeRepository
+from app.schemas.permission import EffectivePrincipal
 from app.services.agent_status_service import AgentStatusService
+from app.services.data_scope_service import DataScopeService
+from app.services.permission_service import PermissionService
 
 logger = logging.getLogger(__name__)
 
@@ -137,24 +140,28 @@ async def _has_visitor_history_for_agent(
     *,
     conversation: Conversation,
     viewer_agent_id: int | None,
-    viewer_is_admin: bool,
+    viewer_is_admin: bool = False,
+    principal: EffectivePrincipal | None = None,
 ) -> bool:
-    """Whether the visitor has any other conversation visible to ``viewer``.
-
-    Mirrors the logic in ``ConversationService.get_agent_conversation``: an
-    admin sees every visitor conversation; a regular agent only sees the ones
-    they handled themselves.
-    """
+    """Whether the visitor has any other conversation visible to ``viewer``."""
     if not conversation.visitor_id:
         return False
+    if principal is not None:
+        history_agent_id, history_predicate = await DataScopeService.session_history_filters(
+            db, principal
+        )
+    else:
+        history_agent_id = None if viewer_is_admin else viewer_agent_id
+        history_predicate = None
     history = await ConversationRepository.get_visitor_history(
         db,
         tenant_id=conversation.tenant_id,
         channel_id=None,
         visitor_id=conversation.visitor_id,
         current_conversation_id=conversation.id,
-        agent_id=None if viewer_is_admin else viewer_agent_id,
+        agent_id=history_agent_id,
         limit=1,
+        scope_predicate=history_predicate,
     )
     return bool(history)
 
@@ -162,8 +169,13 @@ async def _has_visitor_history_for_agent(
 class TransferService:
 
     @staticmethod
-    def _is_admin(roles: list[str] | None) -> bool:
-        return "admin" in (roles or [])
+    async def _assert_can_access_conversation(
+        db: AsyncSession,
+        principal: EffectivePrincipal,
+        conversation: Conversation,
+    ) -> None:
+        if not await DataScopeService.can_access_conversation(db, principal, conversation):
+            raise ForbiddenError("No permission to access this conversation")
 
     @staticmethod
     def _resolve_display_name(employee: Employee | None) -> str:
@@ -181,6 +193,7 @@ class TransferService:
         keyword: str | None = None,
         conversation_id: int | None = None,
         roles: list[str] | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         """Return online-first ranked transfer candidates with realtime status.
 
@@ -196,10 +209,9 @@ class TransferService:
             conversation = await ConversationRepository.get_by_id(db, conversation_id)
             if not conversation or conversation.tenant_id != tenant_id:
                 raise NotFoundError("Conversation not found")
-            if (
-                not TransferService._is_admin(roles)
-                and conversation.agent_id != current_user_id
-            ):
+            if principal is not None:
+                await TransferService._assert_can_access_conversation(db, principal, conversation)
+            elif conversation.agent_id != current_user_id:
                 raise ForbiddenError("No permission to inspect this conversation")
             if conversation.agent_id:
                 exclude_ids.add(conversation.agent_id)
@@ -293,14 +305,16 @@ class TransferService:
         current_user_id: int,
         tenant_id: int,
         roles: list[str] | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         # ── 1. Validate inputs (read-only) ──────────────────────────────
         conversation = await ConversationRepository.get_by_id(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
 
-        is_admin = TransferService._is_admin(roles)
-        if not is_admin and conversation.agent_id != current_user_id:
+        if principal is not None:
+            await TransferService._assert_can_access_conversation(db, principal, conversation)
+        elif conversation.agent_id != current_user_id:
             raise ForbiddenError("No permission to transfer this conversation")
 
         if conversation.status != ConversationStatus.ACTIVE.value:
@@ -315,7 +329,9 @@ class TransferService:
             not target
             or target.tenant_id != tenant_id
             or not target.is_active
-            or "agent" not in (target.roles or [])
+            or not await EmployeeRepository.has_effective_permission(
+                db, tenant_id, target_agent_id, "chat.workspace.use"
+            )
         ):
             raise NotFoundError("Target employee not found")
 
@@ -423,18 +439,27 @@ class TransferService:
         # The receiver sees this conversation through their own permission
         # lens, so compute history availability from the target's perspective.
         # The initiator's REST response uses their own perspective.
-        target_is_admin = "admin" in (target.roles or [])
+        target_principal = await PermissionService.get_current_principal(
+            db,
+            {"user_id": target.id, "tenant_id": tenant_id},
+        )
+        initiator_principal = principal
+        if initiator_principal is None:
+            initiator_principal = await PermissionService.get_current_principal(
+                db,
+                {"user_id": current_user_id, "tenant_id": tenant_id},
+            )
         receiver_has_history = await _has_visitor_history_for_agent(
             db,
             conversation=conversation,
             viewer_agent_id=target.id,
-            viewer_is_admin=target_is_admin,
+            principal=target_principal,
         )
         initiator_has_history = await _has_visitor_history_for_agent(
             db,
             conversation=conversation,
             viewer_agent_id=current_user_id,
-            viewer_is_admin=is_admin,
+            principal=initiator_principal,
         )
 
         receiver_payload = _serialize_conversation(

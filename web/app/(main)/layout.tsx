@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, type ComponentType } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import {
@@ -10,7 +10,6 @@ import {
   IconMessageCircle,
   IconMessageCircleCog,
   IconGitBranch,
-  IconSitemap,
   IconSettings,
   IconClock,
   IconPlugConnected,
@@ -23,93 +22,51 @@ import {
   IconListSearch,
   IconPhone,
   IconFilePhone,
+  IconShieldCheck,
 } from '@tabler/icons-react'
 import { useAuthStore } from '@/context/auth-store'
 import { UserDropdown } from '@/app/components/features/user-dropdown'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
+import {
+  ADMIN_NAV_GROUPS,
+  getAdminRouteRule,
+  isAdminPathMatch,
+  type AdminNavIconKey,
+} from '@/config/admin-permissions'
+import {
+  getDefaultAccessiblePath,
+  getDefaultAdminPath,
+  hasAllPermissions,
+  hasPermission,
+} from '@/utils/permissions'
 
-type NavItem = {
-  labelKey: string
-  href: string
-  icon: React.ComponentType<{ size?: number; className?: string }>
+const ADMIN_NAV_ICONS: Record<AdminNavIconKey, ComponentType<{ size?: number; className?: string }>> = {
+  employees: IconUser,
+  employeeGroups: IconUsers,
+  roles: IconShieldCheck,
+  queueSettings: IconListSearch,
+  flowStudio: IconGitBranch,
+  phoneNumbers: IconPhone,
+  callSummary: IconFilePhone,
+  conversationSettings: IconMessageCircleCog,
+  channels: IconMessageCircle,
+  sessionRouting: IconGitBranch,
+  sessionSummary: IconNotes,
+  userFields: IconAddressBook,
+  organizationFields: IconBuilding,
+  userViews: IconListSearch,
+  organizationViews: IconListSearch,
+  organizationSettings: IconBuildingCog,
+  formLayouts: IconLayoutDashboard,
+  sharedFields: IconStack2,
+  ticketViews: IconListSearch,
+  ticketWorkflows: IconGitBranch,
+  systemSettings: IconSettings,
+  serviceHours: IconClock,
+  openAgent: IconPlugConnected,
 }
-
-type NavGroup = {
-  labelKey: string
-  items: NavItem[]
-}
-
-const NAV_GROUPS: NavGroup[] = [
-  {
-    labelKey: 'nav.group.organization',
-    items: [
-      { labelKey: 'nav.employees', href: '/employees', icon: IconUser },
-      { labelKey: 'nav.employeeGroups', href: '/employee-groups', icon: IconUsers },
-    ],
-  },
-  {
-    labelKey: 'nav.group.callCenter',
-    items: [
-      { labelKey: 'nav.flowStudio', href: '/flow-studio', icon: IconSitemap },
-      { labelKey: 'nav.phoneNumbers', href: '/call-center/phone-numbers', icon: IconPhone },
-      { labelKey: 'nav.callSummary', href: '/call-summary', icon: IconFilePhone },
-    ],
-  },
-  {
-    labelKey: 'nav.group.onlineService',
-    items: [
-      { labelKey: 'nav.conversationSettings', href: '/online-service/conversation-settings', icon: IconMessageCircleCog },
-      { labelKey: 'nav.channels', href: '/channels', icon: IconMessageCircle },
-      { labelKey: 'nav.sessionRouting', href: '/session-routing', icon: IconGitBranch },
-      { labelKey: 'nav.sessionSummary', href: '/session-summary', icon: IconNotes },
-    ],
-  },
-  {
-    labelKey: 'nav.group.userOrganization',
-    items: [
-      { labelKey: 'nav.userFields', href: '/user-fields', icon: IconAddressBook },
-      { labelKey: 'nav.organizationFields', href: '/organization-fields', icon: IconBuilding },
-      { labelKey: 'nav.userViews', href: '/user-views', icon: IconListSearch },
-      { labelKey: 'nav.organizationViews', href: '/organization-views', icon: IconListSearch },
-      { labelKey: 'nav.organizationSettings', href: '/organization-settings', icon: IconBuildingCog },
-    ],
-  },
-  {
-    labelKey: 'nav.group.ticket',
-    items: [
-      { labelKey: 'nav.formLayouts', href: '/form-layouts', icon: IconLayoutDashboard },
-      { labelKey: 'nav.sharedFields', href: '/shared-fields', icon: IconStack2 },
-      { labelKey: 'nav.ticketViews', href: '/ticket-views', icon: IconListSearch },
-    ],
-  },
-  {
-    labelKey: 'nav.group.globalSettings',
-    items: [
-      { labelKey: 'nav.systemSettings', href: '/system-settings', icon: IconSettings },
-      { labelKey: 'nav.serviceHours', href: '/service-hours', icon: IconClock },
-      { labelKey: 'nav.openAgent', href: '/open-agent-settings', icon: IconPlugConnected },
-    ],
-  },
-]
-
-const PREFIX_ROUTES = [
-  '/flow-studio',
-  '/call-center',
-  '/online-service/conversation-settings',
-  '/session-routing',
-  '/channels',
-  '/user-fields',
-  '/organization-fields',
-  '/shared-fields',
-  '/form-layouts',
-  '/session-summary',
-  '/call-summary',
-  '/user-views',
-  '/ticket-views',
-  '/organization-views',
-]
 
 export default function MainLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
@@ -117,6 +74,15 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
   const { token, user } = useAuthStore()
   const { locale } = useLocaleStore()
   const [mounted, setMounted] = useState(false)
+  const visibleNavGroups = useMemo(
+    () => ADMIN_NAV_GROUPS
+      .map((group) => ({
+        ...group,
+        items: group.items.filter((item) => hasPermission(user, item.permission)),
+      }))
+      .filter((group) => group.items.length > 0),
+    [user]
+  )
 
   useEffect(() => {
     setMounted(true)
@@ -129,13 +95,24 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
   }, [mounted, token, router])
 
   useEffect(() => {
-    if (mounted && token && user?.roles && !user.roles.includes('admin')) {
-      router.replace('/workspace/chat')
+    if (mounted && token && user && !hasPermission(user, 'admin.access')) {
+      router.replace(getDefaultAccessiblePath(user))
     }
-  }, [mounted, token, user?.roles, router])
+  }, [mounted, token, user, router])
 
-  if (!mounted || !token) return null
-  if (user?.roles && !user.roles.includes('admin')) return null
+  useEffect(() => {
+    if (!mounted || !token || !user || !hasPermission(user, 'admin.access')) return
+    const routeRule = getAdminRouteRule(pathname)
+    if (routeRule && !hasAllPermissions(user, routeRule.permissions)) {
+      router.replace(getDefaultAdminPath(user))
+    }
+  }, [mounted, token, user, pathname, router])
+
+  if (!mounted || !token || !user) return null
+  if (!hasPermission(user, 'admin.access')) return null
+  const routeRule = getAdminRouteRule(pathname)
+  if (routeRule && !hasAllPermissions(user, routeRule.permissions)) return null
+  if (visibleNavGroups.length === 0) return null
 
   return (
     <div className="flex h-screen flex-col">
@@ -154,16 +131,14 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
         <aside className="flex w-60 shrink-0 flex-col gap-2 overflow-y-auto border-r border-border bg-muted px-4 py-6">
-          {NAV_GROUPS.map((group, gi) => (
+          {visibleNavGroups.map((group, gi) => (
             <div key={group.labelKey} className={cn('flex flex-col gap-1', gi > 0 && 'mt-2')}>
               <span className="mb-1 px-2.5 text-sm font-semibold text-muted-foreground">
                 {t(group.labelKey, locale)}
               </span>
               {group.items.map((item) => {
-                const active = PREFIX_ROUTES.includes(item.href)
-                  ? pathname.startsWith(item.href)
-                  : pathname === item.href
-                const Icon = item.icon
+                const active = isAdminPathMatch(pathname, item.href)
+                const Icon = ADMIN_NAV_ICONS[item.iconKey]
                 return (
                   <Link
                     key={item.href}

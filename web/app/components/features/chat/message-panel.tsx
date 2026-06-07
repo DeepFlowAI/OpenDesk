@@ -4,12 +4,14 @@ import { useState, useRef, useEffect, useCallback, useLayoutEffect } from 'react
 import { useQueryClient } from '@tanstack/react-query'
 import { IconMessageCircle } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { useChatStore } from '@/context/chat-store'
 import { useMessages, conversationKeys, fetchConversationHistory } from '@/service/use-conversations'
 import { useConversationSatisfaction, useSendSatisfactionInvitation } from '@/service/use-satisfaction-survey'
 import { AgentChatRuntimeProvider } from '@/components/assistant-ui/agent-chat-runtime'
 import { AgentThread } from '@/components/assistant-ui/agent-thread'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import type { Conversation, WorkspaceConversationHistoryItem } from '@/models/conversation'
 import type { Socket } from 'socket.io-client'
 
@@ -40,6 +42,7 @@ export function MessagePanel({
   onTransferred,
 }: Props) {
   const { locale } = useLocaleStore()
+  const currentUser = useAuthStore((state) => state.user)
   const queryClient = useQueryClient()
   const { messages, setMessages, visitorTyping, visitorTypingContent, markConversationRead } = useChatStore()
   const [hasMore, setHasMore] = useState(false)
@@ -58,6 +61,8 @@ export function MessagePanel({
   const isTyping = visitorTyping.get(convId) || false
   const typingContent = visitorTypingContent.get(convId) || ''
   const isClosed = conversation?.status === 'closed'
+  const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
+  const canTransfer = hasPermission(currentUser, 'chat.conversation.transfer')
 
   // Force refetch when switching conversations
   useLayoutEffect(() => {
@@ -228,6 +233,8 @@ export function MessagePanel({
           if (socket) socket.emit('end_conversation', { conversation_id: convId })
         }}
         onCreateTicket={() => onCreateTicket?.(convId)}
+        canCreateTicket={canCreateTicket}
+        canTransfer={canTransfer}
         onTransferred={(toName) => onTransferred?.(toName)}
         satisfactionState={satisfactionState ?? null}
         satisfactionLoading={satisfactionLoading}

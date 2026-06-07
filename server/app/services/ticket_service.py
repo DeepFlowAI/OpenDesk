@@ -28,9 +28,12 @@ from app.schemas.ticket import (
     TicketQueryRequest,
     TicketResponse,
 )
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.view_group import ViewGroupRequest
 from app.services.audit_actor_service import AuditActorService
+from app.services.data_scope_service import DataScopeService
 from app.services.fd_field_definition_service import coerce_slot_value
+from app.services.ticket_workflow_execution_service import TicketWorkflowExecutionService
 from app.enums import ApplicableModule
 
 
@@ -61,6 +64,24 @@ SYSTEM_FIELD_ALIASES: dict[str, str] = {
 
 
 class TicketService:
+
+    @staticmethod
+    async def _ticket_scope_context(
+        db: AsyncSession,
+        principal: EffectivePrincipal,
+    ) -> tuple[list[int], object | None]:
+        peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+        predicate = DataScopeService.build_ticket_predicate(principal, peer_ids)
+        return peer_ids, predicate
+
+    @staticmethod
+    async def _assert_ticket_scope(
+        db: AsyncSession,
+        principal: EffectivePrincipal,
+        ticket: Ticket,
+    ) -> None:
+        peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+        DataScopeService.assert_ticket_in_scope(principal, ticket, peer_ids)
 
     @staticmethod
     async def _validate_conversation(db: AsyncSession, tenant_id: int, conversation_id: int) -> None:
@@ -111,6 +132,14 @@ class TicketService:
             target[column] = custom_fields[alias]
             if changed_fields is not None:
                 changed_fields.append(column)
+
+    @staticmethod
+    def _ticket_snapshot(ticket: Ticket) -> dict[str, object]:
+        return {
+            column.name: getattr(ticket, column.name)
+            for column in Ticket.__table__.columns
+            if hasattr(ticket, column.name)
+        }
 
     @staticmethod
     async def _get_slot_map(db: AsyncSession, tenant_id: int) -> dict[int, str]:
@@ -248,8 +277,10 @@ class TicketService:
         field_labels: dict[str, str],
         actor_id: int | None,
         actor_name: str | None,
+        field_sources: dict[str, str] | None = None,
     ) -> list[dict]:
         rows: list[dict] = []
+        field_sources = field_sources or {}
         actor_type = "user" if actor_id is not None else "system"
         resolved_name = actor_name
         if actor_id is not None and not resolved_name:
@@ -274,7 +305,7 @@ class TicketService:
                 "actor_name": resolved_name,
                 "field_key": field_key,
                 "field_label": field_labels.get(field_key, field_key),
-                "field_source": "ticket",
+                "field_source": field_sources.get(field_key, "ticket"),
                 "old_value": old_value,
                 "new_value": new_value,
             })
@@ -290,6 +321,7 @@ class TicketService:
             {
                 "field_key": r["field_key"],
                 "field_label": r["field_label"],
+                "field_source": r["field_source"],
                 "old_value": r["old_value"],
                 "new_value": r["new_value"],
             }
@@ -316,8 +348,10 @@ class TicketService:
         ticket: Ticket,
         field_labels: dict[str, str],
         created_fields: list[str],
+        field_sources: dict[str, str] | None = None,
     ) -> list[dict]:
         entries: list[dict] = []
+        field_sources = field_sources or {}
         seen: set[str] = set()
         for field_key in ["ticket_number", *created_fields]:
             if field_key in seen or not hasattr(ticket, field_key):
@@ -329,6 +363,7 @@ class TicketService:
             entries.append({
                 "field_key": field_key,
                 "field_label": field_labels.get(field_key, field_key),
+                "field_source": field_sources.get(field_key, "ticket"),
                 "old_value": None,
                 "new_value": value,
             })
@@ -421,10 +456,17 @@ class TicketService:
         return resp
 
     @staticmethod
-    async def get_by_id(db: AsyncSession, tenant_id: int, ticket_id: int) -> dict:
+    async def get_by_id(
+        db: AsyncSession,
+        tenant_id: int,
+        ticket_id: int,
+        principal: EffectivePrincipal | None = None,
+    ) -> dict:
         item = await TicketRepository.get_by_id(db, ticket_id)
         if not item or item.tenant_id != tenant_id:
             raise NotFoundError("Ticket not found")
+        if principal is not None:
+            await TicketService._assert_ticket_scope(db, principal, item)
         slot_to_key = await TicketService._get_field_key_slot_map(db, tenant_id)
         conversation_public_ids = await TicketService._get_conversation_public_id_map(
             db,
@@ -454,6 +496,7 @@ class TicketService:
         }
         created_field_keys = ["title", "status"]
         field_labels: dict[str, str] = dict(SYSTEM_FIELD_LABELS)
+        field_sources: dict[str, str] = {}
         explicit_fields = set(data.model_fields_set)
         for field in (
             "description",
@@ -480,13 +523,6 @@ class TicketService:
             explicit_fields,
             created_field_keys,
         )
-        await TicketService._validate_assignee_values(
-            db,
-            tenant_id,
-            model_data.get("assignee_group_id"),
-            model_data.get("agent_id"),
-        )
-
         key_to_meta = await TicketService._get_key_to_field_meta(db, tenant_id) if data.custom_fields else {}
         for cf_key, cf_val in data.custom_fields.items():
             slot_col = key_to_slot.get(cf_key)
@@ -496,6 +532,26 @@ class TicketService:
                 field_meta = key_to_meta.get(cf_key)
                 if field_meta:
                     field_labels[slot_col] = field_meta["name"]
+
+        workflow_result = await TicketWorkflowExecutionService.apply(
+            db,
+            tenant_id,
+            "create",
+            before_data={},
+            current_data=dict(model_data),
+        )
+        if workflow_result.updates:
+            model_data.update(workflow_result.updates)
+            field_labels.update(workflow_result.field_labels)
+            field_sources.update({key: "ticket_workflow" for key in workflow_result.updates})
+            created_field_keys.extend(workflow_result.updates.keys())
+
+        await TicketService._validate_assignee_values(
+            db,
+            tenant_id,
+            model_data.get("assignee_group_id"),
+            model_data.get("agent_id"),
+        )
 
         display_actor_name = await TicketService._resolve_actor_name(db, tenant_id, actor_id)
         audit_actor = await AuditActorService.resolve_current_employee(db, tenant_id, actor_id)
@@ -508,6 +564,7 @@ class TicketService:
             ticket=ticket,
             field_labels=field_labels,
             created_fields=created_field_keys,
+            field_sources=field_sources,
         )
         create_rows = TicketService._build_create_change_row(
             ticket=ticket,
@@ -542,10 +599,13 @@ class TicketService:
         ticket_id: int,
         data: TicketUpdate,
         actor_id: int | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         item = await TicketRepository.get_by_id(db, ticket_id)
         if not item or item.tenant_id != tenant_id:
             raise NotFoundError("Ticket not found")
+        if principal is not None:
+            await TicketService._assert_ticket_scope(db, principal, item)
 
         update_data: dict = {}
         field_labels: dict[str, str] = dict(SYSTEM_FIELD_LABELS)
@@ -569,15 +629,6 @@ class TicketService:
             explicit_fields,
         )
 
-        final_assignee_group_id = update_data.get("assignee_group_id", item.assignee_group_id)
-        final_agent_id = update_data.get("agent_id", item.agent_id)
-        await TicketService._validate_assignee_values(
-            db,
-            tenant_id,
-            final_assignee_group_id,
-            final_agent_id,
-        )
-
         if data.custom_fields:
             key_to_meta = await TicketService._get_key_to_field_meta(db, tenant_id)
             for cf_key, cf_val in data.custom_fields.items():
@@ -587,6 +638,29 @@ class TicketService:
                     update_data[slot_col] = coerce_slot_value(slot_col, cf_val)
                     field_labels[slot_col] = field_meta["name"]
 
+        before_data = TicketService._ticket_snapshot(item)
+        current_data = {**before_data, **update_data}
+        workflow_result = await TicketWorkflowExecutionService.apply(
+            db,
+            tenant_id,
+            "update",
+            before_data=before_data,
+            current_data=current_data,
+        )
+        if workflow_result.updates:
+            update_data.update(workflow_result.updates)
+            field_labels.update(workflow_result.field_labels)
+        field_sources = {key: "ticket_workflow" for key in workflow_result.updates}
+
+        final_assignee_group_id = update_data.get("assignee_group_id", item.assignee_group_id)
+        final_agent_id = update_data.get("agent_id", item.agent_id)
+        await TicketService._validate_assignee_values(
+            db,
+            tenant_id,
+            final_assignee_group_id,
+            final_agent_id,
+        )
+
         display_actor_name = await TicketService._resolve_actor_name(db, tenant_id, actor_id)
 
         field_diff_rows = TicketService._build_change_rows(
@@ -594,6 +668,7 @@ class TicketService:
             tenant_id=tenant_id,
             update_data=update_data,
             field_labels=field_labels,
+            field_sources=field_sources,
             actor_id=actor_id,
             actor_name=display_actor_name,
         )
@@ -624,16 +699,31 @@ class TicketService:
         return TicketService._enrich_response(item, slot_to_key, conversation_public_ids, call_record_call_ids)
 
     @staticmethod
-    async def delete_ticket(db: AsyncSession, tenant_id: int, ticket_id: int) -> None:
+    async def delete_ticket(
+        db: AsyncSession,
+        tenant_id: int,
+        ticket_id: int,
+        principal: EffectivePrincipal | None = None,
+    ) -> None:
         item = await TicketRepository.get_by_id(db, ticket_id)
         if not item or item.tenant_id != tenant_id:
             raise NotFoundError("Ticket not found")
+        if principal is not None:
+            await TicketService._assert_ticket_scope(db, principal, item)
         await TicketRepository.delete(db, item)
 
     @staticmethod
-    async def query_tickets(db: AsyncSession, tenant_id: int, req: TicketQueryRequest) -> dict:
+    async def query_tickets(
+        db: AsyncSession,
+        tenant_id: int,
+        req: TicketQueryRequest,
+        principal: EffectivePrincipal | None = None,
+    ) -> dict:
         slot_map = await TicketService._get_slot_map(db, tenant_id)
         slot_to_key = await TicketService._get_field_key_slot_map(db, tenant_id)
+        scope_predicate = None
+        if principal is not None:
+            _, scope_predicate = await TicketService._ticket_scope_context(db, principal)
 
         view_conditions: list[dict] = []
         view_condition_logic = "and"
@@ -664,6 +754,7 @@ class TicketService:
             sort_order=req.sort_order,
             page=req.page,
             per_page=req.per_page,
+            scope_predicate=scope_predicate,
         )
 
         conversation_public_ids = await TicketService._get_conversation_public_id_map(
@@ -699,19 +790,31 @@ class TicketService:
         return list(result.scalars().all())
 
     @staticmethod
-    async def get_view_counts(db: AsyncSession, tenant_id: int) -> dict:
+    async def get_view_counts(
+        db: AsyncSession,
+        tenant_id: int,
+        principal: EffectivePrincipal | None = None,
+    ) -> dict:
         views = await TicketService.get_enabled_views(db, tenant_id)
         slot_map = await TicketService._get_slot_map(db, tenant_id)
+        scope_predicate = None
+        if principal is not None:
+            _, scope_predicate = await TicketService._ticket_scope_context(db, principal)
 
         total_count = await TicketRepository.count_by_conditions(
-            db, tenant_id, [], "and", slot_map
+            db, tenant_id, [], "and", slot_map, scope_predicate=scope_predicate
         )
 
         counts = []
         for v in views:
             conditions = [c if isinstance(c, dict) else dict(c) for c in (v.conditions or [])]
             count = await TicketRepository.count_by_conditions(
-                db, tenant_id, conditions, v.condition_logic or "and", slot_map
+                db,
+                tenant_id,
+                conditions,
+                v.condition_logic or "and",
+                slot_map,
+                scope_predicate=scope_predicate,
             )
             counts.append({"view_id": v.id, "count": count})
         return {"total_count": total_count, "items": counts}
@@ -722,6 +825,7 @@ class TicketService:
         tenant_id: int,
         view_id: int,
         req: ViewGroupRequest,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         """Aggregate tickets under a saved view by its configured group field."""
         view = await db.get(TicketView, view_id)
@@ -741,6 +845,9 @@ class TicketService:
         view_conditions = [c if isinstance(c, dict) else dict(c) for c in (view.conditions or [])]
         view_condition_logic = view.condition_logic or "and"
         temp_conds = [c.model_dump() for c in req.temp_conditions] if req.temp_conditions else []
+        scope_predicate = None
+        if principal is not None:
+            _, scope_predicate = await TicketService._ticket_scope_context(db, principal)
 
         items, total = await TicketRepository.aggregate_by_group_field(
             db,
@@ -752,6 +859,7 @@ class TicketService:
             temp_conditions=temp_conds,
             temp_condition_logic=req.temp_condition_logic,
             slot_map=slot_map,
+            scope_predicate=scope_predicate,
         )
 
         return {

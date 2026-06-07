@@ -5,8 +5,10 @@ import { createPortal } from 'react-dom'
 import { useRouter } from 'next/navigation'
 import { IconCopy, IconCheck, IconLoader2 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import type { Conversation } from '@/models/conversation'
 import type { Ticket } from '@/models/ticket'
 import type { UnifiedField } from '@/models/field-definition'
@@ -46,6 +48,7 @@ function formatDateTime(dateStr: string | null): string {
 export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseTicketDraft }: Props) {
   const router = useRouter()
   const { locale } = useLocaleStore()
+  const currentUser = useAuthStore((state) => state.user)
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'basic' | 'summary' | 'ticket'>('basic')
   const [summaryDirty, setSummaryDirty] = useState(false)
@@ -54,7 +57,10 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
   const visitorPublicId = conversation?.visitor?.public_id ?? ''
   const visitorDetailRef = visitorPublicId || (visitorId > 0 ? String(visitorId) : '')
   const conversationShareCode = conversation?.share_code || conversation?.public_id || ''
-  const showTicketTab = !!conversation && (ticketDraftOpen || hasTicketDraft(conversation.id))
+  const canViewUsers = hasPermission(currentUser, 'crm.workspace.user.view')
+  const canEditUser = hasPermission(currentUser, 'crm.workspace.user.edit')
+  const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
+  const showTicketTab = !!conversation && canCreateTicket && (ticketDraftOpen || hasTicketDraft(conversation.id))
 
   const userQuery = useUser(visitorId)
   const fieldsQuery = useUnifiedFields({ domain: 'user', locale, include_metadata: true })
@@ -189,7 +195,7 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
                 <section className="mt-5 border-t border-border pt-4">
                   <div className="mb-3 flex items-center justify-between gap-3">
                     <h3 className="text-sm font-semibold text-[#1a1a1a]">{t('ws.chat.userInfo', locale)}</h3>
-                    {visitorDetailRef && (
+                    {canViewUsers && visitorDetailRef && (
                       <button
                         type="button"
                         onClick={() => router.push(`/workspace/users/${visitorDetailRef}`)}
@@ -207,6 +213,7 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
                     isLoading={userQuery.isLoading || fieldsQuery.isLoading}
                     isError={userQuery.isError || fieldsQuery.isError}
                     isSaving={updateUser.isPending}
+                    canEdit={canEditUser}
                     onRetry={() => {
                       void userQuery.refetch()
                       void fieldsQuery.refetch()
@@ -246,6 +253,7 @@ function UserInfoSection({
   isLoading,
   isError,
   isSaving,
+  canEdit,
   onRetry,
   onSave,
 }: {
@@ -256,6 +264,7 @@ function UserInfoSection({
   isLoading: boolean
   isError: boolean
   isSaving: boolean
+  canEdit: boolean
   onRetry: () => void
   onSave: (field: UnifiedField, value: unknown) => Promise<unknown>
 }) {
@@ -291,7 +300,7 @@ function UserInfoSection({
   }
 
   const startEdit = (field: UnifiedField) => {
-    if (!isFieldEditable(field)) return
+    if (!canEdit || !isFieldEditable(field)) return
     setEditingKey(getFieldIdentity(field))
     setDraftValue(getFieldRawValue(user, field))
     setFieldError(null)
@@ -328,7 +337,7 @@ function UserInfoSection({
       {fields.map((field) => {
         const identity = getFieldIdentity(field)
         const editing = editingKey === identity
-        const editable = isFieldEditable(field)
+        const editable = canEdit && isFieldEditable(field)
         return (
           <EditableInfoRow
             key={identity}

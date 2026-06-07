@@ -129,10 +129,52 @@ class ConditionData(BaseModel):
         return v
 
 
+AssignQueueTargetStrategy = Literal[
+    "sequential_overflow",
+    "least_waiting_count",
+    "shortest_tail_wait",
+]
+AssignQueueTargetType = Literal["user_field", "employee_group", "employee"]
+AssignQueuePromptPlayMode = Literal["once", "loop"]
+
+
+class AssignQueueTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    queue_type: AssignQueueTargetType
+    queue_id: int = Field(..., gt=0)
+
+
 class AssignQueueData(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    employee_group_id: int
-    timeout_seconds: int | None = Field(None, ge=1, le=3600)
+    # Legacy single-queue field. Kept so old graph versions can be loaded and
+    # resaved; new clients should write queue_targets instead.
+    employee_group_id: int | None = Field(None, gt=0)
+    target_strategy: AssignQueueTargetStrategy = "sequential_overflow"
+    queue_targets: list[AssignQueueTarget] = Field(default_factory=list, max_length=20)
+    queue_prompt_text: str = Field("正在为您转接，请稍候。", min_length=1, max_length=300)
+    prompt_play_mode: AssignQueuePromptPlayMode = "once"
+    prompt_loop_interval_seconds: int | None = Field(15, ge=5, le=120)
+    queue_limit_prompt_text: str = Field("当前排队人数较多，请稍后再拨。", min_length=1, max_length=300)
+    no_available_queue_prompt_text: str = Field("当前坐席繁忙，请稍后再拨。", min_length=1, max_length=300)
+    queue_timeout_prompt_text: str = Field("暂时无法接通坐席，请稍后再拨。", min_length=1, max_length=300)
+    agent_no_answer_prompt_text: str = Field("暂无坐席接听，请稍后再拨。", min_length=1, max_length=300)
+    timeout_seconds: int | None = Field(60, ge=1, le=3600)
+
+    @model_validator(mode="after")
+    def validate_targets_and_prompt(self) -> "AssignQueueData":
+        if not self.queue_targets and self.employee_group_id is not None:
+            self.queue_targets = [
+                AssignQueueTarget(
+                    queue_type="employee_group",
+                    queue_id=self.employee_group_id,
+                )
+            ]
+        if not self.queue_targets:
+            raise ValueError("At least one queue target is required")
+        if self.prompt_play_mode == "loop" and self.prompt_loop_interval_seconds is None:
+            raise ValueError("prompt_loop_interval_seconds is required when prompt_play_mode is loop")
+        return self
 
 
 class HangupData(BaseModel):
@@ -195,7 +237,7 @@ class Edge(BaseModel):
     source: str = Field(..., min_length=1, max_length=64)
     target: str = Field(..., min_length=1, max_length=64)
     # For play/start: "next"; for collect: "success|no_input|no_match|error";
-    # for condition: group.id or "default"; for assign_queue: "next|timeout".
+    # for condition: group.id or "default"; for assign_queue: "timeout".
     source_handle: str = Field("next", min_length=1, max_length=64)
 
 

@@ -6,9 +6,12 @@ import { IconArrowLeft } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import { useEmployee, useUpdateEmployee } from '@/service/use-employees'
+import { useQueuePolicies, useUpsertQueuePolicy } from '@/service/use-queue-policies'
 import EmployeeForm from '@/app/(main)/employees/form'
 import type { UpdateEmployeePayload } from '@/models/employee'
+import type { QueuePolicyUpsertPayload } from '@/models/queue-policy'
 
 export default function EditEmployeePage() {
   const router = useRouter()
@@ -17,17 +20,30 @@ export default function EditEmployeePage() {
   const { locale } = useLocaleStore()
   const user = useAuthStore((s) => s.user)
   const updateUser = useAuthStore((s) => s.updateUser)
+  const canEdit = hasPermission(user, 'org.employee.edit')
   const { data: employee, isLoading } = useEmployee(employeeId)
+  const { data: defaultQueuePolicies, isLoading: isDefaultQueuePoliciesLoading } = useQueuePolicies({
+    scope_type: 'global',
+  })
+  const { data: employeeQueuePolicies, isLoading: isEmployeeQueuePoliciesLoading } = useQueuePolicies(
+    { scope_type: 'employee', scope_id: employeeId },
+    { enabled: !!employeeId }
+  )
   const updateMutation = useUpdateEmployee()
+  const upsertQueuePolicyMutation = useUpsertQueuePolicy()
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   const handleSubmit = useCallback(
-    async (data: UpdateEmployeePayload) => {
+    async (data: UpdateEmployeePayload, queuePolicyPayloads: QueuePolicyUpsertPayload[] = []) => {
+      if (!canEdit) return
       try {
         const updated = await updateMutation.mutateAsync({
           id: employeeId,
           data: data as UpdateEmployeePayload,
         })
+        if (queuePolicyPayloads.length > 0) {
+          await Promise.all(queuePolicyPayloads.map((queuePayload) => upsertQueuePolicyMutation.mutateAsync(queuePayload)))
+        }
         if (user?.id === employeeId) {
           updateUser({ avatar: updated.avatar ?? null })
         }
@@ -38,10 +54,12 @@ export default function EditEmployeePage() {
         setTimeout(() => setToast(null), 3000)
       }
     },
-    [updateMutation, employeeId, locale, user?.id, updateUser]
+    [canEdit, updateMutation, employeeId, locale, user?.id, updateUser, upsertQueuePolicyMutation]
   )
 
-  if (isLoading) {
+  const saving = updateMutation.isPending || upsertQueuePolicyMutation.isPending
+
+  if (isLoading || isDefaultQueuePoliciesLoading || isEmployeeQueuePoliciesLoading) {
     return (
       <div className="flex h-full items-center justify-center">
         <p className="text-sm text-muted-foreground">{t('emp.loading', locale)}</p>
@@ -71,14 +89,16 @@ export default function EditEmployeePage() {
           <IconArrowLeft size={20} className="text-muted-foreground" />
           <span className="text-base font-semibold">{title}</span>
         </button>
-        <button
-          type="submit"
-          form="employee-form"
-          disabled={updateMutation.isPending}
-          className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
-        >
-          {updateMutation.isPending ? t('emp.saving', locale) : t('emp.save', locale)}
-        </button>
+        {canEdit && (
+          <button
+            type="submit"
+            form="employee-form"
+            disabled={saving}
+            className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
+          >
+            {saving ? t('emp.saving', locale) : t('emp.save', locale)}
+          </button>
+        )}
       </div>
 
       {/* Toast */}
@@ -98,6 +118,10 @@ export default function EditEmployeePage() {
           initialData={employee}
           isEdit
           onSubmit={handleSubmit as (data: UpdateEmployeePayload) => void}
+          queueSettings={{
+            defaultPolicies: defaultQueuePolicies?.items ?? [],
+            scopedPolicies: employeeQueuePolicies?.items ?? [],
+          }}
         />
       </div>
     </div>

@@ -8,6 +8,7 @@ import { useSystemInfo } from '@/service/use-system'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
+import { getDefaultAccessiblePath } from '@/utils/permissions'
 import { loginSchema, TENANT_IDENTIFIER_REGEX } from '@/utils/validators'
 import { cn } from '@/lib/utils'
 import { LegalFooter } from '@/components/legal-footer'
@@ -132,8 +133,7 @@ function LoginPage() {
       }
       setAuth(data.user, data.access_token)
       const redirect = searchParams.get('redirect')
-      const hasAgent = data.user.roles.includes('agent')
-      const defaultPath = hasAgent ? '/workspace/chat' : '/employees'
+      const defaultPath = getDefaultAccessiblePath(data.user)
       router.replace(redirect && redirect.startsWith('/') ? redirect : defaultPath)
     } catch (err: unknown) {
       let status = 0

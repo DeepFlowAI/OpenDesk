@@ -8,6 +8,7 @@ from app.core.exceptions import NotFoundError
 from app.models.employee import Employee
 from app.repositories.ticket_change_repository import TicketChangeRepository
 from app.repositories.ticket_repository import TicketRepository
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.ticket_change import TicketChangeEntryItem, TicketChangeResponse
 from app.services.ticket_service import (
     TicketService,
@@ -25,10 +26,13 @@ class TicketChangeService:
         ticket_id: int,
         page: int = 1,
         per_page: int = 20,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         ticket = await TicketRepository.get_by_id(db, ticket_id)
         if not ticket or ticket.tenant_id != tenant_id:
             raise NotFoundError("Ticket not found")
+        if principal is not None:
+            await TicketService._assert_ticket_scope(db, principal, ticket)
 
         items, total = await TicketChangeRepository.get_paginated(
             db, tenant_id, ticket_id, page, per_page

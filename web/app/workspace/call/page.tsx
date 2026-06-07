@@ -30,15 +30,21 @@ import { toast } from 'sonner'
 
 import { DialBar } from '@/app/components/features/call-center/dial-bar'
 import { CallUserInfoPanel } from '@/app/components/features/call-center/call-user-info-panel'
+import {
+  callRecordCustomerNumber,
+  callRecordServiceNumber,
+} from '@/app/components/features/call-center/call-record-utils'
 import { CallSummaryFields } from '@/app/components/features/call-summary/call-summary-fields'
 import { CallTicketDraftPanel } from '@/app/components/features/call-summary/call-ticket-draft-panel'
 import {
   CALL_STATUS_OPTIONS,
   useCallCenterRuntime,
 } from '@/context/call-center-runtime'
+import { useAuthStore } from '@/context/auth-store'
 import { cn } from '@/lib/utils'
 import { useCallRecord } from '@/service/use-call-center'
 import type { AgentStatus } from '@/models/call-center'
+import { hasPermission } from '@/utils/permissions'
 
 const STATUS_OPTIONS: {
   value: AgentStatus
@@ -65,6 +71,7 @@ function formatDuration(ms: number | null): string {
 
 export default function CallWorkspacePage() {
   const router = useRouter()
+  const currentUser = useAuthStore((state) => state.user)
   const {
     mic,
     leg,
@@ -95,6 +102,13 @@ export default function CallWorkspacePage() {
   } = useCallCenterRuntime()
   const [statusDropdownOpen, setStatusDropdownOpen] = useState(false)
   const statusDropdownRef = useRef<HTMLDivElement>(null)
+  const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
+
+  useEffect(() => {
+    if (!canCreateTicket && callSummaryTab === 'ticket') {
+      setCallSummaryTab('summary')
+    }
+  }, [canCreateTicket, callSummaryTab, setCallSummaryTab])
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -219,7 +233,7 @@ export default function CallWorkspacePage() {
                   ) : (
                     <IconPhoneOutgoing size={14} className="text-green-500" />
                   )}
-                  <span className="truncate">{r.from_number || r.to_number || '未知号码'}</span>
+                  <span className="truncate">{callRecordCustomerNumber(r) || '未知号码'}</span>
                   <span className="ml-auto shrink-0 text-xs text-muted-foreground">
                     {formatRelative(r.started_at)}
                   </span>
@@ -469,22 +483,24 @@ export default function CallWorkspacePage() {
                       >
                         通话纪要
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => setCallSummaryTab('ticket')}
-                        className={cn(
-                          'rounded px-2 py-1 text-xs font-medium transition-colors',
-                          callSummaryTab === 'ticket'
-                            ? 'bg-white text-foreground shadow-sm'
-                            : 'text-muted-foreground hover:text-foreground',
-                        )}
-                      >
-                        新建工单
-                      </button>
+                      {canCreateTicket && (
+                        <button
+                          type="button"
+                          onClick={() => setCallSummaryTab('ticket')}
+                          className={cn(
+                            'rounded px-2 py-1 text-xs font-medium transition-colors',
+                            callSummaryTab === 'ticket'
+                              ? 'bg-white text-foreground shadow-sm'
+                              : 'text-muted-foreground hover:text-foreground',
+                          )}
+                        >
+                          新建工单
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}
-                {callSummaryTab === 'ticket' && callRecordForTicket ? (
+                {canCreateTicket && callSummaryTab === 'ticket' && callRecordForTicket ? (
                   <CallTicketDraftPanel
                     key={callRecordForTicket.id}
                     callRecord={callRecordForTicket}
@@ -581,6 +597,8 @@ function HistoryDetail({ recordId }: { recordId: number }) {
 
   const started = record.started_at ? new Date(record.started_at) : null
   const ended = record.ended_at ? new Date(record.ended_at) : null
+  const customerNumber = callRecordCustomerNumber(record)
+  const serviceNumber = callRecordServiceNumber(record)
   return (
     <div className="space-y-4">
       <section>
@@ -605,8 +623,8 @@ function HistoryDetail({ recordId }: { recordId: number }) {
       </section>
       <dl className="grid grid-cols-2 gap-y-2 text-sm">
         <Dt>通话类型</Dt><Dd>{record.direction === 'inbound' ? '呼入' : '呼出'}</Dd>
-        <Dt>用户号码</Dt><Dd>{record.from_number || '—'}</Dd>
-        <Dt>服务号码</Dt><Dd>{record.to_number || '—'}</Dd>
+        <Dt>用户号码</Dt><Dd>{customerNumber || '—'}</Dd>
+        <Dt>服务号码</Dt><Dd>{serviceNumber || '—'}</Dd>
         <Dt>通话时长</Dt><Dd>{formatDuration(record.talk_duration_ms)}</Dd>
         <Dt>响铃时长</Dt><Dd>{formatDuration(record.ring_duration_ms)}</Dd>
         <Dt>来电时间</Dt><Dd>{started ? started.toLocaleString() : '—'}</Dd>

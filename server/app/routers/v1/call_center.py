@@ -1,10 +1,9 @@
 """
 Call-center workspace + history endpoints.
 
-Note: the orchestrator-internal "pick idle agent from group" call also lives
-here under /agent-status/group/{id}/online — it requires admin auth in
-addition to the regular login, since exposing all-employees status is
-sensitive.
+Note: the orchestrator-facing "pick idle agent from group" call also lives
+here under /agent-status/group/{id}/online and is guarded by the call
+workspace permission.
 """
 from datetime import datetime
 
@@ -13,7 +12,8 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError
-from app.db.deps import get_current_user, get_db, get_redis
+from app.db.deps import get_current_user, get_current_principal, get_db, get_redis, require_permission
+from app.schemas.permission import EffectivePrincipal
 from app.libs.telephony import get_telephony_client
 from app.schemas.call_center import (
     AcceptOfferRequest,
@@ -57,7 +57,11 @@ router = APIRouter(prefix="/call-center", tags=["CallCenter"])
 # ─────────── Agent status ───────────
 
 
-@router.get("/agent-status/me", response_model=AgentStatusResponse)
+@router.get(
+    "/agent-status/me",
+    response_model=AgentStatusResponse,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def get_my_agent_status(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -68,7 +72,11 @@ async def get_my_agent_status(
     )
 
 
-@router.put("/agent-status/me", response_model=AgentStatusResponse)
+@router.put(
+    "/agent-status/me",
+    response_model=AgentStatusResponse,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def set_my_agent_status(
     body: AgentStatusUpdate,
     current_user: dict = Depends(get_current_user),
@@ -86,7 +94,9 @@ async def set_my_agent_status(
 
 
 @router.get(
-    "/agent-status/group/{group_id}/online", response_model=OnlineAgentList,
+    "/agent-status/group/{group_id}/online",
+    response_model=OnlineAgentList,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
 )
 async def list_online_agents_for_group(
     group_id: int,
@@ -101,7 +111,11 @@ async def list_online_agents_for_group(
 # ─────────── Call records ───────────
 
 
-@router.get("/call-records", response_model=CallRecordListResponse)
+@router.get(
+    "/call-records",
+    response_model=CallRecordListResponse,
+    dependencies=[Depends(require_permission("call.record.view"))],
+)
 async def list_call_records(
     page: int = 1,
     per_page: int = 20,
@@ -111,12 +125,12 @@ async def list_call_records(
     keyword: str | None = None,
     start_time: datetime | None = None,
     end_time: datetime | None = None,
-    current_user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
     db: AsyncSession = Depends(get_db),
 ):
     return await CallRecordService.get_paginated(
         db,
-        current_user["tenant_id"],
+        principal.tenant_id,
         page,
         per_page,
         direction,
@@ -125,21 +139,27 @@ async def list_call_records(
         keyword,
         start_time,
         end_time,
+        principal=principal,
     )
 
 
-@router.get("/call-records/{record_id}", response_model=CallRecordDetail)
+@router.get(
+    "/call-records/{record_id}",
+    response_model=CallRecordDetail,
+    dependencies=[Depends(require_permission("call.record.view"))],
+)
 async def get_call_record(
     record_id: int,
-    current_user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
     db: AsyncSession = Depends(get_db),
 ):
-    return await CallRecordService.get_by_id(db, record_id, current_user["tenant_id"])
+    return await CallRecordService.get_by_id(db, record_id, principal.tenant_id, principal)
 
 
 @router.post(
     "/call-records/{record_id}/identify-user",
     response_model=CallUserAssociationResponse,
+    dependencies=[Depends(require_permission("call.record.view"))],
 )
 async def identify_call_record_user(
     record_id: int,
@@ -157,6 +177,7 @@ async def identify_call_record_user(
 @router.put(
     "/call-records/{record_id}/associated-user",
     response_model=CallUserAssociationResponse,
+    dependencies=[Depends(require_permission("call.record.view"))],
 )
 async def link_call_record_user(
     record_id: int,
@@ -175,7 +196,11 @@ async def link_call_record_user(
 # ─────────── Agent WebRTC session ───────────
 
 
-@router.get("/agents/me/webrtc-session", response_model=WebRTCSessionResponse | None)
+@router.get(
+    "/agents/me/webrtc-session",
+    response_model=WebRTCSessionResponse | None,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def get_my_webrtc_session(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -189,6 +214,7 @@ async def get_my_webrtc_session(
     "/agents/me/webrtc-session",
     response_model=WebRTCSessionResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
 )
 async def open_my_webrtc_session(
     body: WebRTCSessionOpenRequest,
@@ -203,7 +229,10 @@ async def open_my_webrtc_session(
     )
 
 
-@router.delete("/agents/me/webrtc-session")
+@router.delete(
+    "/agents/me/webrtc-session",
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def close_my_webrtc_session(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -221,7 +250,11 @@ async def close_my_webrtc_session(
 # ─────────── WebRTC signaling (Browser ↔ Backend ↔ Telephony kernel) ───────────
 
 
-@router.post("/agents/me/webrtc/offer", response_model=WebRTCOfferResponse)
+@router.post(
+    "/agents/me/webrtc/offer",
+    response_model=WebRTCOfferResponse,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def webrtc_offer(
     body: WebRTCOfferRequest,
     current_user: dict = Depends(get_current_user),
@@ -258,7 +291,10 @@ async def webrtc_offer(
     return WebRTCOfferResponse(call_id=real_call_id, sdp=result.get("sdp", ""))
 
 
-@router.post("/agents/me/webrtc/ice")
+@router.post(
+    "/agents/me/webrtc/ice",
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def webrtc_ice(
     body: WebRTCIceRequest,
     current_user: dict = Depends(get_current_user),
@@ -306,7 +342,10 @@ async def webrtc_ice(
 # ─────────── Current-call control (hangup / reject) ───────────
 
 
-@router.post("/agents/me/current-call/hangup")
+@router.post(
+    "/agents/me/current-call/hangup",
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def hangup_current_call(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -364,7 +403,11 @@ async def hangup_current_call(
     return {"ok": True, "call_id": target_call_id}
 
 
-@router.post("/agents/me/current-call/accept", response_model=AcceptOfferResponse)
+@router.post(
+    "/agents/me/current-call/accept",
+    response_model=AcceptOfferResponse,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def accept_offer(
     body: AcceptOfferRequest,
     current_user: dict = Depends(get_current_user),
@@ -489,7 +532,10 @@ async def accept_offer(
         )
 
 
-@router.post("/agents/me/current-call/reject")
+@router.post(
+    "/agents/me/current-call/reject",
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def reject_offer(
     body: RejectOfferRequest,
     current_user: dict = Depends(get_current_user),
@@ -525,7 +571,11 @@ async def reject_offer(
     return {"ok": True}
 
 
-@router.post("/agents/me/dial", response_model=DialOutboundResponse)
+@router.post(
+    "/agents/me/dial",
+    response_model=DialOutboundResponse,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def dial_outbound(
     body: DialOutboundRequest,
     current_user: dict = Depends(get_current_user),
@@ -547,7 +597,10 @@ async def dial_outbound(
     )
 
 
-@router.post("/agents/me/dial/cancel")
+@router.post(
+    "/agents/me/dial/cancel",
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def cancel_outbound(
     body: CancelOutboundRequest,
     current_user: dict = Depends(get_current_user),
@@ -591,7 +644,11 @@ async def cancel_outbound(
     return {"ok": True}
 
 
-@router.post("/agents/me/dial-webrtc/offer", response_model=DialWebRTCOfferResponse)
+@router.post(
+    "/agents/me/dial-webrtc/offer",
+    response_model=DialWebRTCOfferResponse,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
 async def dial_webrtc_offer(
     body: DialWebRTCOfferRequest,
     current_user: dict = Depends(get_current_user),
@@ -613,7 +670,11 @@ async def dial_webrtc_offer(
 # ─────────── Tenant phone numbers (admin) ───────────
 
 
-@router.get("/phone-numbers", response_model=TenantPhoneNumberListResponse)
+@router.get(
+    "/phone-numbers",
+    response_model=TenantPhoneNumberListResponse,
+    dependencies=[Depends(require_permission("call.admin.number.manage"))],
+)
 async def list_tenant_phone_numbers(
     page: int = 1,
     per_page: int = 20,
@@ -626,7 +687,11 @@ async def list_tenant_phone_numbers(
     )
 
 
-@router.get("/phone-numbers/{phone_number_id}", response_model=TenantPhoneNumberResponse)
+@router.get(
+    "/phone-numbers/{phone_number_id}",
+    response_model=TenantPhoneNumberResponse,
+    dependencies=[Depends(require_permission("call.admin.number.manage"))],
+)
 async def get_tenant_phone_number(
     phone_number_id: str,
     current_user: dict = Depends(get_current_user),
@@ -637,7 +702,11 @@ async def get_tenant_phone_number(
     )
 
 
-@router.put("/phone-numbers/{phone_number_id}/tags", response_model=TenantPhoneNumberResponse)
+@router.put(
+    "/phone-numbers/{phone_number_id}/tags",
+    response_model=TenantPhoneNumberResponse,
+    dependencies=[Depends(require_permission("call.admin.number.manage"))],
+)
 async def update_tenant_phone_number_tags(
     phone_number_id: str,
     body: TenantPhoneNumberTagsUpdate,

@@ -14,6 +14,7 @@ import {
   IconBuilding,
 } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import {
@@ -38,6 +39,7 @@ import {
   formatFileFieldValue,
 } from '@/app/components/features/field-system/field-value-display'
 import { formatDatetimeForDisplay } from '@/lib/datetime-display'
+import { hasPermission } from '@/utils/permissions'
 
 // ── localStorage helpers for column config persistence ──
 
@@ -74,6 +76,7 @@ function removeColsFromStorage(viewId: number | null): void {
 
 export default function WorkspaceUsersPage() {
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const router = useRouter()
   const searchParams = useSearchParams()
 
@@ -152,6 +155,8 @@ export default function WorkspaceUsersPage() {
   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false)
   const [columnsDrawerOpen, setColumnsDrawerOpen] = useState(false)
   const [createModalOpen, setCreateModalOpen] = useState(false)
+  const canCreateUser = hasPermission(user, 'crm.workspace.user.create')
+  const canViewOrganizations = hasPermission(user, 'crm.workspace.org.view')
 
   // Sidebar groups
   const [userGroupOpen, setUserGroupOpen] = useState(true)
@@ -398,7 +403,7 @@ export default function WorkspaceUsersPage() {
             )}
           </div>
 
-          {organizationEnabled && (
+          {organizationEnabled && canViewOrganizations && (
             <div>
               <button
                 onClick={() => setOrgGroupOpen(!orgGroupOpen)}
@@ -448,14 +453,16 @@ export default function WorkspaceUsersPage() {
               ? (locale === 'zh' ? '全部' : 'All')
               : activeView?.name ?? ''}
           </h3>
-          <button
-            type="button"
-            onClick={() => setCreateModalOpen(true)}
-            className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
-          >
-            <IconPlus size={16} />
-            {locale === 'zh' ? '新建用户' : 'Create User'}
-          </button>
+          {canCreateUser && (
+            <button
+              type="button"
+              onClick={() => setCreateModalOpen(true)}
+              className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
+            >
+              <IconPlus size={16} />
+              {locale === 'zh' ? '新建用户' : 'Create User'}
+            </button>
+          )}
         </div>
 
         {/* Toolbar: search + filter + columns only */}
@@ -690,7 +697,7 @@ export default function WorkspaceUsersPage() {
       )}
 
       {/* Create User Modal */}
-      {createModalOpen && (
+      {canCreateUser && createModalOpen && (
         <UserFormModal
           mode="create"
           onClose={() => setCreateModalOpen(false)}

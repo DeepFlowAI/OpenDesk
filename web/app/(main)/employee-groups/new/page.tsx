@@ -4,7 +4,9 @@ import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { IconArrowLeft } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import { useCreateEmployeeGroup } from '@/service/use-employee-groups'
 import EmployeeGroupForm from '@/app/(main)/employee-groups/form'
 import type { CreateEmployeeGroupPayload } from '@/models/employee-group'
@@ -12,10 +14,13 @@ import type { CreateEmployeeGroupPayload } from '@/models/employee-group'
 export default function NewEmployeeGroupPage() {
   const router = useRouter()
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const createMutation = useCreateEmployeeGroup()
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const canManage = hasPermission(user, 'org.group.manage')
 
   const handleSave = async (payload: CreateEmployeeGroupPayload) => {
+    if (!canManage) return
     try {
       const created = await createMutation.mutateAsync(payload)
       setToast({ type: 'success', text: t('eg.saveSuccess', locale) })
@@ -41,16 +46,18 @@ export default function NewEmployeeGroupPage() {
             {t('eg.new', locale)}
           </span>
         </button>
-        <button
-          onClick={() => {
-            const form = document.getElementById('eg-form') as HTMLFormElement | null
-            form?.requestSubmit()
-          }}
-          disabled={createMutation.isPending}
-          className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
-        >
-          {createMutation.isPending ? t('eg.saving', locale) : t('eg.save', locale)}
-        </button>
+        {canManage && (
+          <button
+            onClick={() => {
+              const form = document.getElementById('eg-form') as HTMLFormElement | null
+              form?.requestSubmit()
+            }}
+            disabled={createMutation.isPending}
+            className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
+          >
+            {createMutation.isPending ? t('eg.saving', locale) : t('eg.save', locale)}
+          </button>
+        )}
       </div>
 
       {toast && (

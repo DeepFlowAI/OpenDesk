@@ -3,13 +3,23 @@
  * Property panel — switches on selected node type and renders the matching
  * configuration form. All 6 panels live here to keep the surface compact.
  */
-import { IconPlus, IconTrash } from '@tabler/icons-react'
+import {
+  IconArrowDown,
+  IconArrowUp,
+  IconChevronDown,
+  IconGripVertical,
+  IconPlus,
+  IconTrash,
+} from '@tabler/icons-react'
 import type { Node } from '@xyflow/react'
 
 import { PromptInput } from './prompt-input'
 import {
   COLLECT_OUTLET_COLOR,
   type AssignQueueData,
+  type AssignQueueTarget,
+  type AssignQueueTargetStrategy,
+  type AssignQueueTargetType,
   type CollectData,
   type CollectMode,
   type ConditionData,
@@ -18,11 +28,14 @@ import {
   type ConditionOperator,
   type HangupData,
   type PlayData,
+  defaultAssignQueueData,
   defaultGroup,
 } from '@/models/voice-flow-graph'
-import { useEmployeeGroups } from '@/service/use-employee-groups'
+import { useEmployeeGroups, useEmployeeSelect } from '@/service/use-employee-groups'
+import { useUnifiedFields } from '@/service/use-field-definitions'
 import { useServiceHours } from '@/service/use-service-hours'
 import { useSystemVariables } from '@/service/use-system-variables'
+import { FieldDomain, FieldType } from '@/types/field-enums'
 
 type SelectableNode = { id: string; type: string; label: string }
 
@@ -470,34 +483,268 @@ function AssignQueuePanel({
   data: AssignQueueData
   setData: (p: Partial<AssignQueueData>) => void
 }) {
-  const { data: groups } = useEmployeeGroups({ page: 1, per_page: 100 })
+  const { data: groups } = useEmployeeGroups({ page: 1, per_page: 200 })
+  const { data: employees } = useEmployeeSelect({ page: 1, per_page: 200 })
+  const { data: userFields } = useUnifiedFields({
+    domain: FieldDomain.USER,
+    include_metadata: false,
+  })
+  const normalized = normalizeAssignQueueData(data)
+  const queueTargets = normalized.queue_targets
+  const queueFields =
+    userFields?.items.filter(
+      (field) =>
+        field.id != null &&
+        field.status === 'active' &&
+        (field.field_type === FieldType.EMPLOYEE_SELECT || field.field_type === FieldType.GROUP_SELECT),
+    ) ?? []
+
+  const patch = (p: Partial<AssignQueueData>) =>
+    setData({ ...normalized, employee_group_id: null, ...p })
+  const updateTarget = (index: number, next: Partial<AssignQueueTarget>) => {
+    const queue_targets = queueTargets.map((target, i) => {
+      if (i !== index) return target
+      const merged = { ...target, ...next }
+      if (next.queue_type && next.queue_type !== target.queue_type) {
+        merged.queue_id = null
+      }
+      return merged
+    })
+    patch({ queue_targets })
+  }
+  const removeTarget = (index: number) => {
+    const next = queueTargets.filter((_, i) => i !== index)
+    patch({
+      queue_targets: next.length
+        ? next
+        : [{ queue_type: 'employee_group', queue_id: null }],
+    })
+  }
+  const moveTarget = (index: number, direction: -1 | 1) => {
+    const nextIndex = index + direction
+    if (nextIndex < 0 || nextIndex >= queueTargets.length) return
+    const next = [...queueTargets]
+    const [item] = next.splice(index, 1)
+    next.splice(nextIndex, 0, item)
+    patch({ queue_targets: next })
+  }
+
   return (
     <>
-      <div>
-        <label className="mb-1 block text-xs font-medium text-foreground/80">选择队列</label>
-        <select
-          value={data.employee_group_id ?? ''}
-          onChange={(e) =>
-            setData({
-              employee_group_id: e.target.value ? Number(e.target.value) : null,
-            })
-          }
-          className="h-9 w-full rounded-md border border-border bg-white px-2 text-sm"
-        >
-          <option value="">请选择员工组</option>
-          {(groups?.items ?? []).map((g) => (
-            <option key={g.id} value={g.id}>{g.name}</option>
-          ))}
-        </select>
-        <p className="mt-1 text-xs text-foreground/60">数据来源：员工组/技能组列表</p>
-      </div>
+      <section className="space-y-3">
+        <div>
+          <label className="mb-1 block text-xs font-medium text-foreground/80">多队列选择方式</label>
+          <div className="relative">
+            <select
+              value={normalized.target_strategy}
+              onChange={(e) =>
+                patch({ target_strategy: e.target.value as AssignQueueTargetStrategy })
+              }
+              className="h-9 w-full appearance-none rounded-md border border-border bg-white px-2 pr-8 text-sm"
+            >
+              <option value="sequential_overflow">顺序溢出</option>
+              <option value="least_waiting_count">最少排队队列</option>
+              <option value="shortest_tail_wait">最短排队时间队列</option>
+            </select>
+            <IconChevronDown size={14} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
+          </div>
+        </div>
+
+        <div>
+          <div className="mb-1 flex items-center justify-between">
+            <label className="text-xs font-medium text-foreground/80">候选队列</label>
+            <span className="text-[11px] text-foreground/50">{queueTargets.length}/20</span>
+          </div>
+          <div className="overflow-hidden rounded-md border border-border">
+            {queueTargets.map((target, index) => (
+              <div
+                key={`${index}-${target.queue_type}-${target.queue_id ?? 'empty'}`}
+                className="grid grid-cols-[24px_86px_minmax(0,1fr)_28px] items-center gap-2 border-b border-border px-2 py-2 last:border-b-0"
+              >
+                <div className="flex flex-col items-center justify-center gap-0.5 text-muted-foreground">
+                  <IconGripVertical size={14} />
+                  <div className="flex gap-0.5 text-[10px] leading-none">
+                    <button
+                      type="button"
+                      onClick={() => moveTarget(index, -1)}
+                      disabled={index === 0}
+                      className="disabled:opacity-30"
+                      aria-label="上移队列目标"
+                    >
+                      <IconArrowUp size={10} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => moveTarget(index, 1)}
+                      disabled={index === queueTargets.length - 1}
+                      className="disabled:opacity-30"
+                      aria-label="下移队列目标"
+                    >
+                      <IconArrowDown size={10} />
+                    </button>
+                  </div>
+                </div>
+
+                <select
+                  value={target.queue_type}
+                  onChange={(e) =>
+                    updateTarget(index, { queue_type: e.target.value as AssignQueueTargetType })
+                  }
+                  className="h-8 rounded-md border border-border bg-white px-2 text-xs"
+                >
+                  <option value="user_field">用户字段</option>
+                  <option value="employee">员工</option>
+                  <option value="employee_group">员工组</option>
+                </select>
+
+                {target.queue_type === 'user_field' ? (
+                  <select
+                    value={target.queue_id ?? ''}
+                    onChange={(e) =>
+                      updateTarget(index, { queue_id: e.target.value ? Number(e.target.value) : null })
+                    }
+                    className="h-8 min-w-0 rounded-md border border-border bg-white px-2 text-xs"
+                  >
+                    <option value="">请选择用户字段</option>
+                    {queueFields.map((field) => (
+                      <option key={field.id} value={field.id ?? ''}>
+                        {field.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : target.queue_type === 'employee' ? (
+                  <select
+                    value={target.queue_id ?? ''}
+                    onChange={(e) =>
+                      updateTarget(index, { queue_id: e.target.value ? Number(e.target.value) : null })
+                    }
+                    className="h-8 min-w-0 rounded-md border border-border bg-white px-2 text-xs"
+                  >
+                    <option value="">请选择员工</option>
+                    {(employees?.items ?? []).map((employee) => (
+                      <option key={employee.id} value={employee.id}>
+                        {employee.display_name || employee.username}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <select
+                    value={target.queue_id ?? ''}
+                    onChange={(e) =>
+                      updateTarget(index, { queue_id: e.target.value ? Number(e.target.value) : null })
+                    }
+                    className="h-8 min-w-0 rounded-md border border-border bg-white px-2 text-xs"
+                  >
+                    <option value="">请选择员工组</option>
+                    {(groups?.items ?? []).map((g) => (
+                      <option key={g.id} value={g.id}>{g.name}</option>
+                    ))}
+                  </select>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => removeTarget(index)}
+                  className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-red-600"
+                  aria-label="删除队列目标"
+                >
+                  <IconTrash size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              queueTargets.length < 20 &&
+              patch({
+                queue_targets: [
+                  ...queueTargets,
+                  { queue_type: 'employee_group', queue_id: null },
+                ],
+              })
+            }
+            disabled={queueTargets.length >= 20}
+            className="mt-2 flex w-full items-center justify-center gap-1 rounded-md border border-dashed border-border py-2 text-xs text-primary disabled:opacity-40"
+          >
+            <IconPlus size={14} /> 添加队列目标
+          </button>
+          <p className="mt-1 text-xs text-foreground/60">
+            顺序溢出时列表顺序表示尝试顺序；其它策略中用于并列兜底。
+          </p>
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <h4 className="text-sm font-semibold text-foreground">排队提示设置</h4>
+        <TextAreaField
+          label="排队提示话术"
+          value={normalized.queue_prompt_text}
+          onChange={(value) => patch({ queue_prompt_text: value })}
+          placeholder="正在为您转接，请稍候。"
+        />
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-foreground/80">播放方式</label>
+            <select
+              value={normalized.prompt_play_mode}
+              onChange={(e) => patch({ prompt_play_mode: e.target.value as 'once' | 'loop' })}
+              className="h-9 w-full rounded-md border border-border bg-white px-2 text-sm"
+            >
+              <option value="once">仅播放一次</option>
+              <option value="loop">循环播放</option>
+            </select>
+          </div>
+          {normalized.prompt_play_mode === 'loop' && (
+            <div>
+              <label className="mb-1 block text-xs font-medium text-foreground/80">循环间隔（秒）</label>
+              <input
+                type="number"
+                value={normalized.prompt_loop_interval_seconds ?? ''}
+                onChange={(e) =>
+                  patch({
+                    prompt_loop_interval_seconds: e.target.value ? Number(e.target.value) : null,
+                  })
+                }
+                className="h-9 w-full rounded-md border border-border bg-white px-2 text-sm"
+                placeholder="例如 15"
+              />
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <h4 className="text-sm font-semibold text-foreground">失败状态提示</h4>
+        <TextAreaField
+          label="达到排队上限"
+          value={normalized.queue_limit_prompt_text}
+          onChange={(value) => patch({ queue_limit_prompt_text: value })}
+        />
+        <TextAreaField
+          label="无可用队列"
+          value={normalized.no_available_queue_prompt_text}
+          onChange={(value) => patch({ no_available_queue_prompt_text: value })}
+        />
+        <TextAreaField
+          label="排队超时"
+          value={normalized.queue_timeout_prompt_text}
+          onChange={(value) => patch({ queue_timeout_prompt_text: value })}
+        />
+        <TextAreaField
+          label="坐席未接听"
+          value={normalized.agent_no_answer_prompt_text}
+          onChange={(value) => patch({ agent_no_answer_prompt_text: value })}
+        />
+      </section>
+
       <div>
         <label className="mb-1 block text-xs font-medium text-foreground/80">排队超时（秒）</label>
         <input
           type="number"
-          value={data.timeout_seconds ?? ''}
+          value={normalized.timeout_seconds ?? ''}
           onChange={(e) =>
-            setData({ timeout_seconds: e.target.value ? Number(e.target.value) : null })
+            patch({ timeout_seconds: e.target.value ? Number(e.target.value) : null })
           }
           className="h-9 w-full rounded-md border border-border bg-white px-2 text-sm"
           placeholder="例如 60"
@@ -510,6 +757,47 @@ function AssignQueuePanel({
         如需在「排队超时未分到坐席」时走自定义路径，把 <code>timeout</code> 出口连到下一节点（通常是挂断或挂断前播报）。
       </p>
     </>
+  )
+}
+
+function normalizeAssignQueueData(data: AssignQueueData): AssignQueueData {
+  const defaults = defaultAssignQueueData()
+  const queueTargets =
+    data.queue_targets?.length
+      ? data.queue_targets
+      : data.employee_group_id
+        ? [{ queue_type: 'employee_group' as const, queue_id: data.employee_group_id }]
+        : defaults.queue_targets
+  return {
+    ...defaults,
+    ...data,
+    queue_targets: queueTargets,
+  }
+}
+
+function TextAreaField({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  placeholder?: string
+}) {
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-foreground/80">{label}</label>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="min-h-16 w-full resize-y rounded-md border border-border bg-white px-2 py-2 text-sm"
+        maxLength={300}
+        placeholder={placeholder}
+      />
+      <div className="mt-0.5 text-right text-[11px] text-foreground/50">{value.length}/300</div>
+    </div>
   )
 }
 

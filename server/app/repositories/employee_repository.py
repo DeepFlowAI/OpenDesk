@@ -3,12 +3,13 @@ Employee repository — data access for employees / admins
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import cast, select, or_, func, delete
+from sqlalchemy import and_, cast, select, or_, func, delete
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.employee import Employee
 from app.models.employee_group import EmployeeGroup, EmployeeGroupMember
+from app.models.role import EmployeeRole, Role
 from app.schemas.employee import VALID_ROLES
 
 
@@ -55,6 +56,22 @@ class EmployeeRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def get_employee_ids_in_groups(
+        db: AsyncSession,
+        group_ids: list[int],
+    ) -> list[int]:
+        """Return distinct employee IDs that belong to any of the given groups."""
+        if not group_ids:
+            return []
+        result = await db.execute(
+            select(EmployeeGroupMember.employee_id)
+            .where(EmployeeGroupMember.group_id.in_(group_ids))
+            .distinct()
+            .order_by(EmployeeGroupMember.employee_id.asc())
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
     async def get_group_ids_by_employee_ids(
         db: AsyncSession, employee_ids: list[int]
     ) -> dict[int, list[int]]:
@@ -79,6 +96,37 @@ class EmployeeRepository:
         )
         for employee in employees:
             employee.group_ids = grouped.get(employee.id, [])
+        return employees
+
+    @staticmethod
+    async def attach_role_assignments(db: AsyncSession, employees: list[Employee]) -> list[Employee]:
+        """Attach role fields for API serialization."""
+        employee_ids = [employee.id for employee in employees]
+        grouped: dict[int, list[Role]] = {employee_id: [] for employee_id in employee_ids}
+        if employee_ids:
+            result = await db.execute(
+                select(EmployeeRole.employee_id, Role)
+                .join(Role, Role.id == EmployeeRole.role_id)
+                .where(EmployeeRole.employee_id.in_(employee_ids))
+                .order_by(Role.is_system.desc(), Role.id.asc())
+            )
+            for employee_id, role in result.all():
+                grouped.setdefault(employee_id, []).append(role)
+
+        for employee in employees:
+            roles = grouped.get(employee.id, [])
+            employee.role_ids = [role.id for role in roles]
+            employee.role_assignments = [
+                {
+                    "id": role.id,
+                    "key": role.key,
+                    "name": role.name,
+                    "is_system": role.is_system,
+                    "is_active": role.is_active,
+                    "permissions": role.permissions or [],
+                }
+                for role in roles
+            ]
         return employees
 
     @staticmethod
@@ -116,6 +164,7 @@ class EmployeeRepository:
         per_page: int = 10,
         keyword: str | None = None,
         role_filters: list[str] | None = None,
+        role_id_filters: list[int] | None = None,
         status: str | None = None,
         group_id: int | None = None,
     ) -> tuple[list[Employee], int]:
@@ -149,6 +198,14 @@ class EmployeeRepository:
                 base = base.where(
                     or_(*(roles_jsonb.contains([r]) for r in normalized))
                 )
+
+        if role_id_filters:
+            normalized_role_ids = [role_id for role_id in dict.fromkeys(role_id_filters) if role_id > 0]
+            if normalized_role_ids:
+                base = base.join(
+                    EmployeeRole,
+                    EmployeeRole.employee_id == Employee.id,
+                ).where(EmployeeRole.role_id.in_(normalized_role_ids)).distinct()
 
         if status == "active":
             base = base.where(Employee.is_active.is_(True))
@@ -208,6 +265,16 @@ class EmployeeRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def replace_role_ids(
+        db: AsyncSession, employee_id: int, role_ids: list[int]
+    ) -> None:
+        """Replace all role assignments for an employee."""
+        await db.execute(delete(EmployeeRole).where(EmployeeRole.employee_id == employee_id))
+        for role_id in role_ids:
+            db.add(EmployeeRole(employee_id=employee_id, role_id=role_id))
+        await db.commit()
+
+    @staticmethod
     async def get_transfer_candidates(
         db: AsyncSession,
         tenant_id: int,
@@ -219,20 +286,30 @@ class EmployeeRepository:
 
         Constraints:
             - is_active = True
-            - has the ``agent`` role (admin-only accounts that do not serve are excluded)
+            - has effective chat workspace access through an active role or is super admin
             - exclude any ids in ``exclude_user_ids`` (typically the requester
               and the conversation's current owner)
             - optional keyword filters name/job_number/username/email/phone
         """
-        roles_jsonb = cast(Employee.roles, JSONB)
+        permissions_jsonb = cast(Role.permissions, JSONB)
         excluded = [eid for eid in (exclude_user_ids or []) if eid is not None]
         base = (
             select(Employee)
+            .outerjoin(EmployeeRole, EmployeeRole.employee_id == Employee.id)
+            .outerjoin(Role, Role.id == EmployeeRole.role_id)
             .where(
                 Employee.tenant_id == tenant_id,
                 Employee.is_active.is_(True),
-                roles_jsonb.contains(["agent"]),
+                or_(
+                    Employee.is_super_admin.is_(True),
+                    and_(
+                        Role.tenant_id == tenant_id,
+                        Role.is_active.is_(True),
+                        permissions_jsonb.contains(["chat.workspace.use"]),
+                    ),
+                ),
             )
+            .distinct()
         )
         if excluded:
             base = base.where(Employee.id.notin_(excluded))
@@ -253,3 +330,39 @@ class EmployeeRepository:
         base = base.order_by(Employee.name.asc()).limit(limit)
         result = await db.execute(base)
         return list(result.scalars().all())
+
+    @staticmethod
+    async def has_effective_permission(
+        db: AsyncSession,
+        tenant_id: int,
+        employee_id: int,
+        permission_key: str,
+    ) -> bool:
+        """Whether an active employee holds ``permission_key`` effectively.
+
+        True when the employee is an active member of the tenant and either is
+        a super admin or has an active role whose permissions include the key.
+        Mirrors the role-based eligibility used by ``get_transfer_candidates``.
+        """
+        permissions_jsonb = cast(Role.permissions, JSONB)
+        stmt = (
+            select(Employee.id)
+            .outerjoin(EmployeeRole, EmployeeRole.employee_id == Employee.id)
+            .outerjoin(Role, Role.id == EmployeeRole.role_id)
+            .where(
+                Employee.id == employee_id,
+                Employee.tenant_id == tenant_id,
+                Employee.is_active.is_(True),
+                or_(
+                    Employee.is_super_admin.is_(True),
+                    and_(
+                        Role.tenant_id == tenant_id,
+                        Role.is_active.is_(True),
+                        permissions_jsonb.contains([permission_key]),
+                    ),
+                ),
+            )
+            .limit(1)
+        )
+        result = await db.execute(stmt)
+        return result.scalar_one_or_none() is not None

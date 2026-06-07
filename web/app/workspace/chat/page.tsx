@@ -140,7 +140,7 @@ export default function ChatPage() {
 
   // When the user switches back to this tab after it was backgrounded (and
   // possibly frozen by the browser), check if the socket silently died and
-  // force an immediate reconnect + data refresh so the agent is back online
+  // force an immediate reconnect + data refresh so the agent state is current
   // within a single frame rather than waiting for the next reconnection tick.
   useEffect(() => {
     const handleVisibilityChange = () => {

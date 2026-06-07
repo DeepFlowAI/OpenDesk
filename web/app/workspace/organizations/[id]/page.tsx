@@ -9,6 +9,7 @@ import {
   IconSearch,
 } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import {
   useOrganization,
   useDeleteOrganization,
@@ -29,6 +30,7 @@ import {
 import { EntityChangeTimeline } from '@/app/components/features/activity/entity-change-timeline'
 import { formatDatetimeForDisplay } from '@/lib/datetime-display'
 import { OrgFormModal } from '../org-form-modal'
+import { hasPermission } from '@/utils/permissions'
 
 const DATETIME_KEYS = new Set(['created_at', 'updated_at'])
 const SYSTEM_INFO_SYSTEM_KEYS = new Set(['public_id', 'created_by', 'updated_by'])
@@ -45,7 +47,11 @@ export default function OrganizationDetailPage() {
   const router = useRouter()
   const queryClient = useQueryClient()
   const { locale } = useLocaleStore()
+  const currentUser = useAuthStore((state) => state.user)
   const isZh = locale === 'zh'
+  const canEditOrganization = hasPermission(currentUser, 'crm.workspace.org.edit')
+  const canDeleteOrganization = hasPermission(currentUser, 'crm.workspace.org.delete')
+  const canViewUsers = hasPermission(currentUser, 'crm.workspace.user.view')
 
   const orgRef = params.id
   const fromList = searchParams.get('from') === 'list'
@@ -111,7 +117,7 @@ export default function OrganizationDetailPage() {
     page: userPage,
     per_page: userPerPage,
     search: userSearch || undefined,
-  }, !!org)
+  }, !!org && canViewUsers)
   const {
     data: changesData,
     isLoading: changesLoading,
@@ -123,6 +129,12 @@ export default function OrganizationDetailPage() {
     return fields
       .filter((f) => f.source === 'system' && ['name', 'email', 'phone'].includes(f.key ?? ''))
   }, [userFieldsData])
+
+  useEffect(() => {
+    if (!canViewUsers && rightTab === 'users') {
+      setRightTab('activity')
+    }
+  }, [canViewUsers, rightTab])
 
   const [editModalOpen, setEditModalOpen] = useState(false)
   const deleteMutation = useDeleteOrganization()
@@ -253,21 +265,25 @@ export default function OrganizationDetailPage() {
           </button>
         )}
         <h2 className="flex-1 text-base font-semibold text-foreground">{org.name}</h2>
-        <button
-          onClick={() => setEditModalOpen(true)}
-          className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-accent"
-        >
-          <IconEdit size={16} />
-          {isZh ? '编辑组织' : 'Edit'}
-        </button>
-        <button
-          onClick={handleDelete}
-          disabled={deleteMutation.isPending}
-          className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
-        >
-          <IconTrash size={16} />
-          {isZh ? '删除' : 'Delete'}
-        </button>
+        {canEditOrganization && (
+          <button
+            onClick={() => setEditModalOpen(true)}
+            className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-accent"
+          >
+            <IconEdit size={16} />
+            {isZh ? '编辑组织' : 'Edit'}
+          </button>
+        )}
+        {canDeleteOrganization && (
+          <button
+            onClick={handleDelete}
+            disabled={deleteMutation.isPending}
+            className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+          >
+            <IconTrash size={16} />
+            {isZh ? '删除' : 'Delete'}
+          </button>
+        )}
       </div>
 
       {/* Main content: left profile + right user list */}
@@ -376,19 +392,21 @@ export default function OrganizationDetailPage() {
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden border-l border-border bg-white">
           <div className="flex shrink-0 items-center gap-3 border-b border-border bg-white px-6 py-3">
             <div className="flex items-center">
-              <button
-                type="button"
-                onClick={() => setRightTab('users')}
-                className={cn(
-                  'relative px-4 py-1.5 text-sm font-medium transition-colors',
-                  rightTab === 'users' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground/80',
-                )}
-              >
-                {isZh ? '名下用户' : 'Users'}
-                {rightTab === 'users' && (
-                  <span className="absolute bottom-0 left-4 right-4 h-0.5 rounded-full bg-primary" />
-                )}
-              </button>
+              {canViewUsers && (
+                <button
+                  type="button"
+                  onClick={() => setRightTab('users')}
+                  className={cn(
+                    'relative px-4 py-1.5 text-sm font-medium transition-colors',
+                    rightTab === 'users' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground/80',
+                  )}
+                >
+                  {isZh ? '名下用户' : 'Users'}
+                  {rightTab === 'users' && (
+                    <span className="absolute bottom-0 left-4 right-4 h-0.5 rounded-full bg-primary" />
+                  )}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setRightTab('activity')}
@@ -403,7 +421,7 @@ export default function OrganizationDetailPage() {
                 )}
               </button>
             </div>
-            {rightTab === 'users' && (
+            {canViewUsers && rightTab === 'users' && (
               <div className="relative max-w-xs flex-1">
                 <IconSearch size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
                 <input
@@ -483,7 +501,7 @@ export default function OrganizationDetailPage() {
           </div>
 
           {/* Users pagination */}
-          {userTotal > 0 && (
+          {canViewUsers && userTotal > 0 && (
             <div className="flex shrink-0 items-center justify-between border-t border-border bg-white px-6 py-3">
               <span className="text-xs text-muted-foreground">
                 {isZh ? `共 ${userTotal} 条` : `${userTotal} total`}
@@ -513,7 +531,7 @@ export default function OrganizationDetailPage() {
       </div>
 
       {/* Edit modal */}
-      {editModalOpen && (
+      {canEditOrganization && editModalOpen && (
         <OrgFormModal
           mode="edit"
           organization={org}

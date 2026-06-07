@@ -68,8 +68,8 @@ async def seed():
         _AGENT_B_ID = b.scalar_one()
 
         await db.execute(text("""
-            INSERT INTO users (tenant_id, external_id, name)
-            VALUES (:tid, 'rep_emp_v', 'Rep Emp Visitor')
+            INSERT INTO users (tenant_id, public_id, external_id, name)
+            VALUES (:tid, 'rep_emp_v', 'rep_emp_v', 'Rep Emp Visitor')
             ON CONFLICT ON CONSTRAINT uq_users_tenant_external DO NOTHING
         """), {"tid": _TENANT_PK})
         await db.commit()

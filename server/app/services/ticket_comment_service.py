@@ -11,6 +11,7 @@ from app.core.exceptions import NotFoundError, ValidationError
 from app.models.employee import Employee
 from app.repositories.ticket_comment_repository import TicketCommentRepository
 from app.repositories.ticket_repository import TicketRepository
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.ticket_comment import (
     TicketCommentCreate,
     TicketCommentResponse,
@@ -27,11 +28,18 @@ MAX_BODY_LENGTH = 50000
 class TicketCommentService:
 
     @staticmethod
-    async def _ensure_ticket(db: AsyncSession, tenant_id: int, ticket_id: int) -> None:
+    async def _ensure_ticket(
+        db: AsyncSession,
+        tenant_id: int,
+        ticket_id: int,
+        principal: EffectivePrincipal | None = None,
+    ) -> None:
         """Load the ticket and assert it belongs to the current tenant."""
         ticket = await TicketRepository.get_by_id(db, ticket_id)
         if not ticket or ticket.tenant_id != tenant_id:
             raise NotFoundError("Ticket not found")
+        if principal is not None:
+            await TicketService._assert_ticket_scope(db, principal, ticket)
 
     @staticmethod
     def _normalize_body(body: str | None) -> str | None:
@@ -65,8 +73,9 @@ class TicketCommentService:
         ticket_id: int,
         author_id: int | None,
         data: TicketCommentCreate,
+        principal: EffectivePrincipal | None = None,
     ) -> TicketCommentResponse:
-        await cls._ensure_ticket(db, tenant_id, ticket_id)
+        await cls._ensure_ticket(db, tenant_id, ticket_id, principal)
 
         body = cls._normalize_body(data.body)
         attachments = data.attachments or None
@@ -122,8 +131,9 @@ class TicketCommentService:
         ticket_id: int,
         page: int = 1,
         per_page: int = 20,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
-        await cls._ensure_ticket(db, tenant_id, ticket_id)
+        await cls._ensure_ticket(db, tenant_id, ticket_id, principal)
 
         items, total = await TicketCommentRepository.get_paginated(
             db, tenant_id, ticket_id, page, per_page

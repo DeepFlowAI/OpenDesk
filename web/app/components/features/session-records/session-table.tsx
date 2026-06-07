@@ -1,14 +1,15 @@
 'use client'
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useMemo } from 'react'
 import { IconSearch, IconLoader2, IconCalendar, IconChevronDown, IconChevronRight } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
-import { useLocaleStore } from '@/context/locale-store'
+import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useSessionRecords } from '@/service/use-session-records'
 import { useEmployees } from '@/service/use-employees'
 import { useSatisfactionFilterOptions } from '@/service/use-satisfaction-survey'
 import { useAuthStore } from '@/context/auth-store'
+import { getDataScope } from '@/utils/permissions'
 import { DateInput } from '@/components/ui/time-input'
 import type { SessionRecord, SessionRecordFilters } from '@/models/session-record'
 
@@ -29,6 +30,36 @@ function formatDuration(startStr: string | null, endStr: string | null): string 
   const mm = String(m).padStart(2, '0')
   const ss = String(s).padStart(2, '0')
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
+function formatQueueDuration(seconds: number | null): string {
+  if (seconds == null || seconds < 0) return ''
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = seconds % 60
+  const mm = String(m).padStart(2, '0')
+  const ss = String(s).padStart(2, '0')
+  return h > 0 ? `${String(h).padStart(2, '0')}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
+function QueueNameCell({
+  queue,
+  locale,
+}: {
+  queue: SessionRecord['last_assigned_queue']
+  locale: Locale
+}) {
+  if (!queue?.name) return null
+  return (
+    <div className="flex min-w-0 items-center gap-1.5">
+      <span className="min-w-0 truncate" title={queue.name}>{queue.name}</span>
+      {queue.queue_type === 'employee' && (
+        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] leading-4 text-muted-foreground">
+          {t('ws.records.queue.personalQueue', locale)}
+        </span>
+      )}
+    </div>
+  )
 }
 
 function satisfactionLabel(status: string, locale: string) {
@@ -74,7 +105,9 @@ const PER_PAGE_OPTIONS = [20, 50, 100]
 export function SessionTable({ onSelectRecord }: Props) {
   const { locale } = useLocaleStore()
   const { user } = useAuthStore()
-  const isAdmin = user?.roles?.includes('admin') ?? false
+  const sessionScope = getDataScope(user, 'session_record')
+  const canFilterByAgent = sessionScope === 'all' || sessionScope === 'group'
+  const userGroupIds = useMemo(() => new Set(user?.group_ids ?? []), [user?.group_ids])
 
   const now = new Date()
   const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
@@ -108,11 +141,19 @@ export function SessionTable({ onSelectRecord }: Props) {
     draftProductOption,
     draftProductLabel,
   ].filter(Boolean).length
-  // All active employees who may appear as 接待 (agent or admin; role=agent alone omits admin-only staff)
   const { data: employeesData } = useEmployees(
     { per_page: 200, status: 'active' },
-    { enabled: isAdmin }
+    { enabled: canFilterByAgent }
   )
+  const agentOptions = useMemo(() => {
+    const items = employeesData?.items ?? []
+    if (sessionScope !== 'group') return items
+    return items.filter((emp) => {
+      const groupIds = emp.group_ids ?? []
+      if (emp.id === user?.id) return true
+      return groupIds.some((groupId) => userGroupIds.has(groupId))
+    })
+  }, [employeesData?.items, sessionScope, user?.id, userGroupIds])
 
   const handleSearch = useCallback(() => {
     setFilters({
@@ -196,7 +237,7 @@ export function SessionTable({ onSelectRecord }: Props) {
         </div>
 
         {/* Agent select */}
-        {isAdmin && (
+        {canFilterByAgent && (
           <div className="flex flex-col gap-1">
             <label className="text-xs text-muted-foreground">
               {t('ws.records.sessions.filter.agent', locale)}
@@ -207,7 +248,7 @@ export function SessionTable({ onSelectRecord }: Props) {
               className="h-9 min-w-[160px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
             >
               <option value="">{t('ws.records.sessions.filter.allAgents', locale)}</option>
-              {employeesData?.items?.map((emp: { id: number; name: string }) => (
+              {agentOptions.map((emp: { id: number; name: string }) => (
                 <option key={emp.id} value={emp.id}>
                   {emp.name}
                 </option>
@@ -414,6 +455,12 @@ export function SessionTable({ onSelectRecord }: Props) {
                 <th className="sticky top-0 z-10 w-[150px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.channelName', locale)}
                 </th>
+                <th className="sticky top-0 z-10 w-[160px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                  {t('ws.records.sessions.col.lastAssignedQueue', locale)}
+                </th>
+                <th className="sticky top-0 z-10 w-[110px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                  {t('ws.records.sessions.col.queueDuration', locale)}
+                </th>
                 <th className="sticky top-0 z-10 w-[120px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.agent', locale)}
                 </th>
@@ -449,6 +496,12 @@ export function SessionTable({ onSelectRecord }: Props) {
                   </td>
                   <td className="border-b border-border px-3 py-3 text-sm text-muted-foreground">
                     {record.channel?.name || '-'}
+                  </td>
+                  <td className="max-w-[160px] border-b border-border px-3 py-3 text-sm text-muted-foreground">
+                    <QueueNameCell queue={record.last_assigned_queue} locale={locale} />
+                  </td>
+                  <td className="border-b border-border px-3 py-3 font-mono text-sm text-muted-foreground">
+                    {formatQueueDuration(record.queue_duration_seconds)}
                   </td>
                   <td className="border-b border-border px-3 py-3 text-sm text-muted-foreground">
                     {record.agent?.display_name || record.agent?.name || '-'}

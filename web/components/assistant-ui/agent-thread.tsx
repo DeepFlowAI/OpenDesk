@@ -11,7 +11,6 @@ import { AgentComposer } from './agent-composer'
 import { IconArrowsExchange2, IconTicket, IconX, IconLoader2 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
-import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
 import { EndConversationModal } from '@/app/components/features/chat/end-conversation-modal'
 import { TransferConversationModal } from '@/app/components/features/chat/transfer-conversation-modal'
@@ -83,10 +82,10 @@ function AgentSideWelcomeBubble({
   return (
     <div className="mb-4 flex flex-row-reverse gap-2.5">
       <SystemAgentAvatar muted={muted} />
-      <div className="flex max-w-[70%] flex-col items-end">
+      <div className="flex min-w-0 max-w-[70%] flex-col items-end">
         <div
           className={cn(
-            'rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words whitespace-pre-wrap text-[#1a1a1a]',
+            'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all whitespace-pre-wrap text-[#1a1a1a]',
             muted ? 'bg-[#E8E8E8]' : 'bg-[#DBEAFE]',
             richTextListStyleClass,
           )}
@@ -170,7 +169,7 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
           {visitorAvatarChar}
         </div>
       )}
-      <div className={cn('flex max-w-[70%] flex-col', isAssistantSide ? 'items-end' : 'items-start')}>
+      <div className={cn('flex min-w-0 max-w-[70%] flex-col', isAssistantSide ? 'items-end' : 'items-start')}>
         {isBot && meta?.senderName && (
           <span className="mb-1 text-[11px] text-[#737373]">{meta.senderName}</span>
         )}
@@ -185,9 +184,9 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
         ) : (
           <div
             className={cn(
-              'rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words text-[#1a1a1a]',
+              'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all whitespace-pre-wrap text-[#1a1a1a]',
               isAssistantSide ? 'bg-[#DBEAFE]' : 'border border-[#E0E0E0] bg-[#F0F0F0]',
-              isBot ? [markdownTextRootClass, richTextListStyleClass] : 'whitespace-pre-wrap',
+              isBot && [markdownTextRootClass, richTextListStyleClass],
             )}
           >
             {isBot ? (
@@ -313,7 +312,7 @@ function AgentHistoryMessageBubble({
           {visitorAvatarChar}
         </div>
       )}
-      <div className={cn('flex max-w-[70%] flex-col', isAgent ? 'items-end' : 'items-start')}>
+      <div className={cn('flex min-w-0 max-w-[70%] flex-col', isAgent ? 'items-end' : 'items-start')}>
         {isBot && message.sender_name && (
           <span className="mb-1 text-[11px] text-[#737373]">{message.sender_name}</span>
         )}
@@ -328,9 +327,9 @@ function AgentHistoryMessageBubble({
         ) : (
           <div
             className={cn(
-              'rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words text-[#1a1a1a]',
+              'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all whitespace-pre-wrap text-[#1a1a1a]',
               isAgent ? 'bg-[#E8E8E8]' : 'border border-[#E0E0E0] bg-white',
-              isBot ? [markdownTextRootClass, richTextListStyleClass] : 'whitespace-pre-wrap',
+              isBot && [markdownTextRootClass, richTextListStyleClass],
             )}
           >
             {isBot ? <MarkdownText>{message.content}</MarkdownText> : message.content}
@@ -525,18 +524,11 @@ export function AgentThread({ socket }: AgentThreadProps) {
     onLoadHistory,
     onEndConversation,
     onCreateTicket,
+    canCreateTicket,
+    canTransfer,
     onTransferred,
   } = useAgentChatConfig()
   const { locale } = useLocaleStore()
-  const userId = useAuthStore((s) => s.user?.id)
-  const userRoles = useAuthStore((s) => s.user?.roles ?? [])
-  // Mirror the backend's transfer authorization: only the conversation's
-  // current owner or an admin may initiate a transfer. Hiding the button for
-  // unauthorized users avoids 403s and the modal's listing endpoint also
-  // refuses to leak the candidate list to them.
-  const isAdmin = userRoles.includes('admin')
-  const isOwner = userId != null && conversation.agent?.id === userId
-  const canTransfer = isAdmin || isOwner
   const [showEndModal, setShowEndModal] = useState(false)
   const [showTransferModal, setShowTransferModal] = useState(false)
   const viewportRef = useRef<HTMLDivElement | null>(null)
@@ -583,15 +575,17 @@ export function AgentThread({ socket }: AgentThreadProps) {
           <VisitorWebStatusBadge conversation={conversation} socket={socket} />
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <button
-            onClick={onCreateTicket}
-            className="flex h-8 items-center gap-1.5 rounded-md bg-[#E8E8E8] px-2.5 text-[12px] font-medium text-[#666666] transition-colors hover:bg-[#DDDDDD]"
-            title={t('ws.chat.createTicket', locale)}
-            type="button"
-          >
-            <IconTicket size={16} stroke={1.5} />
-            {t('ws.chat.createTicket', locale)}
-          </button>
+          {canCreateTicket && (
+            <button
+              onClick={onCreateTicket}
+              className="flex h-8 items-center gap-1.5 rounded-md bg-[#E8E8E8] px-2.5 text-[12px] font-medium text-[#666666] transition-colors hover:bg-[#DDDDDD]"
+              title={t('ws.chat.createTicket', locale)}
+              type="button"
+            >
+              <IconTicket size={16} stroke={1.5} />
+              {t('ws.chat.createTicket', locale)}
+            </button>
+          )}
           {!isClosed && canTransfer && conversation.agent && (
             <button
               onClick={() => setShowTransferModal(true)}
@@ -702,10 +696,10 @@ export function AgentThread({ socket }: AgentThreadProps) {
             >
               {visitorAvatarChar}
             </div>
-            <div className="flex max-w-[70%] flex-col items-start gap-1">
+            <div className="flex min-w-0 max-w-[70%] flex-col items-start gap-1">
               {visitorTypingContent ? (
                 <>
-                  <div className="rounded-[18px] border border-dashed border-[#D0D0D0] bg-white px-3.5 py-2.5 text-sm leading-normal whitespace-pre-wrap text-[#1a1a1a] shadow-sm">
+                  <div className="max-w-full rounded-[18px] border border-dashed border-[#D0D0D0] bg-white px-3.5 py-2.5 text-sm leading-normal break-words break-all whitespace-pre-wrap text-[#1a1a1a] shadow-sm">
                     {visitorTypingContent}
                   </div>
                   <span className="pl-1 text-[11px] italic text-[#999999]">{t('ws.chat.visitorTyping', locale)}</span>
@@ -731,15 +725,17 @@ export function AgentThread({ socket }: AgentThreadProps) {
       )}
 
       {/* ── Transfer conversation modal ── */}
-      <TransferConversationModal
-        conversation={conversation}
-        open={showTransferModal}
-        onClose={() => setShowTransferModal(false)}
-        onTransferred={(toName) => {
-          setShowTransferModal(false)
-          onTransferred(toName)
-        }}
-      />
+      {canTransfer && (
+        <TransferConversationModal
+          conversation={conversation}
+          open={showTransferModal}
+          onClose={() => setShowTransferModal(false)}
+          onTransferred={(toName) => {
+            setShowTransferModal(false)
+            onTransferred(toName)
+          }}
+        />
+      )}
     </ThreadPrimitive.Root>
   )
 }

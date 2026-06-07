@@ -12,13 +12,28 @@ export type SessionRoutingCondition = {
   value: string | string[]
 }
 
+export type SessionRoutingTargetStrategy =
+  | 'sequential_overflow'
+  | 'least_waiting_count'
+  | 'shortest_tail_wait'
+
+export type SessionRoutingQueueSourceType = 'user_field' | 'employee' | 'employee_group'
+
+export type SessionRoutingQueueSource = {
+  source_type: SessionRoutingQueueSourceType
+  target_ids: number[]
+}
+
 export type SessionRoutingRuleListItem = {
   id: number
   priority: number
   name: string
   enabled: boolean
-  target_group_id: number
+  target_group_id: number | null
   target_group_name: string
+  target_strategy: SessionRoutingTargetStrategy
+  target_queue_sources: SessionRoutingQueueSource[]
+  target_summary: string
   created_at: string | null
   updated_at: string | null
 }
@@ -29,8 +44,11 @@ export type SessionRoutingRule = {
   name: string
   enabled: boolean
   conditions: SessionRoutingCondition[]
-  target_group_id: number
+  target_group_id: number | null
   target_group_name: string
+  target_strategy: SessionRoutingTargetStrategy
+  target_queue_sources: SessionRoutingQueueSource[]
+  target_summary: string
   created_at: string | null
   updated_at: string | null
 }
@@ -41,5 +59,7 @@ export type SaveSessionRoutingRulePayload = {
   name: string
   enabled: boolean
   conditions: SessionRoutingCondition[]
-  target_group_id: number
+  target_group_id?: number | null
+  target_strategy: SessionRoutingTargetStrategy
+  target_queue_sources: SessionRoutingQueueSource[]
 }

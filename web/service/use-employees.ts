@@ -17,6 +17,7 @@ export type EmployeeListParams = {
   keyword?: string
   q?: string
   role?: string | string[]
+  role_id?: number | number[]
   status?: string
   group_id?: number
 }
@@ -34,6 +35,13 @@ export function employeeListSearchParams(params: EmployeeListParams): URLSearchP
     const roles = Array.isArray(r) ? r : [r]
     for (const role of roles) {
       if (role) sp.append('role', role)
+    }
+  }
+  const roleIds = params.role_id
+  if (roleIds != null) {
+    const ids = Array.isArray(roleIds) ? roleIds : [roleIds]
+    for (const roleId of ids) {
+      if (roleId) sp.append('role_id', String(roleId))
     }
   }
   return sp

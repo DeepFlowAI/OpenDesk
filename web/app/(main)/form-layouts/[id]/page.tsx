@@ -62,6 +62,9 @@ type MetadataFieldDef = {
   field_type: FieldType
 }
 
+type CustomPaletteField = Pick<FdFieldDefinition, 'id' | 'key' | 'name' | 'field_type'>
+type LayoutPaletteField = UnifiedField | MetadataFieldDef | CustomPaletteField
+
 const METADATA_FIELDS: MetadataFieldDef[] = [
   { key: 'created_at', name_zh: '创建时间', name_en: 'Created At', field_type: FieldType.DATETIME },
   { key: 'updated_at', name_zh: '更新时间', name_en: 'Updated At', field_type: FieldType.DATETIME },
@@ -120,6 +123,10 @@ type Selection =
 let uidCounter = 0
 function uid() {
   return `_local_${++uidCounter}_${Date.now()}`
+}
+
+function fieldKeyOf(field: LayoutPaletteField): string | null {
+  return field.key ?? null
 }
 
 function customDefinitionToUnifiedField(field: FdFieldDefinition): UnifiedField {
@@ -241,7 +248,7 @@ function computeDropTarget(
     return items.some((i) => {
       if (i.itemType !== 'field') return false
       if (i.field_source !== dragData.fieldSource) return false
-      if (dragData.source === 'system') return i.field_key === dragData.fieldKey
+      if (dragData.fieldKey) return i.field_key === dragData.fieldKey
       return i.field_definition_id === dragData.fieldDefId
     })
   })()
@@ -624,11 +631,18 @@ export default function FormLayoutEditorPage() {
       } else if (i.field_key) {
         const sys = systemFields.find((s) => s.key === i.field_key)
         if (sys) opts.push({ value: `key:${i.field_key}`, label: sys.name, isSystem: true, field: sys })
+        else {
+          const cust = customFields.find((c) => c.key === i.field_key)
+          if (cust) {
+            const field = customDefinitionToUnifiedField(cust)
+            opts.push({ value: `key:${i.field_key}`, label: field.name, isSystem: false, field })
+          }
+        }
       } else if (i.field_definition_id) {
         const cust = customFields.find((c) => c.id === i.field_definition_id)
         if (cust) {
           const field = customDefinitionToUnifiedField(cust)
-          opts.push({ value: `def:${i.field_definition_id}`, label: field.name, isSystem: false, field })
+          opts.push({ value: field.key ? `key:${field.key}` : `def:${i.field_definition_id}`, label: field.name, isSystem: false, field })
         }
       }
     }
@@ -645,7 +659,7 @@ export default function FormLayoutEditorPage() {
   }, [activeCanvasTab, tabs])
 
   const addFieldToActiveTab = useCallback(
-    (fieldSource: FieldSource, source: 'system' | 'custom', field: UnifiedField | MetadataFieldDef | { id: number; name: string; field_type: string }) => {
+    (fieldSource: FieldSource, source: 'system' | 'custom', field: LayoutPaletteField) => {
       const targetTab = getTargetTab()
       if (!targetTab) return
       const isRef = fieldSource === 'user' || fieldSource === 'organization' || fieldSource === 'ticket_metadata'
@@ -654,7 +668,7 @@ export default function FormLayoutEditorPage() {
         _tabUid: targetTab._uid,
         itemType: 'field',
         field_definition_id: source === 'custom' ? (field as { id: number }).id : null,
-        field_key: source === 'system' ? ((field as UnifiedField).key ?? (field as MetadataFieldDef).key) : null,
+        field_key: fieldKeyOf(field),
         field_source: fieldSource,
         default_state: isRef ? 'readonly' : 'optional',
         column_span: 1,
@@ -774,7 +788,7 @@ export default function FormLayoutEditorPage() {
           _tabUid: '', // overwritten by applyDropTarget
           itemType: 'field',
           field_definition_id: dragData.source === 'custom' ? dragData.fieldDefId : null,
-          field_key: dragData.source === 'system' ? dragData.fieldKey : null,
+          field_key: dragData.fieldKey,
           field_source: dragData.fieldSource,
           default_state: isRef ? 'readonly' : 'optional',
           column_span: 1,
@@ -1005,12 +1019,12 @@ function LeftPanel({
   locale: 'zh' | 'en'
   scene: string
   systemFields: UnifiedField[]
-  customFields: { id: number; name: string; field_type: import('@/types/field-enums').FieldType }[]
+  customFields: CustomPaletteField[]
   metadataFields: MetadataFieldDef[]
   userFields: UnifiedField[]
   orgFields: UnifiedField[]
   isFieldOnCanvas: (fieldSource: FieldSource, key: string | null, defId: number | null) => boolean
-  onAddField: (fieldSource: FieldSource, source: 'system' | 'custom', field: UnifiedField | MetadataFieldDef | { id: number; name: string; field_type: string }) => void
+  onAddField: (fieldSource: FieldSource, source: 'system' | 'custom', field: LayoutPaletteField) => void
   onAddSection: () => void
   onAddTab: () => void
 }) {
@@ -1088,12 +1102,12 @@ function LeftPanel({
         >
           <div className="flex flex-col gap-1.5">
             {customFields.map((f) => {
-              const onCanvas = isFieldOnCanvas('ticket', null, f.id)
+              const onCanvas = isFieldOnCanvas('ticket', f.key, f.id)
               return (
                 <DraggablePoolItem
                   key={`cust-${f.id}`}
                   id={`pool-cust-${f.id}`}
-                  dragData={{ origin: 'pool-field', source: 'custom', fieldSource: 'ticket', fieldKey: null, fieldDefId: f.id, displayName: f.name, fieldType: (FIELD_TYPE_LABELS as Record<string, Record<string, string>>)[f.field_type]?.[locale] ?? f.field_type }}
+                  dragData={{ origin: 'pool-field', source: 'custom', fieldSource: 'ticket', fieldKey: f.key, fieldDefId: f.id, displayName: f.name, fieldType: (FIELD_TYPE_LABELS as Record<string, Record<string, string>>)[f.field_type]?.[locale] ?? f.field_type }}
                   onCanvas={onCanvas}
                   onClick={() => !onCanvas && onAddField('ticket', 'custom', f)}
                   name={f.name}
@@ -1116,12 +1130,12 @@ function LeftPanel({
           <div className="flex flex-col gap-1.5">
             {userFields.map((f) => {
               const isSystem = f.source === 'system'
-              const onCanvas = isFieldOnCanvas('user', isSystem ? f.key : null, isSystem ? null : f.id ?? null)
+              const onCanvas = isFieldOnCanvas('user', f.key, isSystem ? null : f.id ?? null)
               return (
                 <DraggablePoolItem
                   key={`user-${f.key ?? f.id}`}
                   id={`pool-user-${f.key ?? f.id}`}
-                  dragData={{ origin: 'pool-field', source: isSystem ? 'system' : 'custom', fieldSource: 'user', fieldKey: isSystem ? f.key : null, fieldDefId: isSystem ? null : f.id ?? null, displayName: f.name, fieldType: (FIELD_TYPE_LABELS as Record<string, Record<string, string>>)[f.field_type]?.[locale] ?? f.field_type }}
+                  dragData={{ origin: 'pool-field', source: isSystem ? 'system' : 'custom', fieldSource: 'user', fieldKey: f.key, fieldDefId: isSystem ? null : f.id ?? null, displayName: f.name, fieldType: (FIELD_TYPE_LABELS as Record<string, Record<string, string>>)[f.field_type]?.[locale] ?? f.field_type }}
                   onCanvas={onCanvas}
                   onClick={() => !onCanvas && onAddField('user', isSystem ? 'system' : 'custom', f)}
                   name={f.name}
@@ -1144,12 +1158,12 @@ function LeftPanel({
           <div className="flex flex-col gap-1.5">
             {orgFields.map((f) => {
               const isSystem = f.source === 'system'
-              const onCanvas = isFieldOnCanvas('organization', isSystem ? f.key : null, isSystem ? null : f.id ?? null)
+              const onCanvas = isFieldOnCanvas('organization', f.key, isSystem ? null : f.id ?? null)
               return (
                 <DraggablePoolItem
                   key={`org-${f.key ?? f.id}`}
                   id={`pool-org-${f.key ?? f.id}`}
-                  dragData={{ origin: 'pool-field', source: isSystem ? 'system' : 'custom', fieldSource: 'organization', fieldKey: isSystem ? f.key : null, fieldDefId: isSystem ? null : f.id ?? null, displayName: f.name, fieldType: (FIELD_TYPE_LABELS as Record<string, Record<string, string>>)[f.field_type]?.[locale] ?? f.field_type }}
+                  dragData={{ origin: 'pool-field', source: isSystem ? 'system' : 'custom', fieldSource: 'organization', fieldKey: f.key, fieldDefId: isSystem ? null : f.id ?? null, displayName: f.name, fieldType: (FIELD_TYPE_LABELS as Record<string, Record<string, string>>)[f.field_type]?.[locale] ?? f.field_type }}
                   onCanvas={onCanvas}
                   onClick={() => !onCanvas && onAddField('organization', isSystem ? 'system' : 'custom', f)}
                   name={f.name}

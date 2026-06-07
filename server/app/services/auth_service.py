@@ -8,6 +8,7 @@ from app.core.security import verify_password, create_access_token
 from app.repositories.tenant_repository import TenantRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.schemas.auth import LoginRequest, LoginResponse, UserInfo
+from app.services.permission_service import PermissionService
 
 
 class AuthService:
@@ -37,8 +38,18 @@ class AuthService:
             "roles": user.roles,
         }
         access_token = create_access_token(token_data)
+        principal = await PermissionService.get_current_principal(
+            db,
+            {"user_id": user.id, "tenant_id": tenant.id},
+        )
+        user_info = UserInfo.model_validate(user)
+        user_info.role_ids = principal.role_ids
+        user_info.permissions = principal.permissions
+        user_info.data_scopes = principal.data_scopes
+        user_info.is_super_admin = principal.is_super_admin
+        user_info.group_ids = principal.group_ids
 
         return LoginResponse(
             access_token=access_token,
-            user=UserInfo.model_validate(user),
+            user=user_info,
         )

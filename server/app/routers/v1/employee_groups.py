@@ -4,7 +4,8 @@ EmployeeGroup router — CRUD endpoints for employee group management
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, get_current_user
+from app.db.deps import get_db, require_permission
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.employee_group import (
     EmployeeGroupCreate,
     EmployeeGroupUpdate,
@@ -23,11 +24,11 @@ async def list_employee_groups(
     keyword: str | None = None,
     q: str | None = None,
     member_id: int | None = None,
-    current_user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(require_permission("org.group.manage")),
     db: AsyncSession = Depends(get_db),
 ):
     """List employee groups with pagination and optional keyword search."""
-    tenant_id = current_user["tenant_id"]
+    tenant_id = principal.tenant_id
     search_keyword = keyword or q
     return await EmployeeGroupService.get_paginated(
         db, tenant_id, page, per_page, search_keyword, member_id
@@ -37,22 +38,22 @@ async def list_employee_groups(
 @router.post("", response_model=EmployeeGroupResponse, status_code=status.HTTP_201_CREATED)
 async def create_employee_group(
     body: EmployeeGroupCreate,
-    current_user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(require_permission("org.group.manage")),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new employee group with optional members."""
-    tenant_id = current_user["tenant_id"]
+    tenant_id = principal.tenant_id
     return await EmployeeGroupService.create(db, tenant_id, body)
 
 
 @router.get("/{group_id}", response_model=EmployeeGroupResponse)
 async def get_employee_group(
     group_id: int,
-    current_user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(require_permission("org.group.manage")),
     db: AsyncSession = Depends(get_db),
 ):
     """Get employee group detail with members."""
-    tenant_id = current_user["tenant_id"]
+    tenant_id = principal.tenant_id
     return await EmployeeGroupService.get_by_id(db, group_id, tenant_id)
 
 
@@ -60,21 +61,21 @@ async def get_employee_group(
 async def update_employee_group(
     group_id: int,
     body: EmployeeGroupUpdate,
-    current_user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(require_permission("org.group.manage")),
     db: AsyncSession = Depends(get_db),
 ):
     """Update employee group (full replace including members)."""
-    tenant_id = current_user["tenant_id"]
+    tenant_id = principal.tenant_id
     return await EmployeeGroupService.update(db, group_id, tenant_id, body)
 
 
 @router.delete("/{group_id}", status_code=status.HTTP_200_OK)
 async def delete_employee_group(
     group_id: int,
-    current_user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(require_permission("org.group.manage")),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete employee group."""
-    tenant_id = current_user["tenant_id"]
+    tenant_id = principal.tenant_id
     await EmployeeGroupService.delete(db, group_id, tenant_id)
     return {"message": "Deleted successfully"}

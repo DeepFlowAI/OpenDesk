@@ -14,6 +14,7 @@ import {
   IconBuilding,
 } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { cn } from '@/lib/utils'
 import {
   useQueryOrganizations,
@@ -36,6 +37,7 @@ import {
   formatFileFieldValue,
 } from '@/app/components/features/field-system/field-value-display'
 import { formatDatetimeForDisplay } from '@/lib/datetime-display'
+import { hasPermission } from '@/utils/permissions'
 
 // ── localStorage helpers ──
 
@@ -72,6 +74,7 @@ function removeColsFromStorage(viewId: number | null): void {
 
 export default function WorkspaceOrganizationsPage() {
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const router = useRouter()
   const searchParams = useSearchParams()
   const isZh = locale === 'zh'
@@ -154,6 +157,8 @@ export default function WorkspaceOrganizationsPage() {
   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false)
   const [columnsDrawerOpen, setColumnsDrawerOpen] = useState(false)
   const [createModalOpen, setCreateModalOpen] = useState(false)
+  const canCreateOrganization = hasPermission(user, 'crm.workspace.org.create')
+  const canViewUsers = hasPermission(user, 'crm.workspace.user.view')
 
   // Sidebar groups
   const [userGroupOpen, setUserGroupOpen] = useState(true)
@@ -361,48 +366,50 @@ export default function WorkspaceOrganizationsPage() {
 
         <div className="flex-1 overflow-y-auto">
           {/* Users group */}
-          <div>
-            <button
-              onClick={() => setUserGroupOpen(!userGroupOpen)}
-              className="flex w-full items-center justify-between px-3 py-2.5"
-            >
-              <span className="flex items-center gap-2">
-                <IconUsers size={18} className="text-foreground" />
-                <span className="text-sm font-semibold text-foreground">
-                  {isZh ? '用户' : 'Users'}
+          {canViewUsers && (
+            <div>
+              <button
+                onClick={() => setUserGroupOpen(!userGroupOpen)}
+                className="flex w-full items-center justify-between px-3 py-2.5"
+              >
+                <span className="flex items-center gap-2">
+                  <IconUsers size={18} className="text-foreground" />
+                  <span className="text-sm font-semibold text-foreground">
+                    {isZh ? '用户' : 'Users'}
+                  </span>
                 </span>
-              </span>
-              {userGroupOpen
-                ? <IconChevronDown size={16} className="text-muted-foreground" />
-                : <IconChevronRight size={16} className="text-muted-foreground" />}
-            </button>
+                {userGroupOpen
+                  ? <IconChevronDown size={16} className="text-muted-foreground" />
+                  : <IconChevronRight size={16} className="text-muted-foreground" />}
+              </button>
 
-            {userGroupOpen && (
-              <div className="pb-2">
-                {userViewsLoading ? (
-                  <div className="px-4 py-2 text-xs text-muted-foreground">Loading...</div>
-                ) : (
-                  <>
-                    <SidebarViewItem
-                      label={isZh ? '全部' : 'All'}
-                      count={totalUserCount}
-                      active={false}
-                      onClick={() => router.push('/workspace/users')}
-                    />
-                    {userViews?.map((v) => (
+              {userGroupOpen && (
+                <div className="pb-2">
+                  {userViewsLoading ? (
+                    <div className="px-4 py-2 text-xs text-muted-foreground">Loading...</div>
+                  ) : (
+                    <>
                       <SidebarViewItem
-                        key={v.id}
-                        label={v.name}
-                        count={userViewCountMap.get(v.id)}
+                        label={isZh ? '全部' : 'All'}
+                        count={totalUserCount}
                         active={false}
-                        onClick={() => router.push(`/workspace/users?view=${v.id}`)}
+                        onClick={() => router.push('/workspace/users')}
                       />
-                    ))}
-                  </>
-                )}
-              </div>
-            )}
-          </div>
+                      {userViews?.map((v) => (
+                        <SidebarViewItem
+                          key={v.id}
+                          label={v.name}
+                          count={userViewCountMap.get(v.id)}
+                          active={false}
+                          onClick={() => router.push(`/workspace/users?view=${v.id}`)}
+                        />
+                      ))}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Organizations group */}
           <div>
@@ -459,14 +466,16 @@ export default function WorkspaceOrganizationsPage() {
               ? (isZh ? '全部' : 'All')
               : activeView?.name ?? ''}
           </h3>
-          <button
-            type="button"
-            onClick={() => setCreateModalOpen(true)}
-            className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
-          >
-            <IconPlus size={16} />
-            {isZh ? '新建组织' : 'Create Organization'}
-          </button>
+          {canCreateOrganization && (
+            <button
+              type="button"
+              onClick={() => setCreateModalOpen(true)}
+              className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
+            >
+              <IconPlus size={16} />
+              {isZh ? '新建组织' : 'Create Organization'}
+            </button>
+          )}
         </div>
 
         {/* Toolbar: search + filter + columns */}
@@ -698,7 +707,7 @@ export default function WorkspaceOrganizationsPage() {
       )}
 
       {/* Create Organization Modal */}
-      {createModalOpen && (
+      {canCreateOrganization && createModalOpen && (
         <OrgFormModal
           mode="create"
           onClose={() => setCreateModalOpen(false)}

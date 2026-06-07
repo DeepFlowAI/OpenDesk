@@ -17,6 +17,8 @@ from app.libs.realtime.base import BaseRealtimeTransport
 from app.models.conversation import Conversation
 from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.user_repository import UserRepository
+from app.schemas.permission import EffectivePrincipal
+from app.services.data_scope_service import DataScopeService
 
 logger = logging.getLogger(__name__)
 
@@ -148,15 +150,19 @@ class VisitorWebStatusService:
         tenant_id: int,
         agent_id: int,
         roles: list[str] | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         """Return visitor Web status for an agent-authorized conversation."""
         conversation = await ConversationRepository.get_by_id(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
 
-        can_view_all = "admin" in (roles or ["agent"])
-        if not can_view_all and conversation.agent_id != agent_id:
-            raise ForbiddenError("No permission to view conversation")
+        if principal is not None:
+            await DataScopeService.assert_conversation_access(db, principal, conversation)
+        else:
+            can_view_all = "admin" in (roles or ["agent"])
+            if not can_view_all and conversation.agent_id != agent_id:
+                raise ForbiddenError("No permission to view conversation")
 
         return await VisitorWebStatusService.build_status_response(r, conversation)
 

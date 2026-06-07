@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.services.channel_service import ChannelService
-from app.services.routing_service import RoutingService
+from app.services.routing_service import RouteQueueCandidate, RoutingService
 
 
 def _channel(cid: int, tenant_id: int = 7, access_mode: str = "url") -> SimpleNamespace:
@@ -24,6 +24,29 @@ def _service_hours(**overrides):
     }
     data.update(overrides)
     return SimpleNamespace(**data)
+
+
+def _candidate(
+    queue_id: int,
+    *,
+    waiting: int,
+    tail: int,
+    available: bool,
+    gate: bool = True,
+    order: int = 0,
+) -> RouteQueueCandidate:
+    return RouteQueueCandidate(
+        queue_type="employee_group",
+        queue_id=queue_id,
+        group_id=queue_id,
+        member_ids=[queue_id * 10],
+        max_concurrent_map={queue_id * 10: 10},
+        waiting_count=waiting,
+        tail_wait_seconds=tail,
+        gate_passed=gate,
+        has_available_agent=available,
+        order=order,
+    )
 
 
 @pytest.mark.asyncio
@@ -127,3 +150,59 @@ async def test_rule_matches_combined_and_semantics():
         ],
     )
     assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_sequential_overflow_requires_immediate_available_candidate(monkeypatch):
+    rule = SimpleNamespace(target_strategy="sequential_overflow")
+
+    async def fake_resolve(*args, **kwargs):
+        return [
+            _candidate(1, waiting=0, tail=0, available=False, order=0),
+            _candidate(2, waiting=4, tail=30, available=True, order=1),
+        ]
+
+    monkeypatch.setattr(RoutingService, "_resolve_candidates_for_rule", fake_resolve)
+
+    selected = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
+
+    assert selected is not None
+    assert selected.queue_id == 2
+
+
+@pytest.mark.asyncio
+async def test_least_waiting_strategy_uses_tail_time_as_tiebreaker(monkeypatch):
+    rule = SimpleNamespace(target_strategy="least_waiting_count")
+
+    async def fake_resolve(*args, **kwargs):
+        return [
+            _candidate(1, waiting=3, tail=20, available=False, order=0),
+            _candidate(2, waiting=1, tail=50, available=False, order=1),
+            _candidate(3, waiting=1, tail=10, available=False, order=2),
+        ]
+
+    monkeypatch.setattr(RoutingService, "_resolve_candidates_for_rule", fake_resolve)
+
+    selected = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
+
+    assert selected is not None
+    assert selected.queue_id == 3
+
+
+@pytest.mark.asyncio
+async def test_shortest_tail_wait_strategy_uses_waiting_count_as_tiebreaker(monkeypatch):
+    rule = SimpleNamespace(target_strategy="shortest_tail_wait")
+
+    async def fake_resolve(*args, **kwargs):
+        return [
+            _candidate(1, waiting=5, tail=10, available=False, order=0),
+            _candidate(2, waiting=2, tail=10, available=False, order=1),
+            _candidate(3, waiting=1, tail=40, available=False, order=2),
+        ]
+
+    monkeypatch.setattr(RoutingService, "_resolve_candidates_for_rule", fake_resolve)
+
+    selected = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
+
+    assert selected is not None
+    assert selected.queue_id == 2

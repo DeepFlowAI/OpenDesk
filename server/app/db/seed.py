@@ -19,6 +19,7 @@ from app.configs.settings import settings
 from app.core.security import hash_password
 from app.models.employee import Employee
 from app.models.tenant import Tenant
+from app.services.role_service import RoleService
 from app.services.tenant_init_service import init_tenant_data
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,10 @@ async def seed_system_defaults(db: AsyncSession) -> None:
     Call site: ``app.main.lifespan`` after ``run_migrations()``.
     """
     await _ensure_default_tenant(db)
+    tenant_ids = (await db.execute(select(Tenant.id))).scalars().all()
+    for tenant_id in tenant_ids:
+        await RoleService.ensure_system_roles(db, tenant_id)
+        await RoleService.backfill_employee_roles(db, tenant_id)
 
 
 async def _ensure_default_tenant(db: AsyncSession) -> None:

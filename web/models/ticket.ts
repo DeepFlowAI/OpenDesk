@@ -45,6 +45,7 @@ export type TicketChangeValue =
 export type TicketChangeEntry = {
   field_key: string
   field_label: string
+  field_source?: string
   old_value: TicketChangeValue
   new_value: TicketChangeValue
 }

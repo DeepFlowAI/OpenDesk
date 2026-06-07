@@ -47,6 +47,12 @@ export type CallRecordUserBrief = {
   email: string | null
 }
 
+export type QueueRecordBrief = {
+  queue_type: 'employee_group' | 'employee' | string
+  queue_id: number
+  name: string
+}
+
 export type WebRTCSession = {
   id: number
   employee_id: number
@@ -76,6 +82,8 @@ export type CallRecordListItem = {
   ended_at: string | null
   ring_duration_ms: number | null
   talk_duration_ms: number | null
+  last_assigned_queue: QueueRecordBrief | null
+  queue_duration_seconds: number | null
 }
 
 export type CallRecordDetail = CallRecordListItem & {

@@ -5,6 +5,7 @@ import { useLocaleStore } from '@/context/locale-store'
 import { useCallReportsTrend } from '@/service/use-call-reports'
 import type { CallMetricKey, CallTrendBucket, TrendType } from '@/models/call-report'
 import { formatDuration } from '@/utils/format-duration'
+import { formatTrendXLabel, shouldShowTrendXLabel } from '@/utils/trend-chart-x-axis'
 import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
 import {
@@ -80,8 +81,6 @@ export function CallTrendChartCard({
     })
   }, [maxValue, metric])
 
-  const xLabels = useMemo(() => buckets.map((bucket) => bucket.label), [buckets])
-
   const chartTitle = t('ws.records.callReports.trend.chartTitle', locale)
     .replace('{metric}', t(callMetricLabelKey[metric], locale))
     .replace('{type}', t(trendTypeLabelKey[trend], locale))
@@ -148,9 +147,21 @@ export function CallTrendChartCard({
                 )
               })}
             </div>
-            <div className="flex h-6 items-center justify-between px-2 pt-1 text-[11px] text-[#999999]">
-              {pickXLabels(xLabels).map((label, index) => (
-                <span key={`${label}-${index}`}>{label}</span>
+            <div
+              className={cn(
+                'flex h-6 gap-1.5 px-2 pt-1 text-[#999999]',
+                trend === 'half_hour' ? 'text-[9px]' : trend === 'hour' ? 'text-[10px]' : 'text-[11px]',
+              )}
+            >
+              {buckets.map((bucket, index) => (
+                <div
+                  key={`x-${bucket.label}-${index}`}
+                  className="flex-1 truncate text-center leading-none"
+                >
+                  {shouldShowTrendXLabel(index, buckets.length, trend)
+                    ? formatTrendXLabel(bucket.label, index, trend)
+                    : ''}
+                </div>
               ))}
             </div>
           </div>
@@ -186,12 +197,4 @@ export function CallTrendChartCard({
       </div>
     </div>
   )
-}
-
-function pickXLabels(all: string[]): string[] {
-  if (all.length <= 12) return all
-  const step = Math.ceil(all.length / 7)
-  const picked: string[] = []
-  for (let i = 0; i < all.length; i += step) picked.push(all[i])
-  return picked
 }

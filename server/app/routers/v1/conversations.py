@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
-from app.db.deps import get_db, get_redis, get_current_user
+from app.db.deps import get_db, get_redis, get_current_user, get_current_principal, require_permission
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.conversation import (
     ConversationResponse,
     ConversationListResponse,
@@ -31,20 +32,24 @@ from app.services.satisfaction_survey_record_service import SatisfactionSurveyRe
 from app.services.visitor_web_status_service import VisitorWebStatusService
 from app.enums import MessageSenderType
 
-router = APIRouter(prefix="/conversations", tags=["Conversations"])
+router = APIRouter(
+    prefix="/conversations",
+    tags=["Conversations"],
+    dependencies=[Depends(require_permission("chat.workspace.use"))],
+)
 
 
 @router.get("", response_model=ConversationListResponse)
 async def list_conversations(
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Get all active conversations for the current agent."""
     items = await ConversationService.get_agent_conversations(
         db,
-        tenant_id=user["tenant_id"],
-        agent_id=user["user_id"],
-        roles=user.get("roles", ["agent"]),
+        tenant_id=principal.tenant_id,
+        agent_id=principal.user_id,
+        principal=principal,
     )
     return {"items": items, "total": len(items)}
 
@@ -53,15 +58,15 @@ async def list_conversations(
 async def get_conversation(
     conversation_id: int,
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Get a single conversation by ID."""
     return await ConversationService.get_agent_conversation(
         db,
         conversation_id=conversation_id,
-        tenant_id=user["tenant_id"],
-        agent_id=user["user_id"],
-        roles=user.get("roles", ["agent"]),
+        tenant_id=principal.tenant_id,
+        agent_id=principal.user_id,
+        principal=principal,
     )
 
 
@@ -94,17 +99,17 @@ async def list_conversation_history(
     before_id: int | None = Query(None, description="Cursor: load history before this conversation ID"),
     limit: int = Query(10, ge=1, le=10),
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Get read-only visitor history for the current workspace conversation."""
     return await ConversationService.get_workspace_visitor_history(
         db,
         conversation_id=conversation_id,
-        tenant_id=user["tenant_id"],
-        agent_id=user["user_id"],
-        roles=user.get("roles", ["agent"]),
+        tenant_id=principal.tenant_id,
+        agent_id=principal.user_id,
         before_id=before_id,
         limit=limit,
+        principal=principal,
     )
 
 
@@ -113,16 +118,16 @@ async def get_visitor_web_status(
     conversation_id: int,
     db: AsyncSession = Depends(get_db),
     r: aioredis.Redis = Depends(get_redis),
-    user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Get the selected conversation's visitor Web SDK online status."""
     return await VisitorWebStatusService.get_conversation_status(
         db,
         r,
         conversation_id=conversation_id,
-        tenant_id=user["tenant_id"],
-        agent_id=user["user_id"],
-        roles=user.get("roles", ["agent"]),
+        tenant_id=principal.tenant_id,
+        agent_id=principal.user_id,
+        principal=principal,
     )
 
 
@@ -131,13 +136,15 @@ async def get_conversation_satisfaction(
     conversation_id: int,
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Get satisfaction survey state for a workspace conversation."""
     return await SatisfactionSurveyRecordService.get_conversation_state(
         db,
         conversation_id=conversation_id,
-        tenant_id=user["tenant_id"],
+        tenant_id=principal.tenant_id,
         user=user,
+        principal=principal,
     )
 
 
@@ -147,14 +154,16 @@ async def send_satisfaction_invitation(
     body: SatisfactionInviteRequest | None = None,
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Create or resend a satisfaction survey invitation."""
     return await SatisfactionSurveyRecordService.send_agent_invitation(
         db,
         conversation_id=conversation_id,
-        tenant_id=user["tenant_id"],
+        tenant_id=principal.tenant_id,
         user=user,
         force=bool(body and body.force),
+        principal=principal,
     )
 
 
@@ -237,7 +246,11 @@ async def send_message(
 
 # -- Agent status endpoints (grouped under /conversations for convenience) --
 
-agent_router = APIRouter(prefix="/agent", tags=["AgentStatus"])
+agent_router = APIRouter(
+    prefix="/agent",
+    tags=["AgentStatus"],
+    dependencies=[Depends(require_permission("chat.workspace.use"))],
+)
 
 
 @agent_router.get("/status", response_model=AgentStatusResponse)

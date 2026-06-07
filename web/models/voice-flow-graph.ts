@@ -67,8 +67,29 @@ export type ConditionGroup = {
 
 export type ConditionData = { groups: ConditionGroup[] }
 
+export type AssignQueueTargetStrategy =
+  | 'sequential_overflow'
+  | 'least_waiting_count'
+  | 'shortest_tail_wait'
+
+export type AssignQueueTargetType = 'user_field' | 'employee_group' | 'employee'
+
+export type AssignQueueTarget = {
+  queue_type: AssignQueueTargetType
+  queue_id: number | null
+}
+
 export type AssignQueueData = {
-  employee_group_id: number | null
+  employee_group_id?: number | null
+  target_strategy: AssignQueueTargetStrategy
+  queue_targets: AssignQueueTarget[]
+  queue_prompt_text: string
+  prompt_play_mode: 'once' | 'loop'
+  prompt_loop_interval_seconds: number | null
+  queue_limit_prompt_text: string
+  no_available_queue_prompt_text: string
+  queue_timeout_prompt_text: string
+  agent_no_answer_prompt_text: string
   timeout_seconds: number | null
 }
 
@@ -147,6 +168,22 @@ export function defaultCollectData(): CollectData {
   }
 }
 
+export function defaultAssignQueueData(): AssignQueueData {
+  return {
+    employee_group_id: null,
+    target_strategy: 'sequential_overflow',
+    queue_targets: [{ queue_type: 'employee_group', queue_id: null }],
+    queue_prompt_text: '正在为您转接，请稍候。',
+    prompt_play_mode: 'once',
+    prompt_loop_interval_seconds: 15,
+    queue_limit_prompt_text: '当前排队人数较多，请稍后再拨。',
+    no_available_queue_prompt_text: '当前坐席繁忙，请稍后再拨。',
+    queue_timeout_prompt_text: '暂时无法接通坐席，请稍后再拨。',
+    agent_no_answer_prompt_text: '暂无坐席接听，请稍后再拨。',
+    timeout_seconds: 60,
+  }
+}
+
 export function defaultGroup(): ConditionGroup {
   return {
     id: `g_${Math.random().toString(36).slice(2, 8)}`,
@@ -167,7 +204,7 @@ export function defaultDataFor(type: NodeType): FlowNode['data'] {
     case 'condition':
       return { groups: [defaultGroup()] }
     case 'assign_queue':
-      return { employee_group_id: null, timeout_seconds: 60 }
+      return defaultAssignQueueData()
     case 'hangup':
       return { pre_play: null }
   }

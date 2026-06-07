@@ -2,23 +2,38 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
+import { type ComponentType } from 'react'
 import { IconActivity, IconChartBar, IconHeadset, IconMessageCircle, IconPhone } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
 import { useSystemInfo } from '@/service/use-system'
 import { t } from '@/utils/i18n'
+import {
+  WORKSPACE_RECORD_NAV_GROUPS,
+  type WorkspaceRecordIconKey,
+} from '@/config/workspace-permissions'
+import { hasAnyPermission } from '@/utils/permissions'
 
 type SubNavItem = {
   labelKey: string
   href: string
-  icon: React.ComponentType<{ size?: number; className?: string }>
-  /** Optional gate; when false, the item is hidden. */
-  visible?: boolean
+  iconKey: WorkspaceRecordIconKey
+  permissions: string[]
+  requiresReports?: boolean
 }
 
 type SubNavGroup = {
   items: SubNavItem[]
+}
+
+const RECORD_NAV_ICONS: Record<WorkspaceRecordIconKey, ComponentType<{ size?: number; className?: string }>> = {
+  onlineMonitor: IconActivity,
+  sessions: IconMessageCircle,
+  sessionReports: IconChartBar,
+  callMonitor: IconHeadset,
+  calls: IconPhone,
+  callReports: IconChartBar,
 }
 
 export default function RecordsLayout({ children }: { children: React.ReactNode }) {
@@ -27,30 +42,13 @@ export default function RecordsLayout({ children }: { children: React.ReactNode 
   const user = useAuthStore((state) => state.user)
   const { data: systemInfo } = useSystemInfo()
   const reportsEnabled = systemInfo?.reports_enabled ?? false
-  const isAdmin = user?.roles?.includes('admin') ?? false
-  const canViewCallMonitor = user?.roles?.some((role) =>
-    ['admin', 'supervisor', 'call_monitor'].includes(role)
-  ) ?? false
 
-  const SUB_NAV_GROUPS: SubNavGroup[] = [
-    {
-      items: [
-        { labelKey: 'ws.records.nav.onlineMonitor', href: '/workspace/records/online-monitor', icon: IconActivity, visible: reportsEnabled },
-        { labelKey: 'ws.records.nav.sessions', href: '/workspace/records/sessions', icon: IconMessageCircle },
-        { labelKey: 'ws.records.nav.sessionReports', href: '/workspace/records/session-reports', icon: IconChartBar, visible: reportsEnabled },
-      ],
-    },
-    {
-      items: [
-        { labelKey: 'ws.records.nav.callMonitor', href: '/workspace/records/call-monitor', icon: IconHeadset, visible: reportsEnabled && canViewCallMonitor },
-        { labelKey: 'ws.records.nav.calls', href: '/workspace/records/calls', icon: IconPhone },
-        { labelKey: 'ws.records.nav.callReports', href: '/workspace/records/call-reports', icon: IconChartBar, visible: reportsEnabled && isAdmin },
-      ],
-    },
-  ]
-  const visibleSubNavGroups = SUB_NAV_GROUPS
+  const visibleSubNavGroups: SubNavGroup[] = WORKSPACE_RECORD_NAV_GROUPS
     .map((group) => ({
-      items: group.items.filter((item) => item.visible !== false),
+      items: group.items.filter((item) => {
+        if (item.requiresReports && !reportsEnabled) return false
+        return hasAnyPermission(user, item.permissions)
+      }),
     }))
     .filter((group) => group.items.length > 0)
 
@@ -69,7 +67,7 @@ export default function RecordsLayout({ children }: { children: React.ReactNode 
             >
               {group.items.map((item) => {
                 const active = pathname.startsWith(item.href)
-                const Icon = item.icon
+                const Icon = RECORD_NAV_ICONS[item.iconKey]
                 return (
                   <Link
                     key={item.href}

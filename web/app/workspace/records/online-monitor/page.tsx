@@ -1,12 +1,14 @@
 'use client'
 
 import { IconRefresh } from '@tabler/icons-react'
+import { EmployeeMonitorTable } from '@/app/components/features/online-monitor/employee-monitor-table'
+import { TodayCards } from '@/app/components/features/online-monitor/today-cards'
+import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
 import { useOnlineMonitor } from '@/service/use-online-monitor'
 import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
-import { EmployeeMonitorTable } from '@/app/components/features/online-monitor/employee-monitor-table'
-import { TodayCards } from '@/app/components/features/online-monitor/today-cards'
+import { hasPermission } from '@/utils/permissions'
 
 function formatTime(asOf?: string | null): string {
   if (!asOf) return '—'
@@ -18,7 +20,17 @@ function formatTime(asOf?: string | null): string {
 
 export default function OnlineMonitorPage() {
   const { locale } = useLocaleStore()
-  const { data, isFetching, isError, refetch } = useOnlineMonitor(true)
+  const user = useAuthStore((state) => state.user)
+  const canView = hasPermission(user, 'chat.online_monitor.view')
+  const { data, isFetching, isError, refetch } = useOnlineMonitor(canView)
+
+  if (!canView) {
+    return (
+      <div className="flex h-full items-center justify-center p-6 text-sm text-muted-foreground">
+        {t('ws.records.onlineMonitor.noPermission', locale)}
+      </div>
+    )
+  }
 
   return (
     <div className="flex h-full flex-col overflow-auto">

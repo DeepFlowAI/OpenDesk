@@ -24,7 +24,7 @@ function formatFullTime(dateStr: string): string {
   return d.toLocaleString('sv-SE').replace('T', ' ')
 }
 
-const BOT_BUBBLE_CLASS = 'rounded-lg bg-secondary px-3 py-2 text-sm text-foreground break-words'
+const BOT_BUBBLE_CLASS = 'rounded-lg bg-secondary px-3 py-2 text-sm text-foreground break-words break-all whitespace-pre-wrap max-w-full min-w-0'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -148,7 +148,7 @@ function OpenAgentThinkingBlock({
         </span>
       </button>
       {expanded && hasContent && (
-        <div className="whitespace-pre-wrap break-words px-3 pb-3 pl-9 text-xs leading-5 text-[#52525B]">
+        <div className="whitespace-pre-wrap break-words break-all px-3 pb-3 pl-9 text-xs leading-5 text-[#52525B]">
           {content}
         </div>
       )}
@@ -400,7 +400,7 @@ function MessageBubble({
       </div>
 
       {/* Content */}
-      <div className={cn('flex max-w-[70%] flex-col', isOwn ? 'items-end' : 'items-start')}>
+      <div className={cn('flex min-w-0 max-w-[70%] flex-col', isOwn ? 'items-end' : 'items-start')}>
         <div className={cn('mb-0.5 text-xs text-muted-foreground', isOwn && 'text-right')}>
           {senderName}
         </div>
@@ -411,7 +411,7 @@ function MessageBubble({
             content={message.content}
           />
         ) : hasOpenAgentTrace ? (
-          <div className="w-full space-y-2">
+          <div className="w-full min-w-0 space-y-2">
             <OpenAgentTraceBlocks
               textBlocks={textBlocks}
               thinkingBlocks={thinkingBlocks}
@@ -425,9 +425,9 @@ function MessageBubble({
         ) : (
           <div
             className={cn(
-              'rounded-lg px-3 py-2 text-sm break-words',
+              'max-w-full rounded-lg px-3 py-2 text-sm break-words break-all whitespace-pre-wrap',
               isAgent ? 'bg-primary text-primary-foreground' : 'bg-secondary text-foreground',
-              isBot ? [markdownTextRootClass, richTextListStyleClass] : 'whitespace-pre-wrap'
+              isBot && [markdownTextRootClass, richTextListStyleClass],
             )}
           >
             {isBot ? <MarkdownText>{stripOpenAgentThinkSections(message.content)}</MarkdownText> : message.content}

@@ -38,3 +38,9 @@ class Employee(Base, TimestampMixin):
     is_super_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     tenant: Mapped["Tenant"] = relationship("Tenant", back_populates="employees")
+    role_links: Mapped[list["EmployeeRole"]] = relationship(
+        "EmployeeRole",
+        back_populates="employee",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )

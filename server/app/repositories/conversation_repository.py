@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, func, update, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.enums import ConversationStatus
 from app.models.conversation import Conversation
@@ -370,6 +371,7 @@ class ConversationRepository:
         before_id: int | None = None,
         agent_id: int | None = None,
         limit: int = 10,
+        scope_predicate: ColumnElement | None = None,
     ) -> list[Conversation]:
         """Get visitor conversations, newest first."""
         sort_expr = func.coalesce(Conversation.started_at, Conversation.created_at)
@@ -377,6 +379,8 @@ class ConversationRepository:
             Conversation.tenant_id == tenant_id,
             Conversation.visitor_id == visitor_id,
         ]
+        if scope_predicate is not None:
+            conditions.append(scope_predicate)
         if channel_id is not None:
             conditions.append(Conversation.channel_id == channel_id)
         if agent_id is not None:

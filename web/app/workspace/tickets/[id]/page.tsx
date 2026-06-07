@@ -9,6 +9,7 @@ import {
   IconChevronRight,
 } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { cn } from '@/lib/utils'
 import {
   useTicket,
@@ -26,7 +27,7 @@ import type {
   FdFormLayoutTab,
 } from '@/models/form-layout'
 import type { FdInteractionRule, InteractionRuleCondition } from '@/models/interaction-rule'
-import type { CustomFieldValue, TicketChange, TicketChangeValue } from '@/models/ticket'
+import type { CustomFieldValue, TicketChange, TicketChangeEntry, TicketChangeValue } from '@/models/ticket'
 import type { UnifiedField } from '@/models/field-definition'
 import { FieldType } from '@/types/field-enums'
 import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
@@ -52,9 +53,11 @@ import { useEmployee } from '@/service/use-employees'
 import { useEmployeeGroup } from '@/service/use-employee-groups'
 import { SessionDetailDrawer } from '@/app/components/features/session-records/session-detail-drawer'
 import { CallRecordDetailDrawer } from '@/app/components/features/call-center/call-record-detail-drawer'
+import { hasPermission } from '@/utils/permissions'
 
 type FieldState = 'hidden' | 'required' | 'optional' | 'readonly'
 const TICKET_CHANGE_CREATE_FIELD_KEY = '__create__'
+const TICKET_WORKFLOW_FIELD_SOURCE = 'ticket_workflow'
 
 /** Maps layout field_source to UnifiedField.domain for scoped definition lookup. */
 function unifiedDomainForLayoutFieldSource(source: FdFormLayoutField['field_source']): string {
@@ -70,14 +73,68 @@ function unifiedDomainForLayoutFieldSource(source: FdFormLayoutField['field_sour
   }
 }
 
+function fieldAppliesToTicket(field: UnifiedField): boolean {
+  return field.domain === 'ticket'
+    || (field.domain === 'shared_pool' && (field.applicable_modules?.some((m) => m === 'ticket') ?? false))
+}
+
+function registerFieldLookup(map: Map<string, UnifiedField>, field: UnifiedField) {
+  const domains = new Set<string>([field.domain])
+  if (fieldAppliesToTicket(field)) domains.add('ticket')
+
+  for (const domain of domains) {
+    if (field.key) map.set(`${domain}:${field.key}`, field)
+    if (field.id != null) map.set(`${domain}:${field.id}`, field)
+  }
+}
+
+function addScopedCustomFieldValueAliases(
+  target: Record<string, unknown>,
+  valueScope: 'ticket' | 'user' | 'org',
+  lookupDomain: 'ticket' | 'user' | 'organization',
+  rawKey: string,
+  value: unknown,
+  fieldDefMap: Map<string, UnifiedField>,
+) {
+  target[`${valueScope}:${rawKey}`] = value
+  const fieldDef = fieldDefMap.get(`${lookupDomain}:${rawKey}`)
+  if (fieldDef?.source !== 'custom') return
+
+  if (fieldDef.key) target[`${valueScope}:${fieldDef.key}`] = value
+  if (fieldDef.id != null) target[`${valueScope}:${fieldDef.id}`] = value
+}
+
+function addTicketEditValueAliases(
+  target: Record<string, unknown>,
+  rawKey: string,
+  value: unknown,
+  fieldDefMap: Map<string, UnifiedField>,
+) {
+  target[rawKey] = value
+  const fieldDef = fieldDefMap.get(`ticket:${rawKey}`)
+  if (fieldDef?.source !== 'custom') return
+
+  if (fieldDef.key) target[fieldDef.key] = value
+  if (fieldDef.id != null) target[String(fieldDef.id)] = value
+}
+
+function ticketPayloadFieldKey(rawKey: string, fieldDefMap: Map<string, UnifiedField>): string {
+  const fieldDef = fieldDefMap.get(`ticket:${rawKey}`)
+  if (fieldDef?.source !== 'custom') return rawKey
+  return fieldDef.key ?? (fieldDef.id != null ? String(fieldDef.id) : rawKey)
+}
+
 export default function TicketDetailPage() {
   const { locale } = useLocaleStore()
+  const currentUser = useAuthStore((state) => state.user)
   const isZh = locale === 'zh'
   const router = useRouter()
   const params = useParams()
   const searchParams = useSearchParams()
   const ticketId = Number(params.id)
   const fromList = searchParams.get('from') === 'list'
+  const canEditTicket = hasPermission(currentUser, 'ticket.workspace.edit')
+  const canCommentTicket = hasPermission(currentUser, 'ticket.workspace.comment')
 
   // ── Data fetching ──
   const { data: ticket, isLoading } = useTicket(ticketId)
@@ -103,7 +160,7 @@ export default function TicketDetailPage() {
   )
 
   const { fieldDefMap, ticketChangeFieldDefMap } = useMemo(() => {
-    const byKey = new Map<string, UnifiedField>()
+    const byRef = new Map<string, UnifiedField>()
     const changeMap = new Map<string, UnifiedField>()
     const all = [
       ...(ticketFields?.items ?? []),
@@ -112,14 +169,15 @@ export default function TicketDetailPage() {
       ...(sharedFields?.items ?? []),
     ]
     for (const f of all) {
-      if (f.key) byKey.set(`${f.domain}:${f.key}`, f)
+      registerFieldLookup(byRef, f)
 
-      if (f.domain === 'ticket' || f.domain === 'shared_pool') {
+      if (fieldAppliesToTicket(f)) {
         if (f.key) changeMap.set(f.key, f)
         if (f.slot_column) changeMap.set(f.slot_column, f)
+        if (f.id != null) changeMap.set(String(f.id), f)
       }
     }
-    return { fieldDefMap: byKey, ticketChangeFieldDefMap: changeMap }
+    return { fieldDefMap: byRef, ticketChangeFieldDefMap: changeMap }
   }, [ticketFields, userFields, orgFields, sharedFields])
 
   const resolveTicketScopedFieldDef = useCallback(
@@ -157,7 +215,7 @@ export default function TicketDetailPage() {
     // Ticket custom fields
     if (ticket.custom_fields) {
       for (const [k, v] of Object.entries(ticket.custom_fields)) {
-        if (v != null) vals[`ticket:${k}`] = v
+        if (v != null) addScopedCustomFieldValueAliases(vals, 'ticket', 'ticket', k, v, fieldDefMap)
       }
     }
 
@@ -169,7 +227,7 @@ export default function TicketDetailPage() {
       }
       if (relatedUser.custom_fields) {
         for (const [k, v] of Object.entries(relatedUser.custom_fields)) {
-          if (v != null) vals[`user:${k}`] = v
+          if (v != null) addScopedCustomFieldValueAliases(vals, 'user', 'user', k, v, fieldDefMap)
         }
       }
     }
@@ -182,13 +240,13 @@ export default function TicketDetailPage() {
       }
       if (relatedOrg.custom_fields) {
         for (const [k, v] of Object.entries(relatedOrg.custom_fields)) {
-          if (v != null) vals[`org:${k}`] = v
+          if (v != null) addScopedCustomFieldValueAliases(vals, 'org', 'organization', k, v, fieldDefMap)
         }
       }
     }
 
     return vals
-  }, [ticket, relatedUser, relatedOrg])
+  }, [ticket, relatedUser, relatedOrg, fieldDefMap])
 
   // Editable form state (only for ticket-source editable fields)
   const [editValues, setEditValues] = useState<Record<string, unknown>>({})
@@ -219,11 +277,11 @@ export default function TicketDetailPage() {
     if (ticket.assignee_group_id != null) vals.assignee_group = ticket.assignee_group_id
     if (ticket.custom_fields) {
       for (const [k, v] of Object.entries(ticket.custom_fields)) {
-        if (v != null) vals[k] = v
+        if (v != null) addTicketEditValueAliases(vals, k, v, fieldDefMap)
       }
     }
     setEditValues(vals)
-  }, [ticket])
+  }, [ticket, fieldDefMap])
 
   // ── Layout ──
   const tabs = useMemo(() => {
@@ -232,8 +290,12 @@ export default function TicketDetailPage() {
   }, [layout])
 
   const setEditFieldValue = useCallback((key: string, value: unknown) => {
-    setEditValues((prev) => ({ ...prev, [key]: value }))
-  }, [])
+    setEditValues((prev) => {
+      const next = { ...prev }
+      addTicketEditValueAliases(next, key, value, fieldDefMap)
+      return next
+    })
+  }, [fieldDefMap])
 
   const toggleTab = useCallback((tabId: number) => {
     setCollapsedTabs((prev) => {
@@ -262,9 +324,10 @@ export default function TicketDetailPage() {
 
   const getFieldDef = useCallback((field: FdFormLayoutField): UnifiedField | undefined => {
     const domain = unifiedDomainForLayoutFieldSource(field.field_source)
-    const key = getFieldKey(field)
-    return fieldDefMap.get(`${domain}:${key}`)
-  }, [fieldDefMap, getFieldKey])
+    if (field.field_key) return fieldDefMap.get(`${domain}:${field.field_key}`)
+    if (field.field_definition_id != null) return fieldDefMap.get(`${domain}:${field.field_definition_id}`)
+    return undefined
+  }, [fieldDefMap])
 
   // Get the display value for a field, considering its source
   const getFieldValue = useCallback((field: FdFormLayoutField): unknown => {
@@ -318,7 +381,7 @@ export default function TicketDetailPage() {
         if (systemFields.includes(payloadKey)) {
           payload[payloadKey] = value
         } else {
-          customFields[payloadKey] = value as CustomFieldValue
+          customFields[ticketPayloadFieldKey(payloadKey, fieldDefMap)] = value as CustomFieldValue
         }
       }
 
@@ -346,7 +409,7 @@ export default function TicketDetailPage() {
     } finally {
       setSaving(false)
     }
-  }, [saving, editValues, ticketId, updateTicket])
+  }, [saving, editValues, ticketId, updateTicket, fieldDefMap])
 
   const columnsPerRow = layout?.columns_per_row ?? 2
   const labelPosition = layout?.label_position ?? 'top'
@@ -398,13 +461,15 @@ export default function TicketDetailPage() {
           </div>
         )}
 
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="relative z-20 h-9 shrink-0 rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
-        >
-          {saving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存' : 'Save')}
-        </button>
+        {canEditTicket && (
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="relative z-20 h-9 shrink-0 rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
+          >
+            {saving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存' : 'Save')}
+          </button>
+        )}
       </div>
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
@@ -440,7 +505,7 @@ export default function TicketDetailPage() {
                     collapsedSections={collapsedSections}
                     onToggleSection={toggleSection}
                     editingFieldId={editingFieldId}
-                    onStartEdit={setEditingFieldId}
+                    onStartEdit={canEditTicket ? setEditingFieldId : () => undefined}
                     onOpenSessionDrawer={setSelectedSessionRecordId}
                     onOpenCallDrawer={setSelectedCallRecordId}
                     conversationPublicId={ticket.conversation_public_id ?? ticket.call_record_call_id ?? undefined}
@@ -502,7 +567,7 @@ export default function TicketDetailPage() {
                   showKindBadge={rightTab === 'all'}
                 />
               )}
-              showComposer={rightTab === 'comments'}
+              showComposer={rightTab === 'comments' && canCommentTicket}
               emptyText={
                 rightTab === 'comments'
                   ? (isZh ? '暂无评论' : 'No comments yet')
@@ -602,6 +667,9 @@ function TicketChangeCard({
 }) {
   const actorName = getChangeActorName(change, isZh)
   const isCreateRecord = change.field_key === TICKET_CHANGE_CREATE_FIELD_KEY
+  const entryGroups = change.entries && change.entries.length > 0
+    ? getTicketChangeEntryGroups(change.entries, isZh)
+    : []
 
   return (
     <div className="min-w-0 rounded-lg bg-white px-4 py-3.5">
@@ -624,43 +692,24 @@ function TicketChangeCard({
           {formatChangeTime(change.created_at, isZh)}
         </time>
       </div>
-      {change.entries && change.entries.length > 0 ? (
+      {entryGroups.length > 0 ? (
         <div className="flex flex-col gap-3">
-          {change.entries.map((entry, idx) => (
-            <div
-              key={`${change.id}-${entry.field_key}-${idx}`}
-              className="min-w-0 text-xs leading-relaxed text-foreground"
-            >
-              {isCreateRecord ? (
-                <>
-                  <span>{entry.field_label}</span>
-                  <span className="mx-1">:</span>
-                  <ChangeValuePill
-                    value={entry.new_value}
-                    fieldKey={entry.field_key}
-                    fieldDef={resolveFieldDef(entry.field_key)}
-                    isZh={isZh}
-                  />
-                </>
-              ) : (
-                <>
-                  <span>{entry.field_label}</span>
-                  <span className="mx-1">{isZh ? '从' : 'from'}</span>
-                  <ChangeValuePill
-                    value={entry.old_value}
-                    fieldKey={entry.field_key}
-                    fieldDef={resolveFieldDef(entry.field_key)}
-                    isZh={isZh}
-                  />
-                  <span className="mx-1">{isZh ? '变更为' : 'to'}</span>
-                  <ChangeValuePill
-                    value={entry.new_value}
-                    fieldKey={entry.field_key}
-                    fieldDef={resolveFieldDef(entry.field_key)}
-                    isZh={isZh}
-                  />
-                </>
+          {entryGroups.map((group) => (
+            <div key={group.source} className="flex flex-col gap-2.5">
+              {(entryGroups.length > 1 || group.source === TICKET_WORKFLOW_FIELD_SOURCE) && (
+                <div className="text-[11px] font-medium text-muted-foreground">
+                  {group.label}
+                </div>
               )}
+              {group.entries.map((entry, idx) => (
+                <TicketChangeEntryLine
+                  key={`${change.id}-${group.source}-${entry.field_key}-${idx}`}
+                  entry={entry}
+                  isCreateRecord={isCreateRecord}
+                  isZh={isZh}
+                  resolveFieldDef={resolveFieldDef}
+                />
+              ))}
             </div>
           ))}
         </div>
@@ -685,6 +734,74 @@ function TicketChangeCard({
       )}
     </div>
   )
+}
+
+function TicketChangeEntryLine({
+  entry,
+  isCreateRecord,
+  isZh,
+  resolveFieldDef,
+}: {
+  entry: TicketChangeEntry
+  isCreateRecord: boolean
+  isZh: boolean
+  resolveFieldDef: (fieldKey: string) => UnifiedField | undefined
+}) {
+  return (
+    <div className="min-w-0 text-xs leading-relaxed text-foreground">
+      {isCreateRecord ? (
+        <>
+          <span>{entry.field_label}</span>
+          <span className="mx-1">:</span>
+          <ChangeValuePill
+            value={entry.new_value}
+            fieldKey={entry.field_key}
+            fieldDef={resolveFieldDef(entry.field_key)}
+            isZh={isZh}
+          />
+        </>
+      ) : (
+        <>
+          <span>{entry.field_label}</span>
+          <span className="mx-1">{isZh ? '从' : 'from'}</span>
+          <ChangeValuePill
+            value={entry.old_value}
+            fieldKey={entry.field_key}
+            fieldDef={resolveFieldDef(entry.field_key)}
+            isZh={isZh}
+          />
+          <span className="mx-1">{isZh ? '变更为' : 'to'}</span>
+          <ChangeValuePill
+            value={entry.new_value}
+            fieldKey={entry.field_key}
+            fieldDef={resolveFieldDef(entry.field_key)}
+            isZh={isZh}
+          />
+        </>
+      )}
+    </div>
+  )
+}
+
+function getTicketChangeEntryGroups(entries: TicketChangeEntry[], isZh: boolean) {
+  const employeeEntries = entries.filter((entry) => entry.field_source !== TICKET_WORKFLOW_FIELD_SOURCE)
+  const workflowEntries = entries.filter((entry) => entry.field_source === TICKET_WORKFLOW_FIELD_SOURCE)
+  return [
+    employeeEntries.length > 0
+      ? {
+          source: 'employee',
+          label: isZh ? '员工改动' : 'Employee changes',
+          entries: employeeEntries,
+        }
+      : null,
+    workflowEntries.length > 0
+      ? {
+          source: 'ticket_workflow',
+          label: isZh ? '工单流程改动' : 'Ticket workflow changes',
+          entries: workflowEntries,
+        }
+      : null,
+  ].filter((group): group is { source: string; label: string; entries: TicketChangeEntry[] } => group != null)
 }
 
 function ChangeValuePill({

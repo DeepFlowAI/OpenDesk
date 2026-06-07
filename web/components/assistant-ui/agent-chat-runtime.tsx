@@ -41,6 +41,8 @@ export type AgentChatConfigValue = {
   onLoadHistory: (beforeId?: number) => Promise<void>
   onEndConversation: () => void
   onCreateTicket: () => void
+  canCreateTicket: boolean
+  canTransfer: boolean
   onTransferred: (toName: string) => void
   satisfactionState: SatisfactionConversationState | null
   satisfactionLoading: boolean

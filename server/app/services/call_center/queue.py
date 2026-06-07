@@ -112,6 +112,71 @@ class QueuePicker:
         self._pointers[key] = idx + 1
         return pick
 
+    async def pick_ready_agent_for_queue(
+        self,
+        db: AsyncSession,
+        tenant_id: int,
+        queue_type: str,
+        queue_id: int,
+        r: aioredis.Redis | None = None,
+        *,
+        call_id: str | None = None,
+        offer_id: str | None = None,
+        ttl_seconds: float | None = None,
+    ) -> dict | None:
+        if queue_type == "employee_group":
+            return await self.pick_ready_agent(
+                db,
+                tenant_id,
+                queue_id,
+                r,
+                call_id=call_id,
+                offer_id=offer_id,
+                ttl_seconds=ttl_seconds,
+            )
+
+        from sqlalchemy import select
+        from app.models.agent_status import AgentStatus
+        from app.models.employee import Employee
+
+        result = await db.execute(
+            select(Employee)
+            .join(AgentStatus, AgentStatus.employee_id == Employee.id)
+            .where(
+                Employee.id == queue_id,
+                Employee.tenant_id == tenant_id,
+                Employee.is_active.is_(True),
+                AgentStatus.tenant_id == tenant_id,
+                AgentStatus.status == "ready",
+            )
+            .limit(1)
+        )
+        employee = result.scalar_one_or_none()
+        if employee is None:
+            return None
+
+        pick = {
+            "employee_id": employee.id,
+            "name": employee.display_name or employee.nickname or employee.name or employee.username,
+        }
+        if r is not None and call_id and offer_id:
+            await CcAgentResourceService.ensure_from_visible(
+                r, tenant_id, employee.id, "ready"
+            )
+            reserved = await CcAgentResourceService.reserve_inbound(
+                r,
+                tenant_id,
+                employee.id,
+                call_id=call_id,
+                offer_id=offer_id,
+                queue_id=queue_id,
+                ttl_seconds=ttl_seconds,
+            )
+            if reserved is None:
+                return None
+            return pick | {"resource_state": reserved["resource_state"]}
+        return pick
+
     def reset(self) -> None:
         """Test helper."""
 

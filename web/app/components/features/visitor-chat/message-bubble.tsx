@@ -269,7 +269,7 @@ function OpenAgentTextPart({
   return (
     <div
       className={cn(
-        'min-h-[42px] w-full break-words px-3 py-2 text-sm leading-6',
+        'min-h-[42px] w-full min-w-0 break-words break-all px-3 py-2 text-sm leading-6 whitespace-pre-wrap',
         markdownTextRootClass,
         richTextListStyleClass,
       )}
@@ -293,7 +293,7 @@ function StaticOpenAgentTextBlock({
   return (
     <div
       className={cn(
-        'min-h-[42px] w-full break-words px-3 py-2 text-sm leading-6',
+        'min-h-[42px] w-full min-w-0 break-words break-all px-3 py-2 text-sm leading-6 whitespace-pre-wrap',
         markdownTextRootClass,
         richTextListStyleClass,
       )}
@@ -417,14 +417,14 @@ export function MessageBubble({
           />
         )}
 
-        <div className="flex w-full max-w-[75%] flex-col items-start">
+        <div className="flex w-full min-w-0 max-w-[75%] flex-col items-start">
           {showName && message.sender_name && (
             <span className="mb-1 text-xs font-medium text-muted-foreground">
               {message.sender_name}
             </span>
           )}
 
-          <div className="w-full space-y-2">
+          <div className="w-full min-w-0 space-y-2">
             <MessagePrimitive.Parts components={assistantPartsComponents} />
           </div>
 
@@ -453,14 +453,14 @@ export function MessageBubble({
           />
         )}
 
-        <div className="flex w-full max-w-[75%] flex-col items-start">
+        <div className="flex w-full min-w-0 max-w-[75%] flex-col items-start">
           {showName && message.sender_name && (
             <span className="mb-1 text-xs font-medium text-muted-foreground">
               {message.sender_name}
             </span>
           )}
 
-          <div className="w-full space-y-2">
+          <div className="w-full min-w-0 space-y-2">
             {isThinking && thinkingBlocks.length === 0 && visibleToolBlocks.length === 0 && (
               <OpenAgentThinkingBlock locale={locale} active={isThinking} />
             )}
@@ -498,7 +498,7 @@ export function MessageBubble({
       )}
 
       {/* Bubble */}
-      <div className={`flex max-w-[75%] flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+      <div className={`flex min-w-0 max-w-[75%] flex-col ${isUser ? 'items-end' : 'items-start'}`}>
         {showName && isAssistant && message.sender_name && (
           <span className="mb-1 text-xs font-medium text-muted-foreground">
             {message.sender_name}
@@ -516,8 +516,8 @@ export function MessageBubble({
         ) : (
           <div
             className={cn(
-              'min-h-[42px] break-words px-3 py-2 text-sm',
-              isBot ? [markdownTextRootClass, richTextListStyleClass] : 'flex items-center whitespace-pre-wrap',
+              'min-h-[42px] max-w-full break-words break-all px-3 py-2 text-sm whitespace-pre-wrap',
+              isBot && [markdownTextRootClass, richTextListStyleClass],
             )}
             style={bubbleStyle}
           >

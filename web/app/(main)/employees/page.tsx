@@ -4,8 +4,11 @@ import { useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { IconPencil, IconTrash, IconPlus, IconSearch, IconChevronDown, IconChevronLeft, IconChevronRight } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import { useEmployees, useDeleteEmployee, useUpdateEmployeeStatus } from '@/service/use-employees'
+import { useRoleOptions } from '@/service/use-roles'
 import type { Employee } from '@/models/employee'
 import type { EmployeeListParams } from '@/service/use-employees'
 
@@ -158,17 +161,33 @@ function RoleMultiSelect({
   )
 }
 
-function RoleBadge({ role, locale }: { role: string; locale: 'zh' | 'en' }) {
-  const label = role === 'admin' ? t('emp.role.admin', locale) : t('emp.role.agent', locale)
-  const bg = role === 'admin' ? 'bg-muted text-foreground' : 'bg-info/10 text-info'
+function RoleBadge({ label, system }: { label: string; system?: boolean }) {
+  const bg = system ? 'bg-muted text-foreground' : 'bg-info/10 text-info'
   return <span className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-medium ${bg}`}>{label}</span>
 }
 
-function RoleBadges({ roles, locale }: { roles: string[]; locale: 'zh' | 'en' }) {
+function RoleBadges({ employee, locale }: { employee: Employee; locale: 'zh' | 'en' }) {
+  const assignments = employee.role_assignments ?? []
+  if (assignments.length > 0) {
+    return (
+      <div className="flex flex-wrap gap-1">
+        {employee.is_super_admin && <RoleBadge label={t('emp.role.superAdmin', locale)} system />}
+        {assignments.map((role) => (
+          <RoleBadge key={role.id} label={role.name} system={role.is_system} />
+        ))}
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-wrap gap-1">
-      {roles.map((role) => (
-        <RoleBadge key={role} role={role} locale={locale} />
+      {employee.is_super_admin && <RoleBadge label={t('emp.role.superAdmin', locale)} system />}
+      {employee.roles.map((role) => (
+        <RoleBadge
+          key={role}
+          label={role === 'admin' ? t('emp.role.admin', locale) : t('emp.role.agent', locale)}
+          system
+        />
       ))}
     </div>
   )
@@ -201,8 +220,10 @@ function AvatarCell({ employee }: { employee: Employee }) {
 export default function EmployeesListPage() {
   const router = useRouter()
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const deleteMutation = useDeleteEmployee()
   const statusMutation = useUpdateEmployeeStatus()
+  const { data: roleOptionsData } = useRoleOptions()
 
   const [keyword, setKeyword] = useState('')
   const [roleFilter, setRoleFilter] = useState<string[]>([])
@@ -229,7 +250,7 @@ export default function EmployeesListPage() {
   const handleSearch = useCallback(() => {
     const params: EmployeeListParams = { page: 1, per_page: perPage }
     if (keyword.trim()) params.keyword = keyword.trim()
-    if (roleFilter.length > 0) params.role = roleFilter
+    if (roleFilter.length > 0) params.role_id = roleFilter.map((roleId) => Number(roleId)).filter(Boolean)
     if (statusFilter) params.status = statusFilter
     setPage(1)
     setAppliedParams(params)
@@ -273,10 +294,10 @@ export default function EmployeesListPage() {
     }
   }
 
-  const roleFilterOptions = [
-    { value: 'admin', label: t('emp.role.admin', locale) },
-    { value: 'agent', label: t('emp.role.agent', locale) },
-  ]
+  const roleFilterOptions = (roleOptionsData?.items ?? []).map((role) => ({
+    value: String(role.id),
+    label: role.name,
+  }))
 
   const statusOptions = [
     { value: '', label: t('emp.filter.all', locale) },
@@ -287,6 +308,10 @@ export default function EmployeesListPage() {
   const items = data?.items ?? []
   const total = data?.total ?? 0
   const pages = data?.pages ?? 0
+  const canCreate = hasPermission(user, 'org.employee.create')
+  const canEdit = hasPermission(user, 'org.employee.edit')
+  const canDelete = hasPermission(user, 'org.employee.delete')
+  const hasRowActions = canEdit || canDelete
 
   return (
     <div className="flex flex-col gap-6">
@@ -303,13 +328,15 @@ export default function EmployeesListPage() {
       {/* Page header */}
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-foreground">{t('emp.title', locale)}</h1>
-        <button
-          onClick={() => router.push('/employees/new')}
-          className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
-        >
-          <IconPlus size={18} />
-          {t('emp.new', locale)}
-        </button>
+        {canCreate && (
+          <button
+            onClick={() => router.push('/employees/new')}
+            className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
+          >
+            <IconPlus size={18} />
+            {t('emp.new', locale)}
+          </button>
+        )}
       </div>
 
       {/* Filter row */}
@@ -350,19 +377,21 @@ export default function EmployeesListPage() {
         /* Empty state */
         <div className="flex flex-col items-center justify-center gap-4 py-20">
           <p className="text-sm text-muted-foreground">{t('emp.empty', locale)}</p>
-          <button
-            onClick={() => router.push('/employees/new')}
-            className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white"
-          >
-            <IconPlus size={18} />
-            {t('emp.new', locale)}
-          </button>
+          {canCreate && (
+            <button
+              onClick={() => router.push('/employees/new')}
+              className="flex h-9 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white"
+            >
+              <IconPlus size={18} />
+              {t('emp.new', locale)}
+            </button>
+          )}
         </div>
       ) : (
         <>
           {/* Table */}
           <div className="overflow-x-auto rounded-lg border border-border">
-            <div style={{ minWidth: 1000 }}>
+            <div style={{ minWidth: 1080 }}>
               {/* Table header */}
               <div className="flex h-14 items-center gap-6 rounded-t-lg bg-muted px-6">
                 <div className="w-9 shrink-0"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.avatar', locale)}</span></div>
@@ -372,9 +401,11 @@ export default function EmployeesListPage() {
                 <div className="w-[100px] shrink-0"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.username', locale)}</span></div>
                 <div className="min-w-[160px] flex-1"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.email', locale)}</span></div>
                 <div className="w-[110px] shrink-0"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.phone', locale)}</span></div>
-                <div className="w-[120px] shrink-0"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.role', locale)}</span></div>
+                <div className="w-[180px] shrink-0"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.role', locale)}</span></div>
                 <div className="w-[60px] shrink-0"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.status', locale)}</span></div>
-                <div className="w-[120px] shrink-0 text-right"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.actions', locale)}</span></div>
+                {hasRowActions && (
+                  <div className="w-[120px] shrink-0 text-right"><span className="text-sm font-semibold text-foreground/80">{t('emp.col.actions', locale)}</span></div>
+                )}
               </div>
 
               {/* Table rows */}
@@ -390,30 +421,36 @@ export default function EmployeesListPage() {
                   <div className="w-[100px] shrink-0 truncate text-sm text-muted-foreground">{emp.username}</div>
                   <div className="min-w-[160px] flex-1 truncate text-sm text-muted-foreground">{emp.email ?? '-'}</div>
                   <div className="w-[110px] shrink-0 truncate text-sm text-muted-foreground">{emp.phone ?? '-'}</div>
-                  <div className="w-[120px] shrink-0"><RoleBadges roles={emp.roles} locale={locale} /></div>
+                  <div className="w-[180px] shrink-0"><RoleBadges employee={emp} locale={locale} /></div>
                   <div className="w-[60px] shrink-0"><StatusBadge active={emp.is_active} locale={locale} /></div>
-                  <div className="flex w-[120px] shrink-0 items-center justify-end gap-3">
-                    <button
-                      onClick={() => router.push(`/employees/${emp.id}`)}
-                      className="text-sm text-foreground/80 transition-colors hover:text-foreground"
-                    >
-                      <IconPencil size={18} />
-                    </button>
-                    <button
-                      onClick={() => setStatusTarget(emp)}
-                      className="text-sm text-foreground/80 transition-colors hover:text-foreground"
-                    >
-                      {emp.is_active ? t('emp.action.disable', locale) : t('emp.action.enable', locale)}
-                    </button>
-                    {!emp.is_super_admin && (
-                      <button
-                        onClick={() => setDeleteTarget(emp)}
-                        className="text-foreground/80 transition-colors hover:text-destructive"
-                      >
-                        <IconTrash size={18} />
-                      </button>
-                    )}
-                  </div>
+                  {hasRowActions && (
+                    <div className="flex w-[120px] shrink-0 items-center justify-end gap-3">
+                      {canEdit && (
+                        <>
+                          <button
+                            onClick={() => router.push(`/employees/${emp.id}`)}
+                            className="text-sm text-foreground/80 transition-colors hover:text-foreground"
+                          >
+                            <IconPencil size={18} />
+                          </button>
+                          <button
+                            onClick={() => setStatusTarget(emp)}
+                            className="text-sm text-foreground/80 transition-colors hover:text-foreground"
+                          >
+                            {emp.is_active ? t('emp.action.disable', locale) : t('emp.action.enable', locale)}
+                          </button>
+                        </>
+                      )}
+                      {canDelete && !emp.is_super_admin && (
+                        <button
+                          onClick={() => setDeleteTarget(emp)}
+                          className="text-foreground/80 transition-colors hover:text-destructive"
+                        >
+                          <IconTrash size={18} />
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -458,7 +495,7 @@ export default function EmployeesListPage() {
       )}
 
       {/* Delete confirm modal */}
-      {deleteTarget && (
+      {canDelete && deleteTarget && (
         <ConfirmModal
           title={t('emp.delete.title', locale)}
           message={t('emp.delete.confirm', locale, { name: deleteTarget.name })}
@@ -472,7 +509,7 @@ export default function EmployeesListPage() {
       )}
 
       {/* Status toggle confirm modal */}
-      {statusTarget && (
+      {canEdit && statusTarget && (
         <ConfirmModal
           title={t('emp.status.title', locale)}
           message={

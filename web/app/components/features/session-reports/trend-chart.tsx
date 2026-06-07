@@ -5,6 +5,7 @@ import { useLocaleStore } from '@/context/locale-store'
 import { useSessionReportsTrend } from '@/service/use-session-reports'
 import type { MetricKey, TrendBucket, TrendType } from '@/models/session-report'
 import { formatDuration } from '@/utils/format-duration'
+import { formatTrendXLabel, shouldShowTrendXLabel } from '@/utils/trend-chart-x-axis'
 import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
 import { metricLabelKey, METRIC_KEYS, isDurationMetric, trendTypeLabelKey, TREND_TYPES } from './types'
@@ -65,8 +66,6 @@ export function TrendChartCard({ start, end, trend, onTrendChange, employeeId, o
       return isDurationMetric(metric) ? formatDuration(v) : Math.round(v).toLocaleString()
     })
   }, [maxValue, metric])
-
-  const xLabels = useMemo(() => buckets.map((b) => b.label), [buckets])
 
   const chartTitle = t('ws.records.sessionReports.trend.chartTitle', locale)
     .replace('{metric}', t(metricLabelKey[metric], locale))
@@ -138,10 +137,21 @@ export function TrendChartCard({ start, end, trend, onTrendChange, employeeId, o
                 )
               })}
             </div>
-            {/* X labels */}
-            <div className="flex h-6 items-center justify-between px-2 pt-1 text-[11px] text-[#999999]">
-              {pickXLabels(xLabels).map((label, i) => (
-                <span key={i}>{label}</span>
+            <div
+              className={cn(
+                'flex h-6 gap-1.5 px-2 pt-1 text-[#999999]',
+                trend === 'half_hour' ? 'text-[9px]' : trend === 'hour' ? 'text-[10px]' : 'text-[11px]',
+              )}
+            >
+              {buckets.map((b, index) => (
+                <div
+                  key={`x-${b.label}-${index}`}
+                  className="flex-1 truncate text-center leading-none"
+                >
+                  {shouldShowTrendXLabel(index, buckets.length, trend)
+                    ? formatTrendXLabel(b.label, index, trend)
+                    : ''}
+                </div>
               ))}
             </div>
           </div>
@@ -179,14 +189,4 @@ export function TrendChartCard({ start, end, trend, onTrendChange, employeeId, o
       </div>
     </div>
   )
-}
-
-/** Show roughly 7 evenly-spaced X labels (e.g. 00, 04, 08, 12, 16, 20, 24).
- *  For very short bucket lists keep them all. */
-function pickXLabels(all: string[]): string[] {
-  if (all.length <= 12) return all
-  const step = Math.ceil(all.length / 7)
-  const picked: string[] = []
-  for (let i = 0; i < all.length; i += step) picked.push(all[i])
-  return picked
 }

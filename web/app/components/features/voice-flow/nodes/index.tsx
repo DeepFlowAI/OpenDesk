@@ -205,6 +205,17 @@ export function ConditionNodeView({ data, selected }: NodeProps) {
 
 export function AssignQueueNodeView({ data, selected }: NodeProps) {
   const d = data as AssignQueueData
+  const targets = assignQueueTargets(d)
+  const strategy = assignQueueStrategyLabel(d.target_strategy)
+  const customPrompt = Boolean(d.queue_prompt_text && d.queue_prompt_text !== '正在为您转接，请稍候。')
+  const targetSummary =
+    d.target_strategy === 'sequential_overflow'
+      ? targets.length
+        ? `${strategy}：${targets.slice(0, 2).map(queueTargetLabel).join(' → ')}${targets.length > 2 ? ` 等 ${targets.length} 个队列` : ''}`
+        : '未选择队列'
+      : targets.length
+        ? `${strategy}：${targets.length} 个候选队列`
+        : '未选择队列'
   // assign_queue has a single outlet: `timeout`. On a successful bridge the
   // workflow ends (user is now talking directly to the agent through the
   // kernel), so there's no `next` outlet — connecting `timeout` is only
@@ -217,7 +228,8 @@ export function AssignQueueNodeView({ data, selected }: NodeProps) {
       badge="assignQueue"
       selected={selected}
     >
-      <p>{d.employee_group_id ? `队列 #${d.employee_group_id}` : '未选择队列'}</p>
+      <p>{targetSummary}</p>
+      {customPrompt && <p className="text-foreground/60">自定义排队提示</p>}
       {d.timeout_seconds && (
         <p className="text-foreground/60">超时 {d.timeout_seconds}s → 跳转</p>
       )}
@@ -229,6 +241,30 @@ export function AssignQueueNodeView({ data, selected }: NodeProps) {
       />
     </NodeCard>
   )
+}
+
+function assignQueueTargets(d: AssignQueueData): AssignQueueData['queue_targets'] {
+  if (d.queue_targets?.length) return d.queue_targets
+  if (d.employee_group_id) {
+    return [{ queue_type: 'employee_group', queue_id: d.employee_group_id }]
+  }
+  return []
+}
+
+function assignQueueStrategyLabel(strategy: AssignQueueData['target_strategy'] | undefined): string {
+  if (strategy === 'least_waiting_count') return '最少排队队列'
+  if (strategy === 'shortest_tail_wait') return '最短排队时间队列'
+  return '顺序溢出'
+}
+
+function queueTargetLabel(target: AssignQueueData['queue_targets'][number]): string {
+  const prefix =
+    target.queue_type === 'user_field'
+      ? '用户字段'
+      : target.queue_type === 'employee'
+        ? '员工'
+        : '员工组'
+  return target.queue_id ? `${prefix} #${target.queue_id}` : `未选择${prefix}`
 }
 
 // ──────────────── hangup ────────────────

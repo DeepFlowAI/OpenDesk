@@ -1,25 +1,37 @@
 """
 Integration tests for EmployeeGroup API
 """
+import uuid
+
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
 
-from app.core.security import create_access_token
+from tests.integration.rbac_helpers import (
+    auth_headers_for_seeded_admin,
+    ensure_admin_principals,
+)
 
 
-def _make_token(tenant_id: int = 7, role: str = "admin") -> str:
-    return create_access_token({"sub": "1", "tenant_id": tenant_id, "roles": [role]})
+@pytest_asyncio.fixture(autouse=True)
+async def seed_admin_principals():
+    await ensure_admin_principals([7, 5555, 6666])
 
 
 def _auth_header(tenant_id: int = 7) -> dict:
-    return {"Authorization": f"Bearer {_make_token(tenant_id)}"}
+    return auth_headers_for_seeded_admin(tenant_id)
 
 
-SAMPLE_PAYLOAD = {
-    "name": "Support Team",
-    "description": "Front-line support agents",
-    "member_ids": [],
-}
+def _unique_name(prefix: str) -> str:
+    return f"{prefix} {uuid.uuid4().hex[:8]}"
+
+
+def _group_payload(prefix: str = "Support Team") -> dict:
+    return {
+        "name": _unique_name(prefix),
+        "description": "Front-line support agents",
+        "member_ids": [],
+    }
 
 
 class TestEmployeeGroupAPI:
@@ -41,10 +53,11 @@ class TestEmployeeGroupAPI:
     async def test_create_returns_201(self, client: AsyncClient):
         """Create with valid data should return 201."""
         headers = _auth_header()
-        resp = await client.post("/api/v1/employee-groups", json=SAMPLE_PAYLOAD, headers=headers)
+        payload = _group_payload()
+        resp = await client.post("/api/v1/employee-groups", json=payload, headers=headers)
         assert resp.status_code == 201
         data = resp.json()
-        assert data["name"] == "Support Team"
+        assert data["name"] == payload["name"]
         assert data["description"] == "Front-line support agents"
         assert "id" in data
         assert "member_count" in data
@@ -53,7 +66,7 @@ class TestEmployeeGroupAPI:
     async def test_get_by_id_returns_200(self, client: AsyncClient):
         """Get existing group should return 200 with members."""
         headers = _auth_header()
-        payload = {"name": "Get Test Group", "description": "For get test"}
+        payload = {"name": _unique_name("Get Test Group"), "description": "For get test"}
         create_resp = await client.post("/api/v1/employee-groups", json=payload, headers=headers)
         created_id = create_resp.json()["id"]
 
@@ -74,20 +87,28 @@ class TestEmployeeGroupAPI:
     async def test_update_returns_200(self, client: AsyncClient):
         """Update existing group should return 200."""
         headers = _auth_header()
-        payload = {"name": "Update Test Group"}
+        payload = {"name": _unique_name("Update Test Group")}
         create_resp = await client.post("/api/v1/employee-groups", json=payload, headers=headers)
         created_id = create_resp.json()["id"]
 
-        update_payload = {"name": "Updated Group Name", "description": "Updated desc", "member_ids": []}
-        resp = await client.put(f"/api/v1/employee-groups/{created_id}", json=update_payload, headers=headers)
+        update_payload = {
+            "name": _unique_name("Updated Group Name"),
+            "description": "Updated desc",
+            "member_ids": [],
+        }
+        resp = await client.put(
+            f"/api/v1/employee-groups/{created_id}",
+            json=update_payload,
+            headers=headers,
+        )
         assert resp.status_code == 200
-        assert resp.json()["name"] == "Updated Group Name"
+        assert resp.json()["name"] == update_payload["name"]
 
     @pytest.mark.asyncio
     async def test_delete_returns_200(self, client: AsyncClient):
         """Delete existing group should return 200."""
         headers = _auth_header()
-        payload = {"name": "Delete Test Group"}
+        payload = {"name": _unique_name("Delete Test Group")}
         create_resp = await client.post("/api/v1/employee-groups", json=payload, headers=headers)
         created_id = create_resp.json()["id"]
 
@@ -108,7 +129,7 @@ class TestEmployeeGroupAPI:
     async def test_create_duplicate_name_returns_400(self, client: AsyncClient):
         """Duplicate name in same tenant should return 400."""
         headers = _auth_header()
-        payload = {"name": "Dup Test Group"}
+        payload = {"name": _unique_name("Dup Test Group")}
         await client.post("/api/v1/employee-groups", json=payload, headers=headers)
         resp = await client.post("/api/v1/employee-groups", json=payload, headers=headers)
         assert resp.status_code == 400
@@ -117,8 +138,16 @@ class TestEmployeeGroupAPI:
     async def test_keyword_search(self, client: AsyncClient):
         """Keyword search should filter results."""
         headers = _auth_header()
-        await client.post("/api/v1/employee-groups", json={"name": "Alpha Team"}, headers=headers)
-        await client.post("/api/v1/employee-groups", json={"name": "Beta Squad"}, headers=headers)
+        await client.post(
+            "/api/v1/employee-groups",
+            json={"name": _unique_name("Alpha Team")},
+            headers=headers,
+        )
+        await client.post(
+            "/api/v1/employee-groups",
+            json={"name": _unique_name("Beta Squad")},
+            headers=headers,
+        )
 
         resp = await client.get("/api/v1/employee-groups?keyword=Alpha", headers=headers)
         assert resp.status_code == 200
@@ -133,7 +162,7 @@ class TestEmployeeGroupAPI:
 
         create_resp = await client.post(
             "/api/v1/employee-groups",
-            json={"name": "Isolated Group"},
+            json={"name": _unique_name("Isolated Group")},
             headers=headers_a,
         )
         created_id = create_resp.json()["id"]
@@ -142,10 +171,10 @@ class TestEmployeeGroupAPI:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_missing_auth_returns_422(self, client: AsyncClient):
+    async def test_missing_auth_returns_401(self, client: AsyncClient):
         """Request without Authorization header should fail."""
         resp = await client.get("/api/v1/employee-groups")
-        assert resp.status_code == 422
+        assert resp.status_code == 401
 
     @pytest.mark.asyncio
     async def test_invalid_token_returns_401(self, client: AsyncClient):

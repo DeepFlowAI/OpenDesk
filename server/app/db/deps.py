@@ -2,7 +2,10 @@ from collections.abc import AsyncGenerator
 from fastapi import Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
+from app.core.exceptions import ForbiddenError
 from app.db.session import AsyncSessionLocal
+from app.schemas.permission import EffectivePrincipal
+from app.services.permission_service import PermissionService
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -44,3 +47,46 @@ async def get_current_user(authorization: str | None = Header(None)) -> dict:
             raise UnauthorizedError("Token contains invalid tenant_id, please re-login")
 
     return payload
+
+
+async def get_current_principal(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> EffectivePrincipal:
+    return await PermissionService.get_current_principal(db, current_user)
+
+
+def require_permission(permission: str):
+    async def dependency(
+        principal: EffectivePrincipal = Depends(get_current_principal),
+    ) -> EffectivePrincipal:
+        if not principal.has_permission(permission):
+            raise ForbiddenError("Permission denied")
+        return principal
+
+    return dependency
+
+
+def require_any_permission(permissions: list[str]):
+    async def dependency(
+        principal: EffectivePrincipal = Depends(get_current_principal),
+    ) -> EffectivePrincipal:
+        if not principal.has_any_permission(permissions):
+            raise ForbiddenError("Permission denied")
+        return principal
+
+    return dependency
+
+
+def require_all_permissions(permissions: list[str]):
+    async def dependency(
+        principal: EffectivePrincipal = Depends(get_current_principal),
+    ) -> EffectivePrincipal:
+        if not principal.has_all_permissions(permissions):
+            raise ForbiddenError("Permission denied")
+        return principal
+
+    return dependency
+
+
+require_admin_access = require_permission("admin.access")

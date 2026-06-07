@@ -9,6 +9,15 @@ VALID_ROLES = {"admin", "agent"}
 VALID_LANGUAGES = {"system", "zh", "en"}
 
 
+class EmployeeRoleAssignment(BaseModel):
+    id: int
+    key: str | None = None
+    name: str
+    is_system: bool
+    is_active: bool
+    permissions: list[str] = []
+
+
 class EmployeeCreate(BaseModel):
     name: str
     nickname: str | None = None
@@ -19,6 +28,7 @@ class EmployeeCreate(BaseModel):
     password: str
     avatar: str | None = None
     roles: list[str] = ["agent"]
+    role_ids: list[int] | None = None
     max_concurrent: int = 10
     default_language: str = "system"
     group_ids: list[int] = []
@@ -92,6 +102,18 @@ class EmployeeCreate(BaseModel):
                 raise ValueError("Group ID must be positive")
         return list(dict.fromkeys(v))
 
+    @field_validator("role_ids")
+    @classmethod
+    def validate_role_ids(cls, v: list[int] | None) -> list[int] | None:
+        if v is None:
+            return None
+        if not v:
+            raise ValueError("At least one role is required")
+        for role_id in v:
+            if role_id <= 0:
+                raise ValueError("Role ID must be positive")
+        return list(dict.fromkeys(v))
+
 
 class EmployeeUpdate(BaseModel):
     name: str | None = None
@@ -103,6 +125,7 @@ class EmployeeUpdate(BaseModel):
     password: str | None = None
     avatar: str | None = None
     roles: list[str] | None = None
+    role_ids: list[int] | None = None
     max_concurrent: int | None = None
     default_language: str | None = None
     group_ids: list[int] | None = None
@@ -184,6 +207,18 @@ class EmployeeUpdate(BaseModel):
                 raise ValueError("Group ID must be positive")
         return list(dict.fromkeys(v))
 
+    @field_validator("role_ids")
+    @classmethod
+    def validate_role_ids(cls, v: list[int] | None) -> list[int] | None:
+        if v is None:
+            return v
+        if not v:
+            raise ValueError("At least one role is required")
+        for role_id in v:
+            if role_id <= 0:
+                raise ValueError("Role ID must be positive")
+        return list(dict.fromkeys(v))
+
 
 class StatusUpdate(BaseModel):
     is_active: bool
@@ -201,6 +236,8 @@ class EmployeeResponse(BaseModel):
     phone: str | None = None
     avatar: str | None = None
     roles: list[str]
+    role_ids: list[int] = []
+    role_assignments: list[EmployeeRoleAssignment] = []
     is_active: bool
     max_concurrent: int
     default_language: str

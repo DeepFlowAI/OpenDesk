@@ -7,6 +7,8 @@ from sqlalchemy.orm import aliased
 
 from app.models.session_routing_rule import SessionRoutingRule
 from app.models.employee_group import EmployeeGroup
+from app.models.employee import Employee
+from app.models.fd_field_definition import FdFieldDefinition
 
 
 class SessionRoutingRuleRepository:
@@ -79,6 +81,59 @@ class SessionRoutingRuleRepository:
             SessionRoutingRule.id == rule_id, SessionRoutingRule.tenant_id == tenant_id
         )
         return (await db.execute(q)).scalar_one_or_none()
+
+    @staticmethod
+    async def get_group_name_map(
+        db: AsyncSession, tenant_id: int, group_ids: list[int]
+    ) -> dict[int, str]:
+        ids = sorted({int(group_id) for group_id in group_ids if group_id})
+        if not ids:
+            return {}
+        q = select(EmployeeGroup.id, EmployeeGroup.name).where(
+            EmployeeGroup.tenant_id == tenant_id,
+            EmployeeGroup.id.in_(ids),
+        )
+        return {int(row.id): row.name for row in (await db.execute(q)).all()}
+
+    @staticmethod
+    async def get_active_employee_name_map(
+        db: AsyncSession, tenant_id: int, employee_ids: list[int]
+    ) -> dict[int, str]:
+        ids = sorted({int(employee_id) for employee_id in employee_ids if employee_id})
+        if not ids:
+            return {}
+        q = select(Employee).where(
+            Employee.tenant_id == tenant_id,
+            Employee.id.in_(ids),
+            Employee.is_active.is_(True),
+        )
+        employees = list((await db.execute(q)).scalars().all())
+        return {
+            employee.id: (
+                employee.display_name
+                or employee.nickname
+                or employee.name
+                or employee.username
+            )
+            for employee in employees
+        }
+
+    @staticmethod
+    async def get_user_queue_field_map(
+        db: AsyncSession, tenant_id: int, field_ids: list[int]
+    ) -> dict[int, tuple[str, str]]:
+        ids = sorted({int(field_id) for field_id in field_ids if field_id})
+        if not ids:
+            return {}
+        q = select(FdFieldDefinition).where(
+            FdFieldDefinition.tenant_id == tenant_id,
+            FdFieldDefinition.id.in_(ids),
+            FdFieldDefinition.domain == "user",
+            FdFieldDefinition.status == "active",
+            FdFieldDefinition.field_type.in_(["employee_select", "group_select"]),
+        )
+        fields = list((await db.execute(q)).scalars().all())
+        return {field.id: (field.name, field.field_type) for field in fields}
 
     @staticmethod
     async def create(db: AsyncSession, data: dict) -> SessionRoutingRule:

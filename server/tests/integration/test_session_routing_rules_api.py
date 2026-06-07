@@ -50,6 +50,9 @@ class TestSessionRoutingRulesAPI:
     async def test_crud_and_reorder(self, client: AsyncClient):
         headers = _auth_header(tenant_id=7)
         group_id = await _create_employee_group(client, headers)
+        existing = await client.get("/api/v1/session-routing-rules", headers=headers)
+        assert existing.status_code == 200
+        existing_ids = [item["id"] for item in existing.json()["items"]]
 
         r1 = await client.post(
             "/api/v1/session-routing-rules",
@@ -63,7 +66,11 @@ class TestSessionRoutingRulesAPI:
         )
         assert r1.status_code == 201
         id1 = r1.json()["id"]
-        assert r1.json()["priority"] == 1
+        assert r1.json()["priority"] == len(existing_ids) + 1
+        assert r1.json()["target_strategy"] == "sequential_overflow"
+        assert r1.json()["target_queue_sources"] == [
+            {"source_type": "employee_group", "target_ids": [group_id]}
+        ]
 
         r2 = await client.post(
             "/api/v1/session-routing-rules",
@@ -77,12 +84,12 @@ class TestSessionRoutingRulesAPI:
         )
         assert r2.status_code == 201
         id2 = r2.json()["id"]
-        assert r2.json()["priority"] == 2
+        assert r2.json()["priority"] == len(existing_ids) + 2
 
         reorder = await client.put(
             "/api/v1/session-routing-rules/reorder",
             headers=headers,
-            json={"ordered_ids": [id2, id1]},
+            json={"ordered_ids": [id2, id1, *existing_ids]},
         )
         assert reorder.status_code == 200
 
@@ -105,6 +112,7 @@ class TestSessionRoutingRulesAPI:
         g = await client.get(f"/api/v1/session-routing-rules/{id2}", headers=headers)
         assert g.status_code == 200
         assert g.json()["target_group_name"] != ""
+        assert g.json()["target_summary"].startswith("顺序溢出")
 
         upd = await client.put(
             f"/api/v1/session-routing-rules/{id1}",
@@ -128,6 +136,13 @@ class TestSessionRoutingRulesAPI:
             json={"ordered_ids": [id1, id2]},
         )
         assert bad_reorder.status_code == 400
+        await client.delete(f"/api/v1/session-routing-rules/{id2}", headers=headers)
+        if existing_ids:
+            await client.put(
+                "/api/v1/session-routing-rules/reorder",
+                headers=headers,
+                json={"ordered_ids": existing_ids},
+            )
 
     @pytest.mark.asyncio
     async def test_current_time_condition_validates_service_hours(self, client: AsyncClient):
@@ -162,6 +177,35 @@ class TestSessionRoutingRulesAPI:
             },
         )
         assert ok.status_code == 201
+
+    @pytest.mark.asyncio
+    async def test_create_with_multi_queue_sources(self, client: AsyncClient):
+        headers = _auth_header(tenant_id=7)
+        group_id_1 = await _create_employee_group(client, headers)
+        group_id_2 = await _create_employee_group(client, headers)
+
+        resp = await client.post(
+            "/api/v1/session-routing-rules",
+            headers=headers,
+            json={
+                "name": f"Multi queue {uuid.uuid4().hex[:8]}",
+                "enabled": True,
+                "conditions": [],
+                "target_strategy": "least_waiting_count",
+                "target_queue_sources": [
+                    {"source_type": "employee_group", "target_ids": [group_id_1, group_id_2]}
+                ],
+            },
+        )
+
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["target_group_id"] == group_id_1
+        assert data["target_strategy"] == "least_waiting_count"
+        assert data["target_queue_sources"] == [
+            {"source_type": "employee_group", "target_ids": [group_id_1, group_id_2]}
+        ]
+        assert "最少排队队列" in data["target_summary"]
 
     @pytest.mark.asyncio
     async def test_channel_condition(self, client: AsyncClient):

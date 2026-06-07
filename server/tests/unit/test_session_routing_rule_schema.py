@@ -3,7 +3,11 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.session_routing_rule import SessionRoutingCondition
+from app.schemas.session_routing_rule import (
+    SessionRoutingCondition,
+    SessionRoutingQueueSource,
+    SessionRoutingRuleCreate,
+)
 
 
 def test_channel_condition_accepts_websdk_value():
@@ -34,3 +38,36 @@ def test_channel_condition_rejects_display_label():
             operator="eq",
             value="Web SDK",
         )
+
+
+def test_queue_source_deduplicates_target_ids():
+    source = SessionRoutingQueueSource(
+        source_type="employee",
+        target_ids=[3, 3, 4],
+    )
+
+    assert source.target_ids == [3, 4]
+
+
+def test_user_field_source_requires_single_field():
+    with pytest.raises(ValidationError):
+        SessionRoutingQueueSource(
+            source_type="user_field",
+            target_ids=[1, 2],
+        )
+
+
+def test_rule_create_accepts_legacy_target_group_id():
+    payload = SessionRoutingRuleCreate(
+        name="Legacy",
+        target_group_id=8,
+        conditions=[],
+    )
+
+    assert payload.target_group_id == 8
+    assert payload.target_queue_sources == []
+
+
+def test_rule_create_requires_queue_target():
+    with pytest.raises(ValidationError):
+        SessionRoutingRuleCreate(name="No target", conditions=[])

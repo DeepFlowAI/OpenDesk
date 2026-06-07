@@ -9,6 +9,7 @@ import {
 } from '@tabler/icons-react'
 import { toast } from 'sonner'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { useDeleteUser, useUser } from '@/service/use-users'
 import { useOrganization } from '@/service/use-organizations'
 import { useSystemSettings } from '@/service/use-system-settings'
@@ -23,6 +24,7 @@ import {
 import { UserRelatedTimeline } from '@/app/components/features/user-related-timeline'
 import { UserFormModal } from '../user-form-modal'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { hasPermission } from '@/utils/permissions'
 
 const SYSTEM_KEY_ALIAS: Record<string, string> = { nickname: 'name' }
 const DATETIME_KEYS = new Set(['created_at', 'updated_at'])
@@ -40,7 +42,10 @@ export default function UserDetailPage() {
   const searchParams = useSearchParams()
   const router = useRouter()
   const { locale } = useLocaleStore()
+  const currentUser = useAuthStore((state) => state.user)
   const isZh = locale === 'zh'
+  const canEditUser = hasPermission(currentUser, 'crm.workspace.user.edit')
+  const canDeleteUser = hasPermission(currentUser, 'crm.workspace.user.delete')
 
   const userRef = params.id
   const fromList = searchParams.get('from') === 'list'
@@ -225,21 +230,25 @@ export default function UserDetailPage() {
           </button>
         )}
         <h2 className="flex-1 text-base font-semibold text-foreground">{user.name}</h2>
-        <button
-          onClick={() => setEditModalOpen(true)}
-          className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-accent"
-        >
-          <IconEdit size={16} />
-          {isZh ? '编辑用户' : 'Edit User'}
-        </button>
-        <button
-          onClick={() => setDeleteConfirmOpen(true)}
-          disabled={deleteMutation.isPending}
-          className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
-        >
-          <IconTrash size={16} />
-          {isZh ? '删除' : 'Delete'}
-        </button>
+        {canEditUser && (
+          <button
+            onClick={() => setEditModalOpen(true)}
+            className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-accent"
+          >
+            <IconEdit size={16} />
+            {isZh ? '编辑用户' : 'Edit User'}
+          </button>
+        )}
+        {canDeleteUser && (
+          <button
+            onClick={() => setDeleteConfirmOpen(true)}
+            disabled={deleteMutation.isPending}
+            className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+          >
+            <IconTrash size={16} />
+            {isZh ? '删除' : 'Delete'}
+          </button>
+        )}
       </div>
 
       {/* Main content: left profile + right timeline */}
@@ -392,7 +401,7 @@ export default function UserDetailPage() {
       </div>
 
       {/* Edit modal */}
-      {editModalOpen && (
+      {canEditUser && editModalOpen && (
         <UserFormModal
           mode="edit"
           user={user}
@@ -401,8 +410,9 @@ export default function UserDetailPage() {
         />
       )}
 
-      <ConfirmDialog
-        open={deleteConfirmOpen}
+      {canDeleteUser && (
+        <ConfirmDialog
+          open={deleteConfirmOpen}
         title={isZh ? '删除用户' : 'Delete user'}
         message={
           isZh
@@ -415,8 +425,9 @@ export default function UserDetailPage() {
         variant="destructive"
         loading={deleteMutation.isPending}
         onCancel={() => setDeleteConfirmOpen(false)}
-        onConfirm={handleDelete}
-      />
+          onConfirm={handleDelete}
+        />
+      )}
     </div>
   )
 }

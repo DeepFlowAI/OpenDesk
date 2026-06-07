@@ -15,6 +15,7 @@ class TicketChangeEntryItem(BaseModel):
 
     field_key: str
     field_label: str
+    field_source: str = "ticket"
     old_value: CustomFieldValue = None
     new_value: CustomFieldValue = None
 

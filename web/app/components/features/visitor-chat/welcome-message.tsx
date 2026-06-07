@@ -46,7 +46,7 @@ export function WelcomeMessage({
         />
       )}
       <div
-        className={`min-h-[42px] max-w-[75%] whitespace-pre-wrap break-words px-3 py-2 text-sm leading-6 ${richTextListStyleClass}`}
+        className={`min-h-[42px] max-w-[75%] min-w-0 whitespace-pre-wrap break-words break-all px-3 py-2 text-sm leading-6 ${richTextListStyleClass}`}
         style={getAgentBubbleStyle(config)}
         dangerouslySetInnerHTML={{ __html: content }}
       />

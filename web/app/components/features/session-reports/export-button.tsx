@@ -8,6 +8,7 @@ import { useSystemInfo } from '@/service/use-system'
 import { useSessionReportExport } from '@/service/use-session-reports'
 import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import type { SessionReportExportParams } from '@/models/session-report'
 
 type ToastState = {
@@ -34,9 +35,9 @@ export function SessionReportExportButton({ params, disabled }: Props) {
   }, [toast])
 
   const reportsEnabled = systemInfo?.reports_enabled ?? true
-  const isAdmin = user?.roles?.includes('admin') ?? false
+  const canExport = hasPermission(user, 'chat.session_report.export')
 
-  if (!reportsEnabled || !isAdmin) return null
+  if (!reportsEnabled || !canExport) return null
 
   const exporting = exportMutation.isPending
 

@@ -23,6 +23,7 @@ from app.enums import MessageSenderType, AgentOnlineStatus
 from app.libs.realtime.base import BaseRealtimeTransport
 from app.services.conversation_service import ConversationService
 from app.services.agent_status_service import AgentStatusService
+from app.services.permission_service import PermissionService
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
 logger = logging.getLogger(__name__)
@@ -151,7 +152,8 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
         logger.info("Agent connected: user_id=%s sid=%s active_count=%d", user_id, sid, active_count)
 
-        # Auto-assign queued conversations to this newly online agent
+        # Try queued conversations after connect; the status check keeps
+        # offline or busy agents from receiving work implicitly.
         try:
             await _assign_queued_conversations(rt, r, tenant_id, user_id)
         except Exception:
@@ -262,12 +264,16 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             return {"error": "conversation_id required"}
 
         async with AsyncSessionLocal() as db:
+            principal = await PermissionService.get_current_principal(
+                db, {"user_id": int(user_id), "tenant_id": int(tenant_id)}
+            )
             state = await SatisfactionSurveyRecordService.send_agent_invitation(
                 db,
                 conversation_id=int(conversation_id),
                 tenant_id=int(tenant_id),
-                user={"user_id": int(user_id), "tenant_id": int(tenant_id), "roles": ["agent"]},
+                user={"user_id": int(user_id), "tenant_id": int(tenant_id)},
                 force=force,
+                principal=principal,
             )
         return {"ok": True, "state": jsonable_encoder(state)}
 

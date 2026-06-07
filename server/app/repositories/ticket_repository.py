@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import Date, DateTime, Integer, Numeric, Float, select, func, String as SAString, or_, and_, cast
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.constants import EMPTY_GROUP_VALUE
 from app.models.ticket import Ticket
@@ -239,9 +240,12 @@ class TicketRepository:
         sort_order: str = "desc",
         page: int = 1,
         per_page: int = 20,
+        scope_predicate: ColumnElement | None = None,
     ) -> tuple[list[Ticket], int]:
         _slot_map = slot_map or {}
         base_where = [Ticket.tenant_id == tenant_id]
+        if scope_predicate is not None:
+            base_where.append(scope_predicate)
 
         if search:
             base_where.append(
@@ -300,8 +304,11 @@ class TicketRepository:
         conditions: list[dict],
         condition_logic: str,
         slot_map: dict[int, str],
+        scope_predicate: ColumnElement | None = None,
     ) -> int:
         base_where = [Ticket.tenant_id == tenant_id]
+        if scope_predicate is not None:
+            base_where.append(scope_predicate)
         if conditions:
             base_where.extend(
                 TicketRepository._build_conditions_filters(
@@ -323,6 +330,7 @@ class TicketRepository:
         temp_conditions: list[dict] | None = None,
         temp_condition_logic: str = "and",
         slot_map: dict[int, str] | None = None,
+        scope_predicate: ColumnElement | None = None,
     ) -> tuple[list[dict], int]:
         """Group tickets by `group_field_col` and count per group.
 
@@ -337,6 +345,8 @@ class TicketRepository:
             return [], 0
 
         base_where = [Ticket.tenant_id == tenant_id]
+        if scope_predicate is not None:
+            base_where.append(scope_predicate)
 
         if search:
             base_where.append(

@@ -11,6 +11,8 @@ Disconnect grace window:
     clears the pending marker and restores the agent's desired status.
     ``get_status`` additionally treats an expired pending marker as offline
     so the state self-heals if the scheduled task is lost (e.g. worker restart).
+    Once the grace window is finalized, the desired status is also reset to
+    offline so a later login does not implicitly put the agent back online.
 """
 import logging
 import time
@@ -154,13 +156,24 @@ class AgentStatusService:
     ) -> None:
         key = AgentStatusService._key(tenant_id, user_id)
         data = await r.hgetall(key)
-        desired_status = (
-            data.get(_DESIRED_STATUS_FIELD)
-            or data.get("status")
-            or AgentOnlineStatus.ONLINE.value
-        )
+        pending = data.get(_PENDING_OFFLINE_FIELD)
+        pending_expired = False
+        if pending:
+            try:
+                pending_expired = time.time() >= float(pending)
+            except ValueError:
+                pending_expired = False
+
+        if pending_expired:
+            desired_status = AgentOnlineStatus.OFFLINE.value
+        else:
+            desired_status = (
+                data.get(_DESIRED_STATUS_FIELD)
+                or data.get("status")
+                or AgentOnlineStatus.OFFLINE.value
+            )
         if desired_status not in [s.value for s in AgentOnlineStatus]:
-            desired_status = AgentOnlineStatus.ONLINE.value
+            desired_status = AgentOnlineStatus.OFFLINE.value
         await r.hset(
             key,
             mapping={
@@ -215,7 +228,7 @@ class AgentStatusService:
             _DESIRED_STATUS_FIELD,
             _PENDING_OFFLINE_FIELD,
             str(expires_at),
-            AgentOnlineStatus.ONLINE.value,
+            AgentOnlineStatus.OFFLINE.value,
         )
         if scheduled:
             logger.info(
@@ -243,6 +256,7 @@ class AgentStatusService:
            and redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then
             redis.call('HDEL', KEYS[1], ARGV[1], ARGV[3])
             redis.call('HSET', KEYS[1], 'status', ARGV[4])
+            redis.call('HSET', KEYS[1], ARGV[5], ARGV[4])
             redis.call('HSET', KEYS[1], 'current_count', 0)
             return 1
         end
@@ -256,6 +270,7 @@ class AgentStatusService:
             sid,
             _PENDING_OFFLINE_FIELD,
             AgentOnlineStatus.OFFLINE.value,
+            _DESIRED_STATUS_FIELD,
         )
         if changed:
             logger.info("Agent %d finalized offline sid=%s", user_id, sid)

@@ -7,10 +7,13 @@ enabled) don't bump the version.
 """
 from __future__ import annotations
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, ValidationError
+from app.models.fd_field_definition import FdFieldDefinition
 from app.repositories.audio_asset_repository import AudioAssetRepository
+from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.employee_group_repository import EmployeeGroupRepository
 from app.repositories.service_hours_repository import ServiceHoursRepository
 from app.repositories.voice_flow_repository import VoiceFlowRepository
@@ -368,7 +371,7 @@ class VoiceFlowService:
                             ),
                         ))
 
-        # Cross-entity references: employee_group_id, audio_asset_id, service_hours.id
+        # Cross-entity references: queue targets, audio_asset_id, service_hours.id
         await _validate_external_refs(db, tenant_id, graph, errors)
 
         # Variable reachability for condition references
@@ -390,7 +393,9 @@ async def _validate_external_refs(
     db, tenant_id: int, graph: VoiceFlowGraph, errors: list[GraphError]
 ) -> None:
     asset_ids: list[int] = []
-    queue_ids: list[int] = []
+    group_targets: list[tuple[str, int]] = []
+    employee_targets: list[tuple[str, int]] = []
+    user_field_targets: list[tuple[str, int]] = []
     sh_ids: list[int] = []
 
     for node in graph.nodes:
@@ -400,7 +405,13 @@ async def _validate_external_refs(
         if node.type == "hangup" and node.data.pre_play and isinstance(node.data.pre_play, AudioPrompt):
             asset_ids.append(node.data.pre_play.asset_id)
         if node.type == "assign_queue":
-            queue_ids.append(node.data.employee_group_id)
+            for target in node.data.queue_targets:
+                if target.queue_type == "user_field":
+                    user_field_targets.append((node.id, target.queue_id))
+                elif target.queue_type == "employee_group":
+                    group_targets.append((node.id, target.queue_id))
+                elif target.queue_type == "employee":
+                    employee_targets.append((node.id, target.queue_id))
         if node.type == "condition":
             for g in node.data.groups:
                 for c in g.conditions:
@@ -416,12 +427,47 @@ async def _validate_external_refs(
                 message=f"Audio asset id {aid} does not exist or has been deleted",
             ))
 
-    for qid in set(queue_ids):
+    for qid in {queue_id for _, queue_id in group_targets}:
         group = await EmployeeGroupRepository.get_by_id(db, qid)
         if group is None or group.tenant_id != tenant_id:
+            node_id = next((nid for nid, target_id in group_targets if target_id == qid), None)
             errors.append(GraphError(
+                node_id=node_id,
+                field="queue_targets",
                 code="queue_not_found",
                 message=f"Employee group id {qid} not found in this tenant",
+            ))
+
+    for eid in {employee_id for _, employee_id in employee_targets}:
+        employee = await EmployeeRepository.get_by_id(db, eid)
+        if employee is None or employee.tenant_id != tenant_id or not employee.is_active:
+            node_id = next((nid for nid, target_id in employee_targets if target_id == eid), None)
+            errors.append(GraphError(
+                node_id=node_id,
+                field="queue_targets",
+                code="queue_not_found",
+                message=f"Employee id {eid} not found in this tenant",
+            ))
+
+    if user_field_targets:
+        field_ids = {field_id for _, field_id in user_field_targets}
+        q = select(FdFieldDefinition.id).where(
+            FdFieldDefinition.tenant_id == tenant_id,
+            FdFieldDefinition.id.in_(field_ids),
+            FdFieldDefinition.domain == "user",
+            FdFieldDefinition.status == "active",
+            FdFieldDefinition.field_type.in_(["employee_select", "group_select"]),
+        )
+        existing_field_ids = set((await db.execute(q)).scalars().all())
+        for fid in field_ids - existing_field_ids:
+            node_id = next((nid for nid, target_id in user_field_targets if target_id == fid), None)
+            errors.append(GraphError(
+                node_id=node_id,
+                field="queue_targets",
+                code="queue_field_not_found",
+                message=(
+                    f"User field id {fid} is not available for queue routing"
+                ),
             ))
 
     for sid in set(sh_ids):

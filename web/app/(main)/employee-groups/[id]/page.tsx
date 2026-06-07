@@ -4,23 +4,44 @@ import { useState } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { IconArrowLeft } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import { useEmployeeGroup, useUpdateEmployeeGroup } from '@/service/use-employee-groups'
+import { useQueuePolicies, useUpsertQueuePolicy } from '@/service/use-queue-policies'
 import EmployeeGroupForm from '@/app/(main)/employee-groups/form'
 import type { UpdateEmployeeGroupPayload } from '@/models/employee-group'
+import type { QueuePolicyUpsertPayload } from '@/models/queue-policy'
 
 export default function EditEmployeeGroupPage() {
   const router = useRouter()
   const params = useParams()
   const id = Number(params.id)
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const { data, isLoading } = useEmployeeGroup(id)
+  const { data: defaultQueuePolicies, isLoading: isDefaultQueuePoliciesLoading } = useQueuePolicies({
+    scope_type: 'global',
+  })
+  const { data: groupQueuePolicies, isLoading: isGroupQueuePoliciesLoading } = useQueuePolicies(
+    { scope_type: 'employee_group', scope_id: id },
+    { enabled: !!id }
+  )
   const updateMutation = useUpdateEmployeeGroup()
+  const upsertQueuePolicyMutation = useUpsertQueuePolicy()
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const canManage = hasPermission(user, 'org.group.manage')
 
-  const handleSave = async (payload: UpdateEmployeeGroupPayload) => {
+  const handleSave = async (
+    payload: UpdateEmployeeGroupPayload,
+    queuePolicyPayloads: QueuePolicyUpsertPayload[] = []
+  ) => {
+    if (!canManage) return
     try {
       await updateMutation.mutateAsync({ id, data: payload })
+      if (queuePolicyPayloads.length > 0) {
+        await Promise.all(queuePolicyPayloads.map((queuePayload) => upsertQueuePolicyMutation.mutateAsync(queuePayload)))
+      }
       setToast({ type: 'success', text: t('eg.saveSuccess', locale) })
       setTimeout(() => setToast(null), 3000)
     } catch {
@@ -29,7 +50,9 @@ export default function EditEmployeeGroupPage() {
     }
   }
 
-  if (isLoading) {
+  const saving = updateMutation.isPending || upsertQueuePolicyMutation.isPending
+
+  if (isLoading || isDefaultQueuePoliciesLoading || isGroupQueuePoliciesLoading) {
     return (
       <div className="flex h-full items-center justify-center">
         <p className="text-sm text-muted-foreground">{t('eg.loading', locale)}</p>
@@ -58,16 +81,18 @@ export default function EditEmployeeGroupPage() {
             {t('eg.edit', locale, { name: data.name })}
           </span>
         </button>
-        <button
-          onClick={() => {
-            const form = document.getElementById('eg-form') as HTMLFormElement | null
-            form?.requestSubmit()
-          }}
-          disabled={updateMutation.isPending}
-          className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
-        >
-          {updateMutation.isPending ? t('eg.saving', locale) : t('eg.save', locale)}
-        </button>
+        {canManage && (
+          <button
+            onClick={() => {
+              const form = document.getElementById('eg-form') as HTMLFormElement | null
+              form?.requestSubmit()
+            }}
+            disabled={saving}
+            className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
+          >
+            {saving ? t('eg.saving', locale) : t('eg.save', locale)}
+          </button>
+        )}
       </div>
 
       {toast && (
@@ -85,7 +110,11 @@ export default function EditEmployeeGroupPage() {
         <EmployeeGroupForm
           initialData={data}
           onSubmit={handleSave}
-          saving={updateMutation.isPending}
+          saving={saving}
+          queueSettings={{
+            defaultPolicies: defaultQueuePolicies?.items ?? [],
+            scopedPolicies: groupQueuePolicies?.items ?? [],
+          }}
         />
       </div>
     </div>

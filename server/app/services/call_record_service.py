@@ -8,15 +8,21 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError
+from app.enums import QueueChannel, QueueTaskType, QueueType
 from app.models.employee import Employee
+from app.models.employee_group import EmployeeGroup
 from app.models.user import User
 from app.repositories.call_record_repository import CallRecordRepository
 from app.repositories.ticket_repository import TicketRepository
 from app.repositories.user_repository import UserRepository
+from app.schemas.permission import EffectivePrincipal
+from app.services.data_scope_service import DataScopeService
+from app.services.queue_history_service import QueueHistoryService
 from app.services.call_user_association_service import CallUserAssociationService
 
 
 logger = logging.getLogger(__name__)
+CALL_QUEUE_SUMMARY_METADATA_KEY = "queue_summary"
 
 
 class CallRecordService:
@@ -136,13 +142,33 @@ class CallRecordService:
 
     @staticmethod
     async def bind_queue(
-        db: AsyncSession, tenant_id: int, call_id: str, employee_group_id: int
+        db: AsyncSession,
+        tenant_id: int,
+        call_id: str,
+        queue_type: str | int,
+        queue_id: int | None = None,
     ) -> None:
         row = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
         if not row:
             return
+        if queue_id is None:
+            queue_id = int(queue_type)
+            queue_type = QueueType.EMPLOYEE_GROUP.value
+        else:
+            queue_type = str(queue_type)
+
+        queue_brief = await _queue_record_brief(db, tenant_id, queue_type, queue_id)
+        metadata = dict(row.extra_metadata or {})
+        metadata[CALL_QUEUE_SUMMARY_METADATA_KEY] = {
+            "last_assigned_queue": queue_brief,
+        }
+        patch: dict = {"state": "queued", "extra_metadata": metadata}
+        if queue_type == QueueType.EMPLOYEE_GROUP.value:
+            patch["employee_group_id"] = queue_id
         await CallRecordRepository.update(
-            db, row, {"employee_group_id": employee_group_id, "state": "queued"}
+            db,
+            row,
+            patch,
         )
 
     @staticmethod
@@ -195,18 +221,32 @@ class CallRecordService:
         keyword: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
+        peer_ids: list[int] = []
+        scope_predicate = None
+        effective_agent_id = agent_id
+        if principal is not None:
+            peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            scope_predicate = DataScopeService.build_call_record_predicate(principal, peer_ids)
+            effective_agent_id = DataScopeService.resolve_agent_filter(
+                principal,
+                DataScopeService.RESOURCE_CALL_RECORD,
+                agent_id,
+                peer_ids,
+            )
         rows, total = await CallRecordRepository.get_paginated(
             db,
             tenant_id,
             page,
             per_page,
             direction,
-            agent_id,
+            effective_agent_id,
             user_id,
             keyword,
             start_time,
             end_time,
+            scope_predicate=scope_predicate,
         )
         # Resolve agent names
         agent_ids = sorted({r.agent_id for r in rows if r.agent_id})
@@ -221,11 +261,19 @@ class CallRecordService:
                 e.id: (e.display_name or e.nickname or e.name or e.username) for e in emps
             }
         users = await _load_user_map(db, tenant_id, [r.user_id for r in rows if r.user_id])
+        queue_summaries = await QueueHistoryService.summaries_for_refs(
+            db,
+            tenant_id,
+            channel=QueueChannel.CALL_CENTER.value,
+            task_types=[QueueTaskType.CALL.value],
+            ref_ids=[r.call_id for r in rows],
+        )
         items = [
             _to_list_item(
                 r,
                 agents.get(r.agent_id) if r.agent_id else None,
                 users.get(r.user_id) if r.user_id else None,
+                queue_summaries.get(r.call_id),
             )
             for r in rows
         ]
@@ -235,10 +283,18 @@ class CallRecordService:
         }
 
     @staticmethod
-    async def get_by_id(db: AsyncSession, record_id: int, tenant_id: int) -> dict:
+    async def get_by_id(
+        db: AsyncSession,
+        record_id: int,
+        tenant_id: int,
+        principal: EffectivePrincipal | None = None,
+    ) -> dict:
         row = await CallRecordRepository.get_by_id(db, record_id, tenant_id)
         if not row:
             raise NotFoundError("Call record not found")
+        if principal is not None:
+            peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            DataScopeService.assert_call_record_in_scope(principal, row, peer_ids)
         agent_name = None
         if row.agent_id:
             emp = (
@@ -249,12 +305,20 @@ class CallRecordService:
         user_map = await _load_user_map(db, tenant_id, [row.user_id] if row.user_id else [])
         candidates = await CallUserAssociationService.candidate_users(db, tenant_id, row)
         related_tickets = await TicketRepository.list_by_call_record_id(db, tenant_id, record_id)
+        queue_summaries = await QueueHistoryService.summaries_for_refs(
+            db,
+            tenant_id,
+            channel=QueueChannel.CALL_CENTER.value,
+            task_types=[QueueTaskType.CALL.value],
+            ref_ids=[row.call_id],
+        )
         return _to_detail(
             row,
             agent_name,
             user_map.get(row.user_id) if row.user_id else None,
             candidates,
             related_tickets,
+            queue_summaries.get(row.call_id),
         )
 
 
@@ -278,8 +342,82 @@ async def _load_user_map(db: AsyncSession, tenant_id: int, user_ids: list[int]) 
     return {user.id: user for user in users}
 
 
-def _to_list_item(row, agent_name: str | None, user: User | None = None) -> dict:
+async def _queue_record_brief(
+    db: AsyncSession,
+    tenant_id: int,
+    queue_type: str,
+    queue_id: int,
+) -> dict | None:
+    if queue_type == QueueType.EMPLOYEE.value:
+        result = await db.execute(
+            select(Employee).where(
+                Employee.tenant_id == tenant_id,
+                Employee.id == queue_id,
+            )
+        )
+        employee = result.scalar_one_or_none()
+        if employee is None:
+            return None
+        name = employee.display_name or employee.nickname or employee.name or employee.username
+    elif queue_type == QueueType.EMPLOYEE_GROUP.value:
+        result = await db.execute(
+            select(EmployeeGroup).where(
+                EmployeeGroup.tenant_id == tenant_id,
+                EmployeeGroup.id == queue_id,
+            )
+        )
+        group = result.scalar_one_or_none()
+        name = group.name if group else None
+    else:
+        return None
+
+    if not name:
+        return None
+    return {"queue_type": queue_type, "queue_id": queue_id, "name": name}
+
+
+def _effective_queue_summary(row, queue_summary: dict | None) -> dict:
+    metadata_summary = _queue_summary_from_metadata(row)
+    queue_summary = queue_summary or {}
+    return {
+        "last_assigned_queue": (
+            queue_summary.get("last_assigned_queue")
+            or metadata_summary.get("last_assigned_queue")
+        ),
+        "queue_duration_seconds": (
+            queue_summary.get("queue_duration_seconds")
+            if queue_summary.get("queue_duration_seconds") is not None
+            else metadata_summary.get("queue_duration_seconds")
+        ),
+    }
+
+
+def _queue_summary_from_metadata(row) -> dict:
+    metadata = row.extra_metadata or {}
+    summary = metadata.get(CALL_QUEUE_SUMMARY_METADATA_KEY)
+    if not isinstance(summary, dict):
+        return {}
+
+    queue = summary.get("last_assigned_queue")
+    if not isinstance(queue, dict):
+        queue = None
+    elif not queue.get("queue_type") or not queue.get("queue_id") or not queue.get("name"):
+        queue = None
+
+    return {
+        "last_assigned_queue": queue,
+        "queue_duration_seconds": None,
+    }
+
+
+def _to_list_item(
+    row,
+    agent_name: str | None,
+    user: User | None = None,
+    queue_summary: dict | None = None,
+) -> dict:
     user_brief = CallUserAssociationService.brief_user(user)
+    queue_summary = _effective_queue_summary(row, queue_summary)
     return {
         "id": row.id,
         "call_id": row.call_id,
@@ -300,6 +438,8 @@ def _to_list_item(row, agent_name: str | None, user: User | None = None) -> dict
         "ended_at": row.ended_at,
         "ring_duration_ms": row.ring_duration_ms,
         "talk_duration_ms": row.talk_duration_ms,
+        "last_assigned_queue": queue_summary.get("last_assigned_queue"),
+        "queue_duration_seconds": queue_summary.get("queue_duration_seconds"),
     }
 
 
@@ -309,8 +449,10 @@ def _to_detail(
     user: User | None = None,
     candidates: list[User] | None = None,
     related_tickets: list | None = None,
+    queue_summary: dict | None = None,
 ) -> dict:
     user_brief = CallUserAssociationService.brief_user(user)
+    queue_summary = _effective_queue_summary(row, queue_summary)
     return {
         "id": row.id,
         "call_id": row.call_id,
@@ -343,6 +485,8 @@ def _to_detail(
         "hangup_reason": row.hangup_reason,
         "recording_url": row.recording_url,
         "recording_duration_ms": row.recording_duration_ms,
+        "last_assigned_queue": queue_summary.get("last_assigned_queue"),
+        "queue_duration_seconds": queue_summary.get("queue_duration_seconds"),
         "related_tickets": [
             {
                 "id": ticket.id,

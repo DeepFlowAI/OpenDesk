@@ -2,13 +2,22 @@
 Integration tests for Employees API
 """
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
-from app.core.security import create_access_token
+
+from tests.integration.rbac_helpers import (
+    auth_headers_for_seeded_admin,
+    ensure_admin_principals,
+)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def seed_admin_principals():
+    await ensure_admin_principals([7, 9999])
 
 
 def _auth_header(tenant_id: int = 7, role: str = "admin") -> dict:
-    token = create_access_token({"sub": "1", "tenant_id": tenant_id, "roles": [role]})
-    return {"Authorization": f"Bearer {token}"}
+    return auth_headers_for_seeded_admin(tenant_id, role)
 
 
 class TestEmployeesAPI:
@@ -291,6 +300,6 @@ class TestEmployeesAPI:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_unauthenticated_returns_422(self, client: AsyncClient):
+    async def test_unauthenticated_returns_401(self, client: AsyncClient):
         resp = await client.get("/api/v1/employees")
-        assert resp.status_code == 422
+        assert resp.status_code == 401

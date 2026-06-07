@@ -7,8 +7,10 @@ import { IconLoader2 } from '@tabler/icons-react'
 
 import { FieldValueDisplay } from '@/app/components/features/field-system/field-value-display'
 import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
+import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { cn } from '@/lib/utils'
+import { hasPermission } from '@/utils/permissions'
 import type { CallRecordUserBrief } from '@/models/call-center'
 import type { CustomFieldValue, UpdateUserPayload, User } from '@/models/user'
 import type { UnifiedField } from '@/models/field-definition'
@@ -41,6 +43,7 @@ const INSTANT_SAVE_FIELD_TYPES = new Set<FieldType>([
 export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
   const router = useRouter()
   const { locale } = useLocaleStore()
+  const currentUser = useAuthStore((state) => state.user)
   const recordQuery = useCallRecord(recordId)
   const identifyUser = useIdentifyCallRecordUser()
   const linkUser = useLinkCallRecordUser()
@@ -51,13 +54,18 @@ export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
   const userQuery = useUser(associatedUserRef)
   const fieldsQuery = useUnifiedFields({ domain: 'user', locale, include_metadata: false })
   const updateUser = useUpdateUser()
+  const canViewUsers = hasPermission(currentUser, 'crm.workspace.user.view')
+  const canCreateUser = hasPermission(currentUser, 'crm.workspace.user.create')
+  const canEditUser = hasPermission(currentUser, 'crm.workspace.user.edit')
+  const canAssociateUser = canCreateUser || canEditUser
 
   useEffect(() => {
+    if (!canAssociateUser) return
     if (!recordId || !record || record.user_association_status !== 'unlinked') return
     if (attemptedIdentifyRef.current === recordId) return
     attemptedIdentifyRef.current = recordId
     identifyUser.mutate(recordId)
-  }, [recordId, record, identifyUser])
+  }, [canAssociateUser, recordId, record, identifyUser])
 
   const workspaceFields = useMemo(
     () =>
@@ -74,7 +82,7 @@ export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
     <div className="space-y-4">
       <div className="mb-3 flex items-center justify-between gap-3 border-b border-border pb-2">
         <h3 className="text-sm font-semibold">用户信息</h3>
-        {canViewUser && (
+        {canViewUsers && canViewUser && (
           <button
             type="button"
             onClick={() => router.push(`/workspace/users/${associatedUserRef}`)}
@@ -106,7 +114,7 @@ export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
         />
       ) : status === 'unknown' ? (
         <PanelStateMessage>无法根据未知号码关联用户</PanelStateMessage>
-      ) : status === 'multiple' ? (
+      ) : status === 'multiple' && canAssociateUser ? (
         <CandidateList
           candidates={record?.associated_user_candidates ?? []}
           isSaving={linkUser.isPending}
@@ -131,6 +139,7 @@ export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
           user={userQuery.data}
           fields={workspaceFields}
           isSaving={updateUser.isPending}
+          canEdit={canEditUser}
           onSave={(field, value) =>
             updateUser.mutateAsync({
               id: userQuery.data.id,
@@ -181,12 +190,14 @@ function EditableUserFields({
   user,
   fields,
   isSaving,
+  canEdit,
   onSave,
 }: {
   locale: Locale
   user: User
   fields: UnifiedField[]
   isSaving: boolean
+  canEdit: boolean
   onSave: (field: UnifiedField, value: unknown) => Promise<unknown>
 }) {
   const [editingKey, setEditingKey] = useState<string | null>(null)
@@ -198,7 +209,7 @@ function EditableUserFields({
   }
 
   const startEdit = (field: UnifiedField) => {
-    if (!isFieldEditable(field)) return
+    if (!canEdit || !isFieldEditable(field)) return
     setEditingKey(getFieldIdentity(field))
     setDraftValue(getFieldRawValue(user, field))
     setFieldError(null)
@@ -235,7 +246,7 @@ function EditableUserFields({
       {fields.map((field) => {
         const identity = getFieldIdentity(field)
         const editing = editingKey === identity
-        const editable = isFieldEditable(field)
+        const editable = canEdit && isFieldEditable(field)
         return (
           <EditableInfoRow
             key={identity}

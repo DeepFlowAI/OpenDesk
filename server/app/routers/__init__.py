@@ -9,11 +9,13 @@ def register_routers(app: FastAPI) -> None:
         system_settings,
         open_agent_settings,
         service_hours,
+        roles,
         employees,
         upload,
         employee_groups,
         system_users,
         voice_flows,
+        ticket_workflows,
         inbound_routing_rules,
         session_routing_rules,
         conversation_settings,
@@ -26,11 +28,13 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(system_settings.router, prefix="/api/v1")
     app.include_router(open_agent_settings.router, prefix="/api/v1")
     app.include_router(service_hours.router, prefix="/api/v1")
+    app.include_router(roles.router, prefix="/api/v1")
     app.include_router(employees.router, prefix="/api/v1")
     app.include_router(upload.router, prefix="/api/v1")
     app.include_router(employee_groups.router, prefix="/api/v1")
     app.include_router(system_users.router, prefix="/api/v1")
     app.include_router(voice_flows.router, prefix="/api/v1")
+    app.include_router(ticket_workflows.router, prefix="/api/v1")
     app.include_router(inbound_routing_rules.router, prefix="/api/v1")
     app.include_router(session_routing_rules.router, prefix="/api/v1")
     app.include_router(conversation_settings.router, prefix="/api/v1")
@@ -47,8 +51,9 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(field_definitions.router, prefix="/api/v1")
     app.include_router(transfer.router, prefix="/api/v1")
 
-    from app.routers.v1 import form_layouts, interaction_rules, session_summary, call_summary, user_views, ticket_views, organization_views, users, organizations, tickets, call_center
+    from app.routers.v1 import form_layouts, interaction_rules, session_summary, call_summary, user_views, ticket_views, organization_views, users, organizations, tickets, call_center, queue
     app.include_router(call_center.router, prefix="/api/v1")
+    app.include_router(queue.router, prefix="/api/v1")
     app.include_router(form_layouts.router, prefix="/api/v1")
     app.include_router(interaction_rules.router, prefix="/api/v1")
     app.include_router(session_summary.router, prefix="/api/v1")

@@ -44,6 +44,20 @@ def _make_employee(
     )
 
 
+def _principal(user_id: int, *, tenant_id: int = 7, group_ids: list[int] | None = None):
+    """Minimal EffectivePrincipal stand-in for transfer authorization paths."""
+    return SimpleNamespace(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        is_super_admin=False,
+        role_ids=[],
+        legacy_roles=[],
+        permissions=[],
+        data_scopes={},
+        group_ids=group_ids or [],
+    )
+
+
 def _make_conversation(
     *,
     id: int = 100,
@@ -210,6 +224,10 @@ class TestListTargets:
             "get_by_id",
             new=AsyncMock(return_value=conversation),
         ), patch.object(
+            ts.DataScopeService,
+            "can_access_conversation",
+            new=AsyncMock(return_value=True),
+        ), patch.object(
             ts.EmployeeRepository, "get_transfer_candidates", new=repo_mock
         ):
             await TransferService.list_targets(
@@ -218,7 +236,7 @@ class TestListTargets:
                 tenant_id=7,
                 current_user_id=99,
                 conversation_id=conversation.id,
-                roles=["admin"],
+                principal=_principal(99),
             )
 
         kwargs = repo_mock.await_args.kwargs
@@ -267,6 +285,13 @@ class _TransferPatches:
         self._patches = []
         self.conv_repo_get_by_id = AsyncMock(return_value=conversation)
         self.emp_repo_get_by_id = AsyncMock(side_effect=[target, initiator])
+        self.has_permission = AsyncMock(return_value=True)
+        # Principal-based history view: ``get_current_principal`` is invoked
+        # for the receiver (and the initiator when no principal is supplied),
+        # while ``session_history_filters`` decides the history query scope.
+        self.get_principal = AsyncMock(side_effect=lambda _db, payload: _principal(payload["user_id"]))
+        self.session_history_filters = AsyncMock(return_value=(None, None))
+        self.can_access = AsyncMock(return_value=True)
         self.status_get = AsyncMock(return_value={
             "user_id": getattr(target, "id", 0),
             "status": target_status,
@@ -291,6 +316,18 @@ class _TransferPatches:
                 ts.ConversationRepository, "get_visitor_history", new=self.history_mock
             ),
             patch.object(ts.EmployeeRepository, "get_by_id", new=self.emp_repo_get_by_id),
+            patch.object(
+                ts.EmployeeRepository, "has_effective_permission", new=self.has_permission
+            ),
+            patch.object(
+                ts.PermissionService, "get_current_principal", new=self.get_principal
+            ),
+            patch.object(
+                ts.DataScopeService, "session_history_filters", new=self.session_history_filters
+            ),
+            patch.object(
+                ts.DataScopeService, "can_access_conversation", new=self.can_access
+            ),
             patch.object(ts.AgentStatusService, "get_status", new=self.status_get),
             patch.object(ts.AgentStatusService, "increment_count", new=self.status_inc),
             patch.object(ts.AgentStatusService, "decrement_count", new=self.status_dec),
@@ -412,7 +449,7 @@ class TestTransferConversation:
                 target_agent_id=target.id,
                 current_user_id=999,  # admin, not the conversation owner
                 tenant_id=7,
-                roles=["admin"],
+                principal=_principal(999),
             )
 
         added_messages = [obj for obj in fake_db.added if isinstance(obj, Message)]
@@ -547,6 +584,37 @@ class TestTransferConversation:
                 )
 
     @pytest.mark.asyncio
+    async def test_target_without_chat_access_raises_not_found(self, fake_db, fake_redis):
+        """A target employee lacking ``chat.workspace.use`` is treated as a
+        non-candidate (NotFound), matching the candidate-list eligibility."""
+        conversation = _make_conversation(agent_id=11)
+        target = _make_employee(id=22, name="Bob")
+
+        with patch.object(
+            ts.ConversationRepository,
+            "get_by_id",
+            new=AsyncMock(return_value=conversation),
+        ), patch.object(
+            ts.EmployeeRepository,
+            "get_by_id",
+            new=AsyncMock(return_value=target),
+        ), patch.object(
+            ts.EmployeeRepository,
+            "has_effective_permission",
+            new=AsyncMock(return_value=False),
+        ):
+            with pytest.raises(NotFoundError):
+                await TransferService.transfer_conversation(
+                    db=fake_db,
+                    r=fake_redis,
+                    conversation_id=conversation.id,
+                    target_agent_id=22,
+                    current_user_id=11,
+                    tenant_id=7,
+                    roles=["agent"],
+                )
+
+    @pytest.mark.asyncio
     async def test_target_offline_raises(self, fake_db, fake_redis):
         conversation = _make_conversation(agent_id=11)
         target = _make_employee(id=22, name="Bob")
@@ -559,6 +627,10 @@ class TestTransferConversation:
             ts.EmployeeRepository,
             "get_by_id",
             new=AsyncMock(return_value=target),
+        ), patch.object(
+            ts.EmployeeRepository,
+            "has_effective_permission",
+            new=AsyncMock(return_value=True),
         ), patch.object(
             ts.AgentStatusService,
             "get_status",
@@ -715,6 +787,10 @@ class TestListTargetsAuthorization:
             "get_by_id",
             new=AsyncMock(return_value=conversation),
         ), patch.object(
+            ts.DataScopeService,
+            "can_access_conversation",
+            new=AsyncMock(return_value=True),
+        ), patch.object(
             ts.EmployeeRepository, "get_transfer_candidates", new=repo_mock
         ):
             await TransferService.list_targets(
@@ -723,7 +799,7 @@ class TestListTargetsAuthorization:
                 tenant_id=7,
                 current_user_id=999,  # admin, not owner
                 conversation_id=conversation.id,
-                roles=["admin"],
+                principal=_principal(999),
             )
         kwargs = repo_mock.await_args.kwargs
         assert set(kwargs["exclude_user_ids"]) == {999, 42}

@@ -20,6 +20,7 @@ from app.core.security import (
 from app.repositories.channel_repository import ChannelRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.service_hours_repository import ServiceHoursRepository
+from app.repositories.user_repository import UserRepository
 from app.models.service_hours import ServiceHours
 from app.schemas.channel import ChannelCreate, ChannelUpdate
 from app.schemas.channel import ChannelConfig, DEFAULT_OFFLINE_MESSAGE, DEFAULT_OFFLINE_TITLE
@@ -239,6 +240,7 @@ class ChannelService:
         db: AsyncSession,
         r: aioredis.Redis,
         channel_id: int,
+        visitor_id: int | None = None,
     ) -> dict:
         """Check whether a visitor may start a new conversation for this channel."""
         item = await ChannelRepository.get_by_id(db, channel_id)
@@ -249,7 +251,7 @@ class ChannelService:
         if config.open_agent_enabled:
             return await ChannelService.check_open_agent_bot_availability(db, item, config)
 
-        return await ChannelService.check_human_availability(db, r, item, config)
+        return await ChannelService.check_human_availability(db, r, item, config, visitor_id=visitor_id)
 
     @staticmethod
     async def check_open_agent_bot_availability(
@@ -309,6 +311,7 @@ class ChannelService:
         r: aioredis.Redis,
         item,
         config: ChannelConfig | None = None,
+        visitor_id: int | None = None,
     ) -> dict:
         """Check whether a human agent can receive a visitor conversation."""
         config = config or ChannelConfig.model_validate(item.config or {})
@@ -323,22 +326,10 @@ class ChannelService:
         # Lazy import to avoid circular dependency with routing_service
         from app.services.routing_service import RoutingService
 
-        _, group_member_ids, max_concurrent_map = await RoutingService.route_conversation(
-            db, item.tenant_id, item.id
+        _, group_member_ids, _ = await RoutingService.route_conversation(
+            db, item.tenant_id, item.id, r, visitor_id=visitor_id
         )
-        has_available_agent = False
-        for user_id in group_member_ids:
-            status_data = await AgentStatusService.get_status(
-                r,
-                item.tenant_id,
-                user_id,
-                max_concurrent_map.get(user_id, 10),
-            )
-            if status_data["status"] == "online" and status_data["current_count"] < status_data["max_concurrent"]:
-                has_available_agent = True
-                break
-
-        if not has_available_agent:
+        if not group_member_ids:
             return {
                 "can_start_conversation": False,
                 "reason": "no_available_agent",
@@ -405,13 +396,12 @@ class ChannelService:
         agent_id: int,
     ) -> tuple[bool, int]:
         employee = await EmployeeRepository.get_by_id(db, agent_id)
-        if (
-            not employee
-            or employee.tenant_id != tenant_id
-            or not employee.is_active
-            or "agent" not in (employee.roles or [])
-        ):
+        if not employee or employee.tenant_id != tenant_id or not employee.is_active:
             return False, 10
+        if not await EmployeeRepository.has_effective_permission(
+            db, tenant_id, agent_id, "chat.workspace.use"
+        ):
+            return False, employee.max_concurrent or 10
 
         max_concurrent = employee.max_concurrent or 10
         status_data = await AgentStatusService.get_status(r, tenant_id, agent_id, max_concurrent)
@@ -434,6 +424,7 @@ class ChannelService:
         r: aioredis.Redis,
         channel_id: int,
         handoff_payload: dict | None = None,
+        visitor_id: int | None = None,
     ) -> dict:
         """Resolve the human target for a bot-to-human handoff."""
         item = await ChannelRepository.get_by_id(db, channel_id)
@@ -503,7 +494,7 @@ class ChannelService:
         from app.services.routing_service import RoutingService
 
         group_id, group_member_ids, max_concurrent_map = await RoutingService.route_conversation(
-            db, item.tenant_id, item.id
+            db, item.tenant_id, item.id, r, visitor_id=visitor_id
         )
         agent_id = await AgentStatusService.find_available_agent(
             r, item.tenant_id, group_member_ids, max_concurrent_map
@@ -530,10 +521,12 @@ class ChannelService:
         item = await ChannelRepository.get_by_id(db, channel_id)
         if not item:
             raise NotFoundError("Channel not found")
-        availability = await ChannelService.check_channel_availability(db, r, channel_id)
         config = ChannelConfig.model_validate(item.config or {}).model_dump()
         has_conversation_history = False
+        visitor_id: int | None = None
         if visitor_external_id:
+            visitor = await UserRepository.get_by_external_id(db, item.tenant_id, visitor_external_id)
+            visitor_id = visitor.id if visitor else None
             from app.services.conversation_service import ConversationService
             has_conversation_history = await ConversationService.has_visitor_history(
                 db,
@@ -541,6 +534,7 @@ class ChannelService:
                 visitor_external_id=visitor_external_id,
                 current_conversation_id=current_conversation_id,
             )
+        availability = await ChannelService.check_channel_availability(db, r, channel_id, visitor_id=visitor_id)
         from app.services.welcome_message_rule_service import WelcomeMessageRuleService
         welcome_message = None
         if not config.get("open_agent_enabled"):
@@ -569,10 +563,12 @@ class ChannelService:
     ) -> dict:
         """Get public channel config using the high-entropy public key."""
         item = await ChannelService.get_public_channel_by_key(db, channel_key)
-        availability = await ChannelService.check_channel_availability(db, r, item.id)
         config = ChannelConfig.model_validate(item.config or {}).model_dump()
         has_conversation_history = False
+        visitor_id: int | None = None
         if visitor_external_id:
+            visitor = await UserRepository.get_by_external_id(db, item.tenant_id, visitor_external_id)
+            visitor_id = visitor.id if visitor else None
             from app.services.conversation_service import ConversationService
 
             has_conversation_history = await ConversationService.has_visitor_history(
@@ -581,6 +577,7 @@ class ChannelService:
                 visitor_external_id=visitor_external_id,
                 current_conversation_public_id=current_conversation_public_id,
             )
+        availability = await ChannelService.check_channel_availability(db, r, item.id, visitor_id=visitor_id)
         from app.services.welcome_message_rule_service import WelcomeMessageRuleService
         welcome_message = None
         if not config.get("open_agent_enabled"):

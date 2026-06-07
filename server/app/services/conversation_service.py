@@ -22,8 +22,10 @@ from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.message_repository import MessageRepository
 from app.schemas.channel import ChannelConfig
 from app.schemas.message import FileMessageContent
+from app.schemas.permission import EffectivePrincipal
 from app.repositories.user_repository import UserRepository
 from app.services.agent_status_service import AgentStatusService
+from app.services.data_scope_service import DataScopeService
 from app.services.routing_service import RoutingService
 from app.services.welcome_message_rule_service import WelcomeMessageRuleService
 
@@ -211,7 +213,7 @@ class ConversationService:
             newly_assigned = False
             if existing.status == ConversationStatus.QUEUED.value and not existing.agent_id:
                 group_id, group_member_ids, max_concurrent_map = await RoutingService.route_conversation(
-                    db, tenant_id, channel_id
+                    db, tenant_id, channel_id, r, visitor_id=existing.visitor_id
                 )
                 if group_member_ids:
                     agent_id = await AgentStatusService.find_available_agent(
@@ -280,7 +282,9 @@ class ConversationService:
             conversation = await ConversationRepository.get_by_id(db, conversation.id)
             return {"conversation": conversation, "is_new": True}
 
-        availability = await ChannelService.check_channel_availability(db, r, channel_id)
+        availability = await ChannelService.check_channel_availability(
+            db, r, channel_id, visitor_id=user.id
+        )
         if not availability["can_start_conversation"]:
             return {
                 "conversation": None,
@@ -290,7 +294,7 @@ class ConversationService:
             }
 
         group_id, group_member_ids, max_concurrent_map = await RoutingService.route_conversation(
-            db, tenant_id, channel_id
+            db, tenant_id, channel_id, r, visitor_id=user.id
         )
 
         agent_id = None
@@ -343,11 +347,21 @@ class ConversationService:
 
     @staticmethod
     async def get_agent_conversations(
-        db: AsyncSession, tenant_id: int, agent_id: int, roles: list[str] | None = None
+        db: AsyncSession,
+        tenant_id: int,
+        agent_id: int,
+        roles: list[str] | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> list:
         conversations = await ConversationRepository.get_active_by_agent(db, tenant_id, agent_id)
-        can_view_all_history = "admin" in (roles or ["agent"])
-        history_agent_id = None if can_view_all_history else agent_id
+        if principal is not None:
+            history_agent_id, history_predicate = await DataScopeService.session_history_filters(
+                db, principal
+            )
+        else:
+            can_view_all_history = "admin" in (roles or ["agent"])
+            history_agent_id = None if can_view_all_history else agent_id
+            history_predicate = None
 
         items = []
         for conversation in conversations:
@@ -361,6 +375,7 @@ class ConversationService:
                     current_conversation_id=conversation.id,
                     agent_id=history_agent_id,
                     limit=1,
+                    scope_predicate=history_predicate,
                 )
                 has_history = bool(history)
 
@@ -392,15 +407,24 @@ class ConversationService:
         tenant_id: int,
         agent_id: int,
         roles: list[str] | None = None,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         """Get a workspace conversation with the history availability marker."""
         conversation = await ConversationRepository.get_by_id(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
 
-        can_view_all_history = "admin" in (roles or ["agent"])
-        if not can_view_all_history and conversation.agent_id != agent_id:
-            raise ForbiddenError("No permission to view conversation")
+        if principal is not None:
+            await DataScopeService.assert_conversation_access(db, principal, conversation)
+            history_agent_id, history_predicate = await DataScopeService.session_history_filters(
+                db, principal
+            )
+        else:
+            can_view_all_history = "admin" in (roles or ["agent"])
+            if not can_view_all_history and conversation.agent_id != agent_id:
+                raise ForbiddenError("No permission to view conversation")
+            history_agent_id = None if can_view_all_history else agent_id
+            history_predicate = None
 
         has_history = False
         if conversation.visitor_id:
@@ -410,8 +434,9 @@ class ConversationService:
                 channel_id=None,
                 visitor_id=conversation.visitor_id,
                 current_conversation_id=conversation.id,
-                agent_id=None if can_view_all_history else agent_id,
+                agent_id=history_agent_id,
                 limit=1,
+                scope_predicate=history_predicate,
             )
             has_history = bool(history)
 
@@ -772,6 +797,7 @@ class ConversationService:
             r,
             conversation.channel_id,
             handoff_payload=handoff_data,
+            visitor_id=conversation.visitor_id,
         )
 
         if not target["can_start_conversation"] or not target.get("agent_id"):
@@ -1304,15 +1330,24 @@ class ConversationService:
         roles: list[str] | None = None,
         before_id: int | None = None,
         limit: int = VISITOR_HISTORY_PAGE_SIZE,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         """Fetch read-only visitor history for the agent workspace."""
         current = await ConversationRepository.get_by_id(db, conversation_id)
         if not current or current.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
 
-        can_view_all_history = "admin" in (roles or ["agent"])
-        if not can_view_all_history and current.agent_id != agent_id:
-            raise ForbiddenError("No permission to view conversation history")
+        if principal is not None:
+            await DataScopeService.assert_conversation_access(db, principal, current)
+            history_agent_id, history_predicate = await DataScopeService.session_history_filters(
+                db, principal
+            )
+        else:
+            can_view_all_history = "admin" in (roles or ["agent"])
+            if not can_view_all_history and current.agent_id != agent_id:
+                raise ForbiddenError("No permission to view conversation history")
+            history_agent_id = None if can_view_all_history else agent_id
+            history_predicate = None
 
         if not current.visitor:
             return {"items": [], "has_more": False}
@@ -1325,8 +1360,9 @@ class ConversationService:
             visitor_id=current.visitor.id,
             current_conversation_id=current.id,
             before_id=before_id,
-            agent_id=None if can_view_all_history else agent_id,
+            agent_id=history_agent_id,
             limit=safe_limit + 1,
+            scope_predicate=history_predicate,
         )
         has_more = len(conversations) > safe_limit
         if has_more:

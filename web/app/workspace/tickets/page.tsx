@@ -13,6 +13,7 @@ import {
   IconTicket,
 } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { cn } from '@/lib/utils'
 import {
   useQueryTickets,
@@ -39,6 +40,7 @@ import {
 import { richTextToPlainCell } from '@/lib/rich-text-plain'
 import { FieldOptionPill } from '@/app/components/features/field-system/field-select-pill-editors'
 import { colorForSelectValue, labelForSelectValue } from '@/lib/field-select-from-unified'
+import { hasPermission } from '@/utils/permissions'
 
 // ── localStorage helpers ──
 
@@ -75,6 +77,7 @@ function removeColsFromStorage(viewId: number | null): void {
 
 export default function WorkspaceTicketsPage() {
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const router = useRouter()
   const searchParams = useSearchParams()
 
@@ -147,6 +150,7 @@ export default function WorkspaceTicketsPage() {
   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false)
   const [columnsDrawerOpen, setColumnsDrawerOpen] = useState(false)
   const [createModalOpen, setCreateModalOpen] = useState(false)
+  const canCreateTicket = hasPermission(user, 'ticket.workspace.create')
 
   const [sidebarOpen, setSidebarOpen] = useState(true)
 
@@ -392,14 +396,16 @@ export default function WorkspaceTicketsPage() {
               ? (locale === 'zh' ? '全部工单' : 'All Tickets')
               : activeView?.name ?? ''}
           </h3>
-          <button
-            type="button"
-            onClick={() => setCreateModalOpen(true)}
-            className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
-          >
-            <IconPlus size={16} />
-            {locale === 'zh' ? '新建工单' : 'Create Ticket'}
-          </button>
+          {canCreateTicket && (
+            <button
+              type="button"
+              onClick={() => setCreateModalOpen(true)}
+              className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
+            >
+              <IconPlus size={16} />
+              {locale === 'zh' ? '新建工单' : 'Create Ticket'}
+            </button>
+          )}
         </div>
 
         <div className="flex items-center gap-3 px-5 pb-3.5 pt-3">
@@ -654,7 +660,7 @@ export default function WorkspaceTicketsPage() {
       )}
 
       {/* Create Ticket Modal */}
-      {createModalOpen && (
+      {canCreateTicket && createModalOpen && (
         <TicketFormModal
           onClose={() => setCreateModalOpen(false)}
           onSuccess={() => setCreateModalOpen(false)}

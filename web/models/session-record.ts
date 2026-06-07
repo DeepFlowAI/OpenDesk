@@ -22,6 +22,12 @@ export type SessionRecordChannel = {
   channel_type: string
 }
 
+export type QueueRecordBrief = {
+  queue_type: 'employee_group' | 'employee' | string
+  queue_id: number
+  name: string
+}
+
 export type SessionRecord = {
   id: number
   public_id: string
@@ -35,6 +41,8 @@ export type SessionRecord = {
   ended_by: string | null
   created_at: string | null
   satisfaction: SatisfactionSummary | null
+  last_assigned_queue: QueueRecordBrief | null
+  queue_duration_seconds: number | null
 }
 
 export type SessionRecordListResponse = {

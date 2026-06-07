@@ -1,5 +1,6 @@
 from app.models.tenant import Tenant  # noqa: F401
 from app.models.employee import Employee  # noqa: F401
+from app.models.role import Role, EmployeeRole  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.system_settings import SystemSettings  # noqa: F401
 from app.models.open_agent_settings import OpenAgentSettings  # noqa: F401
@@ -7,6 +8,8 @@ from app.models.service_hours import ServiceHours  # noqa: F401
 from app.models.employee_group import EmployeeGroup, EmployeeGroupMember  # noqa: F401
 from app.models.voice_flow import VoiceFlow  # noqa: F401
 from app.models.voice_flow_version import VoiceFlowVersion  # noqa: F401
+from app.models.ticket_workflow import TicketWorkflow  # noqa: F401
+from app.models.ticket_workflow_version import TicketWorkflowVersion  # noqa: F401
 from app.models.audio_asset import AudioAsset  # noqa: F401
 from app.models.voice_flow_system_variable import VoiceFlowSystemVariable  # noqa: F401
 from app.models.agent_status import AgentStatus  # noqa: F401
@@ -48,3 +51,4 @@ from app.models.call_summary_field_value import CallSummaryFieldValue  # noqa: F
 from app.models.user_view import UserView  # noqa: F401
 from app.models.ticket_view import TicketView  # noqa: F401
 from app.models.organization_view import OrganizationView  # noqa: F401
+from app.models.queue import QueueTask, QueuePolicy, QueueRoundRobinState, QueueAssignmentEvent, QueueOutboxEvent  # noqa: F401

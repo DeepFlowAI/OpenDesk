@@ -6,6 +6,7 @@ from datetime import datetime
 from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.models.conversation import Conversation
 from app.models.user import User
@@ -34,9 +35,12 @@ class SessionRecordRepository:
         service_labels: list[str] | None = None,
         product_rating_options: list[str] | None = None,
         product_labels: list[str] | None = None,
+        scope_predicate: ColumnElement | None = None,
     ) -> tuple[list[Conversation], int]:
         """Paginated list of conversations with optional filters."""
         base_filter = [Conversation.tenant_id == tenant_id]
+        if scope_predicate is not None:
+            base_filter.append(scope_predicate)
 
         if agent_id is not None:
             base_filter.append(Conversation.agent_id == agent_id)
@@ -88,6 +92,7 @@ class SessionRecordRepository:
                 selectinload(Conversation.visitor),
                 selectinload(Conversation.agent),
                 selectinload(Conversation.channel),
+                selectinload(Conversation.group),
             )
             .where(*filters)
             .order_by(func.coalesce(Conversation.started_at, Conversation.created_at).desc().nullslast())

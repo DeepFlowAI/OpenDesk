@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.base import PaginatedResponse
+from app.schemas.queue import QueueRecordBrief
 from app.schemas.ticket import RelatedTicketResponse
 
 
@@ -101,6 +102,8 @@ class CallRecordListItem(BaseModel):
     ended_at: datetime | None = None
     ring_duration_ms: int | None = None
     talk_duration_ms: int | None = None
+    last_assigned_queue: QueueRecordBrief | None = None
+    queue_duration_seconds: int | None = None
 
 
 class CallRecordListResponse(PaginatedResponse):
@@ -138,6 +141,8 @@ class CallRecordDetail(BaseModel):
     recording_url: str | None = None
     recording_duration_ms: int | None = None
     related_tickets: list[RelatedTicketResponse] = Field(default_factory=list)
+    last_assigned_queue: QueueRecordBrief | None = None
+    queue_duration_seconds: int | None = None
     metadata: dict = {}
 
 

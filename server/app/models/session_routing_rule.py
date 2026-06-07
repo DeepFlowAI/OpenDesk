@@ -22,6 +22,10 @@ class SessionRoutingRule(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     conditions: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
-    target_group_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("employee_groups.id", ondelete="RESTRICT"), nullable=False
+    target_group_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("employee_groups.id", ondelete="RESTRICT"), nullable=True
     )
+    target_strategy: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="sequential_overflow", server_default="sequential_overflow"
+    )
+    target_queue_sources: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")

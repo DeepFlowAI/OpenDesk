@@ -4,7 +4,9 @@ import { useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { IconArrowLeft } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
 import { useCreateEmployee } from '@/service/use-employees'
 import EmployeeForm from '@/app/(main)/employees/form'
 import type { CreateEmployeePayload } from '@/models/employee'
@@ -12,11 +14,14 @@ import type { CreateEmployeePayload } from '@/models/employee'
 export default function NewEmployeePage() {
   const router = useRouter()
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const createMutation = useCreateEmployee()
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const canCreate = hasPermission(user, 'org.employee.create')
 
   const handleSubmit = useCallback(
     async (data: CreateEmployeePayload) => {
+      if (!canCreate) return
       try {
         const created = await createMutation.mutateAsync(data as CreateEmployeePayload)
         setToast({ type: 'success', text: t('emp.saveSuccess', locale) })
@@ -28,7 +33,7 @@ export default function NewEmployeePage() {
         setTimeout(() => setToast(null), 3000)
       }
     },
-    [createMutation, locale, router]
+    [canCreate, createMutation, locale, router]
   )
 
   return (
@@ -43,14 +48,16 @@ export default function NewEmployeePage() {
           <IconArrowLeft size={20} className="text-muted-foreground" />
           <span className="text-base font-semibold">{t('emp.new.title', locale)}</span>
         </button>
-        <button
-          type="submit"
-          form="employee-form"
-          disabled={createMutation.isPending}
-          className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
-        >
-          {createMutation.isPending ? t('emp.saving', locale) : t('emp.save', locale)}
-        </button>
+        {canCreate && (
+          <button
+            type="submit"
+            form="employee-form"
+            disabled={createMutation.isPending}
+            className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
+          >
+            {createMutation.isPending ? t('emp.saving', locale) : t('emp.save', locale)}
+          </button>
+        )}
       </div>
 
       {/* Toast */}

@@ -4,7 +4,7 @@ Organizations router — organization CRUD, list & detail APIs
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, get_current_user
+from app.db.deps import get_db, get_current_user, require_permission
 from app.schemas.organization import (
     OrganizationResponse,
     OrganizationCreate,
@@ -22,7 +22,11 @@ from app.services.organization_service import OrganizationService
 router = APIRouter(prefix="/organizations", tags=["Organizations"])
 
 
-@router.post("/query", response_model=OrganizationListResponse)
+@router.post(
+    "/query",
+    response_model=OrganizationListResponse,
+    dependencies=[Depends(require_permission("crm.workspace.org.view"))],
+)
 async def query_organizations(
     body: OrganizationQueryRequest,
     current_user: dict = Depends(get_current_user),
@@ -33,7 +37,11 @@ async def query_organizations(
     return await OrganizationService.query_organizations(db, tenant_id, body)
 
 
-@router.get("/views/enabled", response_model=list[OrganizationViewResponse])
+@router.get(
+    "/views/enabled",
+    response_model=list[OrganizationViewResponse],
+    dependencies=[Depends(require_permission("crm.workspace.org.view"))],
+)
 async def list_enabled_views(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -43,7 +51,11 @@ async def list_enabled_views(
     return await OrganizationService.get_enabled_views(db, tenant_id)
 
 
-@router.get("/views/counts", response_model=OrgViewCountsResponse)
+@router.get(
+    "/views/counts",
+    response_model=OrgViewCountsResponse,
+    dependencies=[Depends(require_permission("crm.workspace.org.view"))],
+)
 async def get_view_counts(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -53,7 +65,11 @@ async def get_view_counts(
     return await OrganizationService.get_view_counts(db, tenant_id)
 
 
-@router.post("/views/{view_id}/groups", response_model=ViewGroupResponse)
+@router.post(
+    "/views/{view_id}/groups",
+    response_model=ViewGroupResponse,
+    dependencies=[Depends(require_permission("crm.workspace.org.view"))],
+)
 async def get_view_groups(
     view_id: int,
     body: ViewGroupRequest | None = None,
@@ -66,7 +82,12 @@ async def get_view_groups(
     return await OrganizationService.get_view_groups(db, tenant_id, view_id, payload)
 
 
-@router.post("", response_model=OrganizationResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=OrganizationResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("crm.workspace.org.create"))],
+)
 async def create_organization(
     body: OrganizationCreate,
     current_user: dict = Depends(get_current_user),
@@ -82,7 +103,11 @@ async def create_organization(
     )
 
 
-@router.get("/{org_ref}", response_model=OrganizationResponse)
+@router.get(
+    "/{org_ref}",
+    response_model=OrganizationResponse,
+    dependencies=[Depends(require_permission("crm.workspace.org.view"))],
+)
 async def get_organization(
     org_ref: str,
     current_user: dict = Depends(get_current_user),
@@ -93,7 +118,11 @@ async def get_organization(
     return await OrganizationService.get_by_ref(db, tenant_id, org_ref)
 
 
-@router.get("/{org_id}/changes", response_model=EntityChangeListResponse)
+@router.get(
+    "/{org_id}/changes",
+    response_model=EntityChangeListResponse,
+    dependencies=[Depends(require_permission("crm.workspace.org.view"))],
+)
 async def list_organization_changes(
     org_id: int,
     page: int = 1,
@@ -113,7 +142,11 @@ async def list_organization_changes(
     )
 
 
-@router.put("/{org_id}", response_model=OrganizationResponse)
+@router.put(
+    "/{org_id}",
+    response_model=OrganizationResponse,
+    dependencies=[Depends(require_permission("crm.workspace.org.edit"))],
+)
 async def update_organization(
     org_id: int,
     body: OrganizationUpdate,
@@ -131,7 +164,11 @@ async def update_organization(
     )
 
 
-@router.delete("/{org_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{org_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("crm.workspace.org.delete"))],
+)
 async def delete_organization(
     org_id: int,
     current_user: dict = Depends(get_current_user),
@@ -142,7 +179,11 @@ async def delete_organization(
     await OrganizationService.delete_organization(db, tenant_id, org_id)
 
 
-@router.get("/{org_ref}/users", response_model=dict)
+@router.get(
+    "/{org_ref}/users",
+    response_model=dict,
+    dependencies=[Depends(require_permission("crm.workspace.user.view"))],
+)
 async def list_organization_users(
     org_ref: str,
     page: int = 1,

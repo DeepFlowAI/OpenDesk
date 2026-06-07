@@ -19,8 +19,10 @@ from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.satisfaction_survey_config_repository import SatisfactionSurveyConfigRepository
 from app.repositories.satisfaction_survey_record_repository import SatisfactionSurveyRecordRepository
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.satisfaction_survey_config import SatisfactionSurveyConfigPayload
 from app.schemas.satisfaction_survey_record import SatisfactionSubmissionPayload, SatisfactionSubmissionTypePayload
+from app.services.data_scope_service import DataScopeService
 
 logger = logging.getLogger(__name__)
 
@@ -168,10 +170,20 @@ class SatisfactionSurveyRecordService:
         record: SatisfactionSurveyRecord | None,
         user: dict,
         config_error_code: str | None = None,
+        principal: EffectivePrincipal | None = None,
+        peer_employee_ids: list[int] | None = None,
     ) -> str | None:
-        roles = user.get("roles", ["agent"])
-        if "admin" not in roles and conversation.agent_id != user.get("user_id"):
-            return "no_permission"
+        if principal is not None:
+            if not DataScopeService.conversation_in_scope(
+                principal,
+                conversation,
+                peer_employee_ids or [],
+            ):
+                return "no_permission"
+        else:
+            roles = user.get("roles", ["agent"])
+            if "admin" not in roles and conversation.agent_id != user.get("user_id"):
+                return "no_permission"
         if conversation.status == ConversationStatus.CLOSED.value:
             return "conversation_closed"
         if config_error_code == "SATISFACTION_DISABLED":
@@ -267,13 +279,17 @@ class SatisfactionSurveyRecordService:
         conversation_id: int,
         tenant_id: int,
         user: dict,
+        principal: EffectivePrincipal | None = None,
     ) -> Conversation:
         conversation = await ConversationRepository.get_by_id(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
-        roles = user.get("roles", ["agent"])
-        if "admin" not in roles and conversation.agent_id != user.get("user_id"):
-            raise ForbiddenError("No permission to access conversation")
+        if principal is not None:
+            await DataScopeService.assert_conversation_access(db, principal, conversation)
+        else:
+            roles = user.get("roles", ["agent"])
+            if "admin" not in roles and conversation.agent_id != user.get("user_id"):
+                raise ForbiddenError("No permission to access conversation")
         return conversation
 
     @staticmethod
@@ -282,9 +298,15 @@ class SatisfactionSurveyRecordService:
         conversation_id: int,
         tenant_id: int,
         user: dict,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         conversation = await SatisfactionSurveyRecordService._load_conversation_for_agent(
-            db, conversation_id, tenant_id, user
+            db, conversation_id, tenant_id, user, principal
+        )
+        peer_ids = (
+            await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            if principal is not None
+            else []
         )
         record = await SatisfactionSurveyRecordRepository.get_by_conversation(db, conversation_id)
         snapshot: dict | None = None
@@ -301,6 +323,8 @@ class SatisfactionSurveyRecordService:
             record,
             user,
             config_error_code,
+            principal=principal,
+            peer_employee_ids=peer_ids,
         )
         return {
             "can_invite": disabled_reason is None,
@@ -318,13 +342,26 @@ class SatisfactionSurveyRecordService:
         user: dict,
         *,
         force: bool = False,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         conversation = await SatisfactionSurveyRecordService._load_conversation_for_agent(
-            db, conversation_id, tenant_id, user
+            db, conversation_id, tenant_id, user, principal
         )
         config_version, snapshot = await SatisfactionSurveyRecordService._current_snapshot(db, tenant_id)
         existing = await SatisfactionSurveyRecordRepository.get_by_conversation(db, conversation_id)
-        disabled_reason = SatisfactionSurveyRecordService._disabled_reason(conversation, snapshot, existing, user)
+        peer_ids = (
+            await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            if principal is not None
+            else []
+        )
+        disabled_reason = SatisfactionSurveyRecordService._disabled_reason(
+            conversation,
+            snapshot,
+            existing,
+            user,
+            principal=principal,
+            peer_employee_ids=peer_ids,
+        )
         if disabled_reason:
             raise BusinessError(f"Cannot send satisfaction survey: {disabled_reason}", code="SATISFACTION_INVITE_DISABLED")
 
@@ -723,9 +760,10 @@ class SatisfactionSurveyRecordService:
         record_id: int,
         tenant_id: int,
         user: dict,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         conversation = await SatisfactionSurveyRecordService._load_conversation_for_agent(
-            db, record_id, tenant_id, user
+            db, record_id, tenant_id, user, principal
         )
         record = await SatisfactionSurveyRecordRepository.get_by_conversation(db, conversation.id)
         events = await SatisfactionSurveyRecordRepository.get_event_messages_by_conversation(db, conversation.id)

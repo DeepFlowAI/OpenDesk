@@ -12,8 +12,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
-from app.core.exceptions import ForbiddenError
-from app.db.deps import get_current_user, get_db, get_redis
+from app.db.deps import get_current_user, get_current_principal, get_db, get_redis, require_permission
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.conversation import ConversationResponse
 from app.schemas.transfer import (
     TransferConversationRequest,
@@ -21,14 +21,11 @@ from app.schemas.transfer import (
 )
 from app.services.transfer_service import TransferService
 
-router = APIRouter(prefix="/workspace", tags=["Transfer"])
-
-
-def _ensure_workspace_access(user: dict) -> None:
-    """Both ``agent`` and ``admin`` roles can use the transfer feature."""
-    roles = user.get("roles", [])
-    if not any(role in {"agent", "admin"} for role in roles):
-        raise ForbiddenError("No permission to access workspace transfer")
+router = APIRouter(
+    prefix="/workspace",
+    tags=["Transfer"],
+    dependencies=[Depends(require_permission("chat.conversation.transfer"))],
+)
 
 
 @router.get("/transfer-targets", response_model=TransferTargetListResponse)
@@ -41,18 +38,17 @@ async def list_transfer_targets(
     ),
     db: AsyncSession = Depends(get_db),
     r: aioredis.Redis = Depends(get_redis),
-    user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Return colleagues eligible to receive a transferred conversation."""
-    _ensure_workspace_access(user)
     return await TransferService.list_targets(
         db,
         r,
-        tenant_id=user["tenant_id"],
-        current_user_id=user["user_id"],
+        tenant_id=principal.tenant_id,
+        current_user_id=principal.user_id,
         keyword=keyword,
         conversation_id=conversation_id,
-        roles=user.get("roles", []),
+        principal=principal,
     )
 
 
@@ -65,7 +61,7 @@ async def transfer_conversation(
     body: TransferConversationRequest,
     db: AsyncSession = Depends(get_db),
     r: aioredis.Redis = Depends(get_redis),
-    user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Force-transfer a conversation to the chosen online colleague.
 
@@ -73,13 +69,12 @@ async def transfer_conversation(
     we don't need a second permission-checked fetch (the requester may no
     longer own the conversation by the time we'd query it back).
     """
-    _ensure_workspace_access(user)
     return await TransferService.transfer_conversation(
         db,
         r,
         conversation_id=conversation_id,
         target_agent_id=body.target_agent_id,
-        current_user_id=user["user_id"],
-        tenant_id=user["tenant_id"],
-        roles=user.get("roles", []),
+        current_user_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        principal=principal,
     )

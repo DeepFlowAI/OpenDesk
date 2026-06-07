@@ -1,14 +1,8 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import type { UserInfo } from '@/models/auth'
 
-type User = {
-  id: number
-  username: string
-  display_name: string | null
-  avatar?: string | null
-  roles: string[]
-  tenant_id: number
-}
+type User = UserInfo
 
 type AuthState = {
   user: User | null

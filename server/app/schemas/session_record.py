@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.satisfaction_survey_record import SatisfactionSummaryResponse
 from app.schemas.ticket import RelatedTicketResponse
+from app.schemas.queue import QueueRecordBrief
 
 
 class SessionRecordVisitor(BaseModel):
@@ -51,6 +52,8 @@ class SessionRecordResponse(BaseModel):
     ended_by: str | None = None
     created_at: datetime | None = None
     satisfaction: SatisfactionSummaryResponse | None = None
+    last_assigned_queue: QueueRecordBrief | None = None
+    queue_duration_seconds: int | None = None
 
 
 class SessionRecordListResponse(BaseModel):

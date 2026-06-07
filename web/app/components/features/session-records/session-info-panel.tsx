@@ -32,6 +32,16 @@ function formatDuration(startStr: string | null, endStr: string | null, locale: 
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
 }
 
+function formatQueueDuration(seconds: number | null): string {
+  if (seconds == null || seconds < 0) return ''
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = seconds % 60
+  const mm = String(m).padStart(2, '0')
+  const ss = String(s).padStart(2, '0')
+  return h > 0 ? `${String(h).padStart(2, '0')}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
 type Props = {
   record: SessionRecordDetail
   onSummaryDirtyChange?: (dirty: boolean) => void
@@ -118,6 +128,14 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
                 />
                 <InfoRow label={t('ws.records.sessions.detail.channelType', locale)} value={record.channel?.channel_type || '-'} />
                 <InfoRow label={t('ws.records.sessions.detail.channelName', locale)} value={record.channel?.name || '-'} />
+                <InfoRow
+                  label={t('ws.records.sessions.detail.lastAssignedQueue', locale)}
+                  value={<QueueNameValue queue={record.last_assigned_queue} locale={locale} />}
+                />
+                <InfoRow
+                  label={t('ws.records.sessions.detail.queueDuration', locale)}
+                  value={formatQueueDuration(record.queue_duration_seconds)}
+                />
                 <InfoRow label={t('ws.records.sessions.detail.agent', locale)} value={record.agent?.display_name || record.agent?.name || '-'} />
                 <InfoRow label={t('ws.records.sessions.detail.startTime', locale)} value={formatDateTime(record.started_at)} />
                 <InfoRow
@@ -134,6 +152,26 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
           <SessionSummaryFields conversationId={record.id} onDirtyChange={handleSummaryDirtyChange} />
         ) : null}
       </div>
+    </div>
+  )
+}
+
+function QueueNameValue({
+  queue,
+  locale,
+}: {
+  queue: SessionRecordDetail['last_assigned_queue']
+  locale: Locale
+}) {
+  if (!queue?.name) return <span className="text-sm text-foreground" />
+  return (
+    <div className="flex min-w-0 items-center gap-1.5">
+      <span className="min-w-0 break-words text-sm text-foreground">{queue.name}</span>
+      {queue.queue_type === 'employee' && (
+        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] leading-4 text-muted-foreground">
+          {t('ws.records.queue.personalQueue', locale)}
+        </span>
+      )}
     </div>
   )
 }

@@ -14,6 +14,8 @@ import { useCallRecords } from '@/service/use-call-center'
 import type { CallRecordListItem } from '@/models/call-center'
 import { CallRecordDetailDrawer } from '@/app/components/features/call-center/call-record-detail-drawer'
 import { cn } from '@/lib/utils'
+import { useLocaleStore, type Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 
 function fmtDate(iso: string | null): string {
   if (!iso) return '—'
@@ -29,6 +31,17 @@ function fmtDuration(ms: number | null): string {
   const h = Math.floor(s / 3600)
   const m = Math.floor((s % 3600) / 60)
   const sec = s % 60
+  if (h > 0) {
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+  }
+  return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+}
+
+function fmtQueueDuration(seconds: number | null): string {
+  if (seconds == null || seconds < 0) return ''
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const sec = seconds % 60
   if (h > 0) {
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
   }
@@ -67,6 +80,7 @@ function associationStatusLabel(status: CallRecordListItem['user_association_sta
 const PER_PAGE_OPTIONS = [20, 50, 100]
 
 export default function CallRecordsPage() {
+  const { locale } = useLocaleStore()
   const [page, setPage] = useState(1)
   const [perPage, setPerPage] = useState(20)
   const [direction, setDirection] = useState<'all' | 'inbound' | 'outbound'>('all')
@@ -166,6 +180,12 @@ export default function CallRecordsPage() {
                     <th className="sticky top-0 z-10 w-[170px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                       服务号码
                     </th>
+                    <th className="sticky top-0 z-10 w-[160px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                      {t('ws.records.calls.col.lastAssignedQueue', locale)}
+                    </th>
+                    <th className="sticky top-0 z-10 w-[110px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                      {t('ws.records.calls.col.queueDuration', locale)}
+                    </th>
                     <th className="sticky top-0 z-10 w-[140px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                       接待客服
                     </th>
@@ -206,6 +226,12 @@ export default function CallRecordsPage() {
                       </td>
                       <td className="max-w-[170px] truncate border-b border-border px-3 py-3 text-sm text-muted-foreground">
                         {serviceNumber(r) || '—'}
+                      </td>
+                      <td className="max-w-[160px] border-b border-border px-3 py-3 text-sm text-muted-foreground">
+                        <QueueNameInline queue={r.last_assigned_queue} locale={locale} />
+                      </td>
+                      <td className="border-b border-border px-3 py-3 font-mono text-sm text-muted-foreground">
+                        {fmtQueueDuration(r.queue_duration_seconds)}
                       </td>
                       <td className="max-w-[140px] truncate border-b border-border px-3 py-3 text-sm text-muted-foreground">
                         {r.agent_name || '—'}
@@ -280,6 +306,26 @@ export default function CallRecordsPage() {
 
       {openId !== null && (
         <CallRecordDetailDrawer recordId={openId} onClose={() => setOpenId(null)} />
+      )}
+    </div>
+  )
+}
+
+function QueueNameInline({
+  queue,
+  locale,
+}: {
+  queue: CallRecordListItem['last_assigned_queue']
+  locale: Locale
+}) {
+  if (!queue?.name) return null
+  return (
+    <div className="flex min-w-0 items-center gap-1.5">
+      <span className="min-w-0 truncate" title={queue.name}>{queue.name}</span>
+      {queue.queue_type === 'employee' && (
+        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] leading-4 text-muted-foreground">
+          {t('ws.records.queue.personalQueue', locale)}
+        </span>
       )}
     </div>
   )

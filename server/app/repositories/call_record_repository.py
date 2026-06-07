@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.models.call_record import CallRecord
 
@@ -69,8 +70,11 @@ class CallRecordRepository:
         keyword: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
+        scope_predicate: ColumnElement | None = None,
     ) -> tuple[list[CallRecord], int]:
         q = select(CallRecord).where(CallRecord.tenant_id == tenant_id)
+        if scope_predicate is not None:
+            q = q.where(scope_predicate)
         if direction in ("inbound", "outbound"):
             q = q.where(CallRecord.direction == direction)
         if agent_id is not None:

@@ -7,6 +7,7 @@ out of the box.
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.fd_form_layout_repository import FdFormLayoutRepository
+from app.services.role_service import RoleService
 
 
 # ── Default form layout definitions ──
@@ -92,3 +93,4 @@ async def init_tenant_data(db: AsyncSession, tenant_pk: int) -> None:
     """
     for layout_fn in DEFAULT_LAYOUTS:
         await FdFormLayoutRepository.create(db, tenant_pk, layout_fn())
+    await RoleService.ensure_system_roles(db, tenant_pk)

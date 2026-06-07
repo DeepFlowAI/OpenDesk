@@ -2,14 +2,29 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconArrowLeft, IconPlus, IconTrash, IconChevronDown } from '@tabler/icons-react'
+import {
+  IconArrowLeft,
+  IconPlus,
+  IconTrash,
+  IconChevronDown,
+  IconGripVertical,
+  IconCheck,
+  IconX,
+} from '@tabler/icons-react'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import { Switch } from '@/components/ui/switch'
-import type { SessionRoutingCondition, SessionConditionType } from '@/models/session-routing-rule'
+import type {
+  SessionRoutingCondition,
+  SessionConditionType,
+  SessionRoutingQueueSource,
+  SessionRoutingQueueSourceType,
+  SessionRoutingTargetStrategy,
+} from '@/models/session-routing-rule'
 import { useServiceHours } from '@/service/use-service-hours'
-import { useEmployeeGroups } from '@/service/use-employee-groups'
+import { useEmployeeGroups, useEmployeeSelect } from '@/service/use-employee-groups'
+import { useUnifiedFields } from '@/service/use-field-definitions'
 import {
   useSessionRoutingRule,
   useCreateSessionRoutingRule,
@@ -17,12 +32,25 @@ import {
 } from '@/service/use-session-routing-rules'
 import { useChannels } from '@/service/use-channels'
 import type { Channel } from '@/models/channel'
+import { FieldDomain, FieldType } from '@/types/field-enums'
 
 type RowState = {
   _key: string
   condition_type: SessionConditionType
   operator: string
   value: string | string[]
+}
+
+type QueueSourceRowState = {
+  _key: string
+  source_type: SessionRoutingQueueSourceType
+  target_ids: number[]
+}
+
+type QueueTargetOption = {
+  id: number
+  label: string
+  description?: string | null
 }
 
 function newKey() {
@@ -51,13 +79,18 @@ function normalizeConditionValue(
 function serializeRoutingComparePayload(
   name: string,
   enabled: boolean,
-  targetGroupId: number | '',
+  targetStrategy: SessionRoutingTargetStrategy,
+  targetSources: SessionRoutingQueueSource[],
   conditions: Array<{ condition_type: SessionConditionType; operator: string; value: unknown }>
 ): string {
   return JSON.stringify({
     name: name.trim(),
     enabled,
-    target: targetGroupId === '' ? '' : Number(targetGroupId),
+    target_strategy: targetStrategy,
+    target_queue_sources: targetSources.map((source) => ({
+      source_type: source.source_type,
+      target_ids: source.target_ids.map((id) => Number(id)),
+    })),
     conditions: conditions.map((c) => ({
       condition_type: c.condition_type,
       operator: c.operator,
@@ -66,10 +99,20 @@ function serializeRoutingComparePayload(
   })
 }
 
-const EMPTY_NEW_ROUTING_SNAPSHOT = serializeRoutingComparePayload('', true, '', [])
+const EMPTY_NEW_ROUTING_SNAPSHOT = serializeRoutingComparePayload(
+  '',
+  true,
+  'sequential_overflow',
+  [{ source_type: 'employee_group', target_ids: [] }],
+  []
+)
 
 function defaultRow(): RowState {
   return { _key: newKey(), condition_type: 'channel', operator: 'eq', value: '' }
+}
+
+function defaultQueueSourceRow(): QueueSourceRowState {
+  return { _key: newKey(), source_type: 'employee_group', target_ids: [] }
 }
 
 function operatorsForType(ct: SessionConditionType): string[] {
@@ -96,6 +139,152 @@ function channelRoutingLabel(ch: Channel): string {
   return ch.name
 }
 
+function strategyLabel(strategy: SessionRoutingTargetStrategy, locale: Locale): string {
+  if (strategy === 'least_waiting_count') return t('sr.target.strategy.leastWaiting', locale)
+  if (strategy === 'shortest_tail_wait') return t('sr.target.strategy.shortestTail', locale)
+  return t('sr.target.strategy.sequential', locale)
+}
+
+function queueSourceTypeLabel(sourceType: SessionRoutingQueueSourceType, locale: Locale): string {
+  if (sourceType === 'user_field') return t('sr.target.source.userField', locale)
+  if (sourceType === 'employee') return t('sr.target.source.employee', locale)
+  return t('sr.target.source.employeeGroup', locale)
+}
+
+function QueueTargetMultiSelect({
+  value,
+  options,
+  onChange,
+  placeholder,
+  searchPlaceholder,
+  emptyText,
+  className,
+}: {
+  value: number[]
+  options: QueueTargetOption[]
+  onChange: (value: number[]) => void
+  placeholder: string
+  searchPlaceholder: string
+  emptyText: string
+  className?: string
+}) {
+  const [open, setOpen] = useState(false)
+  const [search, setSearch] = useState('')
+
+  const selectedIds = useMemo(
+    () => value.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0),
+    [value]
+  )
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds])
+  const optionMap = useMemo(() => new Map(options.map((option) => [option.id, option])), [options])
+  const selectedLabel = useMemo(
+    () => selectedIds.map((id) => optionMap.get(id)?.label ?? `#${id}`).join(', '),
+    [selectedIds, optionMap]
+  )
+  const filteredOptions = useMemo(() => {
+    const keyword = search.trim().toLocaleLowerCase()
+    if (!keyword) return options
+    return options.filter((option) => {
+      const haystack = `${option.label} ${option.description ?? ''}`.toLocaleLowerCase()
+      return haystack.includes(keyword)
+    })
+  }, [options, search])
+
+  const toggleOption = (id: number) => {
+    if (selectedSet.has(id)) {
+      onChange(selectedIds.filter((selectedId) => selectedId !== id))
+      return
+    }
+    onChange([...selectedIds, id])
+  }
+
+  return (
+    <div
+      className={cn('relative', className)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setOpen(false)
+        }
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className="flex h-9 w-full items-center gap-2 rounded-lg border border-border bg-white px-2.5 text-left text-[13px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className={cn('min-w-0 flex-1 truncate', !selectedLabel && 'text-muted-foreground')}>
+          {selectedLabel || placeholder}
+        </span>
+        {selectedIds.length > 0 && (
+          <span
+            onClick={(event) => {
+              event.stopPropagation()
+              onChange([])
+              setSearch('')
+            }}
+            className="shrink-0 rounded text-muted-foreground transition-colors hover:text-foreground"
+            aria-label="clear selection"
+          >
+            <IconX size={14} />
+          </span>
+        )}
+        <IconChevronDown size={14} className="shrink-0 text-muted-foreground" />
+      </button>
+
+      {open && (
+        <div className="absolute left-0 right-0 z-50 mt-1 rounded-lg border border-border bg-white p-2 shadow-lg">
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                setOpen(false)
+              }
+            }}
+            placeholder={searchPlaceholder}
+            className="mb-2 h-8 w-full rounded-md border border-border bg-white px-2 text-[13px] text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            autoFocus
+          />
+          <div className="max-h-56 overflow-y-auto" role="listbox" aria-multiselectable="true">
+            {filteredOptions.length === 0 ? (
+              <div className="px-2 py-2 text-sm text-muted-foreground">{emptyText}</div>
+            ) : (
+              filteredOptions.map((option) => {
+                const selected = selectedSet.has(option.id)
+                return (
+                  <button
+                    type="button"
+                    key={option.id}
+                    onClick={() => toggleOption(option.id)}
+                    className={cn(
+                      'flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition-colors hover:bg-accent',
+                      selected && 'bg-accent'
+                    )}
+                    role="option"
+                    aria-selected={selected}
+                  >
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium text-foreground">{option.label}</span>
+                      {option.description && (
+                        <span className="block truncate text-xs text-muted-foreground">
+                          {option.description}
+                        </span>
+                      )}
+                    </span>
+                    {selected && <IconCheck size={14} className="shrink-0 text-primary" />}
+                  </button>
+                )
+              })
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 type SessionRoutingFormProps = { ruleId?: number }
 
 export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
@@ -104,12 +293,46 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
   const { locale } = useLocaleStore()
   const { data: rule, isLoading: loadingRule } = useSessionRoutingRule(ruleId ?? 0)
   const { data: groupsData } = useEmployeeGroups({ page: 1, per_page: 200 })
+  const { data: employeesData } = useEmployeeSelect({ page: 1, per_page: 200 })
+  const { data: userFieldsData } = useUnifiedFields({
+    domain: FieldDomain.USER,
+    locale,
+    include_metadata: false,
+  })
   const { data: serviceHoursList } = useServiceHours()
   const { data: channelsData } = useChannels()
   const createMut = useCreateSessionRoutingRule()
   const updateMut = useUpdateSessionRoutingRule()
 
   const groups = groupsData?.items ?? []
+  const employees = employeesData?.items ?? []
+  const employeeTargetOptions = useMemo<QueueTargetOption[]>(
+    () =>
+      employees.map((employee) => ({
+        id: employee.id,
+        label: employee.display_name || employee.username,
+        description: employee.display_name ? employee.username : null,
+      })),
+    [employees]
+  )
+  const groupTargetOptions = useMemo<QueueTargetOption[]>(
+    () =>
+      groups.map((group) => ({
+        id: group.id,
+        label: group.name,
+        description: group.description,
+      })),
+    [groups]
+  )
+  const queueFields = useMemo(
+    () =>
+      (userFieldsData?.items ?? []).filter(
+        (field) =>
+          field.status === 'active' &&
+          (field.field_type === FieldType.EMPLOYEE_SELECT || field.field_type === FieldType.GROUP_SELECT)
+      ),
+    [userFieldsData?.items]
+  )
 
   const sdkChannelOptions = useMemo(() => {
     const list = (channelsData ?? []) as Channel[]
@@ -118,7 +341,9 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
 
   const [name, setName] = useState('')
   const [enabled, setEnabled] = useState(true)
-  const [targetGroupId, setTargetGroupId] = useState<number | ''>('')
+  const [targetStrategy, setTargetStrategy] =
+    useState<SessionRoutingTargetStrategy>('sequential_overflow')
+  const [queueRows, setQueueRows] = useState<QueueSourceRowState[]>([defaultQueueSourceRow()])
   const [rows, setRows] = useState<RowState[]>([])
   const [initialized, setInitialized] = useState(false)
 
@@ -126,6 +351,8 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
     if (isNew) {
       if (!initialized) {
         setRows([])
+        setTargetStrategy('sequential_overflow')
+        setQueueRows([defaultQueueSourceRow()])
         setInitialized(true)
       }
       return
@@ -133,7 +360,18 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
     if (!rule || initialized) return
     setName(rule.name)
     setEnabled(rule.enabled)
-    setTargetGroupId(rule.target_group_id)
+    setTargetStrategy(rule.target_strategy ?? 'sequential_overflow')
+    const existingSources =
+      rule.target_queue_sources?.length
+        ? rule.target_queue_sources
+        : rule.target_group_id
+          ? [{ source_type: 'employee_group' as const, target_ids: [rule.target_group_id] }]
+          : []
+    setQueueRows(
+      existingSources.length
+        ? existingSources.map((source) => ({ _key: newKey(), ...source }))
+        : [defaultQueueSourceRow()]
+    )
     setRows(
       (rule.conditions ?? []).map((c) => ({
         _key: newKey(),
@@ -152,21 +390,43 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
       return
     }
     if (rule && initialized) {
+      const existingSources =
+        rule.target_queue_sources?.length
+          ? rule.target_queue_sources
+          : rule.target_group_id
+            ? [{ source_type: 'employee_group' as const, target_ids: [rule.target_group_id] }]
+            : []
       setSavedSnapshot(
         serializeRoutingComparePayload(
           rule.name,
           rule.enabled,
-          rule.target_group_id,
+          rule.target_strategy ?? 'sequential_overflow',
+          existingSources,
           rule.conditions ?? []
         )
       )
     }
   }, [isNew, rule, initialized])
 
+  const normalizedQueueSources = useMemo<SessionRoutingQueueSource[]>(
+    () =>
+      queueRows.map(({ _key: _, source_type, target_ids }) => ({
+        source_type,
+        target_ids: target_ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0),
+      })),
+    [queueRows]
+  )
+
   const payloadForCompare = useMemo(
     () =>
-      serializeRoutingComparePayload(name, enabled, targetGroupId, rows.map(({ _key: _, ...c }) => c)),
-    [name, enabled, targetGroupId, rows]
+      serializeRoutingComparePayload(
+        name,
+        enabled,
+        targetStrategy,
+        normalizedQueueSources,
+        rows.map(({ _key: _, ...c }) => c)
+      ),
+    [name, enabled, targetStrategy, normalizedQueueSources, rows]
   )
 
   const isDirty = isNew ? payloadForCompare !== EMPTY_NEW_ROUTING_SNAPSHOT : payloadForCompare !== savedSnapshot
@@ -180,6 +440,9 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
 
   const addRow = () => setRows((r) => [...r, defaultRow()])
   const removeRow = (key: string) => setRows((r) => r.filter((x) => x._key !== key))
+  const addQueueRow = () => setQueueRows((r) => [...r, defaultQueueSourceRow()])
+  const removeQueueRow = (key: string) =>
+    setQueueRows((r) => (r.length > 1 ? r.filter((x) => x._key !== key) : [defaultQueueSourceRow()]))
 
   const updateRow = useCallback((key: string, patch: Partial<RowState>) => {
     setRows((r) =>
@@ -203,6 +466,19 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
     )
   }, [])
 
+  const updateQueueRow = useCallback((key: string, patch: Partial<QueueSourceRowState>) => {
+    setQueueRows((r) =>
+      r.map((row) => {
+        if (row._key !== key) return row
+        const next = { ...row, ...patch }
+        if (patch.source_type && patch.source_type !== row.source_type) {
+          next.target_ids = []
+        }
+        return next
+      })
+    )
+  }, [])
+
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const showToast = (type: 'success' | 'error', text: string) => {
     setToast({ type, text })
@@ -215,12 +491,30 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
       showToast('error', t('sr.form.validation.name', locale))
       return
     }
-    if (targetGroupId === '') {
-      showToast('error', t('sr.form.validation.group', locale))
+    const validSources = normalizedQueueSources.filter((source) => source.target_ids.length > 0)
+    if (validSources.length === 0) {
+      showToast('error', t('sr.form.validation.queueSource', locale))
+      return
+    }
+    const invalidSource = normalizedQueueSources.find((source) => source.target_ids.length === 0)
+    if (invalidSource) {
+      const key =
+        invalidSource.source_type === 'employee'
+          ? 'sr.form.validation.employee'
+          : invalidSource.source_type === 'user_field'
+            ? 'sr.form.validation.userField'
+            : 'sr.form.validation.group'
+      showToast('error', t(key, locale))
       return
     }
     const conditions: SessionRoutingCondition[] = rows.map(({ _key: _, ...c }) => c)
-    const body = { name: tn, enabled, conditions, target_group_id: Number(targetGroupId) }
+    const body = {
+      name: tn,
+      enabled,
+      conditions,
+      target_strategy: targetStrategy,
+      target_queue_sources: validSources,
+    }
     try {
       if (isNew) {
         await createMut.mutateAsync(body)
@@ -230,7 +524,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
         await updateMut.mutateAsync({ id: ruleId, data: body })
         showToast('success', t('sr.form.saveSuccess', locale))
         setSavedSnapshot(
-          serializeRoutingComparePayload(tn, enabled, Number(targetGroupId), conditions)
+          serializeRoutingComparePayload(tn, enabled, targetStrategy, validSources, conditions)
         )
       }
     } catch {
@@ -238,7 +532,8 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
     }
   }
 
-  const saveDisabled = createMut.isPending || updateMut.isPending || !isDirty || !name.trim() || targetGroupId === ''
+  const hasValidQueueSources = normalizedQueueSources.some((source) => source.target_ids.length > 0)
+  const saveDisabled = createMut.isPending || updateMut.isPending || !isDirty || !name.trim() || !hasValidQueueSources
 
   if (!isNew && loadingRule) {
     return <p className="p-8 text-sm text-muted-foreground">{t('sr.loading', locale)}</p>
@@ -449,28 +744,131 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
           </button>
         </div>
 
-        {/* Target employee group */}
-        <div className="flex flex-col gap-2">
+        {/* Assignment target */}
+        <div className="flex flex-col gap-3">
           <div className="flex items-center gap-0.5">
-            <span className="text-sm font-medium text-foreground">{t('sr.form.targetGroup', locale)}</span>
+            <span className="text-sm font-medium text-foreground">{t('sr.target.title', locale)}</span>
             <span className="text-sm font-medium text-destructive">*</span>
           </div>
-          <div className="relative">
-            <select
-              value={targetGroupId === '' ? '' : String(targetGroupId)}
-              onChange={(e) => setTargetGroupId(e.target.value ? Number(e.target.value) : '')}
-              className="h-10 w-full appearance-none rounded-lg border border-border bg-white px-3.5 pr-9 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-            >
-              <option value="" className="text-muted-foreground">
-                {t('sr.form.targetGroup.placeholder', locale)}
-              </option>
-              {groups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
+          <div className="flex flex-col gap-2">
+            <span className="text-xs font-medium text-muted-foreground">{t('sr.target.strategy', locale)}</span>
+            <div className="relative">
+              <select
+                value={targetStrategy}
+                onChange={(e) => setTargetStrategy(e.target.value as SessionRoutingTargetStrategy)}
+                className="h-10 w-full appearance-none rounded-lg border border-border bg-white px-3.5 pr-9 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+              >
+                {(['sequential_overflow', 'least_waiting_count', 'shortest_tail_wait'] as const).map((strategy) => (
+                  <option key={strategy} value={strategy}>
+                    {strategyLabel(strategy, locale)}
+                  </option>
+                ))}
+              </select>
+              <IconChevronDown size={18} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {targetStrategy === 'sequential_overflow'
+                ? t('sr.target.strategy.sequentialHint', locale)
+                : t('sr.target.strategy.balanceHint', locale)}
+            </p>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <span className="text-xs font-medium text-muted-foreground">{t('sr.target.sources', locale)}</span>
+            <div className="rounded-lg border border-border">
+              {queueRows.map((row, idx) => (
+                <div
+                  key={row._key}
+                  className={cn(
+                    'flex items-start gap-2 px-4 py-2.5',
+                    idx < queueRows.length - 1 && 'border-b border-border'
+                  )}
+                >
+                  <div className="flex h-9 w-6 shrink-0 items-center justify-center text-muted-foreground">
+                    <IconGripVertical size={16} />
+                  </div>
+                  <div className="relative w-[140px] shrink-0">
+                    <select
+                      value={row.source_type}
+                      onChange={(e) =>
+                        updateQueueRow(row._key, {
+                          source_type: e.target.value as SessionRoutingQueueSourceType,
+                        })
+                      }
+                      className="h-9 w-full appearance-none rounded-lg border border-border bg-white px-2.5 pr-7 text-[13px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                    >
+                      {(['user_field', 'employee', 'employee_group'] as const).map((sourceType) => (
+                        <option key={sourceType} value={sourceType}>
+                          {queueSourceTypeLabel(sourceType, locale)}
+                        </option>
+                      ))}
+                    </select>
+                    <IconChevronDown size={14} className="pointer-events-none absolute right-2 top-[18px] -translate-y-1/2 text-muted-foreground" />
+                  </div>
+
+                  <div className="relative min-w-0 flex-1">
+                    {row.source_type === 'user_field' ? (
+                      <>
+                        <select
+                          value={row.target_ids[0] ? String(row.target_ids[0]) : ''}
+                          onChange={(e) =>
+                            updateQueueRow(row._key, {
+                              target_ids: e.target.value ? [Number(e.target.value)] : [],
+                            })
+                          }
+                          className="h-9 w-full appearance-none rounded-lg border border-border bg-white px-2.5 pr-7 text-[13px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                        >
+                          <option value="">{t('sr.target.placeholder.userField', locale)}</option>
+                          {queueFields
+                            .filter((field) => field.id != null)
+                            .map((field) => (
+                              <option key={field.id} value={String(field.id)}>
+                                {field.name}
+                              </option>
+                            ))}
+                        </select>
+                        <IconChevronDown size={14} className="pointer-events-none absolute right-2 top-[18px] -translate-y-1/2 text-muted-foreground" />
+                      </>
+                    ) : row.source_type === 'employee' ? (
+                      <QueueTargetMultiSelect
+                        value={row.target_ids}
+                        onChange={(targetIds) => updateQueueRow(row._key, { target_ids: targetIds })}
+                        options={employeeTargetOptions}
+                        placeholder={t('sr.target.placeholder.employee', locale)}
+                        searchPlaceholder={t('sr.target.search.employee', locale)}
+                        emptyText={t('sr.target.empty.employee', locale)}
+                      />
+                    ) : (
+                      <QueueTargetMultiSelect
+                        value={row.target_ids}
+                        onChange={(targetIds) => updateQueueRow(row._key, { target_ids: targetIds })}
+                        options={groupTargetOptions}
+                        placeholder={t('sr.target.placeholder.employeeGroup', locale)}
+                        searchPlaceholder={t('sr.target.search.employeeGroup', locale)}
+                        emptyText={t('sr.target.empty.employeeGroup', locale)}
+                      />
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => removeQueueRow(row._key)}
+                    className="flex h-9 shrink-0 items-center text-muted-foreground transition-colors hover:text-red-600"
+                    aria-label={t('sr.target.deleteSource', locale)}
+                  >
+                    <IconTrash size={16} />
+                  </button>
+                </div>
               ))}
-            </select>
-            <IconChevronDown size={18} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            </div>
+            <button
+              type="button"
+              onClick={addQueueRow}
+              className="inline-flex h-9 w-fit items-center gap-1.5 rounded-lg border border-border px-3.5 text-sm font-medium text-foreground/80 transition-colors hover:bg-accent"
+            >
+              <IconPlus size={16} />
+              {t('sr.target.addSource', locale)}
+            </button>
           </div>
         </div>
         </div>

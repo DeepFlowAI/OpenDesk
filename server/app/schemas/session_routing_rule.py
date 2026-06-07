@@ -4,12 +4,18 @@ Session routing rule schemas and condition validation
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.base import PaginatedResponse
 
 
 SessionConditionType = Literal["channel", "web_sdk", "current_time"]
+SessionRoutingTargetStrategy = Literal[
+    "sequential_overflow",
+    "least_waiting_count",
+    "shortest_tail_wait",
+]
+SessionRoutingQueueSourceType = Literal["user_field", "employee", "employee_group"]
 
 
 class SessionRoutingCondition(BaseModel):
@@ -54,11 +60,35 @@ class SessionRoutingCondition(BaseModel):
         return self
 
 
-class SessionRoutingRuleCreate(BaseModel):
+class SessionRoutingQueueSource(BaseModel):
+    source_type: SessionRoutingQueueSourceType
+    target_ids: list[int] = Field(default_factory=list)
+
+    @field_validator("target_ids")
+    @classmethod
+    def validate_target_ids(cls, v: list[int]) -> list[int]:
+        normalized = [int(item) for item in v]
+        if not normalized:
+            raise ValueError("Queue source target_ids must not be empty")
+        for target_id in normalized:
+            if target_id <= 0:
+                raise ValueError("Queue source target id must be positive")
+        return list(dict.fromkeys(normalized))
+
+    @model_validator(mode="after")
+    def validate_user_field_target(self) -> "SessionRoutingQueueSource":
+        if self.source_type == "user_field" and len(self.target_ids) != 1:
+            raise ValueError("User field source must reference exactly one field")
+        return self
+
+
+class SessionRoutingRulePayloadMixin(BaseModel):
     name: str
     enabled: bool = True
-    conditions: list[SessionRoutingCondition] = []
-    target_group_id: int
+    conditions: list[SessionRoutingCondition] = Field(default_factory=list)
+    target_group_id: int | None = None
+    target_strategy: SessionRoutingTargetStrategy = "sequential_overflow"
+    target_queue_sources: list[SessionRoutingQueueSource] = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod
@@ -70,22 +100,21 @@ class SessionRoutingRuleCreate(BaseModel):
             raise ValueError("Name must be at most 64 characters")
         return v
 
+    @model_validator(mode="after")
+    def validate_target_config(self) -> "SessionRoutingRulePayloadMixin":
+        if not self.target_queue_sources and self.target_group_id is None:
+            raise ValueError("At least one queue source is required")
+        if self.target_group_id is not None and self.target_group_id <= 0:
+            raise ValueError("target_group_id must be positive")
+        return self
 
-class SessionRoutingRuleUpdate(BaseModel):
-    name: str
-    enabled: bool = True
-    conditions: list[SessionRoutingCondition] = []
-    target_group_id: int
 
-    @field_validator("name")
-    @classmethod
-    def validate_name(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Name is required")
-        if len(v) > 64:
-            raise ValueError("Name must be at most 64 characters")
-        return v
+class SessionRoutingRuleCreate(SessionRoutingRulePayloadMixin):
+    pass
+
+
+class SessionRoutingRuleUpdate(SessionRoutingRulePayloadMixin):
+    pass
 
 
 class SessionRoutingRuleEnabledPatch(BaseModel):
@@ -111,8 +140,11 @@ class SessionRoutingRuleResponse(BaseModel):
     name: str
     enabled: bool
     conditions: list[dict]
-    target_group_id: int
+    target_group_id: int | None = None
     target_group_name: str = ""
+    target_strategy: str = "sequential_overflow"
+    target_queue_sources: list[SessionRoutingQueueSource] = Field(default_factory=list)
+    target_summary: str = ""
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -124,8 +156,11 @@ class SessionRoutingRuleListItem(BaseModel):
     priority: int
     name: str
     enabled: bool
-    target_group_id: int
+    target_group_id: int | None = None
     target_group_name: str = ""
+    target_strategy: str = "sequential_overflow"
+    target_queue_sources: list[SessionRoutingQueueSource] = Field(default_factory=list)
+    target_summary: str = ""
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

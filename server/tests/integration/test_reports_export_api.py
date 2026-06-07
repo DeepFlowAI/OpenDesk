@@ -78,8 +78,8 @@ async def seed():
         _AGENT_ID = agent.scalar_one()
 
         await db.execute(text("""
-            INSERT INTO users (tenant_id, external_id, name)
-            VALUES (:tid, 'export_visitor', 'Export Visitor')
+            INSERT INTO users (tenant_id, public_id, external_id, name)
+            VALUES (:tid, 'export_visitor', 'export_visitor', 'Export Visitor')
             ON CONFLICT ON CONSTRAINT uq_users_tenant_external DO NOTHING
         """), {"tid": _TENANT_PK})
         await db.commit()
