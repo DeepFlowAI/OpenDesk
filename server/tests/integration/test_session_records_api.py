@@ -54,8 +54,8 @@ async def seed_data():
         )
 
         await db.execute(text("""
-            INSERT INTO users (tenant_id, external_id, name)
-            VALUES (:tid, 'v_rec_test', 'Record Visitor')
+            INSERT INTO users (tenant_id, public_id, external_id, name)
+            VALUES (:tid, 'usr_session_records_visitor', 'v_rec_test', 'Record Visitor')
             ON CONFLICT ON CONSTRAINT uq_users_tenant_external DO NOTHING
         """), {"tid": tenant_pk})
         await db.commit()

@@ -36,6 +36,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "elkjs": "^0.11.1",
+    "isomorphic-dompurify": "^3.16.0",
     "jit-viewer": "^1.5.0",
     "ky": "^1",
     "lucide-react": "^1.8.0",

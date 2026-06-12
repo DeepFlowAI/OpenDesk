@@ -7,6 +7,7 @@ import {
   IconChevronLeft,
   IconChevronRight,
   IconCopy,
+  IconEye,
   IconPencil,
   IconPlus,
   IconSearch,
@@ -291,11 +292,11 @@ export default function RolesListPage() {
                   {canManage && (
                     <div className="flex w-[96px] shrink-0 items-center justify-end gap-3">
                       <button
-                        title={t('role.action.edit', locale)}
+                        title={t(role.is_system ? 'role.action.view' : 'role.action.edit', locale)}
                         onClick={() => router.push(`/roles/${role.id}`)}
                         className="text-foreground/80 transition-colors hover:text-foreground"
                       >
-                        <IconPencil size={18} />
+                        {role.is_system ? <IconEye size={18} /> : <IconPencil size={18} />}
                       </button>
                       <button
                         title={t('role.action.copy', locale)}

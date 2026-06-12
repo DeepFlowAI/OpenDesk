@@ -2,17 +2,19 @@
 Integration tests for System Settings API
 """
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
 
-from app.core.security import create_access_token
+from tests.integration.rbac_helpers import auth_headers_for_seeded_admin, ensure_admin_principals
 
 
-def _make_token(tenant_id: int = 7, role: str = "admin") -> str:
-    return create_access_token({"sub": "1", "tenant_id": tenant_id, "roles": [role]})
+@pytest_asyncio.fixture(autouse=True)
+async def seed_admin_principals():
+    await ensure_admin_principals([7, 9999])
 
 
 def _auth_header(tenant_id: int = 7) -> dict:
-    return {"Authorization": f"Bearer {_make_token(tenant_id)}"}
+    return auth_headers_for_seeded_admin(tenant_id)
 
 
 class TestSystemSettingsAPI:
@@ -89,10 +91,10 @@ class TestSystemSettingsAPI:
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_missing_auth_returns_422(self, client: AsyncClient):
+    async def test_missing_auth_returns_401(self, client: AsyncClient):
         """Request without Authorization header should fail."""
         resp = await client.get("/api/v1/system-settings")
-        assert resp.status_code == 422
+        assert resp.status_code == 401
 
     @pytest.mark.asyncio
     async def test_invalid_token_returns_401(self, client: AsyncClient):

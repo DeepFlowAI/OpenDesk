@@ -18,6 +18,7 @@ import { useLocaleStore } from '@/context/locale-store'
 import { useChatStore } from '@/context/chat-store'
 import { useSocketStore } from '@/context/socket-store'
 import { CallCenterProvider } from '@/context/call-center-runtime'
+import { useRefreshCurrentUser } from '@/hooks/use-refresh-current-user'
 import {
   useConversations,
   conversationKeys,
@@ -87,9 +88,10 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   const { locale } = useLocaleStore()
   const queryClient = useQueryClient()
   const [mounted, setMounted] = useState(false)
+  const { isRefreshing: authRefreshing } = useRefreshCurrentUser(mounted)
   const isChatPage = pathname.startsWith('/workspace/chat')
   const canUseChat = hasPermission(user, 'chat.workspace.use')
-  const syncChatNotifications = mounted && Boolean(token) && canUseChat && !isChatPage
+  const syncChatNotifications = mounted && !authRefreshing && Boolean(token) && canUseChat && !isChatPage
   const { data: convData } = useConversations({ enabled: syncChatNotifications })
   const { socket, connected, connecting, connect } = useSocketStore()
   const {
@@ -120,12 +122,12 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   }, [mounted, token, router])
 
   useEffect(() => {
-    if (!mounted || !token || !user) return
+    if (!mounted || !token || !user || authRefreshing) return
     const routeRule = getWorkspaceRouteRule(pathname)
     if (routeRule && !hasAnyPermission(user, routeRule.permissions)) {
       router.replace(getDefaultAccessiblePath(user))
     }
-  }, [mounted, token, user, pathname, router])
+  }, [authRefreshing, mounted, token, user, pathname, router])
 
   useEffect(() => {
     if (syncChatNotifications && token && !connected && !connecting) {
@@ -250,7 +252,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     queryClient,
   ])
 
-  if (!mounted || !token || !user) return null
+  if (!mounted || authRefreshing || !token || !user) return null
   const routeRule = getWorkspaceRouteRule(pathname)
   if (routeRule && !hasAnyPermission(user, routeRule.permissions)) return null
   if (visibleNavItems.length === 0) return null

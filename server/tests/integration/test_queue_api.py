@@ -4,12 +4,21 @@ Integration tests for unified queue API.
 import time
 
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
 
 from app.core.security import create_access_token
+from tests.integration.rbac_helpers import auth_headers_for_seeded_admin, ensure_admin_principals
 
 
-def _auth_header(tenant_id: int = 7, user_id: int = 1, role: str = "admin") -> dict:
+@pytest_asyncio.fixture(autouse=True)
+async def seed_admin_principals():
+    await ensure_admin_principals([7])
+
+
+def _auth_header(tenant_id: int = 7, user_id: int | None = None, role: str = "admin") -> dict:
+    if user_id is None:
+        return auth_headers_for_seeded_admin(tenant_id)
     token = create_access_token({"sub": str(user_id), "tenant_id": tenant_id, "roles": [role]})
     return {"Authorization": f"Bearer {token}"}
 
@@ -205,7 +214,7 @@ class TestQueueAPI:
     async def test_dispatch_assigns_online_chat_agent(self, client: AsyncClient):
         headers = _auth_header()
         employee_id, group_id = await _create_agent_and_group(client)
-        agent_headers = _auth_header(user_id=employee_id)
+        agent_headers = _auth_header(user_id=employee_id, role="agent")
 
         status_resp = await client.put("/api/v1/agent/status", json={"status": "online"}, headers=agent_headers)
         assert status_resp.status_code == 200, status_resp.text

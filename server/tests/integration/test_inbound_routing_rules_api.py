@@ -4,17 +4,19 @@ Integration tests for InboundRoutingRule API
 import uuid
 
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
 
-from app.core.security import create_access_token
+from tests.integration.rbac_helpers import auth_headers_for_seeded_admin, ensure_admin_principals
 
 
-def _make_token(tenant_id: int = 7, role: str = "admin") -> str:
-    return create_access_token({"sub": "1", "tenant_id": tenant_id, "roles": [role]})
+@pytest_asyncio.fixture(autouse=True)
+async def seed_admin_principals():
+    await ensure_admin_principals([7])
 
 
 def _auth_header(tenant_id: int = 7) -> dict:
-    return {"Authorization": f"Bearer {_make_token(tenant_id)}"}
+    return auth_headers_for_seeded_admin(tenant_id)
 
 
 def _sh_payload() -> dict:
@@ -35,6 +37,9 @@ class TestInboundRoutingRulesAPI:
     @pytest.mark.asyncio
     async def test_crud_and_reorder(self, client: AsyncClient):
         headers = _auth_header(tenant_id=7)
+        existing = await client.get("/api/v1/inbound-routing-rules", headers=headers)
+        assert existing.status_code == 200
+        existing_ids = [item["id"] for item in existing.json()["items"]]
 
         sh = await client.post("/api/v1/service-hours", headers=headers, json=_sh_payload())
         assert sh.status_code == 201
@@ -60,7 +65,7 @@ class TestInboundRoutingRulesAPI:
         )
         assert r1.status_code == 201
         id1 = r1.json()["id"]
-        assert r1.json()["priority"] == 1
+        assert r1.json()["priority"] == len(existing_ids) + 1
 
         r2 = await client.post(
             "/api/v1/inbound-routing-rules",
@@ -74,12 +79,12 @@ class TestInboundRoutingRulesAPI:
         )
         assert r2.status_code == 201
         id2 = r2.json()["id"]
-        assert r2.json()["priority"] == 2
+        assert r2.json()["priority"] == len(existing_ids) + 2
 
         reorder = await client.put(
             "/api/v1/inbound-routing-rules/reorder",
             headers=headers,
-            json={"ordered_ids": [id2, id1]},
+            json={"ordered_ids": [id2, id1, *existing_ids]},
         )
         assert reorder.status_code == 200
 
@@ -112,6 +117,13 @@ class TestInboundRoutingRulesAPI:
             json={"ordered_ids": [id1, id2]},
         )
         assert bad_reorder.status_code == 400
+        await client.delete(f"/api/v1/inbound-routing-rules/{id2}", headers=headers)
+        if existing_ids:
+            await client.put(
+                "/api/v1/inbound-routing-rules/reorder",
+                headers=headers,
+                json={"ordered_ids": existing_ids},
+            )
 
     @pytest.mark.asyncio
     async def test_call_time_condition_validates_service_hours(self, client: AsyncClient):

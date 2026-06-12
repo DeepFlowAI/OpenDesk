@@ -252,6 +252,7 @@
   "role.col.members": "关联员工",
   "role.col.updatedAt": "更新时间",
   "role.col.actions": "操作",
+  "role.action.view": "查看",
   "role.action.edit": "编辑",
   "role.action.copy": "复制",
   "role.action.delete": "删除",

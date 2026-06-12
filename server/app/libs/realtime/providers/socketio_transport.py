@@ -26,9 +26,12 @@ class SocketIOTransport(BaseRealtimeTransport):
             mgr = socketio.AsyncRedisManager(settings.REDIS_URL)
             logger.info("Socket.IO using Redis manager for cluster support")
 
+        # Mirror the REST CORS policy: "*" (any origin) unless an explicit
+        # allowlist is configured via CORS_ALLOW_ORIGINS.
+        cors_origins = settings.cors_origins
         self._sio = socketio.AsyncServer(
             async_mode="asgi",
-            cors_allowed_origins="*",
+            cors_allowed_origins="*" if cors_origins == ["*"] else cors_origins,
             client_manager=mgr,
             logger=False,
             engineio_logger=False,

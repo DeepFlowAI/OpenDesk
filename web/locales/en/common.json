@@ -252,6 +252,7 @@
   "role.col.members": "Employees",
   "role.col.updatedAt": "Updated",
   "role.col.actions": "Actions",
+  "role.action.view": "View",
   "role.action.edit": "Edit",
   "role.action.copy": "Copy",
   "role.action.delete": "Delete",

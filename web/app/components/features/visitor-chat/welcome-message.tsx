@@ -3,6 +3,7 @@
 import type { CSSProperties } from 'react'
 import type { ChannelConfig } from '@/models/channel'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
+import { SafeHtml } from '@/components/safe-html'
 
 const DEFAULT_AGENT_AVATAR_SRC = '/default-avatar.jpg'
 
@@ -45,10 +46,10 @@ export function WelcomeMessage({
           className="h-9 w-9 shrink-0 rounded-full object-cover"
         />
       )}
-      <div
+      <SafeHtml
+        html={content}
         className={`min-h-[42px] max-w-[75%] min-w-0 whitespace-pre-wrap break-words break-all px-3 py-2 text-sm leading-6 ${richTextListStyleClass}`}
         style={getAgentBubbleStyle(config)}
-        dangerouslySetInnerHTML={{ __html: content }}
       />
     </div>
   )

@@ -293,8 +293,8 @@ class EmployeeRepository:
         """
         permissions_jsonb = cast(Role.permissions, JSONB)
         excluded = [eid for eid in (exclude_user_ids or []) if eid is not None]
-        base = (
-            select(Employee)
+        eligible_ids = (
+            select(Employee.id)
             .outerjoin(EmployeeRole, EmployeeRole.employee_id == Employee.id)
             .outerjoin(Role, Role.id == EmployeeRole.role_id)
             .where(
@@ -312,11 +312,11 @@ class EmployeeRepository:
             .distinct()
         )
         if excluded:
-            base = base.where(Employee.id.notin_(excluded))
+            eligible_ids = eligible_ids.where(Employee.id.notin_(excluded))
 
         if keyword:
             like_pattern = f"%{keyword.strip()}%"
-            base = base.where(
+            eligible_ids = eligible_ids.where(
                 or_(
                     Employee.name.ilike(like_pattern),
                     Employee.display_name.ilike(like_pattern),
@@ -327,6 +327,7 @@ class EmployeeRepository:
                 )
             )
 
+        base = select(Employee).where(Employee.id.in_(eligible_ids))
         base = base.order_by(Employee.name.asc()).limit(limit)
         result = await db.execute(base)
         return list(result.scalars().all())

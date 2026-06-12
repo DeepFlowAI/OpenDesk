@@ -27,6 +27,10 @@ class TestTicketService:
             patch.object(TicketService, "_get_field_key_slot_map", AsyncMock(return_value={})),
             patch.object(TicketService, "_validate_conversation", AsyncMock()) as validate_conversation,
             patch.object(TicketService, "_enrich_response", return_value={"id": 1, "conversation_id": 123}),
+            patch(
+                "app.services.ticket_service.TicketWorkflowExecutionService.apply",
+                AsyncMock(return_value=SimpleNamespace(updates={}, field_labels={})),
+            ),
             patch("app.services.ticket_service.TicketRepository") as ticket_repo,
         ):
             ticket_repo.create = AsyncMock(return_value=SimpleNamespace(id=1))
@@ -54,6 +58,10 @@ class TestTicketService:
             patch.object(TicketService, "_validate_call_record", AsyncMock()) as validate_call_record,
             patch.object(TicketService, "_get_call_record_call_id_map", AsyncMock(return_value={456: "call-456"})),
             patch.object(TicketService, "_enrich_response", return_value={"id": 1, "call_record_id": 456}),
+            patch(
+                "app.services.ticket_service.TicketWorkflowExecutionService.apply",
+                AsyncMock(return_value=SimpleNamespace(updates={}, field_labels={})),
+            ),
             patch("app.services.ticket_service.TicketRepository") as ticket_repo,
             patch("app.services.ticket_service.TicketChangeRepository") as ticket_change_repo,
         ):

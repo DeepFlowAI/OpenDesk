@@ -17,6 +17,12 @@ from app.libs.open_agent.base import (
 )
 
 
+# Streaming SSE proxy timeout: bound connect/write/pool so a hung upstream
+# cannot exhaust connections, but leave read unbounded so long-lived event
+# streams are not cut off mid-response.
+_STREAM_TIMEOUT = httpx.Timeout(None, connect=10.0, write=10.0, pool=10.0)
+
+
 class HTTPOpenAgentClient(BaseOpenAgentClient):
     timeout_seconds = 10.0
 
@@ -100,7 +106,7 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=_STREAM_TIMEOUT) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
                     if not 200 <= response.status_code < 300:
                         message = await self._extract_stream_error_message(response)
@@ -130,7 +136,7 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=_STREAM_TIMEOUT) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
                     if not 200 <= response.status_code < 300:
                         message = await self._extract_stream_error_message(response)

@@ -12,7 +12,7 @@ from app.repositories.session_record_repository import SessionRecordRepository
 from app.repositories.satisfaction_survey_record_repository import SatisfactionSurveyRecordRepository
 from app.repositories.ticket_repository import TicketRepository
 from app.schemas.permission import EffectivePrincipal
-from app.services.data_scope_service import DataScopeService
+from app.services.data_scope_service import DataScopeService, RESOURCE_SESSION_RECORD
 from app.services.queue_history_service import QueueHistoryService
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
@@ -54,7 +54,7 @@ class SessionRecordService:
             scope_predicate = DataScopeService.build_session_record_predicate(principal, peer_ids)
             effective_agent_id = DataScopeService.resolve_agent_filter(
                 principal,
-                DataScopeService.RESOURCE_SESSION_RECORD,
+                RESOURCE_SESSION_RECORD,
                 agent_id,
                 peer_ids,
             )

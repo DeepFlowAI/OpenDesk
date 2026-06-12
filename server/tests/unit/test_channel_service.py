@@ -190,11 +190,7 @@ async def test_check_channel_availability_returns_no_agent(monkeypatch):
     )
     monkeypatch.setattr(
         "app.services.routing_service.RoutingService.route_conversation",
-        AsyncMock(return_value=(None, [1], {1: 1})),
-    )
-    monkeypatch.setattr(
-        "app.services.channel_service.AgentStatusService.get_status",
-        AsyncMock(return_value={"status": "offline", "current_count": 0, "max_concurrent": 1}),
+        AsyncMock(return_value=(None, [], {})),
     )
 
     result = await ChannelService.check_channel_availability(AsyncMock(), AsyncMock(), 10)

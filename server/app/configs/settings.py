@@ -1,8 +1,11 @@
+import logging
 import os
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 ENV = os.getenv("APP_ENV", "dev")
 
@@ -54,6 +57,13 @@ class Settings(BaseSettings):
 
     SECRET_KEY: str = Field(default="change-me")
     JWT_ALGORITHM: str = Field(default="HS256")
+    # Comma-separated list of browser origins allowed by CORS / Socket.IO,
+    # e.g. "https://app.example.com,https://admin.example.com". The default
+    # "*" allows any origin (convenient for local/OSS evaluation). Production
+    # deployments should set an explicit allowlist; when an explicit list is
+    # configured, credentialed (cookie/Authorization) cross-origin requests
+    # are permitted, which the "*" wildcard cannot do per the CORS spec.
+    CORS_ALLOW_ORIGINS: str = Field(default="*")
     JWT_EXPIRE_HOURS: int = Field(default=24)
     VISITOR_SESSION_EXPIRE_SECONDS: int = Field(default=86400)
 
@@ -134,5 +144,43 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
     )
 
+    @property
+    def cors_origins(self) -> list[str]:
+        """Parsed CORS allowlist. ``["*"]`` means allow any origin."""
+        raw = self.CORS_ALLOW_ORIGINS.strip()
+        if raw == "*" or not raw:
+            return ["*"]
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
 
 settings = Settings()
+
+# Environments treated as production-like, where booting with an insecure
+# default SECRET_KEY is refused. "dev"/"test"/"local" keep the default.
+_PRODUCTION_ENVS = {"prod", "production", "staging"}
+
+
+def assert_safe_production_config() -> None:
+    """Refuse to start a production deployment that still uses the default SECRET_KEY.
+
+    ``SECRET_KEY`` signs every JWT, so leaving it at "change-me" in production
+    lets tokens be forged. ``DEFAULT_ADMIN_PASSWORD`` is intentionally not
+    checked here: it only seeds the first admin when the tenants table is empty
+    and is a no-op once any tenant exists, so an already-provisioned deployment
+    is unaffected by its value.
+    """
+    if ENV.lower() not in _PRODUCTION_ENVS:
+        return
+    if settings.SECRET_KEY == "change-me":
+        raise RuntimeError(
+            f"Refusing to start in '{ENV}': SECRET_KEY is still the default "
+            "'change-me'. Set a strong random SECRET_KEY via environment "
+            "variables before deploying."
+        )
+    if settings.cors_origins == ["*"]:
+        logger.warning(
+            "Running in '%s' with CORS_ALLOW_ORIGINS='*' (any origin allowed). "
+            "Set CORS_ALLOW_ORIGINS to an explicit comma-separated allowlist of "
+            "trusted browser origins to reduce CSRF/credential-abuse exposure.",
+            ENV,
+        )

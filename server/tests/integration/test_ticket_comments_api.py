@@ -22,12 +22,7 @@ def _auth_header_from_token(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _spoofed_token(tenant_id: int, user_id: int, roles: list[str] | None = None) -> str:
-    """Forge a token for a different ``user_id`` while keeping the real tenant PK.
-
-    Used to assert ``author_id`` propagation without registering a second
-    employee per test.
-    """
+def _token_for_employee(tenant_id: int, user_id: int, roles: list[str] | None = None) -> str:
     return create_access_token(
         {"sub": str(user_id), "tenant_id": tenant_id, "roles": roles or ["admin"]}
     )
@@ -79,6 +74,23 @@ async def _create_ticket(client: AsyncClient, headers: dict) -> int:
         "/api/v1/tickets",
         headers=headers,
         json={"title": "T", "status": "open", "priority": "medium"},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+async def _create_employee(client: AsyncClient, headers: dict) -> int:
+    suffix = uuid.uuid4().hex[:8]
+    resp = await client.post(
+        "/api/v1/employees",
+        headers=headers,
+        json={
+            "name": f"Comment Author {suffix}",
+            "username": f"comment_author_{suffix}",
+            "email": f"comment_author_{suffix}@example.com",
+            "password": "Test1234abc",
+            "roles": ["admin"],
+        },
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
@@ -222,18 +234,19 @@ class TestTicketCommentsAPI:
     async def test_create_comment_records_explicit_author_id(
         self, client: AsyncClient
     ):
-        """Tokens with a different ``sub`` should propagate as ``author_id``."""
+        """Tokens for another real employee should propagate as ``author_id``."""
         ctx = await _bootstrap_tenant(client)
         ticket_id = await _create_ticket(client, ctx["headers"])
+        author_id = await _create_employee(client, ctx["headers"])
 
-        spoof_token = _spoofed_token(ctx["tenant_pk"], user_id=99999)
+        author_token = _token_for_employee(ctx["tenant_pk"], user_id=author_id)
         resp = await client.post(
             f"/api/v1/tickets/{ticket_id}/comments",
-            headers=_auth_header_from_token(spoof_token),
+            headers=_auth_header_from_token(author_token),
             json={"body": "<p>hi</p>"},
         )
         assert resp.status_code == 201, resp.text
-        assert resp.json()["author_id"] == 99999
+        assert resp.json()["author_id"] == author_id
 
     @pytest.mark.asyncio
     async def test_create_comment_cross_tenant_returns_404(self, client: AsyncClient):

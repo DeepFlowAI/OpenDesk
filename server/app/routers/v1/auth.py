@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
-from app.db.deps import get_db, get_redis
-from app.schemas.auth import LoginRequest, LoginResponse
+from app.db.deps import get_current_user, get_db, get_redis
+from app.schemas.auth import LoginRequest, LoginResponse, UserInfo
 from app.schemas.password_reset import (
     SendVerifyCodeRequest,
     SendVerifyCodeResponse,
@@ -23,6 +23,15 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     """User login endpoint"""
     return await AuthService.login(db, body)
+
+
+@router.get("/me", response_model=UserInfo)
+async def get_me(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get current user profile with fresh effective permissions."""
+    return await AuthService.get_current_user_info(db, current_user)
 
 
 @router.post("/send-verify-code", response_model=SendVerifyCodeResponse)

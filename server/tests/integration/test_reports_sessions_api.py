@@ -4,6 +4,7 @@ Reuses the same seeded tenant/conversations as test_reports_queries.py via its
 own seed (we can't import that module's fixture without conflicts), but seeding
 is idempotent.
 """
+import json
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -67,6 +68,41 @@ async def seed():
             "SELECT id FROM employees WHERE username='rep_agent_a' AND tenant_id=:tid"
         ), {"tid": _TENANT_PK})
         _AGENT_A_ID = a.scalar_one()
+
+        role_id = (await db.execute(text("""
+            INSERT INTO roles (
+                tenant_id, key, name, description, is_system, is_active,
+                permissions, data_scopes
+            )
+            VALUES (
+                :tid, 'reports_sessions_access', 'Reports Sessions Access',
+                'Reports Sessions Access', false, true,
+                CAST(:permissions AS JSON), CAST(:data_scopes AS JSON)
+            )
+            ON CONFLICT ON CONSTRAINT uq_roles_tenant_key DO UPDATE SET
+                permissions = EXCLUDED.permissions,
+                data_scopes = EXCLUDED.data_scopes,
+                is_active = true
+            RETURNING id
+        """), {
+            "tid": _TENANT_PK,
+            "permissions": json.dumps([
+                "chat.workspace.use",
+                "chat.session_record.view",
+                "chat.session_report.view",
+                "chat.session_report.export",
+            ]),
+            "data_scopes": json.dumps({"session_record": "all"}),
+        })).scalar_one()
+        await db.execute(text(
+            "DELETE FROM employee_roles WHERE employee_id = :employee_id"
+        ), {"employee_id": _AGENT_A_ID})
+        await db.execute(text("""
+            INSERT INTO employee_roles (employee_id, role_id)
+            VALUES (:employee_id, :role_id)
+            ON CONFLICT ON CONSTRAINT uq_employee_roles_employee_role DO NOTHING
+        """), {"employee_id": _AGENT_A_ID, "role_id": role_id})
+        await db.commit()
 
         await db.execute(text("""
             INSERT INTO users (tenant_id, public_id, external_id, name)

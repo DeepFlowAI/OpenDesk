@@ -18,6 +18,7 @@ import { MessageAttachment } from '@/app/components/features/chat/message-attach
 import { conversationKeys, useVisitorWebStatus } from '@/service/use-conversations'
 import { AssistantMarkdownText, MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
+import { SafeHtml } from '@/components/safe-html'
 import { resolveOpenAgentHandoffEventLabel } from '@/lib/open-agent-handoff-event'
 import type {
   Conversation,
@@ -83,13 +84,13 @@ function AgentSideWelcomeBubble({
     <div className="mb-4 flex flex-row-reverse gap-2.5">
       <SystemAgentAvatar muted={muted} />
       <div className="flex min-w-0 max-w-[70%] flex-col items-end">
-        <div
+        <SafeHtml
+          html={content}
           className={cn(
             'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all whitespace-pre-wrap text-[#1a1a1a]',
             muted ? 'bg-[#E8E8E8]' : 'bg-[#DBEAFE]',
             richTextListStyleClass,
           )}
-          dangerouslySetInnerHTML={{ __html: content }}
         />
         <span className="mt-1 text-right text-[11px] text-[#999999]">{time}</span>
       </div>

@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.configs.settings import settings
+from app.configs.settings import settings, assert_safe_production_config
 from app.routers import register_routers
 from app.core.exceptions import register_exception_handlers
 from app.db.session import AsyncSessionLocal, engine
@@ -19,6 +19,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    assert_safe_production_config()
     run_migrations()
     async with AsyncSessionLocal() as db:
         await seed_system_defaults(db)
@@ -66,10 +67,14 @@ def create_app() -> FastAPI:
         version=settings.APP_VERSION,
         lifespan=lifespan,
     )
+    cors_origins = settings.cors_origins
+    # The CORS spec forbids combining a "*" origin with credentials, so we only
+    # enable credentialed cross-origin requests when an explicit allowlist is set.
+    allow_credentials = cors_origins != ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )

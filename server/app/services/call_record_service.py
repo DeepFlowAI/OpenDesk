@@ -16,7 +16,7 @@ from app.repositories.call_record_repository import CallRecordRepository
 from app.repositories.ticket_repository import TicketRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.permission import EffectivePrincipal
-from app.services.data_scope_service import DataScopeService
+from app.services.data_scope_service import DataScopeService, RESOURCE_CALL_RECORD
 from app.services.queue_history_service import QueueHistoryService
 from app.services.call_user_association_service import CallUserAssociationService
 
@@ -231,7 +231,7 @@ class CallRecordService:
             scope_predicate = DataScopeService.build_call_record_predicate(principal, peer_ids)
             effective_agent_id = DataScopeService.resolve_agent_filter(
                 principal,
-                DataScopeService.RESOURCE_CALL_RECORD,
+                RESOURCE_CALL_RECORD,
                 agent_id,
                 peer_ids,
             )

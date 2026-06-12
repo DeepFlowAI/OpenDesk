@@ -671,8 +671,9 @@ class FdFieldDefinitionService:
         if definition.field_type not in TREE_TYPES:
             raise ValidationError("Tree nodes are only for tree-type fields")
 
+        payload = data.model_dump(exclude={"parent_index"})
         return await FdFieldDefinitionRepository.create_tree_node(
-            db, {**data.model_dump(), "field_definition_id": definition_id},
+            db, {**payload, "field_definition_id": definition_id},
         )
 
     @staticmethod

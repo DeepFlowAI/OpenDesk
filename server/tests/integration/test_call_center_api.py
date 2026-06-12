@@ -7,21 +7,24 @@ Integration tests for the call-center module:
 import uuid
 
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
 from sqlalchemy import delete
 
-from app.core.security import create_access_token
 from app.db.session import AsyncSessionLocal
 from app.models.call_record import CallRecord
 from app.models.tenant import Tenant
 from app.repositories.user_repository import UserRepository
+from tests.integration.rbac_helpers import auth_headers_for_seeded_admin, ensure_admin_principals
 
 
-def _auth(employee_id: int = 1, tenant_id: int = 7) -> dict:
-    token = create_access_token(
-        {"sub": str(employee_id), "tenant_id": tenant_id, "roles": ["admin"]}
-    )
-    return {"Authorization": f"Bearer {token}"}
+@pytest_asyncio.fixture(autouse=True)
+async def seed_admin_principals():
+    await ensure_admin_principals([7, 4242])
+
+
+def _auth(tenant_id: int = 7) -> dict:
+    return auth_headers_for_seeded_admin(tenant_id)
 
 
 async def _create_tenant() -> int:
@@ -34,6 +37,7 @@ async def _create_tenant() -> int:
         db.add(tenant)
         await db.commit()
         await db.refresh(tenant)
+        await ensure_admin_principals([tenant.id])
         return tenant.id
 
 
@@ -95,14 +99,7 @@ class TestAgentStatusAPI:
 
     @pytest.mark.asyncio
     async def test_set_status_persists(self, client: AsyncClient):
-        # use a unique employee id so re-runs don't collide
-        emp = (uuid.uuid4().int % 1_000_000) + 100
-        headers = _auth(employee_id=emp)
-        # employee row may not exist — call the upsert anyway via the API.
-        # The agent_status FK to employees blocks this in a clean DB. We use
-        # an existing employee instead.
-        # Instead, fall back to employee_id=1 which is seeded.
-        headers = _auth(employee_id=1)
+        headers = _auth()
         r = await client.put(
             "/api/v1/call-center/agent-status/me",
             headers=headers,
@@ -122,7 +119,7 @@ class TestWebRTCSessionAPI:
 
     @pytest.mark.asyncio
     async def test_open_close_idempotent(self, client: AsyncClient):
-        headers = _auth(employee_id=1)
+        headers = _auth()
         # Make sure no leftover session from a previous run
         await client.delete("/api/v1/call-center/agents/me/webrtc-session", headers=headers)
 
@@ -154,7 +151,7 @@ class TestWebRTCSessionAPI:
 
     @pytest.mark.asyncio
     async def test_cannot_open_twice(self, client: AsyncClient):
-        headers = _auth(employee_id=1)
+        headers = _auth()
         await client.delete("/api/v1/call-center/agents/me/webrtc-session", headers=headers)
         await client.post(
             "/api/v1/call-center/agents/me/webrtc-session",
@@ -175,7 +172,7 @@ class TestCallRecordsAPI:
 
     @pytest.mark.asyncio
     async def test_list_returns_empty_for_fresh_tenant(self, client: AsyncClient):
-        headers = _auth(tenant_id=4242, employee_id=1)
+        headers = _auth(tenant_id=4242)
         r = await client.get("/api/v1/call-center/call-records", headers=headers)
         # tenant 4242 has no records; might 422 if tenant doesn't exist for FKs
         # — but list query doesn't validate tenant existence, just returns empty.

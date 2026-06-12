@@ -8,6 +8,7 @@ type AuthState = {
   user: User | null
   token: string | null
   setAuth: (user: User, token: string) => void
+  setUser: (user: User) => void
   updateUser: (partial: Partial<Pick<User, 'display_name' | 'avatar'>>) => void
   clearAuth: () => void
 }
@@ -20,6 +21,9 @@ export const useAuthStore = create<AuthState>()(
       setAuth: (user, token) => {
         set({ user, token })
         localStorage.setItem('auth_token', token)
+      },
+      setUser: (user) => {
+        set({ user })
       },
       updateUser: (partial) => {
         set((state) => ({

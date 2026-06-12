@@ -4,17 +4,19 @@ Integration tests for SessionRoutingRule API
 import uuid
 
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
 
-from app.core.security import create_access_token
+from tests.integration.rbac_helpers import auth_headers_for_seeded_admin, ensure_admin_principals
 
 
-def _make_token(tenant_id: int = 7, role: str = "admin") -> str:
-    return create_access_token({"sub": "1", "tenant_id": tenant_id, "roles": [role]})
+@pytest_asyncio.fixture(autouse=True)
+async def seed_admin_principals():
+    await ensure_admin_principals([7])
 
 
 def _auth_header(tenant_id: int = 7) -> dict:
-    return {"Authorization": f"Bearer {_make_token(tenant_id)}"}
+    return auth_headers_for_seeded_admin(tenant_id)
 
 
 def _sh_payload() -> dict:

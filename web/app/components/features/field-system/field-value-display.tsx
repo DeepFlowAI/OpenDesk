@@ -12,6 +12,7 @@ import { useEmployee } from '@/service/use-employees'
 import { useEmployeeGroup } from '@/service/use-employee-groups'
 import { FieldFileDisplay } from '@/app/components/features/field-system/field-file-display'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
+import { SafeHtml } from '@/components/safe-html'
 
 type FieldValueDisplayProps = {
   fieldType: FieldType
@@ -170,13 +171,13 @@ export function FieldValueDisplay({
         )
       }
       return (
-        <div
+        <SafeHtml
+          html={String(value)}
           className={cn(
             'prose prose-sm dark:prose-invert max-w-none min-w-0 break-words',
             richTextListStyleClass,
             className,
           )}
-          dangerouslySetInnerHTML={{ __html: String(value) }}
         />
       )
     }

@@ -18,6 +18,7 @@ import {
   resolveHandoffEventType,
 } from '@/app/components/features/visitor-chat/human-handoff-event-message'
 import { WelcomeMessage } from '@/app/components/features/visitor-chat/welcome-message'
+import { SafeHtml } from '@/components/safe-html'
 import { TypingIndicator } from '@/app/components/features/visitor-chat/typing-indicator'
 import { VisitorComposer } from './visitor-composer'
 import { IconLoader2, IconArrowDown, IconAlertCircle, IconStar, IconX } from '@tabler/icons-react'
@@ -468,9 +469,9 @@ export function VisitorThread({
                 <IconAlertCircle size={18} className="text-amber-600" />
                 {offlineTitle || (locale === 'zh' ? '当前客服不在线' : 'Support is offline')}
               </div>
-              <div
+              <SafeHtml
                 className="prose prose-sm max-w-none text-sm leading-6 text-muted-foreground"
-                dangerouslySetInnerHTML={{ __html: offlineMessage || '' }}
+                html={offlineMessage || ''}
               />
             </div>
           </div>

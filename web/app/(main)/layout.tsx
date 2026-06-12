@@ -20,11 +20,13 @@ import {
   IconLayoutDashboard,
   IconNotes,
   IconListSearch,
+  IconSortAscending,
   IconPhone,
   IconFilePhone,
   IconShieldCheck,
 } from '@tabler/icons-react'
 import { useAuthStore } from '@/context/auth-store'
+import { useRefreshCurrentUser } from '@/hooks/use-refresh-current-user'
 import { UserDropdown } from '@/app/components/features/user-dropdown'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
@@ -46,7 +48,7 @@ const ADMIN_NAV_ICONS: Record<AdminNavIconKey, ComponentType<{ size?: number; cl
   employees: IconUser,
   employeeGroups: IconUsers,
   roles: IconShieldCheck,
-  queueSettings: IconListSearch,
+  queueSettings: IconSortAscending,
   flowStudio: IconGitBranch,
   phoneNumbers: IconPhone,
   callSummary: IconFilePhone,
@@ -74,6 +76,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
   const { token, user } = useAuthStore()
   const { locale } = useLocaleStore()
   const [mounted, setMounted] = useState(false)
+  const { isRefreshing: authRefreshing } = useRefreshCurrentUser(mounted)
   const visibleNavGroups = useMemo(
     () => ADMIN_NAV_GROUPS
       .map((group) => ({
@@ -95,20 +98,20 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
   }, [mounted, token, router])
 
   useEffect(() => {
-    if (mounted && token && user && !hasPermission(user, 'admin.access')) {
+    if (mounted && token && user && !authRefreshing && !hasPermission(user, 'admin.access')) {
       router.replace(getDefaultAccessiblePath(user))
     }
-  }, [mounted, token, user, router])
+  }, [authRefreshing, mounted, token, user, router])
 
   useEffect(() => {
-    if (!mounted || !token || !user || !hasPermission(user, 'admin.access')) return
+    if (!mounted || !token || !user || authRefreshing || !hasPermission(user, 'admin.access')) return
     const routeRule = getAdminRouteRule(pathname)
     if (routeRule && !hasAllPermissions(user, routeRule.permissions)) {
       router.replace(getDefaultAdminPath(user))
     }
-  }, [mounted, token, user, pathname, router])
+  }, [authRefreshing, mounted, token, user, pathname, router])
 
-  if (!mounted || !token || !user) return null
+  if (!mounted || authRefreshing || !token || !user) return null
   if (!hasPermission(user, 'admin.access')) return null
   const routeRule = getAdminRouteRule(pathname)
   if (routeRule && !hasAllPermissions(user, routeRule.permissions)) return null

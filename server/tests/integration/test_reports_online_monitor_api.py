@@ -1,4 +1,5 @@
 """Integration tests for /api/v1/reports/online-monitor (SR3)."""
+import json
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -56,13 +57,79 @@ async def seed():
             VALUES
               (:tid, 'mon_agent_a', 'a@mon.test', :pw, 'Mon Agent A', 'Mon Agent A', '["agent","admin"]'::jsonb, true, 5),
               (:tid, 'mon_agent_b', 'b@mon.test', :pw, 'Mon Agent B', 'Mon Agent B', '["agent"]'::jsonb, true, 3),
-              (:tid, 'mon_agent_c', 'c@mon.test', :pw, 'Mon Agent C (inactive)', 'Mon Agent C', '["agent"]'::jsonb, false, 5)
+              (:tid, 'mon_agent_c', 'c@mon.test', :pw, 'Mon Agent C (inactive)', 'Mon Agent C', '["agent"]'::jsonb, false, 5),
+              (:tid, 'mon_agent_no_workspace', 'no-workspace@mon.test', :pw, 'Mon Agent No Workspace', 'Mon Agent No Workspace', '[]'::jsonb, true, 5)
         """), {"tid": _TENANT_PK, "pw": pw})
         await db.commit()
         a = await db.execute(text("SELECT id FROM employees WHERE username='mon_agent_a' AND tenant_id=:tid"), {"tid": _TENANT_PK})
         _AGENT_A_ID = a.scalar_one()
         b = await db.execute(text("SELECT id FROM employees WHERE username='mon_agent_b' AND tenant_id=:tid"), {"tid": _TENANT_PK})
         _AGENT_B_ID = b.scalar_one()
+        no_workspace = await db.execute(text(
+            "SELECT id FROM employees WHERE username='mon_agent_no_workspace' AND tenant_id=:tid"
+        ), {"tid": _TENANT_PK})
+        no_workspace_id = no_workspace.scalar_one()
+
+        chat_role_id = (await db.execute(text("""
+            INSERT INTO roles (
+                tenant_id, key, name, description, is_system, is_active,
+                permissions, data_scopes
+            )
+            VALUES (
+                :tid, 'online_monitor_chat_access', 'Online Monitor Chat Access',
+                'Online Monitor Chat Access', false, true,
+                CAST(:permissions AS JSON), CAST(:data_scopes AS JSON)
+            )
+            ON CONFLICT ON CONSTRAINT uq_roles_tenant_key DO UPDATE SET
+                permissions = EXCLUDED.permissions,
+                data_scopes = EXCLUDED.data_scopes,
+                is_active = true
+            RETURNING id
+        """), {
+            "tid": _TENANT_PK,
+            "permissions": json.dumps([
+                "chat.workspace.use",
+                "chat.session_record.view",
+                "chat.online_monitor.view",
+            ]),
+            "data_scopes": json.dumps({"session_record": "all"}),
+        })).scalar_one()
+        no_workspace_role_id = (await db.execute(text("""
+            INSERT INTO roles (
+                tenant_id, key, name, description, is_system, is_active,
+                permissions, data_scopes
+            )
+            VALUES (
+                :tid, 'online_monitor_no_workspace', 'Online Monitor No Workspace',
+                'Online Monitor No Workspace', false, true,
+                CAST(:permissions AS JSON), CAST(:data_scopes AS JSON)
+            )
+            ON CONFLICT ON CONSTRAINT uq_roles_tenant_key DO UPDATE SET
+                permissions = EXCLUDED.permissions,
+                data_scopes = EXCLUDED.data_scopes,
+                is_active = true
+            RETURNING id
+        """), {
+            "tid": _TENANT_PK,
+            "permissions": json.dumps([]),
+            "data_scopes": json.dumps({}),
+        })).scalar_one()
+        role_rows = [
+            (_AGENT_A_ID, chat_role_id),
+            (_AGENT_B_ID, chat_role_id),
+            (no_workspace_id, no_workspace_role_id),
+        ]
+        await db.execute(text("""
+            DELETE FROM employee_roles
+            WHERE employee_id = ANY(:employee_ids)
+        """), {"employee_ids": [employee_id for employee_id, _ in role_rows]})
+        for employee_id, role_id in role_rows:
+            await db.execute(text("""
+                INSERT INTO employee_roles (employee_id, role_id)
+                VALUES (:employee_id, :role_id)
+                ON CONFLICT ON CONSTRAINT uq_employee_roles_employee_role DO NOTHING
+            """), {"employee_id": employee_id, "role_id": role_id})
+        await db.commit()
 
         # One session today for agent A
         await db.execute(text("""
@@ -121,6 +188,12 @@ class TestOnlineMonitorAPI:
         assert "Mon Agent B" in names
         # Inactive Mon Agent C must NOT appear (SR3 §1.2 excludes inactive)
         assert "Mon Agent C" not in names
+
+    @pytest.mark.asyncio
+    async def test_employees_without_chat_workspace_not_listed(self, client: AsyncClient):
+        resp = await client.get("/api/v1/reports/online-monitor", headers=_auth())
+        names = [e["employee"]["name"] for e in resp.json()["employees"]]
+        assert "Mon Agent No Workspace" not in names
 
     @pytest.mark.asyncio
     async def test_employee_row_carries_status_and_max_concurrent(self, client: AsyncClient):

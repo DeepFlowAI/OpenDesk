@@ -8,6 +8,7 @@ conversation creates its own row (``_create_active_conversation``) so the
 suite has no implicit ordering coupling between tests.
 """
 import asyncio
+import json
 
 import pytest
 import pytest_asyncio
@@ -78,9 +79,84 @@ async def seed_transfer_data():
         admin_id = await _emp("xfer_admin")
         admin_agent_id = await _emp("xfer_admin_agent")
 
+        async def _upsert_role(
+            key: str,
+            name: str,
+            permissions: list[str],
+            data_scopes: dict[str, str],
+        ) -> int:
+            result = await db.execute(text("""
+                INSERT INTO roles (
+                    tenant_id, key, name, description, is_system, is_active,
+                    permissions, data_scopes
+                )
+                VALUES (
+                    :tid, :key, :name, :name, false, true,
+                    CAST(:permissions AS JSON), CAST(:data_scopes AS JSON)
+                )
+                ON CONFLICT ON CONSTRAINT uq_roles_tenant_key DO UPDATE SET
+                    permissions = EXCLUDED.permissions,
+                    data_scopes = EXCLUDED.data_scopes,
+                    is_active = true
+                RETURNING id
+            """), {
+                "tid": tenant_pk,
+                "key": key,
+                "name": name,
+                "permissions": json.dumps(permissions),
+                "data_scopes": json.dumps(data_scopes),
+            })
+            return result.scalar_one()
+
+        agent_role_id = await _upsert_role(
+            "xfer_agent_access",
+            "Xfer Agent Access",
+            [
+                "chat.workspace.use",
+                "chat.conversation.transfer",
+                "chat.session_record.view",
+            ],
+            {"session_record": "self"},
+        )
+        admin_agent_role_id = await _upsert_role(
+            "xfer_admin_agent_access",
+            "Xfer Admin Agent Access",
+            [
+                "chat.workspace.use",
+                "chat.conversation.transfer",
+                "chat.session_record.view",
+            ],
+            {"session_record": "all"},
+        )
+        no_workspace_role_id = await _upsert_role(
+            "xfer_no_workspace",
+            "Xfer No Workspace",
+            [],
+            {},
+        )
+
+        role_rows = [
+            (owner_id, agent_role_id),
+            (target_id, agent_role_id),
+            (busy_id, agent_role_id),
+            (admin_id, no_workspace_role_id),
+            (admin_agent_id, admin_agent_role_id),
+        ]
         await db.execute(text("""
-            INSERT INTO users (tenant_id, external_id, name)
-            VALUES (:tid, 'xfer-visitor', 'Xfer Visitor')
+            DELETE FROM employee_roles
+            WHERE employee_id = ANY(:employee_ids)
+        """), {"employee_ids": [employee_id for employee_id, _ in role_rows]})
+        for employee_id, role_id in role_rows:
+            await db.execute(text("""
+                INSERT INTO employee_roles (employee_id, role_id)
+                VALUES (:employee_id, :role_id)
+                ON CONFLICT ON CONSTRAINT uq_employee_roles_employee_role DO NOTHING
+            """), {"employee_id": employee_id, "role_id": role_id})
+        await db.commit()
+
+        await db.execute(text("""
+            INSERT INTO users (tenant_id, public_id, external_id, name)
+            VALUES (:tid, 'usr_xfer_visitor', 'xfer-visitor', 'Xfer Visitor')
             ON CONFLICT ON CONSTRAINT uq_users_tenant_external DO NOTHING
         """), {"tid": tenant_pk})
         await db.commit()
