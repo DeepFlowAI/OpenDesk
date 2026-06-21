@@ -4,7 +4,7 @@ enabled rule whose conditions all match and returns its target voice flow.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import asc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +23,7 @@ async def match_routing_rule(
     to_number: str | None,
     now: datetime | None = None,
 ) -> tuple[InboundRoutingRule, VoiceFlow] | None:
-    now = now or datetime.now()
+    now = now or datetime.now(timezone.utc)
 
     q = (
         select(InboundRoutingRule)

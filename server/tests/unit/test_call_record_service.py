@@ -132,12 +132,12 @@ async def test_bind_queue_records_queue_summary_metadata(monkeypatch):
 async def test_mark_answered_does_not_record_queue_duration_metadata(monkeypatch):
     class FrozenDatetime(datetime):
         @classmethod
-        def now(cls):
-            return datetime(2026, 5, 29, 10, 0, 30)
+        def now(cls, tz=None):
+            return datetime(2026, 5, 29, 10, 0, 30, tzinfo=tz)
 
     row = SimpleNamespace(
         call_id="call_001",
-        started_at=datetime(2026, 5, 29, 10, 0),
+        started_at=_dt(),
         extra_metadata={
             "queue_summary": {
                 "last_assigned_queue": {

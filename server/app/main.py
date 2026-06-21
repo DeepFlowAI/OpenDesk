@@ -1,8 +1,12 @@
 import logging
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
+import asyncio
+from contextlib import asynccontextmanager, suppress
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from app.configs.logging import setup_logging
 from app.configs.settings import settings, assert_safe_production_config
+from app.core.trace import set_request_id, set_trace_id
+from app.libs.observability import init_observability, shutdown_observability
 from app.routers import register_routers
 from app.core.exceptions import register_exception_handlers
 from app.db.session import AsyncSessionLocal, engine
@@ -10,11 +14,44 @@ from app.db.migration import run_migrations
 from app.db.seed import seed_system_defaults
 from app.extensions import load_extensions
 
-LOG_FORMAT = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d %(funcName)s] %(message)s"
+# Init order matters: observability must be ready *before* setup_logging() so
+# the OTel logging handler can be attached to the root logger from the start.
+init_observability()
+setup_logging()
 
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, force=True)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+async def _visitor_timeout_close_worker() -> None:
+    from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
+
+    logger = logging.getLogger(__name__)
+    interval = settings.VISITOR_TIMEOUT_CLOSE_SCAN_INTERVAL_SECONDS
+    batch_size = settings.VISITOR_TIMEOUT_CLOSE_SCAN_BATCH_SIZE
+    while True:
+        try:
+            redis = None
+            if settings.REDIS_URL:
+                from app.db.redis import redis_client
+
+                redis = redis_client.client
+            async with AsyncSessionLocal() as db:
+                result = await VisitorTimeoutCloseService.process_due_states(
+                    db,
+                    redis,
+                    limit=batch_size,
+                )
+            if result["reminded"] or result["closed"]:
+                logger.info(
+                    "visitor_timeout_close_scan checked=%s reminded=%s closed=%s skipped=%s",
+                    result["checked"],
+                    result["reminded"],
+                    result["closed"],
+                    result["skipped"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Visitor timeout auto-close scan failed")
+        await asyncio.sleep(interval)
 
 
 @asynccontextmanager
@@ -27,6 +64,13 @@ async def lifespan(app: FastAPI):
     if settings.REDIS_URL:
         from app.db.redis import redis_client
         await redis_client.initialize()
+
+    visitor_timeout_task = None
+    if settings.VISITOR_TIMEOUT_CLOSE_WORKER_ENABLED:
+        visitor_timeout_task = asyncio.create_task(
+            _visitor_timeout_close_worker(),
+            name="visitor-timeout-close-worker",
+        )
 
     # Optional: call-center orchestrator. Off by default in OSS to avoid
     # crashing the app when no telephony kernel is reachable.
@@ -44,6 +88,11 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    if visitor_timeout_task is not None:
+        visitor_timeout_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await visitor_timeout_task
+
     # Shutdown call center
     if orchestrator is not None:
         try:
@@ -59,6 +108,8 @@ async def lifespan(app: FastAPI):
         from app.db.redis import redis_client
         await redis_client.close()
     await engine.dispose()
+    # Flush remaining batched spans/logs before the process exits.
+    shutdown_observability()
 
 
 def create_app() -> FastAPI:
@@ -67,6 +118,20 @@ def create_app() -> FastAPI:
         version=settings.APP_VERSION,
         lifespan=lifespan,
     )
+
+    @app.middleware("http")
+    async def trace_context_middleware(request: Request, call_next):
+        """Assign a trace_id to every request so all logs emitted while
+        handling it carry the same correlation id. Honors a client-supplied
+        ``X-Trace-Id`` / ``X-Request-Id`` when present, and echoes the
+        resolved trace_id back in the ``X-Trace-Id`` response header."""
+        incoming = request.headers.get("X-Trace-Id")
+        trace_id = set_trace_id(incoming if incoming else None)
+        set_request_id(request.headers.get("X-Request-Id"))
+        response = await call_next(request)
+        response.headers["X-Trace-Id"] = trace_id
+        return response
+
     cors_origins = settings.cors_origins
     # The CORS spec forbids combining a "*" origin with credentials, so we only
     # enable credentialed cross-origin requests when an explicit allowlist is set.

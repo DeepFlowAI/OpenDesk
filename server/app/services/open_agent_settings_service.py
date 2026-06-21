@@ -2,6 +2,7 @@
 OpenAgent settings service.
 """
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import ValidationError as PydanticValidationError
 
 from app.core.exceptions import ValidationError
 from app.core.secret_store import decrypt_secret, encrypt_secret
@@ -9,12 +10,14 @@ from app.libs.open_agent import create_open_agent_client
 from app.libs.open_agent.base import BaseOpenAgentClient, OpenAgentClientError
 from app.repositories.open_agent_settings_repository import OpenAgentSettingsRepository
 from app.schemas.open_agent_settings import (
-    OpenAgentConnectionTestRequest,
-    OpenAgentConnectionTestResponse,
+    OpenAgentFAQ,
     OpenAgentAgentListResponse,
     OpenAgentAgentSummary,
+    OpenAgentConnectionTestRequest,
+    OpenAgentConnectionTestResponse,
     OpenAgentSettingsResponse,
     OpenAgentSettingsUpdate,
+    OpenAgentWelcomeMessage,
 )
 
 
@@ -130,6 +133,48 @@ class OpenAgentSettingsService:
             per_page=result.per_page,
             pages=result.pages,
         )
+
+    @staticmethod
+    async def get_agent_welcome_message(
+        db: AsyncSession,
+        tenant_id: int,
+        agent_id: int,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentWelcomeMessage | None:
+        """Return an enabled OpenAgent welcome message for visitor-facing use."""
+        credentials = await OpenAgentSettingsService.get_credentials(db, tenant_id)
+        if not credentials:
+            return None
+
+        base_url, api_key = credentials
+        if not api_key:
+            return None
+
+        client = open_agent_client or create_open_agent_client()
+        try:
+            agent = await client.get_agent(base_url, api_key, agent_id)
+        except OpenAgentClientError:
+            return None
+
+        if agent.status != "active" or not agent.welcome_message:
+            return None
+
+        try:
+            welcome_message = OpenAgentWelcomeMessage.model_validate(agent.welcome_message)
+        except PydanticValidationError:
+            return None
+
+        if not welcome_message.enabled or not welcome_message.blocks:
+            return None
+
+        if agent.faq:
+            try:
+                faq = OpenAgentFAQ.model_validate(agent.faq)
+            except PydanticValidationError:
+                faq = None
+            if faq and faq.enabled and faq.categories:
+                welcome_message.faq = faq
+        return welcome_message
 
     @staticmethod
     async def _load_saved_api_key(db: AsyncSession, tenant_id: int) -> str | None:

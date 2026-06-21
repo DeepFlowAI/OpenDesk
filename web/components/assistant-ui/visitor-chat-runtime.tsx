@@ -16,16 +16,28 @@ import {
   type AppendMessage,
 } from '@assistant-ui/react'
 import { useVisitorChatStore } from '@/context/visitor-chat-store'
+import type { Locale } from '@/context/locale-store'
 import type {
   Message,
   OpenAgentTextBlock,
   OpenAgentThinkingBlock,
   OpenAgentToolBlock,
   VisitorConversationHistoryItem,
+  VisitorUnreadOfflineReplyItem,
 } from '@/models/conversation'
 import type { ChannelConfig } from '@/models/channel'
-import type { ChannelPublicConfig } from '@/service/use-visitor-chat'
-import { uploadVisitorConversationFile } from '@/service/use-conversation-files'
+import type { EmojiTargetConfig } from '@/models/emoji-setting'
+import {
+  createOfflineMessageWithMessage,
+  sendOfflineMessage,
+  type ChannelPublicConfig,
+  type PublicMessage,
+} from '@/service/use-visitor-chat'
+import {
+  sendVisitorOfflineMessageFile,
+  uploadVisitorConversationFile,
+  uploadVisitorOfflineMessageFile,
+} from '@/service/use-conversation-files'
 import type { SatisfactionSurveyRecord } from '@/models/satisfaction-survey'
 import type { Socket } from 'socket.io-client'
 import {
@@ -38,16 +50,36 @@ import {
   type OpenAgentToolResultPayload,
   type OpenAgentStreamController,
 } from '@/service/use-open-agent-conversation'
+import { createStreamMetrics, telemetry } from '@/service/telemetry'
+import { isVisitorQueueEnteredMessage } from '@/lib/visitor-queue-notice'
+import {
+  getAssistantAvatarSrc,
+  shouldShowAssistantAvatar,
+} from '@/app/components/features/visitor-chat/avatar'
+import {
+  isHandoffLeaveMessagePayload,
+  isHandoffQueueFullPayload,
+  type HandoffRouteUnavailablePayload,
+} from '@/lib/handoff-route-unavailable'
 
 // ─── Config context ──────────────────────────────────────────────
 
 export type VisitorChatConfigValue = {
   channel: ChannelPublicConfig
   config: ChannelConfig
-  locale: string
+  locale: Locale
   isMobile: boolean
   ended: boolean
+  conversationStatus: string | null
   conversationPublicId: string | null
+  offlineMode: boolean
+  offlineMessagePublicId: string | null
+  queueFull: boolean
+  queueFullMessage: string
+  queueFullShowLeaveMessageButton: boolean
+  queueFullLeaveMessageButtonLabel: string
+  startConversationError: string | null
+  currentQueueCount: number | null
   visitorSessionToken: string
   hasMore: boolean
   loadingMore: boolean
@@ -58,6 +90,13 @@ export type VisitorChatConfigValue = {
   historyLoaded: boolean
   historyError: boolean
   historyLimitReached: boolean
+  unreadReplyConversations: VisitorUnreadOfflineReplyItem[]
+  unreadReplyHasMore: boolean
+  unreadReplyError: boolean
+  currentUnreadReplyNotice: {
+    conversationPublicId: string
+    unread: boolean
+  } | null
   initializing: boolean
   botMode: boolean
   botRunning: boolean
@@ -71,10 +110,14 @@ export type VisitorChatConfigValue = {
   handoffRouting: boolean
   satisfactionCanInitiate: boolean
   satisfactionLoading: boolean
+  emojiConfig: EmojiTargetConfig | null
   onLoadMore: () => void
   onLoadHistory: (beforeId?: string) => Promise<void>
+  onUnreadReplyVisible: (conversationPublicId: string) => void
   onTyping: (content: string) => void
   onRestartConversation: () => Promise<void>
+  onQueueFullLeaveMessage: () => void
+  onAssistSendMessage: (text: string) => Promise<boolean>
   onRequestHumanHandoff: (payload?: HumanHandoffEventPayload | null) => Promise<boolean>
   onDismissHumanHandoff: () => void
   onSatisfactionInitiate: () => Promise<SatisfactionSurveyRecord | null>
@@ -382,6 +425,20 @@ function applyThinkingStepId(
   ))
 }
 
+function mapPublicMessage(message: PublicMessage): Message {
+  return {
+    ...message,
+    conversation_id: 0,
+  }
+}
+
+function mapDeliveredPublicMessage(message: PublicMessage): Message {
+  const mapped = mapPublicMessage(message)
+  return message.sender_type === 'visitor'
+    ? { ...mapped, status: 'delivered' }
+    : mapped
+}
+
 // ─── OpenAgent in-flight turn persistence ───────────────────────
 
 const OPEN_AGENT_PENDING_TURN_VERSION = 1
@@ -567,11 +624,16 @@ type ProviderProps = Omit<
   | 'onFileSend'
   | 'botRunning'
   | 'handoffRouting'
+  | 'onAssistSendMessage'
   | 'onRequestHumanHandoff'
   | 'onDismissHumanHandoff'
 > & {
   socket: Socket | null
   onConversationStatusChange: (status: string | null) => void
+  onCurrentQueueCountChange?: (count: number | null) => void
+  onOfflineMessageCreated: (offlineMessagePublicId: string) => void
+  onHandoffLeaveMessage?: (prompt?: string) => void
+  onHandoffQueueFull?: (payload: HandoffRouteUnavailablePayload) => void
   children: ReactNode
 }
 
@@ -674,10 +736,19 @@ export function VisitorChatRuntimeProvider({
   children,
   socket,
   onConversationStatusChange,
+  onCurrentQueueCountChange,
+  onOfflineMessageCreated,
+  onHandoffLeaveMessage,
+  onHandoffQueueFull,
   ...chatConfig
 }: ProviderProps) {
   const messages = useVisitorChatStore((s) => s.messages)
-  const { conversationPublicId, visitorSessionToken } = chatConfig
+  const {
+    conversationPublicId,
+    offlineMode,
+    offlineMessagePublicId,
+    visitorSessionToken,
+  } = chatConfig
   const [botRunning, setBotRunning] = useState(false)
   const abortRef = useRef<OpenAgentStreamController | null>(null)
   const pendingTurnRef = useRef<PendingOpenAgentTurn | null>(null)
@@ -688,18 +759,18 @@ export function VisitorChatRuntimeProvider({
     (msg: Message, idx: number): ThreadMessageLike => {
       const prev = idx > 0 ? messages[idx - 1] : null
       const next = idx < messages.length - 1 ? messages[idx + 1] : null
-      const useAgentAvatar = chatConfig.config.use_agent_avatar === true
       const showAvatar = msg.sender_type === 'agent' || msg.sender_type === 'bot'
-        ? useAgentAvatar
+        ? shouldShowAssistantAvatar(msg.sender_type, chatConfig.config)
         : shouldShowAvatar(msg, next)
+      const senderAvatar = getAssistantAvatarSrc(msg, chatConfig.config) ?? msg.sender_avatar
 
       const meta: VisitorMessageMeta = {
         senderName: msg.sender_name,
-        senderAvatar: msg.sender_avatar,
+        senderAvatar,
         senderType: msg.sender_type,
         senderId: msg.sender_id,
         contentType: msg.content_type,
-        conversationPublicId: msg.conversation_public_id || conversationPublicId || '',
+        conversationPublicId: msg.conversation_public_id || conversationPublicId || offlineMessagePublicId || '',
         metadata: msg.metadata,
         eventType: getMetadataString(msg, 'event_type') || undefined,
         handoffPayload: msg.metadata?.handoff_payload,
@@ -738,7 +809,13 @@ export function VisitorChatRuntimeProvider({
 
       return converted
     },
-    [messages, chatConfig.config.use_agent_avatar, conversationPublicId],
+    [
+      messages,
+      chatConfig.config.open_agent_avatar_url,
+      chatConfig.config.use_agent_avatar,
+      conversationPublicId,
+      offlineMessagePublicId,
+    ],
   )
 
   const addOptimistic = useVisitorChatStore((s) => s.addOptimisticMessage)
@@ -761,10 +838,72 @@ export function VisitorChatRuntimeProvider({
   const handoffRouting = useVisitorChatStore((s) => s.handoffRouting)
   const visitorExternalId = useVisitorChatStore((s) => s.visitorId)
 
+  const applyQueueConversationState = useCallback((input: {
+    status?: string | null
+    queuePosition?: unknown
+    message?: Message
+  }) => {
+    const hasQueueMessage =
+      (input.message ? isVisitorQueueEnteredMessage(input.message) : false)
+      || useVisitorChatStore.getState().messages.some(isVisitorQueueEnteredMessage)
+    const shouldQueue = input.status === 'queued' || hasQueueMessage
+
+    if (shouldQueue) {
+      onConversationStatusChange('queued')
+      resetHandoffUiState()
+    } else if (input.status) {
+      onConversationStatusChange(input.status)
+      if (input.status === 'active') {
+        resetHandoffUiState()
+      }
+    }
+
+    if (typeof input.queuePosition === 'number') {
+      onCurrentQueueCountChange?.(input.queuePosition)
+    }
+  }, [onConversationStatusChange, onCurrentQueueCountChange, resetHandoffUiState])
+
+  const applyHandoffUnavailableState = useCallback((payload: HandoffRouteUnavailablePayload) => {
+    if (isHandoffLeaveMessagePayload(payload)) {
+      resetHandoffUiState()
+      onHandoffLeaveMessage?.(payload.leave_message_prompt)
+      return true
+    }
+    if (isHandoffQueueFullPayload(payload)) {
+      resetHandoffUiState()
+      onHandoffQueueFull?.(payload)
+      return true
+    }
+    return false
+  }, [onHandoffLeaveMessage, onHandoffQueueFull, resetHandoffUiState])
+
+  const trackEvent = useCallback((
+    name: string,
+    input: Parameters<typeof telemetry.track>[1] = {},
+  ) => {
+    telemetry.track(name, {
+      ...input,
+      channel_key: chatConfig.channel.channel_key,
+      conversation_external_id: input.conversation_external_id ?? conversationPublicId,
+      props: {
+        bot_mode: chatConfig.botMode,
+        offline_mode: offlineMode,
+        ...(input.props ?? {}),
+      },
+    })
+  }, [chatConfig.botMode, chatConfig.channel.channel_key, conversationPublicId, offlineMode])
+
   const requestHumanHandoff = useCallback(
     async (payload?: HumanHandoffEventPayload | null) => {
       if (!socket || !conversationPublicId) return false
+      const startedAt = Date.now()
       const toolCallId = typeof payload?.tool_call_id === 'string' ? payload.tool_call_id : undefined
+      trackEvent('human_handoff_requested', {
+        props: {
+          source: payload ? 'bot_confirmed' : 'visitor',
+          has_tool_call_id: Boolean(toolCallId),
+        },
+      })
       if (payload && toolCallId) {
         markHandoffConfirming(toolCallId)
       } else if (payload) {
@@ -784,15 +923,38 @@ export function VisitorChatRuntimeProvider({
             status?: string
             message?: Message
             reason?: string
+            queue_position?: number
+            error?: string
+            leave_message?: boolean
+            queue_full?: boolean
+            leave_message_prompt?: string
+            queue_full_message?: string
+            queue_full_show_leave_message_button?: boolean
+            queue_full_leave_message_button_label?: string
           }) => {
             if (res?.message) addMessage(res.message)
-            if (res?.status) {
-              onConversationStatusChange(res.status)
-              if (res.status === 'active') {
-                resetHandoffUiState()
-              }
+            if (applyHandoffUnavailableState(res)) {
+              trackEvent('human_handoff_unavailable', {
+                props: {
+                  error: res.error || res.reason || 'unknown',
+                  leave_message: isHandoffLeaveMessagePayload(res),
+                  queue_full: isHandoffQueueFullPayload(res),
+                },
+                metrics: { duration_ms: Date.now() - startedAt },
+              })
+              resolve(false)
+              return
             }
+            applyQueueConversationState({
+              status: res?.status,
+              queuePosition: res?.queue_position,
+              message: res?.message,
+            })
             if (res?.ok) {
+              trackEvent('human_handoff_succeeded', {
+                props: { status: res.status || 'unknown' },
+                metrics: { duration_ms: Date.now() - startedAt },
+              })
               if (!payload) {
                 resetHandoffUiState()
               }
@@ -812,6 +974,11 @@ export function VisitorChatRuntimeProvider({
             } else {
               setHandoffRouting(false)
             }
+            trackEvent('human_handoff_failed', {
+              level: 'warn',
+              props: { reason: res?.reason || 'unknown' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
             resolve(false)
           },
         )
@@ -819,48 +986,163 @@ export function VisitorChatRuntimeProvider({
     },
     [
       addMessage,
+      applyHandoffUnavailableState,
+      applyQueueConversationState,
       clearHandoffConfirming,
       conversationPublicId,
       handleHandoffRouteFailed,
       markHandoffConfirming,
-      onConversationStatusChange,
       resetHandoffUiState,
       setHandoffRouting,
-      setPendingHumanHandoff,
       socket,
+      trackEvent,
     ],
   )
 
   const onFileSend = useCallback(
     async (file: File) => {
+      if (chatConfig.botMode) return
+      const startedAt = Date.now()
+      trackEvent('file_send_started', {
+        props: {
+          target: offlineMode ? 'offline_message' : 'conversation',
+          mime_type: file.type || 'unknown',
+        },
+        metrics: { size_bytes: file.size },
+      })
+
+      if (offlineMode && !offlineMessagePublicId) {
+        try {
+          const res = await sendVisitorOfflineMessageFile({
+            visitorSessionToken,
+            file,
+          })
+          const returnedMessages = res.messages?.length
+            ? res.messages
+            : res.message
+              ? [res.message]
+              : []
+          if (res.ok && res.offline_message_public_id && returnedMessages.length > 0) {
+            onOfflineMessageCreated(res.offline_message_public_id)
+            returnedMessages.forEach((message) => {
+              addMessage(mapDeliveredPublicMessage(message))
+            })
+            trackEvent('file_send_succeeded', {
+              props: { target: 'offline_message', created_thread: true },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+          }
+        } catch {
+          trackEvent('file_send_failed', {
+            level: 'error',
+            props: { target: 'offline_message', stage: 'create_and_upload' },
+            metrics: { duration_ms: Date.now() - startedAt },
+          })
+          throw new Error('Failed to send offline message file')
+        }
+        return
+      }
+
+      if (offlineMode && offlineMessagePublicId) {
+        try {
+          const uploaded = await uploadVisitorOfflineMessageFile({
+            offlineMessagePublicId,
+            visitorSessionToken,
+            file,
+          })
+          const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
+          const content = JSON.stringify({
+            schema_version: uploaded.schema_version,
+            file_id: uploaded.file_id,
+            name: uploaded.name,
+            size: uploaded.size,
+            mime_type: uploaded.mime_type,
+          })
+          const tempId = addOptimistic(offlineMessagePublicId, content, contentType)
+          const res = await sendOfflineMessage({
+            offlineMessagePublicId,
+            visitorSessionToken,
+            contentType,
+            content,
+          })
+          if (res.ok && res.message) {
+            confirmOptimistic(tempId, mapPublicMessage(res.message))
+            trackEvent('file_send_succeeded', {
+              props: { target: 'offline_message', created_thread: false },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+          }
+        } catch {
+          trackEvent('file_send_failed', {
+            level: 'error',
+            props: { target: 'offline_message', stage: 'upload_or_send' },
+            metrics: { duration_ms: Date.now() - startedAt },
+          })
+          throw new Error('Failed to send offline message file')
+        }
+        return
+      }
+
       if (!socket || !conversationPublicId || !visitorExternalId) return
 
-      const uploaded = await uploadVisitorConversationFile({
-        conversationPublicId,
-        visitorSessionToken,
-        file,
-      })
-      const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
-      const content = JSON.stringify({
-        schema_version: uploaded.schema_version,
-        file_id: uploaded.file_id,
-        name: uploaded.name,
-        size: uploaded.size,
-        mime_type: uploaded.mime_type,
-      })
-      const tempId = addOptimistic(conversationPublicId, content, contentType)
+      try {
+        const uploaded = await uploadVisitorConversationFile({
+          conversationPublicId,
+          visitorSessionToken,
+          file,
+        })
+        const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
+        const content = JSON.stringify({
+          schema_version: uploaded.schema_version,
+          file_id: uploaded.file_id,
+          name: uploaded.name,
+          size: uploaded.size,
+          mime_type: uploaded.mime_type,
+        })
+        const tempId = addOptimistic(conversationPublicId, content, contentType)
 
-      socket.emit('send_message', {
-        conversation_public_id: conversationPublicId,
-        content,
-        content_type: contentType,
-      }, (res: { ok?: boolean; message?: Message }) => {
-        if (res?.ok && res.message) {
-          confirmOptimistic(tempId, res.message)
-        }
-      })
+        socket.emit('send_message', {
+          conversation_public_id: conversationPublicId,
+          content,
+          content_type: contentType,
+        }, (res: { ok?: boolean; message?: Message }) => {
+          if (res?.ok && res.message) {
+            confirmOptimistic(tempId, res.message)
+            trackEvent('file_send_succeeded', {
+              props: { target: 'conversation' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            return
+          }
+          trackEvent('file_send_failed', {
+            level: 'warn',
+            props: { target: 'conversation', stage: 'socket_ack' },
+            metrics: { duration_ms: Date.now() - startedAt },
+          })
+        })
+      } catch {
+        trackEvent('file_send_failed', {
+          level: 'error',
+          props: { target: 'conversation', stage: 'upload_or_send' },
+          metrics: { duration_ms: Date.now() - startedAt },
+        })
+        throw new Error('Failed to send conversation file')
+      }
     },
-    [socket, conversationPublicId, visitorExternalId, visitorSessionToken, addOptimistic, confirmOptimistic],
+    [
+      socket,
+      chatConfig.botMode,
+      conversationPublicId,
+      offlineMode,
+      offlineMessagePublicId,
+      visitorExternalId,
+      visitorSessionToken,
+      onOfflineMessageCreated,
+      addOptimistic,
+      confirmOptimistic,
+      addMessage,
+      trackEvent,
+    ],
   )
 
   const runOpenAgentTurn = useCallback(
@@ -873,6 +1155,17 @@ export function VisitorChatRuntimeProvider({
       addVisitorOptimistic = false,
     }: RunOpenAgentTurnOptions) => {
       if (!conversationPublicId || abortRef.current) return
+      const streamMetrics = createStreamMetrics()
+      const turnStartedAt = Date.now()
+      trackEvent('open_agent_turn_started', {
+        request_id: requestId,
+        client_message_id: clientMessageId,
+        props: {
+          resume,
+          has_last_event_id: Boolean(lastEventId),
+          add_visitor_optimistic: addVisitorOptimistic,
+        },
+      })
 
       if (addVisitorOptimistic) {
         const tempId = addOptimistic(conversationPublicId, text, 'text')
@@ -1058,6 +1351,7 @@ export function VisitorChatRuntimeProvider({
         resume,
         handlers: {
           onLlmStepCreated: (data) => {
+            streamMetrics.recordChunk()
             persistControllerSnapshot()
             lastLlmStepId = getLlmStepId(data)
             if (assistantTempId !== null) {
@@ -1071,6 +1365,7 @@ export function VisitorChatRuntimeProvider({
             }
           },
           onThinkingDelta: (data) => {
+            streamMetrics.recordChunk()
             persistControllerSnapshot()
             if (!getThinkingDeltaText(data)) return
             updateAssistantThinkingBlocks((blocks) => {
@@ -1080,6 +1375,7 @@ export function VisitorChatRuntimeProvider({
             })
           },
           onContentDelta: (delta) => {
+            streamMetrics.recordChunk()
             persistControllerSnapshot()
             if (!delta) return
             if (delta.trim().length > 0) {
@@ -1096,14 +1392,21 @@ export function VisitorChatRuntimeProvider({
             appendMessageContent(messageId, delta)
           },
           onToolCall: (data) => {
+            streamMetrics.recordChunk()
             persistControllerSnapshot()
             const toolCallId = getToolCallId(data, `tool_${openAgentTimelineIndex + 1}`)
             pendingToolCalls.set(toolCallId, data)
             if (isHumanHandoffToolName(resolveToolEventName(data))) return
+            trackEvent('open_agent_tool_call', {
+              request_id: requestId,
+              client_message_id: clientMessageId,
+              props: { tool_name: resolveToolEventName(data) || 'unknown' },
+            })
             openAgentTimelineIndex += 1
             updateAssistantToolBlocks((blocks) => upsertToolCallBlock(blocks, data, openAgentTimelineIndex))
           },
           onToolResult: (data) => {
+            streamMetrics.recordChunk()
             persistControllerSnapshot()
             const toolCallId = getToolCallId(data, `tool_${openAgentTimelineIndex + 1}`)
             const pendingCall = pendingToolCalls.get(toolCallId)
@@ -1123,6 +1426,10 @@ export function VisitorChatRuntimeProvider({
           },
           onHumanHandoff: () => {
             // Handoff UI is driven by backend-persisted system messages via onMessageSaved.
+            trackEvent('open_agent_handoff_event', {
+              request_id: requestId,
+              client_message_id: clientMessageId,
+            })
             persistControllerSnapshot()
           },
           onHandoffUpdated: (data) => {
@@ -1185,13 +1492,30 @@ export function VisitorChatRuntimeProvider({
             } else {
               addMessage(saved)
             }
+            applyQueueConversationState({ message: saved })
           },
           onConversationStatus: (data) => {
-            const status = getStringValue(data.status)
-            if (status) {
-              onConversationStatusChange(status)
-              if (status === 'active') resetHandoffUiState()
+            if (applyHandoffUnavailableState({
+              error: typeof data.error === 'string' ? data.error : undefined,
+              reason: getStringValue(data.reason) || undefined,
+              leave_message: data.leave_message === true,
+              queue_full: data.queue_full === true,
+              leave_message_prompt: getStringValue(data.leave_message_prompt) || undefined,
+              queue_full_message: getStringValue(data.queue_full_message) || undefined,
+              queue_full_show_leave_message_button:
+                typeof data.queue_full_show_leave_message_button === 'boolean'
+                  ? data.queue_full_show_leave_message_button
+                  : undefined,
+              queue_full_leave_message_button_label: (
+                getStringValue(data.queue_full_leave_message_button_label) || undefined
+              ),
+            })) {
+              return
             }
+            applyQueueConversationState({
+              status: getStringValue(data.status) || null,
+              queuePosition: data.queue_position,
+            })
           },
           onAssistantReset: () => {
             persistControllerSnapshot()
@@ -1213,6 +1537,23 @@ export function VisitorChatRuntimeProvider({
             }
           },
           onDone: (data) => {
+            const finished = streamMetrics.finish()
+            trackEvent('open_agent_turn_done', {
+              request_id: requestId,
+              client_message_id: clientMessageId,
+              props: {
+                resume,
+                has_final_content: Boolean(
+                  getStringValue(data.final_content)
+                    || getStringValue(data.content)
+                    || getStringValue(data.text),
+                ),
+              },
+              metrics: {
+                ...finished,
+                wall_duration_ms: Date.now() - turnStartedAt,
+              },
+            })
             persistControllerSnapshot()
             clearPendingTurn()
             const finalContent =
@@ -1269,10 +1610,29 @@ export function VisitorChatRuntimeProvider({
             }
             clearAssistantPlaceholder()
           },
-          onRetry: () => {
+          onRetry: (attempt, maxAttempts) => {
+            trackEvent('open_agent_turn_retry', {
+              level: 'warn',
+              request_id: requestId,
+              client_message_id: clientMessageId,
+              props: { attempt, max_attempts: maxAttempts },
+            })
             persistControllerSnapshot()
           },
-          onError: () => {
+          onError: (message) => {
+            trackEvent('open_agent_turn_failed', {
+              level: 'error',
+              request_id: requestId,
+              client_message_id: clientMessageId,
+              props: {
+                error_excerpt: message.slice(0, 200),
+                resume,
+              },
+              metrics: {
+                ...streamMetrics.finish(),
+                wall_duration_ms: Date.now() - turnStartedAt,
+              },
+            })
             showBotError()
           },
         },
@@ -1284,6 +1644,19 @@ export function VisitorChatRuntimeProvider({
         await controller.completion
       } catch (error) {
         if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          trackEvent('open_agent_turn_failed', {
+            level: 'error',
+            request_id: requestId,
+            client_message_id: clientMessageId,
+            props: {
+              error_excerpt: error instanceof Error ? error.message.slice(0, 200) : 'unknown',
+              resume,
+            },
+            metrics: {
+              ...streamMetrics.finish(),
+              wall_duration_ms: Date.now() - turnStartedAt,
+            },
+          })
           showBotError()
         }
       } finally {
@@ -1319,6 +1692,134 @@ export function VisitorChatRuntimeProvider({
       requestHumanHandoff,
       resetHandoffUiState,
       setPendingHumanHandoff,
+      applyHandoffUnavailableState,
+      applyQueueConversationState,
+      trackEvent,
+    ],
+  )
+
+  const sendTextMessage = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim()
+      if (!trimmed) return false
+      const startedAt = Date.now()
+
+      if (offlineMode) {
+        trackEvent('message_send_started', {
+          props: { target: 'offline_message', content_type: 'text' },
+          metrics: { content_length: trimmed.length },
+        })
+        const tempId = addOptimistic(offlineMessagePublicId ?? 'offline-message-pending', trimmed, 'text')
+        try {
+          const res = offlineMessagePublicId
+            ? await sendOfflineMessage({
+                offlineMessagePublicId,
+                visitorSessionToken,
+                contentType: 'text',
+                content: trimmed,
+              })
+            : await createOfflineMessageWithMessage({
+                visitorSessionToken,
+                contentType: 'text',
+                content: trimmed,
+              })
+          if (res.ok && res.message) {
+            if (res.offline_message_public_id) {
+              onOfflineMessageCreated(res.offline_message_public_id)
+            }
+            if (!offlineMessagePublicId && res.messages?.length) {
+              removeMessage(tempId)
+              res.messages.forEach((message) => {
+                addMessage(mapDeliveredPublicMessage(message))
+              })
+            } else {
+              confirmOptimistic(tempId, mapDeliveredPublicMessage(res.message))
+            }
+            trackEvent('message_send_succeeded', {
+              props: {
+                target: 'offline_message',
+                created_thread: Boolean(res.offline_message_public_id && !offlineMessagePublicId),
+              },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            return true
+          }
+        } catch {
+          trackEvent('message_send_failed', {
+            level: 'error',
+            props: { target: 'offline_message' },
+            metrics: { duration_ms: Date.now() - startedAt },
+          })
+          removeMessage(tempId)
+          return false
+        }
+        trackEvent('message_send_failed', {
+          level: 'warn',
+          props: { target: 'offline_message', reason: 'empty_ack' },
+          metrics: { duration_ms: Date.now() - startedAt },
+        })
+        removeMessage(tempId)
+        return false
+      }
+
+      if (!conversationPublicId) return false
+
+      if (chatConfig.botMode) {
+        if (botRunning) return false
+        await runOpenAgentTurn({
+          text: trimmed,
+          addVisitorOptimistic: true,
+        })
+        return true
+      }
+
+      if (!socket) return false
+
+      trackEvent('message_send_started', {
+        props: { target: 'conversation', content_type: 'text' },
+        metrics: { content_length: trimmed.length },
+      })
+      const tempId = addOptimistic(conversationPublicId, trimmed, 'text')
+
+      return await new Promise<boolean>((resolve) => {
+        socket.emit('send_message', {
+          conversation_public_id: conversationPublicId,
+          content: trimmed,
+          content_type: 'text',
+        }, (res: { ok?: boolean; message?: Message }) => {
+          if (res?.ok && res.message) {
+            confirmOptimistic(tempId, res.message)
+            trackEvent('message_send_succeeded', {
+              props: { target: 'conversation' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            resolve(true)
+            return
+          }
+          trackEvent('message_send_failed', {
+            level: 'warn',
+            props: { target: 'conversation', reason: 'socket_ack' },
+            metrics: { duration_ms: Date.now() - startedAt },
+          })
+          resolve(false)
+        })
+      })
+    },
+    [
+      socket,
+      conversationPublicId,
+      offlineMode,
+      offlineMessagePublicId,
+      visitorSessionToken,
+      onOfflineMessageCreated,
+      chatConfig.botMode,
+      botRunning,
+      runOpenAgentTurn,
+      addOptimistic,
+      confirmOptimistic,
+      addMessage,
+      removeMessage,
+      trackEvent,
     ],
   )
 
@@ -1326,40 +1827,9 @@ export function VisitorChatRuntimeProvider({
     async (message: AppendMessage) => {
       const textPart = message.content.find((p) => p.type === 'text')
       if (!textPart || textPart.type !== 'text') return
-      if (!conversationPublicId) return
-
-      if (chatConfig.botMode) {
-        if (botRunning) return
-        await runOpenAgentTurn({
-          text: textPart.text,
-          addVisitorOptimistic: true,
-        })
-        return
-      }
-
-      if (!socket) return
-
-      const tempId = addOptimistic(conversationPublicId, textPart.text, 'text')
-
-      socket.emit('send_message', {
-        conversation_public_id: conversationPublicId,
-        content: textPart.text,
-        content_type: 'text',
-      }, (res: { ok?: boolean; message?: Message }) => {
-        if (res?.ok && res.message) {
-          confirmOptimistic(tempId, res.message)
-        }
-      })
+      await sendTextMessage(textPart.text)
     },
-    [
-      socket,
-      conversationPublicId,
-      chatConfig.botMode,
-      botRunning,
-      runOpenAgentTurn,
-      addOptimistic,
-      confirmOptimistic,
-    ],
+    [sendTextMessage],
   )
 
   const persistCurrentTurnForResume = useCallback((detach = false) => {
@@ -1461,6 +1931,7 @@ export function VisitorChatRuntimeProvider({
         botRunning,
         handoffRouting,
         onFileSend,
+        onAssistSendMessage: sendTextMessage,
         onRequestHumanHandoff: requestHumanHandoff,
         onDismissHumanHandoff: () => {
           useVisitorChatStore.getState().dismissPendingHumanHandoff()

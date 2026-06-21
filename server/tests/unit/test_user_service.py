@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, ValidationError
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserUpdate
@@ -24,6 +24,14 @@ class _DummyDB:
 
 
 class TestUserServiceOrganizationAssociation:
+
+    def test_normalize_level_defaults_to_normal(self):
+        assert UserService._normalize_level(None) == "normal"
+        assert UserService._normalize_level("") == "normal"
+
+    def test_normalize_level_rejects_unknown_value(self):
+        with pytest.raises(ValidationError):
+            UserService._normalize_level("gold")
 
     @pytest.mark.asyncio
     async def test_update_user_allows_clearing_organization(self, monkeypatch):

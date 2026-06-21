@@ -5,14 +5,25 @@ import type { Message } from '@/models/conversation'
 import type { ChannelConfig } from '@/models/channel'
 import { MessageBubble } from './message-bubble'
 import { SystemMessage } from './system-message'
+import { resolveVisitorSystemEventContent } from '@/lib/workspace-agent-display'
 import {
   HumanHandoffEventMessage,
   isOpenAgentHandoffEventMessage,
   resolveHandoffEventType,
 } from './human-handoff-event-message'
-import { WelcomeMessage } from './welcome-message'
+import {
+  OpenAgentWelcomeMessage,
+  WelcomeMessage,
+} from './welcome-message'
 import { TypingIndicator } from './typing-indicator'
 import { IconLoader2 } from '@tabler/icons-react'
+import {
+  getOpenAgentAvatarUrl,
+  shouldShowAssistantAvatar,
+} from './avatar'
+import { isLeaveMessagePromptMessage } from '@/lib/offline-message-event'
+import { getOpenAgentWelcomeBlocksFromMetadata } from '@/lib/open-agent-welcome-message'
+import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 
 type MessageListProps = {
   messages: Message[]
@@ -64,6 +75,35 @@ function formatTimestamp(dateStr: string, locale: string): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${time}`
 }
 
+function VisitorWelcomeBubble({
+  message,
+  config,
+}: {
+  message: Message
+  config: ChannelConfig
+}) {
+  const openAgentWelcomeBlocks = getOpenAgentWelcomeBlocksFromMetadata(message.metadata)
+
+  if (openAgentWelcomeBlocks.length > 0) {
+    return (
+      <OpenAgentWelcomeMessage
+        blocks={openAgentWelcomeBlocks}
+        config={config}
+        showAvatar={shouldShowAssistantAvatar('bot', config)}
+        avatarSrc={getOpenAgentAvatarUrl(config)}
+      />
+    )
+  }
+
+  return (
+    <WelcomeMessage
+      content={message.content}
+      config={config}
+      showAvatar={config.use_agent_avatar === true}
+    />
+  )
+}
+
 export function MessageList({
   messages,
   config,
@@ -82,9 +122,9 @@ export function MessageList({
     (msg) =>
       msg.sender_type !== 'system'
       && msg.content_type !== 'system'
-      && msg.content_type !== 'welcome',
+      && !isWelcomeLikeContentType(msg.content_type),
   )
-  const hasWelcomeMessage = messages.some((msg) => msg.content_type === 'welcome')
+  const hasWelcomeMessage = messages.some((msg) => isWelcomeLikeContentType(msg.content_type))
 
   useEffect(() => {
     if (autoScroll) {
@@ -154,7 +194,7 @@ export function MessageList({
         const next = idx < messages.length - 1 ? messages[idx + 1] : null
         const showTs = shouldShowTimestamp(msg, prev)
 
-        if (msg.content_type === 'welcome') {
+        if (isWelcomeLikeContentType(msg.content_type)) {
           return (
             <div key={msg.id}>
               {showTs && (
@@ -162,10 +202,9 @@ export function MessageList({
                   {formatTimestamp(msg.created_at, locale)}
                 </div>
               )}
-              <WelcomeMessage
-                content={msg.content}
+              <VisitorWelcomeBubble
+                message={msg}
                 config={config}
-                showAvatar={config.use_agent_avatar === true}
               />
             </div>
           )
@@ -179,7 +218,13 @@ export function MessageList({
                   {formatTimestamp(msg.created_at, locale)}
                 </div>
               )}
-              {isOpenAgentHandoffEventMessage(msg) ? (
+              {isLeaveMessagePromptMessage(msg) ? (
+                <WelcomeMessage
+                  content={msg.content}
+                  config={config}
+                  showAvatar={config.use_agent_avatar === true}
+                />
+              ) : isOpenAgentHandoffEventMessage(msg) ? (
                 <HumanHandoffEventMessage
                   content={msg.content}
                   config={config}
@@ -187,14 +232,14 @@ export function MessageList({
                   handoffEventType={resolveHandoffEventType(msg.metadata)}
                 />
               ) : (
-                <SystemMessage content={msg.content} />
+                <SystemMessage content={resolveVisitorSystemEventContent(msg.content, msg.metadata, locale)} />
               )}
             </div>
           )
         }
 
         const showAvatar = msg.sender_type === 'agent' || msg.sender_type === 'bot'
-          ? config.use_agent_avatar === true
+          ? shouldShowAssistantAvatar(msg.sender_type, config)
           : shouldShowAvatar(msg, next)
 
         return (

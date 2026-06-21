@@ -1,7 +1,7 @@
 """
 AgentStatus repository.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,7 +32,7 @@ class AgentStatusRepository:
         existing = await AgentStatusRepository.get_for_employee(db, tenant_id, employee_id)
         if existing:
             if existing.status != status:
-                existing.status_changed_at = datetime.utcnow()
+                existing.status_changed_at = datetime.now(timezone.utc)
             existing.status = status
             existing.reason = reason
             await db.commit()

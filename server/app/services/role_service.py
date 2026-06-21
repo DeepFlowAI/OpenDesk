@@ -15,12 +15,16 @@ from app.services.permission_catalog import (
     DATA_SCOPE_KEYS,
     DATA_SCOPE_VALUES,
     PERMISSION_DATA_SCOPE_RESOURCES,
+    RESOURCE_CHAT_QUEUE,
+    RESOURCE_PEER_CONVERSATION,
     SYSTEM_ROLE_PRESETS,
     missing_required_permissions,
     normalize_data_scopes,
     normalize_permissions,
     permission_tree,
 )
+
+LEGACY_SESSION_SCOPED_RESOURCES = {RESOURCE_PEER_CONVERSATION, RESOURCE_CHAT_QUEUE}
 
 
 class RoleService:
@@ -129,7 +133,12 @@ class RoleService:
         for permission in normalized_permissions:
             resource = PERMISSION_DATA_SCOPE_RESOURCES.get(permission)
             if resource:
-                normalized_scopes.setdefault(resource, "self")
+                if resource in normalized_scopes:
+                    continue
+                if resource in LEGACY_SESSION_SCOPED_RESOURCES and "session_record" in normalized_scopes:
+                    normalized_scopes[resource] = normalized_scopes["session_record"]
+                else:
+                    normalized_scopes[resource] = "self"
         return normalized_permissions, normalize_data_scopes(normalized_scopes)
 
     @staticmethod

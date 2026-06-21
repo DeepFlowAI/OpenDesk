@@ -34,6 +34,12 @@ class OpenAgentAgentListResult:
     pages: int
 
 
+@dataclass(frozen=True)
+class OpenAgentAgentDetail(OpenAgentAgentSummary):
+    welcome_message: dict[str, Any] | None = None
+    faq: dict[str, Any] | None = None
+
+
 class BaseOpenAgentClient(ABC):
 
     @abstractmethod
@@ -51,6 +57,16 @@ class BaseOpenAgentClient(ABC):
         per_page: int = 100,
     ) -> OpenAgentAgentListResult:
         """List OpenAgent agents available to the provided API key."""
+        ...
+
+    @abstractmethod
+    async def get_agent(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: int,
+    ) -> OpenAgentAgentDetail:
+        """Get a single OpenAgent agent including configuration."""
         ...
 
     @abstractmethod

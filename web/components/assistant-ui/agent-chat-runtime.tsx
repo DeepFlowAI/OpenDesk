@@ -4,7 +4,9 @@ import {
   createContext,
   useContext,
   useCallback,
+  useEffect,
   useMemo,
+  useState,
   type ReactNode,
 } from 'react'
 import {
@@ -15,16 +17,21 @@ import {
 } from '@assistant-ui/react'
 import { useChatStore } from '@/context/chat-store'
 import { useAuthStore } from '@/context/auth-store'
+import type { Locale } from '@/context/locale-store'
 import { uploadAgentConversationFile } from '@/service/use-conversation-files'
 import type { Message, Conversation, WorkspaceConversationHistoryItem } from '@/models/conversation'
+import type { ConversationFileUploadResponse } from '@/models/conversation-file'
+import type { EmojiTargetConfig } from '@/models/emoji-setting'
 import type { SatisfactionConversationState } from '@/models/satisfaction-survey'
 import type { Socket } from 'socket.io-client'
 
 // ─── Config context ──────────────────────────────────────────────
 
+export type ComposerMode = 'public' | 'internal'
+
 export type AgentChatConfigValue = {
   conversation: Conversation
-  locale: string
+  locale: Locale
   isClosed: boolean
   isTyping: boolean
   visitorTypingContent: string
@@ -43,11 +50,20 @@ export type AgentChatConfigValue = {
   onCreateTicket: () => void
   canCreateTicket: boolean
   canTransfer: boolean
+  canEndConversation: boolean
+  canSendPublicReply: boolean
+  canCreateInternalNote: boolean
+  composerReadOnlyReason: string | null
+  canStartNewConversation: boolean
+  startNewConversationDisabledReason: string | null
+  startingNewConversation: boolean
+  onStartNewConversation: () => void
   onTransferred: (toName: string) => void
   satisfactionState: SatisfactionConversationState | null
   satisfactionLoading: boolean
   satisfactionSending: boolean
   onSendSatisfaction: () => Promise<boolean>
+  emojiConfig: EmojiTargetConfig | null
 }
 
 export type AgentImageMessage = {
@@ -58,6 +74,10 @@ export type AgentImageMessage = {
 type AgentChatContextValue = AgentChatConfigValue & {
   imageMessages: AgentImageMessage[]
   onFileSend: (file: File) => Promise<void>
+  onRichTextImageUpload: (file: File) => Promise<ConversationFileUploadResponse>
+  onRichTextSend: (html: string) => Promise<void>
+  composerMode: ComposerMode
+  setComposerMode: (mode: ComposerMode) => void
 }
 
 const AgentChatConfigCtx = createContext<AgentChatContextValue | null>(null)
@@ -106,6 +126,9 @@ export function AgentChatRuntimeProvider({
 }: ProviderProps) {
   const { conversation } = chatConfig
   const convId = conversation.id
+  const [composerMode, setComposerMode] = useState<ComposerMode>(
+    chatConfig.canSendPublicReply ? 'public' : 'internal',
+  )
   const messagesMap = useChatStore((s) => s.messages)
   const currentMessages = useMemo(() => messagesMap.get(convId) || [], [messagesMap, convId])
   const imageMessages = useMemo<AgentImageMessage[]>(
@@ -117,8 +140,13 @@ export function AgentChatRuntimeProvider({
   )
   const userId = useAuthStore((s) => s.user?.id)
 
+  useEffect(() => {
+    setComposerMode(chatConfig.canSendPublicReply ? 'public' : 'internal')
+  }, [chatConfig.canSendPublicReply, convId])
+
   const onFileSend = useCallback(
     async (file: File) => {
+      if (composerMode === 'internal' || !chatConfig.canSendPublicReply) return
       if (!socket || !convId) return
 
       const uploaded = await uploadAgentConversationFile({
@@ -140,7 +168,34 @@ export function AgentChatRuntimeProvider({
         content_type: contentType,
       })
     },
-    [socket, convId],
+    [socket, convId, composerMode, chatConfig.canSendPublicReply],
+  )
+
+  const onRichTextImageUpload = useCallback(
+    async (file: File) => {
+      if (composerMode === 'internal' || !chatConfig.canSendPublicReply) {
+        throw new Error('Rich text image upload is not available')
+      }
+      if (!convId) throw new Error('Conversation is required')
+      return uploadAgentConversationFile({
+        conversationId: convId,
+        file,
+      })
+    },
+    [convId, composerMode, chatConfig.canSendPublicReply],
+  )
+
+  const onRichTextSend = useCallback(
+    async (html: string) => {
+      if (!socket || !convId) return
+      if (composerMode === 'internal' || !chatConfig.canSendPublicReply) return
+      socket.emit('send_message', {
+        conversation_id: convId,
+        content: html,
+        content_type: 'rich_text',
+      })
+    },
+    [socket, convId, composerMode, chatConfig.canSendPublicReply],
   )
 
   const convertMessage = useCallback(
@@ -175,13 +230,15 @@ export function AgentChatRuntimeProvider({
       const textPart = message.content.find((p) => p.type === 'text')
       if (!textPart || textPart.type !== 'text') return
       if (!socket || !convId) return
+      if (composerMode === 'internal' && !chatConfig.canCreateInternalNote) return
+      if (composerMode === 'public' && !chatConfig.canSendPublicReply) return
       socket.emit('send_message', {
         conversation_id: convId,
         content: textPart.text,
-        content_type: 'text',
+        content_type: composerMode === 'internal' ? 'internal_note' : 'text',
       })
     },
-    [socket, convId],
+    [socket, convId, composerMode, chatConfig.canCreateInternalNote, chatConfig.canSendPublicReply],
   )
 
   const runtime = useExternalStoreRuntime({
@@ -192,7 +249,17 @@ export function AgentChatRuntimeProvider({
   })
 
   return (
-    <AgentChatConfigCtx.Provider value={{ ...chatConfig, imageMessages, onFileSend }}>
+    <AgentChatConfigCtx.Provider
+      value={{
+        ...chatConfig,
+        imageMessages,
+        onFileSend,
+        onRichTextImageUpload,
+        onRichTextSend,
+        composerMode,
+        setComposerMode,
+      }}
+    >
       <AssistantRuntimeProvider runtime={runtime}>
         {children}
       </AssistantRuntimeProvider>

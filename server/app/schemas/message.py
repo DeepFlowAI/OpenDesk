@@ -20,7 +20,7 @@ class FileMessageContent(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    content_type: Literal["text", "image", "file", "system"] = "text"
+    content_type: Literal["text", "rich_text", "image", "file", "system", "internal_note"] = "text"
     content: str = Field(..., max_length=20000)
 
 
@@ -86,6 +86,22 @@ class VisitorConversationHistoryResponse(BaseModel):
     has_more: bool
 
 
+class VisitorUnreadOfflineReplyItem(VisitorConversationHistoryItem):
+    offline_message_public_id: str
+    customer_unread_at: datetime
+    customer_unread_message_id: int | None = None
+    offline_reply_unread: bool = True
+
+
+class VisitorUnreadOfflineReplyResponse(BaseModel):
+    items: list[VisitorUnreadOfflineReplyItem]
+    has_more: bool
+
+
+class CustomerReadResponse(BaseModel):
+    ok: bool = True
+
+
 class WorkspaceHistoryChannel(BaseModel):
     id: int
     name: str
@@ -114,4 +130,31 @@ class WorkspaceConversationHistoryItem(BaseModel):
 
 class WorkspaceConversationHistoryResponse(BaseModel):
     items: list[WorkspaceConversationHistoryItem]
+    has_more: bool
+
+
+class WorkspaceMessageSearchConversation(BaseModel):
+    id: int
+    share_code: str
+    status: str
+    started_at: datetime | None = None
+    channel: WorkspaceHistoryChannel | None = None
+
+
+class WorkspaceMessageSearchResult(BaseModel):
+    id: int
+    conversation_id: int
+    sender_type: str
+    sender_id: int | None = None
+    sender_name: str | None = None
+    sender_avatar: str | None = None
+    content_type: str
+    content: str
+    created_at: datetime
+    conversation: WorkspaceMessageSearchConversation
+
+
+class WorkspaceMessageSearchResponse(BaseModel):
+    items: list[WorkspaceMessageSearchResult]
+    total: int
     has_more: bool

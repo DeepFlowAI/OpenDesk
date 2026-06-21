@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { ThreadPrimitive, type MessageState } from '@assistant-ui/react'
 import {
   useVisitorChatConfig,
@@ -10,6 +10,11 @@ import { useVisitorChatStore } from '@/context/visitor-chat-store'
 import { ChatHeader } from '@/app/components/features/visitor-chat/chat-header'
 import { MessageBubble } from '@/app/components/features/visitor-chat/message-bubble'
 import { SystemMessage } from '@/app/components/features/visitor-chat/system-message'
+import { resolveVisitorSystemEventContent } from '@/lib/workspace-agent-display'
+import {
+  isVisitorQueueEnteredContent,
+  QUEUE_ENTERED_SYSTEM_MESSAGE,
+} from '@/lib/visitor-queue-notice'
 import {
   HumanHandoffEventMessage,
   collectConfirmedHandoffToolCallIds,
@@ -17,15 +22,35 @@ import {
   resolveHandoffConfirmCardState,
   resolveHandoffEventType,
 } from '@/app/components/features/visitor-chat/human-handoff-event-message'
-import { WelcomeMessage } from '@/app/components/features/visitor-chat/welcome-message'
+import {
+  OpenAgentFAQMessage,
+  OpenAgentWelcomeMessage,
+  WelcomeMessage,
+} from '@/app/components/features/visitor-chat/welcome-message'
 import { SafeHtml } from '@/components/safe-html'
 import { TypingIndicator } from '@/app/components/features/visitor-chat/typing-indicator'
 import { VisitorComposer } from './visitor-composer'
 import { IconLoader2, IconArrowDown, IconAlertCircle, IconStar, IconX } from '@tabler/icons-react'
 import { SatisfactionSurveyModal } from '@/app/components/features/satisfaction-survey-modal'
 import { submitPublicSatisfaction } from '@/service/use-satisfaction-survey'
+import { isLeaveMessagePromptMessage, leaveMessagePromptToPlainText } from '@/lib/offline-message-event'
+import { t } from '@/utils/i18n'
 import type { SatisfactionSubmissionPayload } from '@/models/satisfaction-survey'
-import type { Message, VisitorConversationHistoryItem } from '@/models/conversation'
+import type {
+  Message,
+  VisitorConversationHistoryItem,
+  VisitorUnreadOfflineReplyItem,
+} from '@/models/conversation'
+import {
+  getOpenAgentAvatarUrl,
+  shouldShowAssistantAvatar,
+} from '@/app/components/features/visitor-chat/avatar'
+import {
+  getOpenAgentWelcomeBlocksFromMetadata,
+  getValidOpenAgentFAQ,
+  isValidOpenAgentWelcomeBlock,
+} from '@/lib/open-agent-welcome-message'
+import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 
 // ─── Timestamp formatting (reused from original) ────────────────
 
@@ -117,6 +142,106 @@ function ConversationDivider({ label }: { label: string }) {
   )
 }
 
+function renderQueueMessage(html: string, currentQueueCount: number | null): string {
+  const value = currentQueueCount == null ? '-' : String(currentQueueCount)
+  return html.replaceAll('{{current_queue_count}}', value)
+}
+
+const OLD_DEFAULT_QUEUE_MESSAGE = '当前咨询人数较多，您正在排队中，当前排队数：{{current_queue_count}}。请稍候，我们会尽快为您接入客服。'
+const DEFAULT_QUEUE_MESSAGE = '您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。客服接入后会立即回复您。'
+function isDefaultQueueMessage(html: string): boolean {
+  const value = html.trim()
+  return !value || value === OLD_DEFAULT_QUEUE_MESSAGE || value === DEFAULT_QUEUE_MESSAGE
+}
+
+function displaySystemMessageContent(
+  content: string,
+  metadata?: Record<string, unknown>,
+  locale = 'zh',
+): string {
+  if (isVisitorQueueEnteredContent(content)) {
+    return QUEUE_ENTERED_SYSTEM_MESSAGE
+  }
+  return resolveVisitorSystemEventContent(content, metadata, locale)
+}
+
+function QueueStatusNotice({
+  locale,
+  html,
+  currentQueueCount,
+}: {
+  locale: string
+  html: string
+  currentQueueCount: number | null
+}) {
+  const showDefaultCopy = isDefaultQueueMessage(html)
+  const renderedHtml = renderQueueMessage(showDefaultCopy ? DEFAULT_QUEUE_MESSAGE : html, currentQueueCount)
+  const queueCountLabel = currentQueueCount == null
+    ? locale === 'zh'
+      ? '正在为您安排人工客服，请稍候。客服接入后会立即回复您。'
+      : 'We are arranging a human support agent. They will reply as soon as they join.'
+    : locale === 'zh'
+      ? `当前排队人数：${currentQueueCount} 位，请稍候。客服接入后会立即回复您。`
+      : `Current queue: ${currentQueueCount}. A support agent will reply as soon as they join.`
+
+  return (
+    <div className="px-5 py-1">
+      <div className="flex items-start gap-3 border-l-2 border-primary/60 bg-primary/5 px-3 py-2">
+        {showDefaultCopy ? (
+          <div className="min-w-0 text-sm leading-6">
+            <p className="font-medium text-foreground">
+              {locale === 'zh' ? '您已进入人工客服队列' : 'You are in the human support queue'}
+            </p>
+            <p className="text-muted-foreground">{queueCountLabel}</p>
+          </div>
+        ) : (
+          <SafeHtml
+            className="prose prose-sm max-w-none text-sm leading-6 text-muted-foreground [&_p]:my-0"
+            html={renderedHtml}
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+function UnreadReplyDivider({
+  locale,
+  unread,
+  timestamp,
+}: {
+  locale: string
+  unread: boolean
+  timestamp?: string | null
+}) {
+  const timeLabel = timestamp ? formatTimestamp(new Date(timestamp), locale) : null
+  return (
+    <div className="px-5 py-2">
+      <div className="flex items-center gap-3 text-xs text-muted-foreground">
+        <div className="h-px flex-1 bg-border" />
+        <div className="flex max-w-[80%] items-center gap-2">
+          <span className="truncate">
+            {locale === 'zh' ? '客服已回复你的留言' : 'Support replied to your message'}
+          </span>
+          {unread && (
+            <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-foreground">
+              {locale === 'zh' ? '未读' : 'Unread'}
+            </span>
+          )}
+          {timeLabel && <span className="hidden shrink-0 sm:inline">{timeLabel}</span>}
+        </div>
+        <div className="h-px flex-1 bg-border" />
+      </div>
+    </div>
+  )
+}
+
+function isUnreadOfflineReply(
+  conversation: VisitorConversationHistoryItem | VisitorUnreadOfflineReplyItem,
+): conversation is VisitorUnreadOfflineReplyItem {
+  return 'offline_message_public_id' in conversation
+}
+
 function HistoryActionButton({
   label,
   loading,
@@ -141,12 +266,59 @@ function HistoryActionButton({
   )
 }
 
+function VisitorWelcomeBubble({
+  message,
+  config,
+  faq,
+  faqDisabled,
+  onFAQQuestionClick,
+}: {
+  message: Message
+  config: ReturnType<typeof useVisitorChatConfig>['config']
+  faq?: ReturnType<typeof getValidOpenAgentFAQ>
+  faqDisabled?: boolean
+  onFAQQuestionClick?: (text: string) => Promise<boolean> | boolean
+}) {
+  const openAgentWelcomeBlocks = getOpenAgentWelcomeBlocksFromMetadata(message.metadata)
+
+  if (openAgentWelcomeBlocks.length > 0) {
+    return (
+      <>
+        <OpenAgentWelcomeMessage
+          blocks={openAgentWelcomeBlocks}
+          config={config}
+          showAvatar={shouldShowAssistantAvatar('bot', config)}
+          avatarSrc={getOpenAgentAvatarUrl(config)}
+        />
+        {faq && (
+          <div className="mt-2">
+            <OpenAgentFAQMessage
+              faq={faq}
+              config={config}
+              faqDisabled={faqDisabled}
+              onFAQQuestionClick={onFAQQuestionClick}
+            />
+          </div>
+        )}
+      </>
+    )
+  }
+
+  return (
+    <WelcomeMessage
+      content={message.content}
+      config={config}
+      showAvatar={config.use_agent_avatar === true}
+    />
+  )
+}
+
 function HistoryConversationBlock({
   conversation,
   config,
   locale,
 }: {
-  conversation: VisitorConversationHistoryItem
+  conversation: VisitorConversationHistoryItem | VisitorUnreadOfflineReplyItem
   config: ReturnType<typeof useVisitorChatConfig>['config']
   locale: string
 }) {
@@ -159,7 +331,15 @@ function HistoryConversationBlock({
 
   return (
     <div className="space-y-2">
-      <ConversationDivider label={dividerLabel} />
+      {isUnreadOfflineReply(conversation) ? (
+        <UnreadReplyDivider
+          locale={locale}
+          unread={conversation.offline_reply_unread}
+          timestamp={conversation.customer_unread_at || conversation.last_message_at}
+        />
+      ) : (
+        <ConversationDivider label={dividerLabel} />
+      )}
       {conversation.messages_truncated && (
         <SystemMessage
           content={locale === 'zh' ? '仅显示最近 200 条消息' : 'Showing latest 200 messages'}
@@ -169,7 +349,7 @@ function HistoryConversationBlock({
         const prev = idx > 0 ? conversation.messages[idx - 1] : null
         const next = idx < conversation.messages.length - 1 ? conversation.messages[idx + 1] : null
         const showAvatar = msg.sender_type === 'agent' || msg.sender_type === 'bot'
-          ? config.use_agent_avatar === true
+          ? shouldShowAssistantAvatar(msg.sender_type, config)
           : shouldShowAvatar(msg, next)
 
         if (msg.sender_type === 'system') {
@@ -184,15 +364,14 @@ function HistoryConversationBlock({
               />
             )
           }
-          return msg.content_type === 'welcome' ? (
-            <WelcomeMessage
+          return isWelcomeLikeContentType(msg.content_type) || isLeaveMessagePromptMessage(msg) ? (
+            <VisitorWelcomeBubble
               key={msg.id}
-              content={msg.content}
+              message={msg}
               config={config}
-              showAvatar={config.use_agent_avatar === true}
             />
           ) : (
-            <SystemMessage key={msg.id} content={msg.content} />
+            <SystemMessage key={msg.id} content={displaySystemMessageContent(msg.content, msg.metadata, locale)} />
           )
         }
 
@@ -225,6 +404,7 @@ type VisitorThreadProps = {
   offlineTitle?: string
   offlineMessage?: string
   isEmbed?: boolean
+  showHeader?: boolean
   onEmbedClose?: () => void
 }
 
@@ -232,6 +412,7 @@ export function VisitorThread({
   offlineTitle,
   offlineMessage,
   isEmbed = false,
+  showHeader = true,
   onEmbedClose,
 }: VisitorThreadProps) {
   const {
@@ -240,6 +421,7 @@ export function VisitorThread({
     locale,
     isMobile,
     ended,
+    conversationStatus,
     hasMore,
     loadingMore,
     historyAvailable,
@@ -249,16 +431,32 @@ export function VisitorThread({
     historyLoaded,
     historyError,
     historyLimitReached,
+    unreadReplyConversations,
+    unreadReplyHasMore,
+    unreadReplyError,
+    currentUnreadReplyNotice,
     initializing,
     botMode,
+    botRunning,
+    offlineMode,
+    queueFull,
+    queueFullMessage,
+    queueFullShowLeaveMessageButton,
+    queueFullLeaveMessageButtonLabel,
+    startConversationError,
+    currentQueueCount,
     pendingHumanHandoff,
     satisfactionCanInitiate,
     satisfactionLoading,
     conversationPublicId,
+    offlineMessagePublicId,
     visitorSessionToken,
     onLoadMore,
     onLoadHistory,
+    onUnreadReplyVisible,
     onRestartConversation,
+    onQueueFullLeaveMessage,
+    onAssistSendMessage,
     onRequestHumanHandoff,
     onDismissHumanHandoff,
     onSatisfactionInitiate,
@@ -283,21 +481,53 @@ export function VisitorThread({
   const [surveySubmitting, setSurveySubmitting] = useState(false)
   const [surveySuccess, setSurveySuccess] = useState(false)
   const [surveyError, setSurveyError] = useState<string | null>(null)
+  const sendButtonStyle = {
+    '--opendesk-send-button-bg': config.send_button_bg_color || 'var(--color-primary)',
+  } as CSSProperties
 
-  const defaultWelcomeMessage =
-    locale === 'zh' ? '您好，有什么可以帮您？' : 'Hi, how can we help?'
-  const welcomeMessage = channel.welcome_message?.content || ''
-  const initialWelcomeMessage = welcomeMessage || (botMode ? '' : defaultWelcomeMessage)
-  const hasConversationMessages = messages.some(
-    (msg) =>
-      msg.sender_type !== 'system'
-      && msg.content_type !== 'system'
-      && msg.content_type !== 'welcome',
+  const initialPromptMessage = offlineMode
+    ? config.leave_message_prompt
+    : ''
+  const openAgentWelcomeBlocks = useMemo(() => {
+    const welcome = channel.open_agent_welcome_message
+    if (!welcome?.enabled) return []
+    return welcome.blocks.filter(isValidOpenAgentWelcomeBlock)
+  }, [channel.open_agent_welcome_message])
+  const openAgentFAQ = useMemo(
+    () => getValidOpenAgentFAQ(channel.open_agent_welcome_message?.faq),
+    [channel.open_agent_welcome_message?.faq],
   )
-  const hasWelcomeMessage = messages.some((msg) => msg.content_type === 'welcome')
+  const hasConversationMessages = messages.some((msg) =>
+    msg.sender_type !== 'system'
+    && msg.content_type !== 'system'
+    && !isWelcomeLikeContentType(msg.content_type),
+  )
+  const hasWelcomeMessage = messages.some((msg) => isWelcomeLikeContentType(msg.content_type))
+  const hasLeaveMessagePromptMessage = messages.some((msg) => isLeaveMessagePromptMessage(msg))
+  // Match the server-persisted prompt so the client preview and the server
+  // message render identically. The offline message record (and its prompt
+  // message) is only created on first send, so show the client preview until
+  // then. offlineMessagePublicId stays null through the optimistic-send window,
+  // so the preview no longer flashes out while the first message is in flight.
+  const initialPromptPlainText = leaveMessagePromptToPlainText(initialPromptMessage)
+  const showInitialPromptMessage = Boolean(initialPromptPlainText)
+    && offlineMode
+    && !offlineMessagePublicId
+    && !hasLeaveMessagePromptMessage
+    && !loadingMore
   const isOffline = Boolean(offlineMessage)
+  const isQueued = conversationStatus === 'queued'
+  const showOpenAgentWelcomeMessage = !offlineMode
+    && !isQueued
+    && config.open_agent_enabled
+    && openAgentWelcomeBlocks.length > 0
+    && !hasConversationMessages
+    && !hasWelcomeMessage
+    && !loadingMore
   const oldestHistoryId = historyConversations[0]?.conversation_public_id
-  const showCurrentDivider = historyLoaded && !isOffline && historyConversations.length > 0
+  const showCurrentDivider =
+    unreadReplyConversations.length > 0
+    || (historyLoaded && !isOffline && !offlineMode && historyConversations.length > 0)
   const showHistoryEntry = historyAvailable && !historyLoaded
   const showHistoryDone =
     historyLoaded && historyConversations.length > 0 && (!historyHasMore || historyLimitReached)
@@ -322,6 +552,16 @@ export function VisitorThread({
     satisfactionInvitation && (ended || satisfactionInvitation.invitation_source !== 'visitor')
   const showComposerSatisfactionButton =
     !botMode && (satisfactionCanInitiate || satisfactionInvitation?.invitation_source === 'visitor')
+  const currentUnreadReplyKey = currentUnreadReplyNotice?.conversationPublicId ?? null
+  const visibleUnreadReplyKey = useMemo(() => {
+    const ids = unreadReplyConversations
+      .filter((conversation) => conversation.offline_reply_unread)
+      .map((conversation) => conversation.conversation_public_id)
+    if (currentUnreadReplyNotice?.unread && currentUnreadReplyNotice.conversationPublicId) {
+      ids.push(currentUnreadReplyNotice.conversationPublicId)
+    }
+    return Array.from(new Set(ids)).join('|')
+  }, [currentUnreadReplyNotice, unreadReplyConversations])
 
   const handleComposerSatisfactionClick = useCallback(() => {
     if (satisfactionInvitation) {
@@ -381,14 +621,31 @@ export function VisitorThread({
     pendingScrollDeltaRef.current = null
   }, [historyConversations.length])
 
+  useLayoutEffect(() => {
+    if (!currentUnreadReplyKey && unreadReplyConversations.length === 0) return
+    const viewport = viewportRef.current
+    if (!viewport) return
+    viewport.scrollTop = 0
+  }, [currentUnreadReplyKey, unreadReplyConversations.length])
+
+  useEffect(() => {
+    if (!visibleUnreadReplyKey) return
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+    visibleUnreadReplyKey.split('|').forEach((conversationPublicId) => {
+      if (conversationPublicId) onUnreadReplyVisible(conversationPublicId)
+    })
+  }, [onUnreadReplyVisible, visibleUnreadReplyKey])
+
   return (
     <ThreadPrimitive.Root className="relative flex h-full flex-col">
-      <ChatHeader
-        channel={channel}
-        isMobile={isMobile}
-        isEmbed={isEmbed}
-        onEmbedClose={onEmbedClose}
-      />
+      {showHeader && (
+        <ChatHeader
+          channel={channel}
+          isMobile={isMobile}
+          isEmbed={isEmbed}
+          onEmbedClose={onEmbedClose}
+        />
+      )}
 
       <ThreadPrimitive.Viewport
         ref={viewportRef}
@@ -398,7 +655,38 @@ export function VisitorThread({
             config.message_area_bg_color || 'var(--color-background)',
         }}
       >
-        {!initializing && showHistoryEntry && (
+        {!initializing && unreadReplyError && (
+          <SystemMessage
+            content={
+              locale === 'zh'
+                ? '部分历史回复暂时无法加载'
+                : 'Some previous replies could not be loaded'
+            }
+          />
+        )}
+
+        {!initializing && unreadReplyHasMore && !historyLoaded && (
+          <HistoryActionButton
+            label={
+              locale === 'zh'
+                ? '还有更多历史留言回复，可查看历史会话'
+                : 'More message replies are available in conversation history'
+            }
+            loading={historyLoading}
+            onClick={() => void loadHistoryWithAnchor()}
+          />
+        )}
+
+        {!initializing && unreadReplyConversations.map((conversation) => (
+          <HistoryConversationBlock
+            key={`unread-${conversation.conversation_public_id}`}
+            conversation={conversation}
+            config={config}
+            locale={locale}
+          />
+        ))}
+
+        {!initializing && showHistoryEntry && !unreadReplyHasMore && (
           <HistoryActionButton
             label={
               historyError
@@ -462,6 +750,16 @@ export function VisitorThread({
           <div className="flex flex-1 items-center justify-center p-6">
             <IconLoader2 size={28} className="animate-spin text-muted-foreground" />
           </div>
+        ) : startConversationError ? (
+          <div className="flex flex-1 items-center justify-center p-6">
+            <div className="w-full max-w-[520px] rounded-xl border border-destructive/20 bg-destructive/5 p-6 shadow-sm">
+              <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-destructive">
+                <IconAlertCircle size={18} />
+                {t('chat.start.noAssignableQueueTitle', locale)}
+              </div>
+              <p className="text-sm leading-6 text-muted-foreground">{startConversationError}</p>
+            </div>
+          </div>
         ) : isOffline ? (
           <div className="flex flex-1 items-center justify-center p-6">
             <div className="w-full max-w-[520px] rounded-xl border border-border bg-card p-6 shadow-sm">
@@ -475,17 +773,55 @@ export function VisitorThread({
               />
             </div>
           </div>
+        ) : queueFull ? (
+          <div className="flex flex-1 items-center justify-center p-6">
+            <div className="w-full max-w-[520px] rounded-xl border border-border bg-card p-6 shadow-sm">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
+                <IconAlertCircle size={18} className="text-amber-600" />
+                {locale === 'zh' ? '排队人数已满' : 'Queue is full'}
+              </div>
+              <SafeHtml
+                className="prose prose-sm max-w-none text-sm leading-6 text-muted-foreground"
+                html={queueFullMessage}
+              />
+              {queueFullShowLeaveMessageButton && (
+                <button
+                  type="button"
+                  onClick={onQueueFullLeaveMessage}
+                  className="mt-5 rounded-lg bg-[var(--opendesk-send-button-bg)] px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
+                  style={sendButtonStyle}
+                >
+                  {queueFullLeaveMessageButtonLabel || (locale === 'zh' ? '留言' : 'Leave a message')}
+                </button>
+              )}
+            </div>
+          </div>
         ) : (
           <>
-            {/* ── Initial welcome ── */}
-            {initialWelcomeMessage && !hasConversationMessages && !hasWelcomeMessage && !loadingMore && (
-              <div className={msgCount === 0 ? 'py-2' : 'py-1'}>
+            {isQueued && (
+              <QueueStatusNotice
+                locale={locale}
+                html={config.queue_message}
+                currentQueueCount={currentQueueCount}
+              />
+            )}
+
+            {/* ── Initial leave-message prompt ── */}
+            {showInitialPromptMessage && (
+              <div className="py-2">
                 <WelcomeMessage
-                  content={initialWelcomeMessage}
+                  content={initialPromptPlainText}
                   config={config}
                   showAvatar={config.use_agent_avatar === true}
                 />
               </div>
+            )}
+
+            {currentUnreadReplyNotice && (
+              <UnreadReplyDivider
+                locale={locale}
+                unread={currentUnreadReplyNotice.unread}
+              />
             )}
 
             {/* ── Load more ── */}
@@ -511,6 +847,8 @@ export function VisitorThread({
                 {({ message }: { message: MessageState }) => {
                   const meta = message.metadata?.custom as VisitorMessageMeta | undefined
                   const original = toOriginalMessage(message, meta)
+                  const isWelcomeLikeMessage = (meta?.contentType && isWelcomeLikeContentType(meta.contentType))
+                    || isLeaveMessagePromptMessage(original)
 
                   return (
                     <div>
@@ -520,11 +858,13 @@ export function VisitorThread({
                         </div>
                       )}
 
-                      {meta?.contentType === 'welcome' ? (
-                        <WelcomeMessage
-                          content={original.content}
+                      {isQueued && isWelcomeLikeMessage ? null : isWelcomeLikeMessage ? (
+                        <VisitorWelcomeBubble
+                          message={original}
                           config={config}
-                          showAvatar={config.use_agent_avatar === true}
+                          faq={openAgentFAQ}
+                          faqDisabled={botRunning || !conversationPublicId}
+                          onFAQQuestionClick={onAssistSendMessage}
                         />
                       ) : message.role === 'system' ? (
                         isOpenAgentHandoffEventMessage(original) ? (
@@ -557,7 +897,7 @@ export function VisitorThread({
                             )
                           })()
                         ) : (
-                          <SystemMessage content={original.content} />
+                          <SystemMessage content={displaySystemMessageContent(original.content, original.metadata, locale)} />
                         )
                       ) : (
                         <MessageBubble
@@ -577,8 +917,29 @@ export function VisitorThread({
               </ThreadPrimitive.Messages>
             )}
 
+            {showOpenAgentWelcomeMessage && (
+              <div className={msgCount === 0 ? 'py-2' : 'py-1'}>
+                <OpenAgentWelcomeMessage
+                  blocks={openAgentWelcomeBlocks}
+                  config={config}
+                  showAvatar={shouldShowAssistantAvatar('bot', config)}
+                  avatarSrc={getOpenAgentAvatarUrl(config)}
+                />
+                {openAgentFAQ && (
+                  <div className="mt-2">
+                    <OpenAgentFAQMessage
+                      faq={openAgentFAQ}
+                      config={config}
+                      faqDisabled={botRunning || !conversationPublicId}
+                      onFAQQuestionClick={onAssistSendMessage}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* ── Typing indicator ── */}
-            {agentTyping && !botMode && (
+            {agentTyping && !botMode && !offlineMode && (
               <TypingIndicator
                 agentBubbleBg={config.agent_bubble_bg_color || undefined}
                 agentBubbleTextColor={config.agent_bubble_text_color || undefined}
@@ -605,7 +966,10 @@ export function VisitorThread({
 
       {!initializing && !isOffline && showFloatingInvitation && (
         <div className="pointer-events-none absolute inset-x-0 bottom-[88px] z-30 flex justify-center px-4">
-          <div className="pointer-events-auto flex items-center gap-2 rounded-full bg-[#1a1a1a] px-3 py-2 text-sm font-medium text-white shadow-lg">
+          <div
+            className="pointer-events-auto flex items-center gap-2 rounded-full bg-[var(--opendesk-send-button-bg)] px-3 py-2 text-sm font-medium text-primary-foreground shadow-lg"
+            style={sendButtonStyle}
+          >
             <button
               type="button"
               onClick={() => setSurveyOpen(true)}
@@ -618,7 +982,7 @@ export function VisitorThread({
               <button
                 type="button"
                 onClick={() => setSurveyCollapsed(true)}
-                className="flex h-5 w-5 items-center justify-center rounded-full text-white/80 hover:bg-white/10 hover:text-white"
+                className="flex h-5 w-5 items-center justify-center rounded-full text-primary-foreground/80 hover:bg-primary-foreground/10 hover:text-primary-foreground"
                 aria-label={locale === 'zh' ? '收起评价入口' : 'Collapse survey entry'}
               >
                 <IconX size={13} aria-hidden />
@@ -635,15 +999,17 @@ export function VisitorThread({
           submitting={surveySubmitting}
           success={surveySuccess}
           error={surveyError}
+          sendButtonBgColor={config.send_button_bg_color}
           onSubmit={handleSubmitSatisfaction}
           onClose={() => setSurveyOpen(false)}
         />
       )}
 
-      {!initializing && !isOffline && (
+      {!initializing && !isOffline && !queueFull && (
         ended ? (
           <ConversationEndedPanel
             locale={locale}
+            sendButtonBgColor={config.send_button_bg_color}
             onRestartConversation={onRestartConversation}
           />
         ) : (
@@ -663,12 +1029,17 @@ export function VisitorThread({
 
 function ConversationEndedPanel({
   locale,
+  sendButtonBgColor,
   onRestartConversation,
 }: {
   locale: string
+  sendButtonBgColor: string | null
   onRestartConversation: () => Promise<void>
 }) {
   const [restarting, setRestarting] = useState(false)
+  const restartButtonStyle = {
+    backgroundColor: sendButtonBgColor || 'var(--color-primary)',
+  } as CSSProperties
 
   const handleRestart = async () => {
     setRestarting(true)
@@ -689,7 +1060,8 @@ function ConversationEndedPanel({
           type="button"
           onClick={handleRestart}
           disabled={restarting}
-          className="shrink-0 rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+          className="shrink-0 rounded-full px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+          style={restartButtonStyle}
         >
           {restarting
             ? locale === 'zh'

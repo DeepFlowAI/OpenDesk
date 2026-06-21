@@ -19,6 +19,8 @@ export const richTextListStyleClass =
     '[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2',
     '[&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.9em]',
     '[&_img]:my-2 [&_img]:max-w-full [&_img]:rounded-md [&_img]:border [&_img]:border-border',
+    '[&_img[data-rich-text-loading=true]]:h-20 [&_img[data-rich-text-loading=true]]:w-32 [&_img[data-rich-text-loading=true]]:bg-muted [&_img[data-rich-text-loading=true]]:object-contain',
+    '[&_img[data-rich-text-load-failed=true]]:hidden',
     '[&_table]:my-3 [&_table]:w-max [&_table]:min-w-max [&_table]:border-collapse [&_table]:text-left [&_table]:text-sm [&_table]:leading-7 [&_table]:text-[#111827]',
     '[&_thead]:bg-white',
     '[&_tbody_tr:nth-child(even)]:bg-[#F8FAFC]',

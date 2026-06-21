@@ -1,5 +1,5 @@
 """
-Data scope helpers for ticket, session record, and call record queries.
+Data scope helpers for ticket, conversation, queue, and call record queries.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from app.core.exceptions import ForbiddenError
 from app.models.call_record import CallRecord
 from app.models.conversation import Conversation
+from app.models.offline_message import OfflineMessage
 from app.models.ticket import Ticket
 from app.repositories.employee_repository import EmployeeRepository
 from app.schemas.permission import EffectivePrincipal
@@ -21,6 +22,9 @@ SCOPE_SELF = "self"
 RESOURCE_TICKET = "ticket"
 RESOURCE_SESSION_RECORD = "session_record"
 RESOURCE_CALL_RECORD = "call_record"
+RESOURCE_OFFLINE_MESSAGE = "offline_message"
+RESOURCE_PEER_CONVERSATION = "chat.conversation.peer.view"
+RESOURCE_CHAT_QUEUE = "chat.queue.view"
 
 
 class DataScopeService:
@@ -79,8 +83,9 @@ class DataScopeService:
     def build_session_record_predicate(
         principal: EffectivePrincipal,
         peer_employee_ids: list[int],
+        resource: str = RESOURCE_SESSION_RECORD,
     ) -> ColumnElement | None:
-        scope = DataScopeService.get_scope(principal, RESOURCE_SESSION_RECORD)
+        scope = DataScopeService.get_scope(principal, resource)
         if scope == SCOPE_ALL:
             return None
         if scope == SCOPE_SELF:
@@ -107,6 +112,26 @@ class DataScopeService:
             peer_employee_ids,
             group_column=CallRecord.employee_group_id,
             agent_column=CallRecord.agent_id,
+        )
+
+    @staticmethod
+    def build_offline_message_predicate(
+        principal: EffectivePrincipal,
+        peer_employee_ids: list[int],
+    ) -> ColumnElement | None:
+        scope = DataScopeService.get_scope(principal, RESOURCE_OFFLINE_MESSAGE)
+        if scope == SCOPE_ALL:
+            return None
+        if scope == SCOPE_SELF:
+            clauses: list[ColumnElement] = [OfflineMessage.handled_by_id == principal.user_id]
+            if principal.group_ids:
+                clauses.append(OfflineMessage.target_group_id.in_(principal.group_ids))
+            return or_(*clauses)
+        return DataScopeService._build_group_predicate(
+            principal,
+            peer_employee_ids,
+            group_column=OfflineMessage.target_group_id,
+            agent_column=OfflineMessage.handled_by_id,
         )
 
     @staticmethod
@@ -150,8 +175,9 @@ class DataScopeService:
         principal: EffectivePrincipal,
         conversation: Conversation,
         peer_employee_ids: list[int],
+        resource: str = RESOURCE_SESSION_RECORD,
     ) -> bool:
-        scope = DataScopeService.get_scope(principal, RESOURCE_SESSION_RECORD)
+        scope = DataScopeService.get_scope(principal, resource)
         if scope == SCOPE_ALL:
             return True
         if scope == SCOPE_SELF:
@@ -182,6 +208,26 @@ class DataScopeService:
         )
 
     @staticmethod
+    def offline_message_in_scope(
+        principal: EffectivePrincipal,
+        row: OfflineMessage,
+        peer_employee_ids: list[int],
+    ) -> bool:
+        scope = DataScopeService.get_scope(principal, RESOURCE_OFFLINE_MESSAGE)
+        if scope == SCOPE_ALL:
+            return True
+        if scope == SCOPE_SELF:
+            if row.handled_by_id == principal.user_id:
+                return True
+            return row.status == "pending" and row.target_group_id in principal.group_ids
+        return DataScopeService._row_in_group_scope(
+            principal,
+            peer_employee_ids,
+            group_id=row.target_group_id,
+            agent_id=row.handled_by_id,
+        )
+
+    @staticmethod
     def _row_in_group_scope(
         principal: EffectivePrincipal,
         peer_employee_ids: list[int],
@@ -208,8 +254,9 @@ class DataScopeService:
         principal: EffectivePrincipal,
         conversation: Conversation,
         peer_employee_ids: list[int],
+        resource: str = RESOURCE_SESSION_RECORD,
     ) -> None:
-        if not DataScopeService.conversation_in_scope(principal, conversation, peer_employee_ids):
+        if not DataScopeService.conversation_in_scope(principal, conversation, peer_employee_ids, resource):
             raise ForbiddenError("Permission denied")
 
     @staticmethod
@@ -219,6 +266,15 @@ class DataScopeService:
         peer_employee_ids: list[int],
     ) -> None:
         if not DataScopeService.call_record_in_scope(principal, row, peer_employee_ids):
+            raise ForbiddenError("Permission denied")
+
+    @staticmethod
+    def assert_offline_message_in_scope(
+        principal: EffectivePrincipal,
+        row: OfflineMessage,
+        peer_employee_ids: list[int],
+    ) -> None:
+        if not DataScopeService.offline_message_in_scope(principal, row, peer_employee_ids):
             raise ForbiddenError("Permission denied")
 
     @staticmethod

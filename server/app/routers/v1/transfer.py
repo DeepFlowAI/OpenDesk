@@ -12,19 +12,25 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
-from app.db.deps import get_current_user, get_current_principal, get_db, get_redis, require_permission
+from app.db.deps import get_current_principal, get_db, get_redis, require_any_permission
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.conversation import ConversationResponse
 from app.schemas.transfer import (
     TransferConversationRequest,
     TransferTargetListResponse,
 )
-from app.services.transfer_service import TransferService
+from app.services.transfer_service import (
+    PEER_VIEW_PERMISSION,
+    TRANSFER_PERMISSION,
+    TransferService,
+)
 
 router = APIRouter(
     prefix="/workspace",
     tags=["Transfer"],
-    dependencies=[Depends(require_permission("chat.conversation.transfer"))],
+    dependencies=[
+        Depends(require_any_permission([TRANSFER_PERMISSION, PEER_VIEW_PERMISSION]))
+    ],
 )
 
 

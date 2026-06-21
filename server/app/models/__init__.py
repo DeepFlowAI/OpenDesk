@@ -5,6 +5,7 @@ from app.models.user import User  # noqa: F401
 from app.models.system_settings import SystemSettings  # noqa: F401
 from app.models.open_agent_settings import OpenAgentSettings  # noqa: F401
 from app.models.service_hours import ServiceHours  # noqa: F401
+from app.models.api_key import ApiKey  # noqa: F401
 from app.models.employee_group import EmployeeGroup, EmployeeGroupMember  # noqa: F401
 from app.models.voice_flow import VoiceFlow  # noqa: F401
 from app.models.voice_flow_version import VoiceFlowVersion  # noqa: F401
@@ -22,10 +23,14 @@ from app.models.phone_number_tenant_meta import PhoneNumberTenantMeta  # noqa: F
 from app.models.session_routing_rule import SessionRoutingRule  # noqa: F401
 from app.models.welcome_message_rule import WelcomeMessageRule  # noqa: F401
 from app.models.satisfaction_survey_config import SatisfactionSurveyConfig, SatisfactionSurveyConfigVersion  # noqa: F401
+from app.models.emoji_setting import EmojiSetting  # noqa: F401
+from app.models.conversation_user_stat_setting import ConversationUserStatSetting  # noqa: F401
+from app.models.visitor_timeout_close import VisitorTimeoutCloseSetting, VisitorTimeoutCloseState  # noqa: F401
 from app.models.satisfaction_survey_record import SatisfactionSurveyRecord  # noqa: F401
 from app.models.channel import Channel  # noqa: F401
 from app.models.conversation import Conversation  # noqa: F401
 from app.models.message import Message  # noqa: F401
+from app.models.offline_message import OfflineMessage, OfflineMessageEntry  # noqa: F401
 from app.models.fd_field_definition import FdFieldDefinition  # noqa: F401
 from app.models.fd_field_option import FdFieldOption  # noqa: F401
 from app.models.fd_tree_node import FdTreeNode  # noqa: F401
@@ -37,6 +42,7 @@ from app.models.fd_form_layout_tab import FdFormLayoutTab  # noqa: F401
 from app.models.fd_form_layout_field import FdFormLayoutField  # noqa: F401
 from app.models.fd_interaction_rule import FdInteractionRule  # noqa: F401
 from app.models.ticket import Ticket  # noqa: F401
+from app.models.knowledge import KnowledgeDirectory, KnowledgeDocument  # noqa: F401
 from app.models.ticket_change import TicketChange  # noqa: F401
 from app.models.entity_change import EntityChange  # noqa: F401
 from app.models.ticket_comment import TicketComment  # noqa: F401

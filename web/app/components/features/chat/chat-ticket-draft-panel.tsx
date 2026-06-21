@@ -10,6 +10,7 @@ import { TicketCreateForm } from '@/app/workspace/tickets/ticket-form-modal'
 
 type Props = {
   conversation: Conversation
+  summaryEnabled?: boolean
   onClose: () => void
   onNotice?: (type: 'success' | 'error', text: string, payload?: { ticket?: Ticket }) => void
 }
@@ -92,15 +93,15 @@ function buildInitialValues(conversation: Conversation, summaryData: ReturnType<
   }
 }
 
-export function ChatTicketDraftPanel({ conversation, onClose, onNotice }: Props) {
+export function ChatTicketDraftPanel({ conversation, summaryEnabled = true, onClose, onNotice }: Props) {
   const { locale } = useLocaleStore()
-  const summaryQuery = useSessionSummaryUsage(conversation.id)
+  const summaryQuery = useSessionSummaryUsage(conversation.id, { enabled: summaryEnabled })
   const [initialValues, setInitialValues] = useState<Record<string, unknown> | null>(null)
   const [initializedAt, setInitializedAt] = useState<string | null>(null)
   const [saveError, setSaveError] = useState(false)
 
   useEffect(() => {
-    if (summaryQuery.isLoading) return
+    if (summaryEnabled && summaryQuery.isLoading) return
 
     const stored = readDraft(conversation.id)
     if (stored) {
@@ -109,11 +110,11 @@ export function ChatTicketDraftPanel({ conversation, onClose, onNotice }: Props)
       return
     }
 
-    const built = buildInitialValues(conversation, summaryQuery.data)
+    const built = buildInitialValues(conversation, summaryEnabled ? summaryQuery.data : undefined)
     setInitialValues(built.values)
     setInitializedAt(built.initializedAt)
     writeDraft(conversation.id, built.values, built.initializedAt)
-  }, [conversation, summaryQuery.data, summaryQuery.isLoading])
+  }, [conversation, summaryEnabled, summaryQuery.data, summaryQuery.isLoading])
 
   const resetKey = useMemo(
     () => `${conversation.id}:${initialValues ? JSON.stringify(initialValues) : 'loading'}`,
@@ -137,7 +138,7 @@ export function ChatTicketDraftPanel({ conversation, onClose, onNotice }: Props)
 
   return (
     <div className="flex min-h-full flex-col">
-      {summaryQuery.isError && (
+      {summaryEnabled && summaryQuery.isError && (
         <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-muted-foreground">
           {t('ws.chatTicket.summaryLoadFailed', locale)}
         </div>

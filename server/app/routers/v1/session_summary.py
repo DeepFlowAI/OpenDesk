@@ -4,7 +4,7 @@ Session summary (conversation minutes) configuration router
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, get_current_user
+from app.db.deps import get_current_principal, get_current_user, get_db
 from app.schemas.cs_summary_config import (
     CsSummaryConfigResponse,
     CsSummaryConfigFieldCreate,
@@ -24,6 +24,7 @@ from app.schemas.cs_summary_usage import (
     CsSummaryFieldValueUpdate,
     CsSummaryFieldValueResponse,
 )
+from app.schemas.permission import EffectivePrincipal
 from app.services.cs_summary_usage_service import CsSummaryUsageService
 
 router = APIRouter(prefix="/session-summary", tags=["SessionSummary"])
@@ -46,10 +47,15 @@ async def get_config(
 async def get_session_summary(
     conversation_id: int,
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Get conversation minutes fields, rules, and values for a conversation."""
-    return await CsSummaryUsageService.get_summary(db, user["tenant_id"], conversation_id)
+    return await CsSummaryUsageService.get_summary(
+        db,
+        principal.tenant_id,
+        conversation_id,
+        principal=principal,
+    )
 
 
 @router.patch("/sessions/{conversation_id}/fields", response_model=CsSummaryFieldValueResponse)
@@ -57,10 +63,16 @@ async def update_session_summary_field(
     conversation_id: int,
     body: CsSummaryFieldValueUpdate,
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(get_current_principal),
 ):
     """Update a single conversation minutes field value."""
-    return await CsSummaryUsageService.update_field(db, user["tenant_id"], conversation_id, body)
+    return await CsSummaryUsageService.update_field(
+        db,
+        principal.tenant_id,
+        conversation_id,
+        body,
+        principal=principal,
+    )
 
 
 # ── Fields ──

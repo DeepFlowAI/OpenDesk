@@ -3,7 +3,17 @@ Permission catalog and built-in role presets.
 """
 from copy import deepcopy
 
-DATA_SCOPE_KEYS = {"ticket", "session_record", "call_record"}
+RESOURCE_PEER_CONVERSATION = "chat.conversation.peer.view"
+RESOURCE_CHAT_QUEUE = "chat.queue.view"
+
+DATA_SCOPE_KEYS = {
+    "ticket",
+    "session_record",
+    "call_record",
+    "offline_message",
+    RESOURCE_PEER_CONVERSATION,
+    RESOURCE_CHAT_QUEUE,
+}
 DATA_SCOPE_VALUES = {"all", "group", "self"}
 SYSTEM_ROLE_KEYS = {"admin", "agent"}
 DATA_SCOPE_PRIORITY = {"self": 1, "group": 2, "all": 3}
@@ -33,7 +43,15 @@ PERMISSION_TREE: list[dict] = [
                 "name_en": "Online Service",
                 "permissions": [
                     {"key": "chat.workspace.use", "name": "启用在线客服工作台", "name_en": "Use chat workspace", "type": "switch"},
+                    {"key": "chat.workspace.max_concurrent.edit", "name": "修改自己的最大接待人数", "name_en": "Edit own max concurrent sessions", "type": "action", "requires": "chat.workspace.use"},
                     {"key": "chat.conversation.transfer", "name": "会话转接", "name_en": "Transfer conversations", "type": "action", "requires": "chat.workspace.use"},
+                    {"key": "chat.conversation.peer.view", "name": "查看同事会话", "name_en": "View peer conversations", "type": "action", "requires": "chat.workspace.use", "data_scope_resource": RESOURCE_PEER_CONVERSATION},
+                    {"key": "chat.conversation.peer_message.send", "name": "同事会话发送消息", "name_en": "Send messages in peer conversations", "type": "action", "requires": "chat.conversation.peer.view"},
+                    {"key": "chat.conversation.internal_note.create", "name": "发送内部消息", "name_en": "Create internal notes", "type": "action", "requires": "chat.workspace.use"},
+                    {"key": "chat.offline_message.view", "name": "查看留言", "name_en": "View offline messages", "type": "menu", "requires": "chat.workspace.use", "data_scope_resource": "offline_message"},
+                    {"key": "chat.queue.view", "name": "查看排队", "name_en": "View chat queue", "type": "menu", "requires": "chat.workspace.use", "data_scope_resource": RESOURCE_CHAT_QUEUE},
+                    {"key": "chat.queue.assign_self", "name": "分配排队给自己", "name_en": "Assign queued visitor to self", "type": "action", "requires": "chat.queue.view"},
+                    {"key": "chat.queue.assign_other", "name": "分配排队给同事", "name_en": "Assign queued visitor to teammate", "type": "action", "requires": "chat.queue.view"},
                     {"key": "chat.session_record.view", "name": "查看会话记录", "name_en": "View session records", "type": "menu", "requires": "chat.workspace.use", "data_scope_resource": "session_record"},
                     {"key": "chat.session_record.export", "name": "导出会话记录", "name_en": "Export session records", "type": "action", "requires": "chat.session_record.view"},
                     {"key": "chat.online_monitor.view", "name": "查看在线监控", "name_en": "View online monitor", "type": "menu", "requires": "chat.workspace.use"},
@@ -50,10 +68,14 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "crm.workspace.user.create", "name": "新建用户", "name_en": "Create users", "type": "action", "requires": "crm.workspace.user.view"},
                     {"key": "crm.workspace.user.edit", "name": "编辑用户", "name_en": "Edit users", "type": "action", "requires": "crm.workspace.user.view"},
                     {"key": "crm.workspace.user.delete", "name": "删除用户", "name_en": "Delete users", "type": "action", "requires": "crm.workspace.user.view"},
+                    {"key": "crm.workspace.user.export", "name": "导出用户", "name_en": "Export users", "type": "action", "requires": "crm.workspace.user.view"},
+                    {"key": "crm.workspace.user.import", "name": "导入用户", "name_en": "Import users", "type": "action", "requires": "crm.workspace.user.view"},
                     {"key": "crm.workspace.org.view", "name": "查看组织", "name_en": "View organizations", "type": "menu"},
                     {"key": "crm.workspace.org.create", "name": "新建组织", "name_en": "Create organizations", "type": "action", "requires": "crm.workspace.org.view"},
                     {"key": "crm.workspace.org.edit", "name": "编辑组织", "name_en": "Edit organizations", "type": "action", "requires": "crm.workspace.org.view"},
                     {"key": "crm.workspace.org.delete", "name": "删除组织", "name_en": "Delete organizations", "type": "action", "requires": "crm.workspace.org.view"},
+                    {"key": "crm.workspace.org.export", "name": "导出组织", "name_en": "Export organizations", "type": "action", "requires": "crm.workspace.org.view"},
+                    {"key": "crm.workspace.org.import", "name": "导入组织", "name_en": "Import organizations", "type": "action", "requires": "crm.workspace.org.view"},
                 ],
             },
             {
@@ -67,6 +89,20 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "ticket.workspace.delete", "name": "删除工单", "name_en": "Delete tickets", "type": "action", "requires": "ticket.workspace.view"},
                     {"key": "ticket.workspace.comment", "name": "工单评论", "name_en": "Comment on tickets", "type": "action", "requires": "ticket.workspace.view"},
                     {"key": "ticket.workspace.export", "name": "导出工单", "name_en": "Export tickets", "type": "action", "requires": "ticket.workspace.view"},
+                ],
+            },
+            {
+                "key": "knowledge",
+                "name": "知识库",
+                "name_en": "Knowledge Base",
+                "permissions": [
+                    {"key": "knowledge.workspace.view", "name": "查看知识库", "name_en": "View knowledge base", "type": "menu"},
+                    {"key": "knowledge.workspace.document.create", "name": "新建知识文档", "name_en": "Create knowledge documents", "type": "action", "requires": "knowledge.workspace.view"},
+                    {"key": "knowledge.workspace.document.edit", "name": "编辑知识文档", "name_en": "Edit knowledge documents", "type": "action", "requires": "knowledge.workspace.view"},
+                    {"key": "knowledge.workspace.document.delete", "name": "删除知识文档", "name_en": "Delete knowledge documents", "type": "action", "requires": "knowledge.workspace.view"},
+                    {"key": "knowledge.workspace.directory.manage", "name": "管理知识目录", "name_en": "Manage knowledge directories", "type": "manage", "requires": "knowledge.workspace.view"},
+                    {"key": "knowledge.workspace.import", "name": "导入知识库", "name_en": "Import knowledge base", "type": "action", "requires": "knowledge.workspace.view"},
+                    {"key": "knowledge.workspace.export", "name": "导出知识库", "name_en": "Export knowledge base", "type": "action", "requires": "knowledge.workspace.view"},
                 ],
             },
         ],
@@ -197,6 +233,7 @@ PERMISSION_DATA_SCOPE_RESOURCES = permission_data_scope_resources()
 
 ADMIN_DATA_SCOPES = {key: "all" for key in DATA_SCOPE_KEYS}
 AGENT_DATA_SCOPES = {key: "self" for key in DATA_SCOPE_KEYS}
+AGENT_DATA_SCOPES["offline_message"] = "group"
 
 AGENT_PERMISSION_KEYS = [
     "chat.workspace.use",
@@ -205,11 +242,16 @@ AGENT_PERMISSION_KEYS = [
     "ticket.workspace.create",
     "ticket.workspace.edit",
     "ticket.workspace.comment",
+    "knowledge.workspace.view",
     "crm.workspace.user.view",
     "crm.workspace.org.view",
     "chat.session_record.view",
+    "chat.offline_message.view",
+    "chat.queue.view",
+    "chat.queue.assign_self",
     "call.record.view",
     "chat.conversation.transfer",
+    "chat.conversation.internal_note.create",
 ]
 
 SYSTEM_ROLE_PRESETS = {

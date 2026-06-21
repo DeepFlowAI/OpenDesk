@@ -46,7 +46,8 @@ from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.schemas.permission import EffectivePrincipal
 from app.services.agent_status_service import AgentStatusService
-from app.services.data_scope_service import DataScopeService
+from app.services.conversation_realtime_service import ConversationRealtimeService
+from app.services.data_scope_service import DataScopeService, RESOURCE_PEER_CONVERSATION
 from app.services.permission_service import PermissionService
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ logger = logging.getLogger(__name__)
 CHAT_NAMESPACE = "/chat"
 VISITOR_NAMESPACE = "/visitor"
 MAX_TARGETS_RETURNED = 200
+TRANSFER_PERMISSION = "chat.conversation.transfer"
+PEER_VIEW_PERMISSION = "chat.conversation.peer.view"
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -169,20 +172,54 @@ async def _has_visitor_history_for_agent(
 class TransferService:
 
     @staticmethod
-    async def _assert_can_access_conversation(
+    async def _can_transfer_peer_conversation(
+        db: AsyncSession,
+        principal: EffectivePrincipal,
+        conversation: Conversation,
+    ) -> bool:
+        if conversation.agent_id == principal.user_id:
+            return False
+        if not principal.has_permission(PEER_VIEW_PERMISSION):
+            return False
+        if DataScopeService.get_scope(principal, RESOURCE_PEER_CONVERSATION) == "self":
+            return False
+
+        peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+        return DataScopeService.conversation_in_scope(
+            principal,
+            conversation,
+            peer_ids,
+            RESOURCE_PEER_CONVERSATION,
+        )
+
+    @staticmethod
+    async def _assert_can_transfer_conversation(
         db: AsyncSession,
         principal: EffectivePrincipal,
         conversation: Conversation,
     ) -> None:
-        if not await DataScopeService.can_access_conversation(db, principal, conversation):
-            raise ForbiddenError("No permission to access this conversation")
+        if principal.has_permission(TRANSFER_PERMISSION):
+            if await DataScopeService.can_access_conversation(db, principal, conversation):
+                return
+
+        if await TransferService._can_transfer_peer_conversation(db, principal, conversation):
+            return
+
+        raise ForbiddenError("No permission to transfer this conversation")
 
     @staticmethod
-    def _resolve_display_name(employee: Employee | None) -> str:
-        """Pick the most user-friendly name for system message rendering."""
+    def _resolve_agent_name(employee: Employee | None) -> str:
+        """Legal employee name for workspace-facing transfer audit messages."""
         if not employee:
             return "未知员工"
-        return employee.display_name or employee.name or employee.username or "未知员工"
+        return employee.name or employee.username or "未知员工"
+
+    @staticmethod
+    def _resolve_visitor_nickname(employee: Employee | None) -> str:
+        """Visitor-facing nickname for transfer audit messages."""
+        if not employee:
+            return "未知员工"
+        return employee.nickname or employee.name or employee.username or "未知员工"
 
     @staticmethod
     async def list_targets(
@@ -204,17 +241,25 @@ class TransferService:
         agent from probing the candidate list with a foreign ``conversation_id``
         to infer who currently owns it.
         """
-        exclude_ids = {current_user_id}
+        # When listing targets for a specific conversation, only exclude the
+        # current owner — colleagues (and admins) may transfer the session to
+        # themselves. Without conversation context, exclude the requester so
+        # they cannot pick themselves in a generic browse.
+        exclude_ids: set[int] = set()
         if conversation_id is not None:
             conversation = await ConversationRepository.get_by_id(db, conversation_id)
             if not conversation or conversation.tenant_id != tenant_id:
                 raise NotFoundError("Conversation not found")
             if principal is not None:
-                await TransferService._assert_can_access_conversation(db, principal, conversation)
+                await TransferService._assert_can_transfer_conversation(db, principal, conversation)
             elif conversation.agent_id != current_user_id:
                 raise ForbiddenError("No permission to inspect this conversation")
             if conversation.agent_id:
                 exclude_ids.add(conversation.agent_id)
+        else:
+            exclude_ids.add(current_user_id)
+            if principal is not None and not principal.has_permission(TRANSFER_PERMISSION):
+                raise ForbiddenError("No permission to inspect transfer targets")
 
         employees = await EmployeeRepository.get_transfer_candidates(
             db,
@@ -262,9 +307,11 @@ class TransferService:
         tenant_id = conversation.tenant_id
         conv_room = f"conv:{conversation.id}"
 
-        # System message to target agent's personal room + visitor conv room
+        # System message to target agent's personal room + open workspace viewers
+        # + visitor conv room.
         to_agent_room = f"agent:{tenant_id}:{target_agent_id}"
         await rt.emit("new_message", message_payload, room=to_agent_room, namespace=CHAT_NAMESPACE)
+        await rt.emit("new_message", message_payload, room=conv_room, namespace=CHAT_NAMESPACE)
         await rt.emit("new_message", message_payload, room=conv_room, namespace=VISITOR_NAMESPACE)
 
         base_payload = {
@@ -295,6 +342,12 @@ class TransferService:
             room=to_room,
             namespace=CHAT_NAMESPACE,
         )
+        await ConversationRealtimeService.emit_conversation_list_updated(
+            tenant_id,
+            action="transferred",
+            conversation_id=conversation.id,
+            rt=rt,
+        )
 
     @staticmethod
     async def transfer_conversation(
@@ -313,7 +366,7 @@ class TransferService:
             raise NotFoundError("Conversation not found")
 
         if principal is not None:
-            await TransferService._assert_can_access_conversation(db, principal, conversation)
+            await TransferService._assert_can_transfer_conversation(db, principal, conversation)
         elif conversation.agent_id != current_user_id:
             raise ForbiddenError("No permission to transfer this conversation")
 
@@ -345,9 +398,18 @@ class TransferService:
         # transferring on behalf of someone else). The requirement names the
         # initiator in the audit message.
         initiator = await EmployeeRepository.get_by_id(db, current_user_id)
-        initiator_name = TransferService._resolve_display_name(initiator)
-        to_name = TransferService._resolve_display_name(target)
+        initiator_name = TransferService._resolve_agent_name(initiator)
+        to_name = TransferService._resolve_agent_name(target)
+        from_nickname = TransferService._resolve_visitor_nickname(initiator)
+        to_nickname = TransferService._resolve_visitor_nickname(target)
         system_text = f"{initiator_name} 将会话转接给 {to_name}"
+        transfer_metadata = {
+            "event_type": "session_transfer",
+            "from_agent_name": initiator_name,
+            "to_agent_name": to_name,
+            "from_agent_nickname": from_nickname,
+            "to_agent_nickname": to_nickname,
+        }
         now = datetime.now(timezone.utc)
 
         # ── 2. Atomic DB write with optimistic concurrency check ─────────
@@ -391,6 +453,7 @@ class TransferService:
                 sender_type=MessageSenderType.SYSTEM.value,
                 content_type=MessageContentType.SYSTEM.value,
                 content=system_text,
+                metadata_=transfer_metadata,
             )
             db.add(system_message)
 
@@ -428,6 +491,7 @@ class TransferService:
                 logger.exception(
                     "Failed to decrement count for agent %s after transfer", from_agent_id
                 )
+            await AgentStatusService.trigger_queue_backfill(r, tenant_id, from_agent_id)
         try:
             await AgentStatusService.increment_count(r, tenant_id, target.id)
         except Exception:
@@ -475,6 +539,8 @@ class TransferService:
             "sender_avatar": None,
             "content_type": MessageContentType.SYSTEM.value,
             "content": system_text,
+            "metadata": transfer_metadata,
+            "event_type": transfer_metadata["event_type"],
             "created_at": (
                 system_message.created_at.isoformat() if system_message.created_at else None
             ),

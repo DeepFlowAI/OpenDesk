@@ -1,15 +1,15 @@
 """
 HTTP OpenAgent client provider.
 """
-from urllib.parse import urlparse
-
 from collections.abc import AsyncIterator
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from app.libs.open_agent.base import (
     BaseOpenAgentClient,
+    OpenAgentAgentDetail,
     OpenAgentAgentListResult,
     OpenAgentAgentSummary,
     OpenAgentClientError,
@@ -91,6 +91,42 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
             pages=self._safe_int(payload.get("pages"), 1),
         )
 
+    async def get_agent(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: int,
+    ) -> OpenAgentAgentDetail:
+        """Get one agent through the configured OpenAgent HTTP API."""
+        url = self._build_agent_detail_url(base_url, agent_id)
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.get(url, headers=headers)
+        except httpx.RequestError as exc:
+            raise OpenAgentClientError(f"OpenAgent agent detail failed: {exc}") from exc
+
+        if not 200 <= response.status_code < 300:
+            message = self._extract_error_message(response)
+            if response.status_code in {401, 403}:
+                message = message or "OpenAgent API key is invalid or unauthorized"
+            raise OpenAgentClientError(message or "OpenAgent agent detail failed")
+
+        payload = self._parse_json_object(response)
+        parsed = self._parse_agent(payload)
+        if not parsed:
+            raise OpenAgentClientError("OpenAgent returned an unexpected agent detail response")
+
+        return OpenAgentAgentDetail(
+            id=parsed.id,
+            name=parsed.name,
+            description=parsed.description,
+            status=parsed.status,
+            welcome_message=self._parse_agent_welcome_message(payload),
+            faq=self._parse_agent_faq(payload),
+        )
+
     async def stream_chat(
         self,
         base_url: str,
@@ -165,6 +201,14 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
         return f"{base}/api/v1/agents/{agent_id}/chat"
 
     @staticmethod
+    def _build_agent_detail_url(base_url: str, agent_id: int) -> str:
+        parsed = urlparse(base_url)
+        base = base_url.rstrip("/")
+        if parsed.path.rstrip("/").endswith("/api/v1"):
+            return f"{base}/agents/{agent_id}"
+        return f"{base}/api/v1/agents/{agent_id}"
+
+    @staticmethod
     def _build_tool_results_url(base_url: str, agent_id: int, conversation_id: int) -> str:
         parsed = urlparse(base_url)
         base = base_url.rstrip("/")
@@ -233,6 +277,91 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
             description=description if isinstance(description, str) else None,
             status=status,
         )
+
+    @staticmethod
+    def _parse_agent_welcome_message(raw: dict[str, Any]) -> dict[str, Any] | None:
+        engine_config = raw.get("engine_config")
+        if not isinstance(engine_config, dict):
+            return None
+        conversation_settings = engine_config.get("conversation_settings")
+        if not isinstance(conversation_settings, dict):
+            return None
+        welcome = conversation_settings.get("welcome_message")
+        if not isinstance(welcome, dict):
+            return None
+
+        blocks: list[dict[str, Any]] = []
+        raw_blocks = welcome.get("blocks")
+        if isinstance(raw_blocks, list):
+            for raw_block in raw_blocks:
+                if not isinstance(raw_block, dict):
+                    continue
+                if raw_block.get("type") == "markdown":
+                    blocks.append(
+                        {
+                            "type": "markdown",
+                            "content": raw_block.get("content")
+                            if isinstance(raw_block.get("content"), str)
+                            else "",
+                        }
+                    )
+                elif raw_block.get("type") == "embed":
+                    blocks.append(
+                        {
+                            "type": "embed",
+                            "embed_code": raw_block.get("embed_code")
+                            if isinstance(raw_block.get("embed_code"), str)
+                            else "",
+                            "height": HTTPOpenAgentClient._safe_int(raw_block.get("height"), 360),
+                        }
+                    )
+
+        return {
+            "enabled": bool(welcome.get("enabled")),
+            "blocks": blocks,
+        }
+
+    @staticmethod
+    def _parse_agent_faq(raw: dict[str, Any]) -> dict[str, Any] | None:
+        engine_config = raw.get("engine_config")
+        if not isinstance(engine_config, dict):
+            return None
+        conversation_settings = engine_config.get("conversation_settings")
+        if not isinstance(conversation_settings, dict):
+            return None
+        faq = conversation_settings.get("faq")
+        if not isinstance(faq, dict):
+            return None
+
+        categories: list[dict[str, Any]] = []
+        raw_categories = faq.get("categories")
+        if isinstance(raw_categories, list):
+            for raw_category in raw_categories:
+                if not isinstance(raw_category, dict):
+                    continue
+                name = raw_category.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    continue
+
+                questions: list[dict[str, str]] = []
+                raw_questions = raw_category.get("questions")
+                if isinstance(raw_questions, list):
+                    for raw_question in raw_questions:
+                        if not isinstance(raw_question, dict):
+                            continue
+                        text = raw_question.get("text")
+                        if isinstance(text, str) and text.strip():
+                            questions.append({"text": text.strip()})
+
+                if questions:
+                    categories.append({"name": name.strip(), "questions": questions})
+
+        title = faq.get("title")
+        return {
+            "enabled": bool(faq.get("enabled")),
+            "title": title.strip() if isinstance(title, str) and title.strip() else "常见问题",
+            "categories": categories,
+        }
 
     @staticmethod
     def _safe_int(value: Any, fallback: int) -> int:

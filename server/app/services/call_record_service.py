@@ -1,7 +1,7 @@
 """
 Call record service — write CDR lifecycle (orchestrator) + read for history.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 from sqlalchemy import select
@@ -59,7 +59,7 @@ class CallRecordService:
                 "to_number": to_number,
                 "voice_flow_id": voice_flow_id,
                 "voice_flow_version_id": voice_flow_version_id,
-                "started_at": datetime.now(),
+                "started_at": datetime.now(timezone.utc),
                 "extra_metadata": {},
             },
         )
@@ -98,7 +98,7 @@ class CallRecordService:
                 "from_number": from_number,  # outbound DID (caller_id)
                 "to_number": to_number,      # dialed number
                 "agent_id": agent_id,
-                "started_at": datetime.now(),
+                "started_at": datetime.now(timezone.utc),
                 "extra_metadata": {},
             },
         )
@@ -112,7 +112,7 @@ class CallRecordService:
         row = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
         if not row:
             return
-        ts = datetime.now()
+        ts = datetime.now(timezone.utc)
         patch: dict = {"state": "in_progress", "answered_at": ts}
         if agent_id is not None:
             patch["agent_id"] = agent_id
@@ -132,7 +132,7 @@ class CallRecordService:
         row = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
         if not row:
             return
-        ts = datetime.now()
+        ts = datetime.now(timezone.utc)
         patch: dict = {"state": end_state, "ended_at": ts, "hangup_reason": hangup_reason}
         if row.answered_at:
             patch["talk_duration_ms"] = int((ts - row.answered_at).total_seconds() * 1000)

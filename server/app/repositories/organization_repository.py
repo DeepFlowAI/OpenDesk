@@ -134,6 +134,27 @@ class OrganizationRepository:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def list_by_ids(db: AsyncSession, tenant_id: int, org_ids: list[int]) -> list[Organization]:
+        ids = sorted({org_id for org_id in org_ids if org_id is not None})
+        if not ids:
+            return []
+        result = await db.execute(
+            select(Organization).where(
+                Organization.tenant_id == tenant_id,
+                Organization.id.in_(ids),
+            )
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_name_id_map(db: AsyncSession, tenant_id: int) -> dict[str, int]:
+        """Map exact organization names to ids for import matching."""
+        result = await db.execute(
+            select(Organization.id, Organization.name).where(Organization.tenant_id == tenant_id)
+        )
+        return {name.strip(): org_id for org_id, name in result.all() if name and name.strip()}
+
+    @staticmethod
     def generate_public_id() -> str:
         suffix = "".join(
             secrets.choice(ORGANIZATION_PUBLIC_ID_ALPHABET)

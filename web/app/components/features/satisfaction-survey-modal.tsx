@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useMemo, useState, type CSSProperties } from 'react'
 import { IconLoader2, IconStar, IconX } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import type {
@@ -26,6 +26,7 @@ type Props = {
   submitting?: boolean
   success?: boolean
   error?: string | null
+  sendButtonBgColor?: string | null
   onSubmit: (payload: SatisfactionSubmissionPayload) => Promise<void> | void
   onClose: () => void
 }
@@ -342,6 +343,7 @@ export function SatisfactionSurveyModal({
   submitting,
   success,
   error,
+  sendButtonBgColor,
   onSubmit,
   onClose,
 }: Props) {
@@ -353,6 +355,9 @@ export function SatisfactionSurveyModal({
   const modalTitle = locale === 'zh' ? '满意度评价' : 'Rate your experience'
   const submitText = locale === 'zh' ? '提交评价' : 'Submit'
   const laterText = locale === 'zh' ? '稍后评价' : 'Maybe later'
+  const sendButtonStyle = {
+    '--opendesk-send-button-bg': sendButtonBgColor || 'var(--color-primary)',
+  } as CSSProperties
 
   const sections = useMemo(
     () =>
@@ -445,7 +450,8 @@ export function SatisfactionSurveyModal({
               type="button"
               onClick={() => void handleSubmit()}
               disabled={submitting}
-              className="flex h-9 flex-1 items-center justify-center gap-1 rounded-lg bg-primary text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60"
+              className="flex h-9 flex-1 items-center justify-center gap-1 rounded-lg bg-[var(--opendesk-send-button-bg)] text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              style={sendButtonStyle}
             >
               {submitting && <IconLoader2 size={15} className="animate-spin" />}
               {submitText}

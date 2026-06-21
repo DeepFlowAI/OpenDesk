@@ -1,7 +1,7 @@
 """
 AudioAsset repository
 """
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,5 +46,5 @@ class AudioAssetRepository:
 
     @staticmethod
     async def soft_delete(db: AsyncSession, row: AudioAsset) -> None:
-        row.deleted_at = datetime.utcnow()
+        row.deleted_at = datetime.now(timezone.utc)
         await db.commit()

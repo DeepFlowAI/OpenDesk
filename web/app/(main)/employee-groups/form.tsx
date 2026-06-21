@@ -23,8 +23,13 @@ import { Checkbox } from '@/components/ui/checkbox'
 
 type MemberEntry = {
   employee_id: number
+  name: string | null
   username: string
   display_name: string | null
+}
+
+function memberDisplayName(member: Pick<MemberEntry, 'name' | 'display_name' | 'username'>) {
+  return member.name || member.display_name || member.username
 }
 
 function AddMemberModal({
@@ -65,6 +70,7 @@ function AddMemberModal({
   const handleConfirm = () => {
     const members: MemberEntry[] = Array.from(selected.values()).map((u) => ({
       employee_id: u.id,
+      name: u.name ?? null,
       username: u.username,
       display_name: u.display_name,
     }))
@@ -128,7 +134,11 @@ function AddMemberModal({
                       />
                     </div>
                     <div className="min-w-0 flex-1 truncate text-sm">
-                      {user.display_name || user.username}
+                      {memberDisplayName({
+                        name: user.name ?? null,
+                        display_name: user.display_name,
+                        username: user.username,
+                      })}
                       {inGroup && (
                         <span className="ml-2 text-xs text-muted-foreground">
                           ({t('eg.addMember.inGroup', locale)})
@@ -177,6 +187,7 @@ export default function EmployeeGroupForm({ initialData, onSubmit, saving, queue
   const [members, setMembers] = useState<MemberEntry[]>(
     initialData?.members?.map((m: EmployeeGroupMember) => ({
       employee_id: m.employee_id,
+      name: m.name ?? null,
       username: m.username,
       display_name: m.display_name,
     })) ?? []
@@ -307,7 +318,7 @@ export default function EmployeeGroupForm({ initialData, onSubmit, saving, queue
                   className="flex h-10 items-center gap-4 border-t px-4"
                 >
                   <div className="min-w-0 flex-1 truncate text-sm">
-                    {m.display_name || m.username}
+                    {memberDisplayName(m)}
                   </div>
                   <div className="w-[160px] shrink-0 truncate text-sm text-muted-foreground">{m.username}</div>
                   <div className="w-[60px] shrink-0">

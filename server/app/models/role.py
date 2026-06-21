@@ -48,7 +48,7 @@ class EmployeeRole(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     employee_id: Mapped[int] = mapped_column(Integer, ForeignKey("employees.id", ondelete="CASCADE"), nullable=False)
     role_id: Mapped[int] = mapped_column(Integer, ForeignKey("roles.id", ondelete="CASCADE"), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     employee: Mapped["Employee"] = relationship("Employee", back_populates="role_links")
     role: Mapped["Role"] = relationship("Role", back_populates="employee_links", lazy="selectin")

@@ -58,9 +58,7 @@ type Props = {
 
 const INSTANT_SAVE_FIELD_TYPES = new Set<FieldType>([
   FieldType.SINGLE_SELECT,
-  FieldType.MULTI_SELECT,
   FieldType.SINGLE_SELECT_TREE,
-  FieldType.MULTI_SELECT_TREE,
   FieldType.FILE,
 ])
 

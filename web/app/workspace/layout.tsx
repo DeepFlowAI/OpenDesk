@@ -6,6 +6,7 @@ import { useRouter, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import {
   IconAddressBook,
+  IconBook2,
   IconHeadset,
   IconHistory,
   IconMessageCircle,
@@ -25,7 +26,9 @@ import {
   patchConversationListCache,
 } from '@/service/use-conversations'
 import { GlobalCallBar } from '@/app/components/features/call-center/global-call-bar'
+import { NetworkMonitor } from '@/app/components/features/network-monitor'
 import { UserDropdown } from '@/app/components/features/user-dropdown'
+import { KnowledgeFloatingDrawer } from '@/app/components/features/knowledge/knowledge-floating-drawer'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import {
@@ -40,6 +43,9 @@ import {
   hasPermission,
 } from '@/utils/permissions'
 import type { Conversation, Message } from '@/models/conversation'
+import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
+import { logAuthEvent } from '@/utils/auth-log'
+import { useWorkspaceNotificationAlert } from '@/hooks/use-workspace-notification-alert'
 
 type NavItem = {
   labelKey: string
@@ -54,11 +60,12 @@ const WORKSPACE_NAV_ICONS: Record<WorkspaceNavIconKey, ComponentType<{ size?: nu
   call: IconPhone,
   records: IconHistory,
   contacts: IconAddressBook,
+  knowledge: IconBook2,
 }
 
 function buildMessagePreview(msg: Message): string {
   if (msg.content_type === 'text' || msg.content_type === 'system') return msg.content
-  if (msg.content_type === 'welcome') {
+  if (isWelcomeLikeContentType(msg.content_type)) {
     return msg.content
       .replace(/<[^>]*>/g, ' ')
       .replace(/&nbsp;/g, ' ')
@@ -90,10 +97,14 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   const [mounted, setMounted] = useState(false)
   const { isRefreshing: authRefreshing } = useRefreshCurrentUser(mounted)
   const isChatPage = pathname.startsWith('/workspace/chat')
+  const showKnowledgeFloatingDrawer =
+    hasPermission(user, 'knowledge.workspace.view') &&
+    !pathname.startsWith('/workspace/chat') &&
+    !pathname.startsWith('/workspace/knowledge')
   const canUseChat = hasPermission(user, 'chat.workspace.use')
   const syncChatNotifications = mounted && !authRefreshing && Boolean(token) && canUseChat && !isChatPage
   const { data: convData } = useConversations({ enabled: syncChatNotifications })
-  const { socket, connected, connecting, connect } = useSocketStore()
+  const { socket, connected, connecting, authFailed, connect } = useSocketStore()
   const {
     conversations,
     setConversations,
@@ -102,6 +113,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     removeConversation,
     addMessage,
   } = useChatStore()
+  const { playSessionAlert } = useWorkspaceNotificationAlert()
   const totalUnreadCount = useMemo(
     () => conversations.reduce((sum, conv) => sum + Math.max(0, conv.unread_count || 0), 0),
     [conversations],
@@ -130,10 +142,18 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   }, [authRefreshing, mounted, token, user, pathname, router])
 
   useEffect(() => {
-    if (syncChatNotifications && token && !connected && !connecting) {
+    if (authFailed) {
+      void logAuthEvent('session_cleared', { trigger: 'socket_auth_failed' }, { immediate: true }).then(() => {
+        useAuthStore.getState().clearAuth()
+      })
+    }
+  }, [authFailed])
+
+  useEffect(() => {
+    if (syncChatNotifications && token && !connected && !connecting && !authFailed) {
       connect(token)
     }
-  }, [syncChatNotifications, token, connected, connecting, connect])
+  }, [syncChatNotifications, token, connected, connecting, authFailed, connect])
 
   useEffect(() => {
     if (syncChatNotifications && convData?.items) {
@@ -146,9 +166,10 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        const sock = useSocketStore.getState().socket
-        if (sock && !sock.connected) {
-          sock.connect()
+        const state = useSocketStore.getState()
+        if (state.authFailed) return
+        if (state.socket && !state.socket.connected) {
+          state.socket.connect()
         }
         queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
       }
@@ -175,6 +196,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     if (!syncChatNotifications || !socket) return
 
     const handleNewConversation = (data: { conversation_id: number; visitor: Conversation['visitor'] }) => {
+      playSessionAlert()
       const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001/api/'
       fetch(`${apiBase}v1/conversations/${data.conversation_id}`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -230,16 +252,47 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
       patchConversationListCache(queryClient, data.conversation_id, updates)
     }
 
+    const handleConversationTransferred = (data: {
+      conversation_id: number
+      from_agent_id: number | null
+      to_agent_id: number
+      conversation?: Conversation
+    }) => {
+      const me = useAuthStore.getState().user?.id
+      if (data.from_agent_id != null && data.from_agent_id === me) {
+        removeConversation(data.conversation_id)
+      }
+      if (data.to_agent_id === me) {
+        playSessionAlert()
+        if (data.conversation) {
+          addConversation(data.conversation)
+        } else {
+          const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001/api/'
+          fetch(`${apiBase}v1/conversations/${data.conversation_id}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          })
+            .then((r) => r.json())
+            .then((conv: Conversation) => addConversation(conv))
+            .catch(() => {
+              queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+            })
+        }
+        queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+      }
+    }
+
     socket.on('new_conversation', handleNewConversation)
     socket.on('new_message', handleNewMessage)
     socket.on('conversation_ended', handleConversationEnded)
     socket.on('conversation_updated', handleConversationUpdated)
+    socket.on('conversation_transferred', handleConversationTransferred)
 
     return () => {
       socket.off('new_conversation', handleNewConversation)
       socket.off('new_message', handleNewMessage)
       socket.off('conversation_ended', handleConversationEnded)
       socket.off('conversation_updated', handleConversationUpdated)
+      socket.off('conversation_transferred', handleConversationTransferred)
     }
   }, [
     syncChatNotifications,
@@ -249,6 +302,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     addMessage,
     updateConversation,
     removeConversation,
+    playSessionAlert,
     queryClient,
   ])
 
@@ -328,13 +382,17 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
             <div className="absolute left-1/2 top-1/2 flex min-w-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
               <GlobalCallBar hidden={pathname.startsWith('/workspace/call')} />
             </div>
-            <UserDropdown />
+            <div className="flex items-center gap-2">
+              <NetworkMonitor />
+              <UserDropdown />
+            </div>
           </header>
 
           {/* Content Area */}
           <main className="flex-1 overflow-y-auto bg-surface">
             {children}
           </main>
+          {showKnowledgeFloatingDrawer && <KnowledgeFloatingDrawer />}
         </div>
       </div>
     </CallCenterProvider>

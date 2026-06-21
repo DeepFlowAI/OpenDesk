@@ -49,6 +49,10 @@ def _candidate(
     )
 
 
+def _rule(strategy: str) -> SimpleNamespace:
+    return SimpleNamespace(id=1, target_strategy=strategy)
+
+
 @pytest.mark.asyncio
 async def test_rule_matches_channel_eq_web_sdk():
     ch = _channel(3, access_mode="url")
@@ -154,7 +158,7 @@ async def test_rule_matches_combined_and_semantics():
 
 @pytest.mark.asyncio
 async def test_sequential_overflow_requires_immediate_available_candidate(monkeypatch):
-    rule = SimpleNamespace(target_strategy="sequential_overflow")
+    rule = _rule("sequential_overflow")
 
     async def fake_resolve(*args, **kwargs):
         return [
@@ -164,15 +168,54 @@ async def test_sequential_overflow_requires_immediate_available_candidate(monkey
 
     monkeypatch.setattr(RoutingService, "_resolve_candidates_for_rule", fake_resolve)
 
-    selected = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
+    selected, block_reason = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
 
     assert selected is not None
     assert selected.queue_id == 2
+    assert block_reason is None
+
+
+@pytest.mark.asyncio
+async def test_sequential_overflow_falls_back_to_last_enqueueable_candidate(monkeypatch):
+    rule = _rule("sequential_overflow")
+
+    async def fake_resolve(*args, **kwargs):
+        return [
+            _candidate(1, waiting=0, tail=0, available=False, gate=False, order=0),
+            _candidate(2, waiting=2, tail=20, available=False, order=1),
+            _candidate(3, waiting=0, tail=0, available=False, order=2),
+        ]
+
+    monkeypatch.setattr(RoutingService, "_resolve_candidates_for_rule", fake_resolve)
+
+    selected, block_reason = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
+
+    assert selected is not None
+    assert selected.queue_id == 3
+    assert block_reason is None
+
+
+@pytest.mark.asyncio
+async def test_sequential_overflow_returns_none_when_no_candidate_can_enqueue(monkeypatch):
+    rule = _rule("sequential_overflow")
+
+    async def fake_resolve(*args, **kwargs):
+        return [
+            _candidate(1, waiting=0, tail=0, available=False, gate=False, order=0),
+            _candidate(2, waiting=2, tail=20, available=False, gate=False, order=1),
+        ]
+
+    monkeypatch.setattr(RoutingService, "_resolve_candidates_for_rule", fake_resolve)
+
+    selected, block_reason = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
+
+    assert selected is None
+    assert block_reason == "queue_limit"
 
 
 @pytest.mark.asyncio
 async def test_least_waiting_strategy_uses_tail_time_as_tiebreaker(monkeypatch):
-    rule = SimpleNamespace(target_strategy="least_waiting_count")
+    rule = _rule("least_waiting_count")
 
     async def fake_resolve(*args, **kwargs):
         return [
@@ -183,15 +226,16 @@ async def test_least_waiting_strategy_uses_tail_time_as_tiebreaker(monkeypatch):
 
     monkeypatch.setattr(RoutingService, "_resolve_candidates_for_rule", fake_resolve)
 
-    selected = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
+    selected, block_reason = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
 
     assert selected is not None
     assert selected.queue_id == 3
+    assert block_reason is None
 
 
 @pytest.mark.asyncio
 async def test_shortest_tail_wait_strategy_uses_waiting_count_as_tiebreaker(monkeypatch):
-    rule = SimpleNamespace(target_strategy="shortest_tail_wait")
+    rule = _rule("shortest_tail_wait")
 
     async def fake_resolve(*args, **kwargs):
         return [
@@ -202,7 +246,8 @@ async def test_shortest_tail_wait_strategy_uses_waiting_count_as_tiebreaker(monk
 
     monkeypatch.setattr(RoutingService, "_resolve_candidates_for_rule", fake_resolve)
 
-    selected = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
+    selected, block_reason = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
 
     assert selected is not None
     assert selected.queue_id == 2
+    assert block_reason is None

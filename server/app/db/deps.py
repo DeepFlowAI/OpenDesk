@@ -49,6 +49,28 @@ async def get_current_user(authorization: str | None = Header(None)) -> dict:
     return payload
 
 
+async def get_optional_current_user(authorization: str | None = Header(None)) -> dict | None:
+    """Best-effort JWT decode for optional auth (e.g. client telemetry)."""
+    from app.core.security import decode_access_token
+
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    payload = decode_access_token(authorization[7:])
+    if not payload:
+        return None
+    if "sub" in payload and "user_id" not in payload:
+        try:
+            payload["user_id"] = int(payload["sub"])
+        except (ValueError, TypeError):
+            return None
+    if "tenant_id" in payload:
+        try:
+            payload["tenant_id"] = int(payload["tenant_id"])
+        except (ValueError, TypeError):
+            return None
+    return payload
+
+
 async def get_current_principal(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),

@@ -2,6 +2,7 @@
 Session record service — business logic for historical session queries
 """
 from datetime import datetime
+from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +19,15 @@ from app.services.satisfaction_survey_record_service import SatisfactionSurveyRe
 
 
 class SessionRecordService:
+    _BOT_HANDOFF_STATUS_MAP = {
+        "pending": "waiting_confirmation",
+        "requested": "handoff_in_progress",
+        "queued": "in_queue",
+        "success": "succeeded",
+        "failed": "failed",
+        "dismissed": "dismissed",
+    }
+
     @staticmethod
     def _bot_sender_name(conversation, metadata: dict) -> str:
         return (
@@ -26,6 +36,27 @@ class SessionRecordService:
             or getattr(conversation, "open_agent_agent_name", None)
             or "智能助手"
         )
+
+    @staticmethod
+    def _session_type(conversation) -> str | None:
+        if (
+            getattr(conversation, "open_agent_agent_id", None)
+            or getattr(conversation, "open_agent_conversation_id", None)
+            or getattr(conversation, "open_agent_conversation_external_id", None)
+        ):
+            if getattr(conversation, "open_agent_handoff_state", None) == "success":
+                return "bot_human"
+            return "bot"
+        return "human"
+
+    @staticmethod
+    def _bot_handoff_status(conversation, session_type: str | None) -> str | None:
+        if session_type not in {"bot", "bot_human"}:
+            return None
+        state = getattr(conversation, "open_agent_handoff_state", None)
+        if state is None:
+            return "not_triggered"
+        return SessionRecordService._BOT_HANDOFF_STATUS_MAP.get(state)
 
     @staticmethod
     async def get_paginated(
@@ -44,6 +75,7 @@ class SessionRecordService:
         service_labels: list[str] | None = None,
         product_rating_options: list[str] | None = None,
         product_labels: list[str] | None = None,
+        session_type: Literal["human", "bot", "bot_human"] | None = None,
         principal: EffectivePrincipal | None = None,
     ) -> dict:
         peer_ids: list[int] = []
@@ -76,6 +108,7 @@ class SessionRecordService:
             service_labels=service_labels,
             product_rating_options=product_rating_options,
             product_labels=product_labels,
+            session_type=session_type,
             scope_predicate=scope_predicate,
         )
         satisfaction_by_conversation = await SatisfactionSurveyRecordRepository.get_by_conversation_ids(
@@ -123,10 +156,13 @@ class SessionRecordService:
         queue_summary: dict | None = None,
     ) -> dict:
         queue_summary = _effective_queue_summary(conversation, queue_summary)
+        session_type = SessionRecordService._session_type(conversation)
         return {
             "id": conversation.id,
             "public_id": conversation.public_id,
             "share_code": conversation.share_code,
+            "session_type": session_type,
+            "bot_handoff_status": SessionRecordService._bot_handoff_status(conversation, session_type),
             "visitor": conversation.visitor,
             "agent": conversation.agent,
             "channel": conversation.channel,

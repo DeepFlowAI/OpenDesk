@@ -153,8 +153,11 @@ class EmployeeQueryRepository:
         )
         if keyword:
             base_query = base_query.where(
-                Employee.display_name.ilike(f"%{keyword}%")
-                | Employee.username.ilike(f"%{keyword}%")
+                or_(
+                    Employee.name.ilike(f"%{keyword}%"),
+                    Employee.display_name.ilike(f"%{keyword}%"),
+                    Employee.username.ilike(f"%{keyword}%"),
+                )
             )
 
         count_query = select(func.count()).select_from(base_query.subquery())

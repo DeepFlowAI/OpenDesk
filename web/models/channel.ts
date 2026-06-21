@@ -1,5 +1,56 @@
 import type { WelcomeMessagePublic } from '@/models/welcome-message-rule'
 
+export type OpenAgentWelcomeMessageBlock =
+  | {
+      type: 'markdown'
+      content: string
+      embed_code?: null
+      height?: null
+    }
+  | {
+      type: 'embed'
+      content?: null
+      embed_code: string
+      height: number
+    }
+
+export type OpenAgentFAQQuestion = {
+  text: string
+}
+
+export type OpenAgentFAQCategory = {
+  name: string
+  questions: OpenAgentFAQQuestion[]
+}
+
+export type OpenAgentFAQ = {
+  enabled: boolean
+  title: string
+  categories: OpenAgentFAQCategory[]
+}
+
+export type OpenAgentWelcomeMessage = {
+  enabled: boolean
+  blocks: OpenAgentWelcomeMessageBlock[]
+  faq?: OpenAgentFAQ | null
+}
+
+export type AssistPanelConfigValue =
+  | string
+  | number
+  | boolean
+  | null
+  | AssistPanelConfigValue[]
+  | { [key: string]: AssistPanelConfigValue }
+
+export type ChannelCustomButton = {
+  label: string
+  action_type: 'send_message' | 'link'
+  message: string | null
+  url: string | null
+  enabled: boolean
+}
+
 export type ChannelConfig = {
   title: string | null
   document_title: string | null
@@ -23,25 +74,47 @@ export type ChannelConfig = {
   input_placeholder: string | null
   service_hours_enabled: boolean
   service_hours_id: number | null
+  outside_service_hours_strategy: 'offline_message' | 'leave_message'
   offline_title: string
   offline_message: string
+  leave_message_prompt: string
+  queue_message: string
+  queue_full_message: string
+  queue_full_show_leave_message_button: boolean
+  queue_full_leave_message_button_label: string
   open_agent_enabled: boolean
   open_agent_agent_id: number | null
   open_agent_agent_name: string | null
   open_agent_bot_strategy: 'always' | 'service_hours'
   open_agent_bot_service_hours_id: number | null
+  open_agent_avatar_url: string | null
   open_agent_input_placeholder: string | null
   open_agent_handoff_enabled: boolean
   open_agent_handoff_label: string
   open_agent_handoff_after_messages: number
   open_agent_handoff_behavior: 'confirm' | 'auto'
+  open_agent_custom_buttons_enabled: boolean
+  open_agent_custom_buttons: ChannelCustomButton[]
+  human_custom_buttons_enabled: boolean
+  human_custom_buttons: ChannelCustomButton[]
+  assist_panel_enabled: boolean
+  assist_panel_title: string | null
+  assist_panel_react_code: string | null
+  assist_panel_config: Record<string, AssistPanelConfigValue>
 }
 
 export type ChannelAvailability = {
   can_start_conversation: boolean
-  reason: 'available' | 'outside_service_hours' | 'no_available_agent'
+  reason: 'available' | 'outside_service_hours' | 'no_available_agent' | 'queue_full'
   offline_title: string
   offline_message: string
+  outside_service_hours_strategy: 'offline_message' | 'leave_message'
+  leave_message_prompt: string
+  queue_message: string
+  queue_full_message: string
+  queue_full_show_leave_message_button: boolean
+  queue_full_leave_message_button_label: string
+  current_queue_count: number | null
   checked_at: string | null
 }
 
@@ -68,6 +141,7 @@ export type ChannelPublic = Pick<
   availability: ChannelAvailability | null
   has_conversation_history: boolean
   welcome_message: WelcomeMessagePublic | null
+  open_agent_welcome_message: OpenAgentWelcomeMessage | null
 }
 
 export type CreateChannelPayload = {

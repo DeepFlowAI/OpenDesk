@@ -7,11 +7,21 @@ from app.core.exceptions import UnauthorizedError, NotFoundError
 from app.core.security import verify_password, create_access_token
 from app.repositories.tenant_repository import TenantRepository
 from app.repositories.employee_repository import EmployeeRepository
-from app.schemas.auth import LoginRequest, LoginResponse, UserInfo
+from app.schemas.auth import LoginRequest, LoginResponse, UserInfo, UserPreferencesUpdate
 from app.services.permission_service import PermissionService
 
 
 class AuthService:
+    @staticmethod
+    def _merge_preferences(current: dict, patch: dict) -> dict:
+        merged = {**current}
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = AuthService._merge_preferences(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
     @staticmethod
     def _build_user_info(user, principal) -> UserInfo:
         user_info = UserInfo.model_validate(user)
@@ -59,10 +69,41 @@ class AuthService:
         )
 
     @staticmethod
+    async def refresh_token(db: AsyncSession, user_payload: dict) -> str:
+        """Issue a fresh access token for an already-authenticated user."""
+        user_id = user_payload.get("user_id") or user_payload.get("sub")
+        tenant_id = user_payload.get("tenant_id")
+        user = await EmployeeRepository.get_by_id(db, int(user_id))
+        if not user or user.tenant_id != int(tenant_id) or not user.is_active:
+            raise UnauthorizedError("Invalid or disabled account")
+        token_data = {
+            "sub": str(user.id),
+            "tenant_id": user.tenant_id,
+            "roles": user.roles,
+        }
+        return create_access_token(token_data)
+
+    @staticmethod
     async def get_current_user_info(db: AsyncSession, user_payload: dict) -> UserInfo:
         """Return fresh user profile and effective permissions for the current token."""
         principal = await PermissionService.get_current_principal(db, user_payload)
         user = await EmployeeRepository.get_by_id(db, principal.user_id)
         if not user or user.tenant_id != principal.tenant_id or not user.is_active:
             raise UnauthorizedError("Invalid or disabled account")
+        return AuthService._build_user_info(user, principal)
+
+    @staticmethod
+    async def update_current_user_preferences(
+        db: AsyncSession,
+        user_payload: dict,
+        body: UserPreferencesUpdate,
+    ) -> UserInfo:
+        """Merge account-scoped UI preferences for the current employee."""
+        principal = await PermissionService.get_current_principal(db, user_payload)
+        user = await EmployeeRepository.get_by_id(db, principal.user_id)
+        if not user or user.tenant_id != principal.tenant_id or not user.is_active:
+            raise UnauthorizedError("Invalid or disabled account")
+
+        preferences = AuthService._merge_preferences(user.preferences or {}, body.preferences)
+        user = await EmployeeRepository.update(db, user, {"preferences": preferences})
         return AuthService._build_user_info(user, principal)

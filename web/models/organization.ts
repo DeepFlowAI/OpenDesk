@@ -47,6 +47,18 @@ export type OrganizationQueryPayload = {
   per_page?: number
 }
 
+export type OrganizationExportColumn = {
+  field_key?: string | null
+  field_id?: number | null
+  name: string
+  field_type?: string | null
+}
+
+export type OrganizationExportPayload = Omit<OrganizationQueryPayload, 'page' | 'per_page'> & {
+  locale?: string
+  columns?: OrganizationExportColumn[]
+}
+
 export type OrgViewCountItem = {
   view_id: number
   count: number

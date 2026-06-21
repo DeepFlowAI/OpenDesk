@@ -1,5 +1,9 @@
+import logging
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
 
 
 class BusinessError(Exception):
@@ -52,6 +56,18 @@ class InvalidCodeError(BusinessError):
 
 
 def register_exception_handlers(app: FastAPI) -> None:
+    @app.exception_handler(UnauthorizedError)
+    async def unauthorized_error_handler(request: Request, exc: UnauthorizedError):
+        client_host = request.client.host if request.client else "-"
+        logger.warning(
+            "Unauthorized request: path=%s reason=%s client=%s",
+            request.url.path,
+            exc.message,
+            client_host,
+        )
+        body = {"code": exc.code, "message": exc.message, "status": exc.status_code}
+        return JSONResponse(status_code=exc.status_code, content=body)
+
     @app.exception_handler(BusinessError)
     async def business_error_handler(request: Request, exc: BusinessError):
         body = {"code": exc.code, "message": exc.message, "status": exc.status_code}

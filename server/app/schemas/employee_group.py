@@ -12,6 +12,7 @@ class EmployeeGroupMemberInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     employee_id: int
+    name: str = ""
     username: str
     display_name: str | None = None
 
@@ -96,6 +97,7 @@ class EmployeeSelectListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    name: str = ""
     username: str
     display_name: str | None = None
 

@@ -1,7 +1,7 @@
 """
 VoiceFlow repository
 """
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -85,7 +85,7 @@ class VoiceFlowRepository:
 
     @staticmethod
     async def soft_delete(db: AsyncSession, row: VoiceFlow) -> None:
-        row.deleted_at = datetime.utcnow()
+        row.deleted_at = datetime.now(timezone.utc)
         await db.commit()
 
     @staticmethod

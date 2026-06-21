@@ -10,7 +10,7 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.configs.settings import settings
-from app.core.exceptions import NotFoundError, UnauthorizedError, ValidationError
+from app.core.exceptions import ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
 from app.core.security import (
     create_visitor_identity_secret,
     create_visitor_session_token,
@@ -23,10 +23,20 @@ from app.repositories.service_hours_repository import ServiceHoursRepository
 from app.repositories.user_repository import UserRepository
 from app.models.service_hours import ServiceHours
 from app.schemas.channel import ChannelCreate, ChannelUpdate
-from app.schemas.channel import ChannelConfig, DEFAULT_OFFLINE_MESSAGE, DEFAULT_OFFLINE_TITLE
+from app.schemas.channel import (
+    ChannelConfig,
+    DEFAULT_LEAVE_MESSAGE_PROMPT,
+    DEFAULT_OFFLINE_MESSAGE,
+    DEFAULT_OFFLINE_TITLE,
+    DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY,
+    DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL,
+    DEFAULT_QUEUE_FULL_MESSAGE,
+    DEFAULT_QUEUE_MESSAGE,
+)
 from app.schemas.visitor_session import VisitorSessionRequest
 from app.services.agent_status_service import AgentStatusService
 from app.services.open_agent_settings_service import OpenAgentSettingsService
+from app.services.web_sdk_context_service import WebSdkContextService
 
 CHANNEL_KEY_RE = re.compile(r"^ch_[A-Za-z0-9_-]{24,}$")
 VISITOR_EXTERNAL_ID_PREFIX = "v_"
@@ -99,20 +109,69 @@ class ChannelService:
         return False
 
     @staticmethod
+    def _availability_payload(
+        config: ChannelConfig,
+        *,
+        can_start_conversation: bool,
+        reason: str,
+        checked_at: datetime,
+    ) -> dict:
+        return {
+            "can_start_conversation": can_start_conversation,
+            "reason": reason,
+            "offline_title": config.offline_title or DEFAULT_OFFLINE_TITLE,
+            "offline_message": config.offline_message or DEFAULT_OFFLINE_MESSAGE,
+            "outside_service_hours_strategy": (
+                config.outside_service_hours_strategy or DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY
+            ),
+            "leave_message_prompt": config.leave_message_prompt or DEFAULT_LEAVE_MESSAGE_PROMPT,
+            "queue_message": config.queue_message or DEFAULT_QUEUE_MESSAGE,
+            "queue_full_message": config.queue_full_message or DEFAULT_QUEUE_FULL_MESSAGE,
+            "queue_full_show_leave_message_button": config.queue_full_show_leave_message_button,
+            "queue_full_leave_message_button_label": (
+                config.queue_full_leave_message_button_label
+                or DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL
+            ),
+            "checked_at": checked_at,
+        }
+
+    @staticmethod
     async def _normalize_config(
         db: AsyncSession,
         tenant_id: int,
         config: ChannelConfig,
     ) -> dict:
         payload = config.model_dump()
+        payload["outside_service_hours_strategy"] = (
+            payload.get("outside_service_hours_strategy") or DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY
+        )
         payload["offline_title"] = (payload.get("offline_title") or DEFAULT_OFFLINE_TITLE).strip()
         payload["offline_message"] = payload.get("offline_message") or DEFAULT_OFFLINE_MESSAGE
+        payload["leave_message_prompt"] = payload.get("leave_message_prompt") or DEFAULT_LEAVE_MESSAGE_PROMPT
+        payload["queue_message"] = payload.get("queue_message") or DEFAULT_QUEUE_MESSAGE
+        payload["queue_full_message"] = payload.get("queue_full_message") or DEFAULT_QUEUE_FULL_MESSAGE
+        payload["queue_full_show_leave_message_button"] = bool(
+            payload.get("queue_full_show_leave_message_button", True)
+        )
+        payload["queue_full_leave_message_button_label"] = (
+            payload.get("queue_full_leave_message_button_label")
+            or DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL
+        ).strip()
         payload["open_agent_input_placeholder"] = (
             payload.get("open_agent_input_placeholder") or None
         )
+        payload["open_agent_avatar_url"] = payload.get("open_agent_avatar_url") or None
         payload["open_agent_handoff_label"] = (
             payload.get("open_agent_handoff_label") or "转人工"
         ).strip()
+        payload["open_agent_custom_buttons_enabled"] = bool(
+            payload.get("open_agent_custom_buttons_enabled", False)
+        )
+        payload["open_agent_custom_buttons"] = list(payload.get("open_agent_custom_buttons") or [])
+        payload["human_custom_buttons_enabled"] = bool(
+            payload.get("human_custom_buttons_enabled", False)
+        )
+        payload["human_custom_buttons"] = list(payload.get("human_custom_buttons") or [])
 
         if not payload.get("service_hours_enabled"):
             payload["service_hours_enabled"] = False
@@ -236,6 +295,20 @@ class ChannelService:
         return item
 
     @staticmethod
+    async def _get_open_agent_welcome_message(
+        db: AsyncSession,
+        item,
+        config: dict,
+    ):
+        if not config.get("open_agent_enabled") or not config.get("open_agent_agent_id"):
+            return None
+        return await OpenAgentSettingsService.get_agent_welcome_message(
+            db,
+            item.tenant_id,
+            int(config["open_agent_agent_id"]),
+        )
+
+    @staticmethod
     async def check_channel_availability(
         db: AsyncSession,
         r: aioredis.Redis,
@@ -260,50 +333,44 @@ class ChannelService:
         config: ChannelConfig,
     ) -> dict:
         """Check whether the OpenAgent bot can receive the visitor first."""
-        offline_title = config.offline_title or DEFAULT_OFFLINE_TITLE
-        offline_message = config.offline_message or DEFAULT_OFFLINE_MESSAGE
         checked_at = datetime.now(timezone.utc)
 
         credentials = await OpenAgentSettingsService.get_credentials(db, item.tenant_id)
         if not credentials or not credentials[1] or not config.open_agent_agent_id:
-            return {
-                "can_start_conversation": False,
-                "reason": "no_available_agent",
-                "offline_title": offline_title,
-                "offline_message": offline_message,
-                "checked_at": checked_at,
-            }
+            return ChannelService._availability_payload(
+                config,
+                can_start_conversation=False,
+                reason="no_available_agent",
+                checked_at=checked_at,
+            )
 
         if config.open_agent_bot_strategy == "service_hours":
             if not config.open_agent_bot_service_hours_id:
-                return {
-                    "can_start_conversation": False,
-                    "reason": "outside_service_hours",
-                    "offline_title": offline_title,
-                    "offline_message": offline_message,
-                    "checked_at": checked_at,
-                }
+                return ChannelService._availability_payload(
+                    config,
+                    can_start_conversation=False,
+                    reason="outside_service_hours",
+                    checked_at=checked_at,
+                )
             service_hours = await ServiceHoursRepository.get_by_id(db, config.open_agent_bot_service_hours_id)
             if (
                 not service_hours
                 or service_hours.tenant_id != item.tenant_id
                 or not ChannelService.is_within_service_hours(service_hours, checked_at)
             ):
-                return {
-                    "can_start_conversation": False,
-                    "reason": "outside_service_hours",
-                    "offline_title": offline_title,
-                    "offline_message": offline_message,
-                    "checked_at": checked_at,
-                }
+                return ChannelService._availability_payload(
+                    config,
+                    can_start_conversation=False,
+                    reason="outside_service_hours",
+                    checked_at=checked_at,
+                )
 
-        return {
-            "can_start_conversation": True,
-            "reason": "available",
-            "offline_title": offline_title,
-            "offline_message": offline_message,
-            "checked_at": checked_at,
-        }
+        return ChannelService._availability_payload(
+            config,
+            can_start_conversation=True,
+            reason="available",
+            checked_at=checked_at,
+        )
 
     @staticmethod
     async def check_human_availability(
@@ -319,8 +386,6 @@ class ChannelService:
         if not gate["can_start_conversation"]:
             return gate
 
-        offline_title = gate["offline_title"]
-        offline_message = gate["offline_message"]
         checked_at = gate["checked_at"]
 
         # Lazy import to avoid circular dependency with routing_service
@@ -330,21 +395,19 @@ class ChannelService:
             db, item.tenant_id, item.id, r, visitor_id=visitor_id
         )
         if not group_member_ids:
-            return {
-                "can_start_conversation": False,
-                "reason": "no_available_agent",
-                "offline_title": offline_title,
-                "offline_message": offline_message,
-                "checked_at": checked_at,
-            }
+            return ChannelService._availability_payload(
+                config,
+                can_start_conversation=False,
+                reason="no_available_agent",
+                checked_at=checked_at,
+            )
 
-        return {
-            "can_start_conversation": True,
-            "reason": "available",
-            "offline_title": offline_title,
-            "offline_message": offline_message,
-            "checked_at": checked_at,
-        }
+        return ChannelService._availability_payload(
+            config,
+            can_start_conversation=True,
+            reason="available",
+            checked_at=checked_at,
+        )
 
     @staticmethod
     async def check_human_service_gate(
@@ -353,40 +416,35 @@ class ChannelService:
         config: ChannelConfig,
     ) -> dict:
         """Check human service-hours gate without resolving a target agent."""
-        offline_title = config.offline_title or DEFAULT_OFFLINE_TITLE
-        offline_message = config.offline_message or DEFAULT_OFFLINE_MESSAGE
         checked_at = datetime.now(timezone.utc)
 
         if config.service_hours_enabled:
             if not config.service_hours_id:
-                return {
-                    "can_start_conversation": False,
-                    "reason": "outside_service_hours",
-                    "offline_title": offline_title,
-                    "offline_message": offline_message,
-                    "checked_at": checked_at,
-                }
+                return ChannelService._availability_payload(
+                    config,
+                    can_start_conversation=False,
+                    reason="outside_service_hours",
+                    checked_at=checked_at,
+                )
             service_hours = await ServiceHoursRepository.get_by_id(db, config.service_hours_id)
             if (
                 not service_hours
                 or service_hours.tenant_id != item.tenant_id
                 or not ChannelService.is_within_service_hours(service_hours, checked_at)
             ):
-                return {
-                    "can_start_conversation": False,
-                    "reason": "outside_service_hours",
-                    "offline_title": offline_title,
-                    "offline_message": offline_message,
-                    "checked_at": checked_at,
-                }
+                return ChannelService._availability_payload(
+                    config,
+                    can_start_conversation=False,
+                    reason="outside_service_hours",
+                    checked_at=checked_at,
+                )
 
-        return {
-            "can_start_conversation": True,
-            "reason": "available",
-            "offline_title": offline_title,
-            "offline_message": offline_message,
-            "checked_at": checked_at,
-        }
+        return ChannelService._availability_payload(
+            config,
+            can_start_conversation=True,
+            reason="available",
+            checked_at=checked_at,
+        )
 
     @staticmethod
     async def _agent_can_receive(
@@ -537,8 +595,11 @@ class ChannelService:
         availability = await ChannelService.check_channel_availability(db, r, channel_id, visitor_id=visitor_id)
         from app.services.welcome_message_rule_service import WelcomeMessageRuleService
         welcome_message = None
+        open_agent_welcome_message = None
         if not config.get("open_agent_enabled"):
             welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
+        else:
+            open_agent_welcome_message = await ChannelService._get_open_agent_welcome_message(db, item, config)
         return {
             "id": item.id,
             "tenant_id": item.tenant_id,
@@ -551,6 +612,7 @@ class ChannelService:
             "availability": availability,
             "has_conversation_history": has_conversation_history,
             "welcome_message": welcome_message,
+            "open_agent_welcome_message": open_agent_welcome_message,
         }
 
     @staticmethod
@@ -580,8 +642,11 @@ class ChannelService:
         availability = await ChannelService.check_channel_availability(db, r, item.id, visitor_id=visitor_id)
         from app.services.welcome_message_rule_service import WelcomeMessageRuleService
         welcome_message = None
+        open_agent_welcome_message = None
         if not config.get("open_agent_enabled"):
             welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
+        else:
+            open_agent_welcome_message = await ChannelService._get_open_agent_welcome_message(db, item, config)
         return {
             "channel_key": item.channel_key,
             "name": item.name,
@@ -593,6 +658,7 @@ class ChannelService:
             "availability": availability,
             "has_conversation_history": has_conversation_history,
             "welcome_message": welcome_message,
+            "open_agent_welcome_message": open_agent_welcome_message,
         }
 
     @staticmethod
@@ -604,6 +670,23 @@ class ChannelService:
         """Create a short-lived signed visitor session bound to a channel key."""
         channel = await ChannelService.get_public_channel_by_key(db, channel_key)
         issued_visitor_secret = None
+        context_warnings: list[str] = []
+        context_visitor_external_id = None
+        context_visitor_name = None
+
+        if data.context_token:
+            try:
+                identity = await WebSdkContextService.resolve_visitor_identity(
+                    db,
+                    tenant_id=channel.tenant_id,
+                    channel_key=channel.channel_key,
+                    context_token=data.context_token,
+                )
+                context_visitor_external_id = identity.visitor_external_id
+                context_visitor_name = identity.visitor_name
+                context_warnings.extend(identity.warnings)
+            except (ForbiddenError, UnauthorizedError, ValidationError):
+                context_warnings.append("INVALID_CONTEXT_TOKEN")
 
         if data.visitor_external_id:
             if not data.visitor_secret:
@@ -620,7 +703,7 @@ class ChannelService:
         else:
             if data.visitor_secret:
                 raise ValidationError("visitor_external_id is required when visitor_secret is provided")
-            visitor_external_id = ChannelService.generate_visitor_external_id()
+            visitor_external_id = context_visitor_external_id or ChannelService.generate_visitor_external_id()
             issued_visitor_secret = create_visitor_identity_secret(
                 tenant_id=channel.tenant_id,
                 channel_id=channel.id,
@@ -635,8 +718,9 @@ class ChannelService:
             "channel_key_version": channel.channel_key_version,
             "visitor_external_id": visitor_external_id,
         }
-        if data.visitor_name:
-            payload["visitor_name"] = data.visitor_name
+        visitor_name = context_visitor_name or data.visitor_name
+        if visitor_name:
+            payload["visitor_name"] = visitor_name
         if data.metadata:
             payload["metadata"] = data.metadata
 
@@ -649,6 +733,7 @@ class ChannelService:
             "visitor_external_id": visitor_external_id,
             "visitor_secret": issued_visitor_secret,
             "expires_in": settings.VISITOR_SESSION_EXPIRE_SECONDS,
+            "context_warnings": context_warnings,
         }
 
     @staticmethod

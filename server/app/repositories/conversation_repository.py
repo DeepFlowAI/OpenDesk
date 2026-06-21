@@ -4,13 +4,14 @@ Conversation repository
 import secrets
 from datetime import datetime, timezone
 
-from sqlalchemy import select, func, update, and_, or_
+from sqlalchemy import select, func, update, and_, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.enums import ConversationStatus
+from app.enums import ConversationStatus, MessageContentType, MessageSenderType
 from app.models.conversation import Conversation
+from app.models.message import Message
 
 CONVERSATION_PUBLIC_ID_PREFIX = "cv_"
 CONVERSATION_PUBLIC_ID_RANDOM_BYTES = 24
@@ -110,6 +111,110 @@ class ConversationRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def has_agent_participated(
+        db: AsyncSession,
+        *,
+        tenant_id: int,
+        conversation_id: int,
+        agent_id: int,
+    ) -> bool:
+        result = await db.execute(
+            select(Message.conversation_id)
+            .where(
+                Message.tenant_id == tenant_id,
+                Message.conversation_id == conversation_id,
+                Message.sender_type == MessageSenderType.AGENT.value,
+                Message.sender_id == agent_id,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
+    async def get_recent_closed_by_agent(
+        db: AsyncSession,
+        *,
+        tenant_id: int,
+        agent_id: int,
+        ended_since: datetime,
+        before_id: int | None = None,
+        limit: int = 20,
+    ) -> list[Conversation]:
+        participated_conversation_ids = (
+            select(Message.conversation_id)
+            .where(
+                Message.tenant_id == tenant_id,
+                Message.sender_type == MessageSenderType.AGENT.value,
+                Message.sender_id == agent_id,
+            )
+            .distinct()
+        )
+        conditions = [
+            Conversation.tenant_id == tenant_id,
+            Conversation.status == ConversationStatus.CLOSED.value,
+            Conversation.ended_at.is_not(None),
+            Conversation.ended_at >= ended_since,
+            or_(
+                Conversation.agent_id == agent_id,
+                Conversation.id.in_(participated_conversation_ids),
+            ),
+        ]
+
+        if before_id is not None:
+            cursor = await db.get(Conversation, before_id)
+            if cursor and cursor.ended_at is not None:
+                conditions.append(
+                    or_(
+                        Conversation.ended_at < cursor.ended_at,
+                        and_(Conversation.ended_at == cursor.ended_at, Conversation.id < cursor.id),
+                    )
+                )
+
+        result = await db.execute(
+            select(Conversation)
+            .options(
+                selectinload(Conversation.visitor),
+                selectinload(Conversation.agent),
+                selectinload(Conversation.channel),
+                selectinload(Conversation.group),
+            )
+            .where(*conditions)
+            .order_by(Conversation.ended_at.desc(), Conversation.id.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_active_peer_conversations(
+        db: AsyncSession,
+        tenant_id: int,
+        agent_id: int,
+        scope_predicate: ColumnElement | None = None,
+    ) -> list[Conversation]:
+        """Get active conversations owned by other agents in the viewer's scope."""
+        conditions = [
+            Conversation.tenant_id == tenant_id,
+            Conversation.agent_id.is_not(None),
+            Conversation.agent_id != agent_id,
+            Conversation.status == ConversationStatus.ACTIVE.value,
+        ]
+        if scope_predicate is not None:
+            conditions.append(scope_predicate)
+
+        result = await db.execute(
+            select(Conversation)
+            .options(
+                selectinload(Conversation.visitor),
+                selectinload(Conversation.agent),
+                selectinload(Conversation.channel),
+                selectinload(Conversation.group),
+            )
+            .where(*conditions)
+            .order_by(Conversation.last_message_at.desc().nullslast())
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
     async def count_active_by_agent(db: AsyncSession, tenant_id: int, agent_id: int) -> int:
         result = await db.execute(
             select(func.count())
@@ -169,6 +274,17 @@ class ConversationRepository:
         return conversation
 
     @staticmethod
+    async def update_group(
+        db: AsyncSession,
+        conversation: Conversation,
+        group_id: int,
+    ) -> Conversation:
+        conversation.group_id = group_id
+        await db.commit()
+        await db.refresh(conversation, attribute_names=["visitor", "agent", "channel", "group"])
+        return conversation
+
+    @staticmethod
     async def update_open_agent_state(
         db: AsyncSession,
         conversation: Conversation,
@@ -189,6 +305,26 @@ class ConversationRepository:
                 setattr(conversation, key, value)
         await db.commit()
         await db.refresh(conversation, attribute_names=["visitor", "agent", "channel", "group"])
+        return conversation
+
+    @staticmethod
+    async def update_visitor_environment(
+        db: AsyncSession,
+        conversation: Conversation,
+        data: dict,
+    ) -> Conversation:
+        allowed = {"visitor_system", "visitor_browser", "visitor_ip"}
+        changed = False
+        for key, value in data.items():
+            if key not in allowed or value is None:
+                continue
+            if getattr(conversation, key) == value:
+                continue
+            setattr(conversation, key, value)
+            changed = True
+        if changed:
+            await db.commit()
+            await db.refresh(conversation, attribute_names=["visitor", "agent", "channel", "group"])
         return conversation
 
     @staticmethod
@@ -370,6 +506,7 @@ class ConversationRepository:
         current_conversation_id: int | None = None,
         before_id: int | None = None,
         agent_id: int | None = None,
+        keyword: str | None = None,
         limit: int = 10,
         scope_predicate: ColumnElement | None = None,
     ) -> list[Conversation]:
@@ -385,6 +522,20 @@ class ConversationRepository:
             conditions.append(Conversation.channel_id == channel_id)
         if agent_id is not None:
             conditions.append(Conversation.agent_id == agent_id)
+        if keyword:
+            conditions.append(
+                exists()
+                .where(
+                    Message.tenant_id == tenant_id,
+                    Message.conversation_id == Conversation.id,
+                    Message.content_type.in_([
+                        MessageContentType.TEXT.value,
+                        MessageContentType.RICH_TEXT.value,
+                        MessageContentType.INTERNAL_NOTE.value,
+                    ]),
+                    Message.content.ilike(f"%{keyword}%"),
+                )
+            )
 
         if current_conversation_id is not None:
             conditions.append(Conversation.id != current_conversation_id)

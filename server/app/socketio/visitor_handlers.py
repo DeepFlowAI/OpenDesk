@@ -19,6 +19,7 @@ from app.core.exceptions import UnauthorizedError
 from app.libs.realtime.base import BaseRealtimeTransport
 from app.services.channel_service import ChannelService
 from app.services.conversation_service import ConversationService
+from app.services.conversation_realtime_service import ConversationRealtimeService
 from app.services.open_agent_conversation_service import OpenAgentConversationService
 from app.schemas.satisfaction_survey_record import SatisfactionSubmissionPayload
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
@@ -26,10 +27,26 @@ from app.services.visitor_web_status_service import (
     VISITOR_WEB_DISCONNECT_GRACE_SECONDS,
     VisitorWebStatusService,
 )
+from app.socketio.connect_throttle import ConnectRejectionTracker, client_ip_from_environ
 
 logger = logging.getLogger(__name__)
 
 NAMESPACE = "/visitor"
+
+# Tracks rejected visitor connects per client IP so a widget stuck reconnecting
+# with an invalid session token is escalated to a single ERROR.
+_rejection_tracker = ConnectRejectionTracker()
+
+
+def _log_rejected_connect(environ: dict, reason: str) -> None:
+    ip = client_ip_from_environ(environ) or "unknown"
+    count, storm = _rejection_tracker.record(ip)
+    if storm:
+        logger.error(
+            "Socket auth reconnect storm on %s: %d rejected connects from %s "
+            "within the last minute (reason=%s)",
+            NAMESPACE, count, ip, reason,
+        )
 
 
 def _open_desk_messages_from_sse_events(events: list[bytes]) -> list[dict]:
@@ -43,6 +60,35 @@ def _open_desk_messages_from_sse_events(events: list[bytes]) -> list[dict]:
             if event == "open_desk_message_saved" and data:
                 messages.append(data)
     return messages
+
+
+def _handoff_unavailable_socket_response(result: dict) -> dict | None:
+    """Map bot handoff route failures to visitor leave-message / queue-full UX."""
+    if result.get("leave_message"):
+        availability = result.get("availability") or {}
+        return {
+            "ok": False,
+            "error": "LEAVE_MESSAGE",
+            "reason": availability.get("reason") or result.get("reason"),
+            "leave_message_prompt": availability.get("leave_message_prompt"),
+        }
+    if result.get("queue_full"):
+        availability = result.get("availability") or {}
+        return {
+            "ok": False,
+            "error": "QUEUE_FULL",
+            "reason": availability.get("reason") or result.get("reason") or "queue_full",
+            "queue_full_message": availability.get("queue_full_message"),
+            "queue_full_show_leave_message_button": availability.get(
+                "queue_full_show_leave_message_button",
+                True,
+            ),
+            "queue_full_leave_message_button_label": availability.get(
+                "queue_full_leave_message_button_label",
+            ),
+            "leave_message_prompt": availability.get("leave_message_prompt"),
+        }
+    return None
 
 
 async def _finalize_visitor_disconnect_after_grace(
@@ -87,14 +133,19 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
         """Visitor connects with a visitor session token."""
         token = (auth or {}).get("visitor_session_token")
         if not token:
+            _log_rejected_connect(environ, "missing visitor_session_token")
             raise ConnectionRefusedError("visitor_session_token required")
 
         try:
             async with AsyncSessionLocal() as db:
                 context = await ChannelService.validate_visitor_session_token(db, token)
         except UnauthorizedError:
+            _log_rejected_connect(environ, "invalid visitor session")
             raise ConnectionRefusedError("Invalid visitor session")
 
+        visitor_ip = client_ip_from_environ(environ)
+        if visitor_ip:
+            context["visitor_ip"] = visitor_ip
         await rt.save_session(sid, context, namespace=NAMESPACE)
 
         visitor_room = f"visitor:{context['tenant_id']}:{context['visitor_external_id']}"
@@ -149,6 +200,8 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             return {"error": "channel_id required"}
 
         r = redis_client.client
+        payload = data if isinstance(data, dict) else {}
+        context_token = payload.get("contextToken") or payload.get("context_token")
         async with AsyncSessionLocal() as db:
             result = await ConversationService.create_from_visitor(
                 db,
@@ -157,8 +210,24 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 channel_id=int(channel_id),
                 visitor_external_id=visitor_external_id,
                 visitor_name=session.get("visitor_name"),
-                metadata=data.get("metadata") or session.get("metadata"),
+                metadata=payload.get("metadata") or session.get("metadata"),
+                context_token=context_token if isinstance(context_token, str) else None,
+                channel_key=session.get("channel_key"),
+                visitor_system=payload.get("system") or payload.get("visitor_system"),
+                visitor_browser=payload.get("browser") or payload.get("visitor_browser"),
+                visitor_ip=session.get("visitor_ip"),
             )
+
+        if result.get("leave_message"):
+            availability = result["availability"]
+            return {
+                "ok": False,
+                "error": "LEAVE_MESSAGE",
+                "reason": availability["reason"],
+                "offline_title": availability["offline_title"],
+                "offline_message": availability["offline_message"],
+                "leave_message_prompt": availability.get("leave_message_prompt"),
+            }
 
         if result.get("offline"):
             availability = result["availability"]
@@ -168,6 +237,30 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 "reason": availability["reason"],
                 "offline_title": availability["offline_title"],
                 "offline_message": availability["offline_message"],
+            }
+
+        if result.get("queue_full"):
+            availability = result["availability"]
+            return {
+                "ok": False,
+                "error": "QUEUE_FULL",
+                "reason": availability["reason"],
+                "queue_full_message": availability.get("queue_full_message"),
+                "queue_full_show_leave_message_button": availability.get(
+                    "queue_full_show_leave_message_button",
+                    True,
+                ),
+                "queue_full_leave_message_button_label": availability.get(
+                    "queue_full_leave_message_button_label",
+                ),
+                "leave_message_prompt": availability.get("leave_message_prompt"),
+            }
+
+        if result.get("no_assignable_queue"):
+            return {
+                "ok": False,
+                "error": "NO_ASSIGNABLE_QUEUE",
+                "reason": "no_assignable_queue",
             }
 
         conv = result["conversation"]
@@ -201,10 +294,12 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             } if conv.visitor else None,
             "agent": {
                 "id": conv.agent.id,
-                "name": conv.agent.display_name or conv.agent.name,
+                "name": ConversationService.visitor_agent_display_name(conv.agent),
                 "avatar": conv.agent.avatar,
             } if conv.agent else None,
         }
+        if conv.status == "queued":
+            conv_payload["queue_position"] = result.get("queue_position")
 
         should_notify = conv.agent_id and (result["is_new"] or result.get("newly_assigned"))
         if should_notify:
@@ -214,11 +309,23 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 "visitor": conv_payload.get("visitor"),
                 "channel": {"id": conv.channel_id} if conv.channel_id else None,
             }, room=agent_room, namespace="/chat")
+            await ConversationRealtimeService.emit_conversation_list_updated(
+                int(tenant_id),
+                action="assigned",
+                conversation_id=conv.id,
+                rt=rt,
+            )
 
         r = redis_client.client
         await VisitorWebStatusService.emit_status_for_conversation(rt, r, conv)
 
-        return {"ok": True, "conversation": conv_payload, "is_new": result["is_new"]}
+        return {
+            "ok": True,
+            "conversation": conv_payload,
+            "is_new": result["is_new"],
+            **({"queue_position": result["queue_position"]} if result.get("queue_position") is not None else {}),
+            **({"context_sync": result["context_sync"]} if result.get("context_sync") else {}),
+        }
 
     @rt.on("send_message", namespace=NAMESPACE)  # type: ignore
     async def on_send_message(sid: str, data: dict):
@@ -257,6 +364,22 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 "last_message_at": msg_payload["created_at"],
                 "unread_count": conv.unread_count,
             }, room=agent_room, namespace="/chat")
+            await rt.emit("new_message", agent_payload, room=conv_room, namespace="/chat")
+            await rt.emit("conversation_updated", {
+                "conversation_id": conv.id,
+                "last_message_preview": ConversationService.build_message_preview(
+                    msg_payload["content_type"],
+                    msg_payload["content"],
+                ),
+                "last_message_at": msg_payload["created_at"],
+                "unread_count": conv.unread_count,
+            }, room=conv_room, namespace="/chat")
+            await ConversationRealtimeService.emit_conversation_list_updated(
+                int(tenant_id),
+                action="message",
+                conversation_id=conv.id,
+                rt=rt,
+            )
 
         return {"ok": True, "message": msg_payload}
 
@@ -306,6 +429,14 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
 
         msg_payload = message_payloads[-1] if message_payloads else None
 
+        unavailable = _handoff_unavailable_socket_response(result)
+        if unavailable:
+            return jsonable_encoder({
+                **unavailable,
+                "status": conv.status,
+                "message": msg_payload,
+            })
+
         if result.get("ok") and conv.agent_id:
             agent_room = f"agent:{tenant_id}:{conv.agent_id}"
             conv_payload = {
@@ -319,6 +450,12 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 "channel": {"id": conv.channel_id} if conv.channel_id else None,
             }
             await rt.emit("new_conversation", conv_payload, room=agent_room, namespace="/chat")
+            await ConversationRealtimeService.emit_conversation_list_updated(
+                int(tenant_id),
+                action="assigned",
+                conversation_id=conv.id,
+                rt=rt,
+            )
             if msg_payload:
                 agent_payload = {**msg_payload, "conversation_id": conv.id}
                 agent_payload.pop("conversation_public_id", None)
@@ -332,13 +469,23 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                     "last_message_at": msg_payload["created_at"],
                     "unread_count": conv.unread_count,
                 }, room=agent_room, namespace="/chat")
+                await rt.emit("new_message", agent_payload, room=conv_room, namespace="/chat")
+                await rt.emit("conversation_updated", {
+                    "conversation_id": conv.id,
+                    "last_message_preview": ConversationService.build_message_preview(
+                        msg_payload["content_type"],
+                        msg_payload["content"],
+                    ),
+                    "last_message_at": msg_payload["created_at"],
+                    "unread_count": conv.unread_count,
+                }, room=conv_room, namespace="/chat")
 
             await rt.emit("conversation_assigned", {
                 "conversation_id": conv.id,
                 "conversation_public_id": conv.public_id,
                 "agent": {
                     "id": conv.agent.id,
-                    "name": conv.agent.display_name or conv.agent.name,
+                    "name": ConversationService.visitor_agent_display_name(conv.agent),
                     "avatar": conv.agent.avatar,
                 } if conv.agent else None,
             }, room=f"conv:{conv.id}", namespace=NAMESPACE)
@@ -350,9 +497,10 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             "message": msg_payload,
             "agent": {
                 "id": conv.agent.id,
-                "name": conv.agent.display_name or conv.agent.name,
+                "name": ConversationService.visitor_agent_display_name(conv.agent),
                 "avatar": conv.agent.avatar,
             } if conv.agent else None,
+            **({"queue_position": result["queue_position"]} if result.get("queue_position") is not None else {}),
         })
 
     @rt.on("dismiss_human_handoff", namespace=NAMESPACE)  # type: ignore
@@ -389,6 +537,9 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
         conv_room = f"conv:{conv.id}"
         for msg_payload in tool_result_messages:
             await rt.emit("new_message", msg_payload, room=conv_room, namespace=NAMESPACE)
+            agent_payload = {**msg_payload, "conversation_id": conv.id}
+            agent_payload.pop("conversation_public_id", None)
+            await rt.emit("new_message", agent_payload, room=conv_room, namespace="/chat")
         return jsonable_encoder({
             "ok": result.get("ok", False),
             "status": conv.status,

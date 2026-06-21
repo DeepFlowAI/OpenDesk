@@ -328,16 +328,25 @@ async def test_stream_chat_saves_final_bot_message(monkeypatch):
     monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
     monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
+    client = CapturingOpenAgentClient([
+        b"event: content_delta\ndata: {\"content\":\"Hello\"}\n\n",
+        b"event: done\ndata: {\"final_content\":\"Hello\"}\n\n",
+    ])
+
     stream = OpenAgentConversationService.stream_chat_for_session(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
         OpenAgentChatRequest(message="hi", client_message_id="cm_1"),
-        open_agent_client=FakeOpenAgentClient(),
+        open_agent_client=client,
     )
     chunks = [chunk async for chunk in stream]
 
     assert any(b"open_desk_message_saved" in chunk for chunk in chunks)
+    assert client.payloads
+    assert client.payloads[0]["message"] == "hi"
+    assert "messages" not in client.payloads[0]
+    assert "open_agent_welcome_blocks" not in json.dumps(client.payloads[0], ensure_ascii=False)
     assert created_messages[-1]["sender_type"] == "bot"
     assert created_messages[-1]["content"] == "Hello"
     assert created_messages[-1]["metadata_"]["client_message_id"] == "cm_1"

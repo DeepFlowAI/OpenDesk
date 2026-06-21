@@ -222,7 +222,7 @@ export default function TicketDetailPage() {
     // User fields
     if (relatedUser) {
       const userObj = relatedUser as Record<string, unknown>
-      for (const k of ['name', 'email', 'phone', 'gender', 'address', 'remark', 'external_id', 'nickname', 'created_by', 'updated_by']) {
+      for (const k of ['name', 'email', 'phone', 'gender', 'level', 'address', 'remark', 'external_id', 'nickname', 'created_by', 'updated_by']) {
         if (userObj[k] != null) vals[`user:${k}`] = userObj[k]
       }
       if (relatedUser.custom_fields) {

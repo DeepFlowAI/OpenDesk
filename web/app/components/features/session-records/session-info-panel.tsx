@@ -6,7 +6,7 @@ import { useRouter } from 'next/navigation'
 import { cn } from '@/lib/utils'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import type { SessionRecordDetail } from '@/models/session-record'
+import type { BotHandoffStatus, SessionRecordDetail, SessionRecordType } from '@/models/session-record'
 import { SessionSummaryFields } from '@/app/components/features/session-summary/session-summary-fields'
 import { useSessionRecordSatisfaction } from '@/service/use-satisfaction-survey'
 import type { SatisfactionSurveyResult } from '@/models/satisfaction-survey'
@@ -40,6 +40,50 @@ function formatQueueDuration(seconds: number | null): string {
   const mm = String(m).padStart(2, '0')
   const ss = String(s).padStart(2, '0')
   return h > 0 ? `${String(h).padStart(2, '0')}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
+const sessionTypeClassName: Record<SessionRecordType, string> = {
+  human: 'bg-muted text-muted-foreground',
+  bot: 'bg-info/10 text-info',
+  bot_human: 'bg-success/10 text-success',
+}
+
+const botHandoffClassName: Record<BotHandoffStatus, string> = {
+  not_triggered: 'bg-muted text-muted-foreground',
+  waiting_confirmation: 'bg-warning/10 text-warning',
+  handoff_in_progress: 'bg-warning/10 text-warning',
+  in_queue: 'bg-warning/10 text-warning',
+  succeeded: 'bg-success/10 text-success',
+  failed: 'bg-destructive/10 text-destructive',
+  dismissed: 'bg-muted text-muted-foreground',
+}
+
+function StatusBadge({ label, className }: { label: string; className: string }) {
+  return (
+    <span className={cn('inline-flex whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium', className)}>
+      {label}
+    </span>
+  )
+}
+
+function SessionTypeValue({ value, locale }: { value: SessionRecordType | null; locale: Locale }) {
+  if (!value) return ''
+  return (
+    <StatusBadge
+      label={t(`ws.records.sessions.sessionType.${value}`, locale)}
+      className={sessionTypeClassName[value]}
+    />
+  )
+}
+
+function BotHandoffValue({ value, locale }: { value: BotHandoffStatus | null; locale: Locale }) {
+  if (!value) return ''
+  return (
+    <StatusBadge
+      label={t(`ws.records.sessions.botHandoff.${value}`, locale)}
+      className={botHandoffClassName[value]}
+    />
+  )
 }
 
 type Props = {
@@ -125,6 +169,14 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
                 <InfoRow
                   label={t('ws.records.sessions.detail.relatedTickets', locale)}
                   value={<RelatedTicketsLinks tickets={record.related_tickets ?? []} />}
+                />
+                <InfoRow
+                  label={t('ws.records.sessions.detail.sessionType', locale)}
+                  value={<SessionTypeValue value={record.session_type} locale={locale} />}
+                />
+                <InfoRow
+                  label={t('ws.records.sessions.detail.botHandoff', locale)}
+                  value={<BotHandoffValue value={record.bot_handoff_status} locale={locale} />}
                 />
                 <InfoRow label={t('ws.records.sessions.detail.channelType', locale)} value={record.channel?.channel_type || '-'} />
                 <InfoRow label={t('ws.records.sessions.detail.channelName', locale)} value={record.channel?.name || '-'} />

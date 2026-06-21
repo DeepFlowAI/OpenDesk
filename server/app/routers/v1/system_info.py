@@ -28,4 +28,8 @@ async def get_system_info(request: Request) -> dict:
         "single_tenant_mode": not has_tenants_ext,
         "default_tenant_id": settings.DEFAULT_TENANT_ID,
         "reports_enabled": has_reports_ext,
+        # Whether the voice call center (telephony) is turned on for this
+        # deployment. When false the backend never connects to the telephony
+        # kernel and the agent call workspace shows a "not enabled" notice.
+        "call_center_enabled": settings.CALL_CENTER_ENABLED,
     }

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   IconPlus,
   IconFilter,
@@ -12,26 +13,32 @@ import {
   IconX,
   IconUsers,
   IconBuilding,
+  IconUpload,
 } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
 import { cn } from '@/lib/utils'
+import { t } from '@/utils/i18n'
 import {
   useQueryOrganizations,
   useEnabledOrgViews,
   useOrgViewCounts,
   useOrgViewGroups,
+  useExportOrganizations,
+  orgKeys,
 } from '@/service/use-organizations'
 import { useEnabledUserViews, useUserViewCounts } from '@/service/use-users'
 import { useUnifiedFields } from '@/service/use-field-definitions'
 import type { OrganizationView, ConditionItem, ColumnConfigItem } from '@/models/organization-view'
-import type { Organization, OrganizationQueryPayload } from '@/models/organization'
+import type { Organization, OrganizationExportColumn, OrganizationQueryPayload } from '@/models/organization'
 import type { UnifiedField } from '@/models/field-definition'
 import type { ViewGroupRequestPayload } from '@/models/view-group'
 import { FilterDrawer } from './filter-drawer'
 import { ColumnsDrawer } from './columns-drawer'
 import { OrgFormModal } from './org-form-modal'
+import { OrgImportModal } from './org-import-modal'
 import { GroupBar } from '@/components/workspace/group-bar'
+import { WorkspaceListExport } from '@/app/components/features/workspace-list-export'
 import {
   formatActorFieldValue,
   formatFileFieldValue,
@@ -44,13 +51,13 @@ import { hasPermission } from '@/utils/permissions'
 const COL_STORAGE_PREFIX = 'ws_org_cols_'
 const PER_PAGE_OPTIONS = [20, 50, 100]
 
-function getColStorageKey(viewId: number | null): string {
-  return `${COL_STORAGE_PREFIX}${viewId ?? 'default'}`
+function getColStorageKey(tenantId: number | null, viewId: number | null): string {
+  return `${COL_STORAGE_PREFIX}${tenantId ?? 'unknown'}_${viewId ?? 'default'}`
 }
 
-function readColsFromStorage(viewId: number | null): ColumnConfigItem[] | null {
+function readColsFromStorage(tenantId: number | null, viewId: number | null): ColumnConfigItem[] | null {
   try {
-    const raw = localStorage.getItem(getColStorageKey(viewId))
+    const raw = localStorage.getItem(getColStorageKey(tenantId, viewId))
     if (!raw) return null
     return JSON.parse(raw) as ColumnConfigItem[]
   } catch {
@@ -58,15 +65,15 @@ function readColsFromStorage(viewId: number | null): ColumnConfigItem[] | null {
   }
 }
 
-function writeColsToStorage(viewId: number | null, cols: ColumnConfigItem[]): void {
+function writeColsToStorage(tenantId: number | null, viewId: number | null, cols: ColumnConfigItem[]): void {
   try {
-    localStorage.setItem(getColStorageKey(viewId), JSON.stringify(cols))
+    localStorage.setItem(getColStorageKey(tenantId, viewId), JSON.stringify(cols))
   } catch { /* quota exceeded */ }
 }
 
-function removeColsFromStorage(viewId: number | null): void {
+function removeColsFromStorage(tenantId: number | null, viewId: number | null): void {
   try {
-    localStorage.removeItem(getColStorageKey(viewId))
+    localStorage.removeItem(getColStorageKey(tenantId, viewId))
   } catch { /* ignore */ }
 }
 
@@ -77,6 +84,7 @@ export default function WorkspaceOrganizationsPage() {
   const user = useAuthStore((state) => state.user)
   const router = useRouter()
   const searchParams = useSearchParams()
+  const queryClient = useQueryClient()
   const isZh = locale === 'zh'
 
   // Organization views & counts
@@ -148,7 +156,7 @@ export default function WorkspaceOrganizationsPage() {
   useEffect(() => {
     if (!colInitRef.current) {
       colInitRef.current = true
-      setColumnOverrides(readColsFromStorage(activeView?.id ?? null))
+      setColumnOverrides(readColsFromStorage(user?.tenant_id ?? null, activeView?.id ?? null))
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
   const hasColumnOverride = columnOverrides !== null
@@ -157,7 +165,10 @@ export default function WorkspaceOrganizationsPage() {
   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false)
   const [columnsDrawerOpen, setColumnsDrawerOpen] = useState(false)
   const [createModalOpen, setCreateModalOpen] = useState(false)
+  const [importModalOpen, setImportModalOpen] = useState(false)
   const canCreateOrganization = hasPermission(user, 'crm.workspace.org.create')
+  const canImportOrganizations = hasPermission(user, 'crm.workspace.org.import')
+  const canExportOrganizations = hasPermission(user, 'crm.workspace.org.export')
   const canViewUsers = hasPermission(user, 'crm.workspace.user.view')
 
   // Sidebar groups
@@ -224,6 +235,7 @@ export default function WorkspaceOrganizationsPage() {
   )
 
   const { data: orgsData, isLoading: orgsLoading } = useQueryOrganizations(queryPayload)
+  const { mutateAsync: exportOrganizationsAsync } = useExportOrganizations()
 
   // Resolve visible columns
   const visibleColumns = useMemo(() => {
@@ -293,6 +305,31 @@ export default function WorkspaceOrganizationsPage() {
     return [...configurable, userCountCol, ...pinnedMetadataCols]
   }, [visibleColumns, allFields, userCountCol, pinnedMetadataCols])
 
+  const exportColumns: OrganizationExportColumn[] = useMemo(
+    () => displayColumns.map((column) => ({
+      field_key: column.field_key,
+      field_id: column.field_id,
+      name: column.name,
+      field_type: column.field_type,
+    })),
+    [displayColumns],
+  )
+
+  const handleExportOrganizations = useCallback(
+    () => exportOrganizationsAsync({
+      view_id: queryPayload.view_id,
+      search: queryPayload.search,
+      temp_conditions: queryPayload.temp_conditions,
+      temp_condition_logic: queryPayload.temp_condition_logic,
+      group_value: queryPayload.group_value,
+      sort_by: queryPayload.sort_by,
+      sort_order: queryPayload.sort_order,
+      locale,
+      columns: exportColumns,
+    }),
+    [exportColumns, exportOrganizationsAsync, locale, queryPayload],
+  )
+
   const fieldLookup = useMemo(() => buildFieldLookup(allFieldsRaw, locale), [allFieldsRaw, locale])
 
   // Handlers
@@ -304,9 +341,9 @@ export default function WorkspaceOrganizationsPage() {
     setTempConditions([])
     setTempConditionLogic('and')
     setGroupValue(undefined)
-    setColumnOverrides(readColsFromStorage(viewId === 'all' ? null : viewId))
+    setColumnOverrides(readColsFromStorage(user?.tenant_id ?? null, viewId === 'all' ? null : viewId))
     router.replace(buildOrgsUrl(viewId, undefined), { scroll: false })
-  }, [router])
+  }, [router, user?.tenant_id])
 
   const handleSelectGroup = useCallback((value: string | undefined) => {
     setGroupValue(value)
@@ -340,16 +377,17 @@ export default function WorkspaceOrganizationsPage() {
   }, [])
 
   const storageViewId = selectedViewId === 'all' ? null : selectedViewId
+  const storageTenantId = user?.tenant_id ?? null
 
   const handleResetColumns = useCallback(() => {
     setColumnOverrides(null)
-    removeColsFromStorage(storageViewId)
-  }, [storageViewId])
+    removeColsFromStorage(storageTenantId, storageViewId)
+  }, [storageTenantId, storageViewId])
 
   const handleApplyColumns = useCallback((cols: ColumnConfigItem[]) => {
     setColumnOverrides(cols)
-    writeColsToStorage(storageViewId, cols)
-  }, [storageViewId])
+    writeColsToStorage(storageTenantId, storageViewId, cols)
+  }, [storageTenantId, storageViewId])
 
   const totalPages = orgsData?.pages ?? 0
   const total = orgsData?.total ?? 0
@@ -466,15 +504,29 @@ export default function WorkspaceOrganizationsPage() {
               ? (isZh ? '全部' : 'All')
               : activeView?.name ?? ''}
           </h3>
-          {canCreateOrganization && (
-            <button
-              type="button"
-              onClick={() => setCreateModalOpen(true)}
-              className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
-            >
-              <IconPlus size={16} />
-              {isZh ? '新建组织' : 'Create Organization'}
-            </button>
+          {(canImportOrganizations || canCreateOrganization) && (
+            <div className="flex items-center gap-2">
+              {canImportOrganizations && (
+                <button
+                  type="button"
+                  onClick={() => setImportModalOpen(true)}
+                  className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-accent"
+                >
+                  <IconUpload size={16} />
+                  {t('ws.orgs.importOrganizations', locale)}
+                </button>
+              )}
+              {canCreateOrganization && (
+                <button
+                  type="button"
+                  onClick={() => setCreateModalOpen(true)}
+                  className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
+                >
+                  <IconPlus size={16} />
+                  {isZh ? '新建组织' : 'Create Organization'}
+                </button>
+              )}
+            </div>
           )}
         </div>
 
@@ -543,6 +595,43 @@ export default function WorkspaceOrganizationsPage() {
             <IconColumns3 size={16} />
             {isZh ? '列字段' : 'Columns'}
           </button>
+
+          <WorkspaceListExport
+            allowed={canExportOrganizations}
+            locale={locale}
+            buttonLabel={isZh ? '导出' : 'Export'}
+            title={isZh ? '导出组织' : 'Export organizations'}
+            description={
+              isZh
+                ? '将导出当前列表条件下的全部组织，不受当前页码限制。'
+                : 'All organizations matching the current list conditions will be exported, regardless of the current page.'
+            }
+            scopeLabel={
+              selectedViewId === 'all'
+                ? (isZh ? '全部' : 'All')
+                : activeView?.name ?? (isZh ? '当前视图' : 'Current view')
+            }
+            totalLabel={
+              isZh
+                ? `${total} 条组织`
+                : `${total} organizations`
+            }
+            columnsLabel={
+              isZh
+                ? `当前表格可见列（${exportColumns.length} 列）`
+                : `Current visible table columns (${exportColumns.length} columns)`
+            }
+            formatLabel="Excel .xlsx"
+            confirmLabel={isZh ? '确认导出' : 'Export'}
+            cancelLabel={isZh ? '取消' : 'Cancel'}
+            successMessage={isZh ? '已导出组织' : 'Organizations exported'}
+            errorMessage={
+              isZh
+                ? '导出失败，请稍后重试'
+                : 'Export failed. Please try again later.'
+            }
+            onExport={handleExportOrganizations}
+          />
         </div>
 
         {groupsEnabled && (
@@ -712,6 +801,19 @@ export default function WorkspaceOrganizationsPage() {
           mode="create"
           onClose={() => setCreateModalOpen(false)}
           onSuccess={() => setCreateModalOpen(false)}
+        />
+      )}
+
+      {canImportOrganizations && (
+        <OrgImportModal
+          locale={locale}
+          open={importModalOpen}
+          onClose={() => setImportModalOpen(false)}
+          onCompleted={() => {
+            queryClient.invalidateQueries({ queryKey: orgKeys.queries() })
+            queryClient.invalidateQueries({ queryKey: orgKeys.viewCounts() })
+            queryClient.invalidateQueries({ queryKey: orgKeys.viewGroupsRoot() })
+          }}
         />
       )}
     </div>

@@ -43,6 +43,8 @@ class SessionRecordResponse(BaseModel):
     id: int
     public_id: str
     share_code: str
+    session_type: str | None = None
+    bot_handoff_status: str | None = None
     visitor: SessionRecordVisitor | None = None
     agent: SessionRecordAgent | None = None
     channel: SessionRecordChannel | None = None

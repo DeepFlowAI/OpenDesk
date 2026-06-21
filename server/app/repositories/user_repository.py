@@ -31,6 +31,7 @@ SYSTEM_FIELD_MAP: dict[str, str] = {
     "email": "email",
     "phone": "phone",
     "gender": "gender",
+    "level": "level",
     "address": "address",
     "remark": "remark",
     "web_id": "web_id",
@@ -187,6 +188,41 @@ class UserRepository:
             )
         )
         return result.scalar_one_or_none()
+
+    @staticmethod
+    async def list_by_email(
+        db: AsyncSession,
+        tenant_id: int,
+        email: str,
+    ) -> list[User]:
+        normalized = email.strip().lower()
+        if not normalized:
+            return []
+        result = await db.execute(
+            select(User).where(
+                User.tenant_id == tenant_id,
+                func.lower(User.email) == normalized,
+            )
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_identifier_lookup(db: AsyncSession, tenant_id: int) -> dict[str, dict[str, int]]:
+        """Build email/phone/web_id maps for duplicate detection during import."""
+        result = await db.execute(
+            select(User.id, User.email, User.phone, User.web_id).where(User.tenant_id == tenant_id)
+        )
+        emails: dict[str, int] = {}
+        phones: dict[str, int] = {}
+        web_ids: dict[str, int] = {}
+        for user_id, email, phone, web_id in result.all():
+            if email:
+                emails[email.strip().lower()] = user_id
+            if phone:
+                phones[phone.strip()] = user_id
+            if web_id:
+                web_ids[web_id.strip()] = user_id
+        return {"emails": emails, "phones": phones, "web_ids": web_ids}
 
     @staticmethod
     async def create(db: AsyncSession, data: dict, commit: bool = True) -> User:

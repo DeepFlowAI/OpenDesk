@@ -2,6 +2,7 @@
 Session record router — read-only APIs for historical conversation records
 """
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +43,10 @@ async def list_session_records(
     satisfaction_service_label: list[str] | None = Query(None, description="Current-version service labels"),
     satisfaction_product_option: list[str] | None = Query(None, description="Current-version product rating option keys"),
     satisfaction_product_label: list[str] | None = Query(None, description="Current-version product labels"),
+    session_type: Literal["human", "bot", "bot_human"] | None = Query(
+        None,
+        description="Session type: human, bot, bot_human",
+    ),
     db: AsyncSession = Depends(get_db),
     principal: EffectivePrincipal = Depends(get_current_principal),
 ):
@@ -62,6 +67,7 @@ async def list_session_records(
         service_labels=SatisfactionSurveyRecordService._normalize_list_param(satisfaction_service_label),
         product_rating_options=SatisfactionSurveyRecordService._normalize_list_param(satisfaction_product_option),
         product_labels=SatisfactionSurveyRecordService._normalize_list_param(satisfaction_product_label),
+        session_type=session_type,
         principal=principal,
     )
 

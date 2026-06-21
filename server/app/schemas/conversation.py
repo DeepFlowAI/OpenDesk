@@ -58,14 +58,31 @@ class ConversationResponse(BaseModel):
     ended_by: str | None = None
     last_message_at: datetime | None = None
     last_message_preview: str | None = None
+    visitor_system: str | None = None
+    visitor_browser: str | None = None
+    visitor_ip: str | None = None
     unread_count: int = 0
     has_history_conversations: bool = False
+    viewer_relation: Literal["own", "peer"] | None = None
+    collaborated_by_current_user: bool = False
     created_at: datetime | None = None
 
 
 class ConversationListResponse(BaseModel):
     items: list[ConversationResponse]
     total: int
+
+
+class ConversationHistoryListResponse(BaseModel):
+    items: list[ConversationResponse]
+    total: int
+    has_more: bool
+
+
+class StartConversationFromHistoryResponse(BaseModel):
+    conversation: ConversationResponse
+    is_new: bool
+    already_active: bool = False
 
 
 class VisitorWebStatusResponse(BaseModel):

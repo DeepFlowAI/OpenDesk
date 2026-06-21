@@ -4,27 +4,41 @@ import { useEffect, useCallback, useMemo, useState, useRef } from 'react'
 import { useParams, useSearchParams } from 'next/navigation'
 import {
   createVisitorSession,
+  fetchCurrentOfflineMessage,
   fetchPublicMessages,
+  fetchOfflineMessages,
+  fetchUnreadOfflineReplies,
   fetchVisitorConversationHistory,
+  markConversationCustomerRead,
+  syncConversationContext,
   useChannelPublic,
   type ChannelPublicConfig,
   type PublicMessage,
 } from '@/service/use-visitor-chat'
+import { telemetry } from '@/service/telemetry'
 import {
   createPublicSatisfactionInvitation,
   fetchPublicSatisfactionInvitation,
 } from '@/service/use-satisfaction-survey'
+import { usePublicEmojiSettings } from '@/service/use-emoji-settings'
 import type { HumanHandoffEventPayload } from '@/service/use-open-agent-conversation'
 import { useVisitorChatStore } from '@/context/visitor-chat-store'
 import { VisitorChatRuntimeProvider } from '@/components/assistant-ui/visitor-chat-runtime'
 import { VisitorThread } from '@/components/assistant-ui/visitor-thread'
 import { ChatHeader } from '@/app/components/features/visitor-chat/chat-header'
+import { VisitorAssistPanel } from '@/app/components/features/visitor-chat/visitor-assist-panel'
 import { LegalFooter } from '@/components/legal-footer'
 import { IconLoader2, IconAlertTriangle } from '@tabler/icons-react'
 import type { Locale } from '@/context/locale-store'
-import type { Message, VisitorConversationHistoryItem } from '@/models/conversation'
+import { t } from '@/utils/i18n'
+import type {
+  Message,
+  VisitorConversationHistoryItem,
+  VisitorUnreadOfflineReplyItem,
+} from '@/models/conversation'
 import type { ChannelConfig } from '@/models/channel'
 import { cn } from '@/lib/utils'
+import { isVisitorQueueEnteredMessage } from '@/lib/visitor-queue-notice'
 
 const HISTORY_PAGE_SIZE = 10
 const HISTORY_CLIENT_LIMIT = 200
@@ -41,11 +55,31 @@ type VisitorCredential = {
 
 type EmbedVisitorPayload = {
   name?: string
+  customer?: Record<string, unknown>
   metadata?: Record<string, unknown>
 }
 
 type EmbedInitPayload = {
   visitor?: EmbedVisitorPayload | null
+  contextToken?: string | null
+  sessionSummary?: Record<string, unknown> | null
+}
+
+type UserAgentBrand = {
+  brand: string
+  version: string
+}
+
+type NavigatorWithUserAgentData = Navigator & {
+  userAgentData?: {
+    platform?: string
+    brands?: UserAgentBrand[]
+  }
+}
+
+type VisitorEnvironment = {
+  system: string | null
+  browser: string | null
 }
 
 const EMPTY_EMBED_INIT_PAYLOAD: EmbedInitPayload = {}
@@ -55,15 +89,29 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function sanitizeMetadata(value: unknown): Record<string, unknown> | null {
+  return sanitizePlainRecord(value, 8192)
+}
+
+function sanitizeContextObject(value: unknown): Record<string, unknown> | null {
+  return sanitizePlainRecord(value, 16384)
+}
+
+function sanitizePlainRecord(value: unknown, maxLength: number): Record<string, unknown> | null {
   if (!isPlainRecord(value)) return null
   try {
     const json = JSON.stringify(value)
-    if (!json || json.length > 8192) return null
+    if (!json || json.length > maxLength) return null
     const parsed = JSON.parse(json) as unknown
     return isPlainRecord(parsed) ? parsed : null
   } catch {
     return null
   }
+}
+
+function sanitizeContextToken(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const token = value.trim()
+  return token || null
 }
 
 function sanitizeEmbedVisitor(value: unknown): EmbedVisitorPayload | null {
@@ -73,17 +121,86 @@ function sanitizeEmbedVisitor(value: unknown): EmbedVisitorPayload | null {
     const name = value.name.trim().slice(0, 64)
     if (name) visitor.name = name
   }
+  const customer = sanitizeContextObject(value.customer)
+  if (customer) visitor.customer = customer
   const metadata = sanitizeMetadata(value.metadata)
   if (metadata) visitor.metadata = metadata
   return Object.keys(visitor).length > 0 ? visitor : null
+}
+
+function sanitizeEmbedPayload(data: Record<string, unknown>): EmbedInitPayload {
+  return {
+    visitor: sanitizeEmbedVisitor(data.visitor),
+    contextToken: sanitizeContextToken(data.contextToken),
+    sessionSummary: sanitizeContextObject(data.sessionSummary),
+  }
+}
+
+function browserLabel(name: string, version?: string): string {
+  const major = version?.split('.')[0]
+  return major ? `${name} ${major}` : name
+}
+
+function detectSystem(ua: string, platform: string): string | null {
+  const android = ua.match(/Android\s+([\d.]+)/i)
+  if (android?.[1]) return `Android ${android[1]}`
+
+  const ios = ua.match(/(?:iPhone|iPad|iPod).*OS\s+([\d_]+)/i)
+  if (ios?.[1]) return `iOS ${ios[1].replace(/_/g, '.')}`
+
+  const mac = ua.match(/Mac OS X\s+([\d_]+)/i)
+  if (mac?.[1]) return `macOS ${mac[1].replace(/_/g, '.')}`
+
+  if (/Windows NT/i.test(ua)) return 'Windows'
+  if (/Linux/i.test(ua)) return 'Linux'
+  return platform || null
+}
+
+function detectBrowser(ua: string, brands?: UserAgentBrand[]): string | null {
+  const edge = ua.match(/Edg(?:e|A|iOS)?\/([\d.]+)/i)
+  if (edge?.[1]) return browserLabel('Edge', edge[1])
+
+  const opera = ua.match(/(?:OPR|Opera)\/([\d.]+)/i)
+  if (opera?.[1]) return browserLabel('Opera', opera[1])
+
+  const firefox = ua.match(/(?:Firefox|FxiOS)\/([\d.]+)/i)
+  if (firefox?.[1]) return browserLabel('Firefox', firefox[1])
+
+  const chrome = ua.match(/(?:Chrome|CriOS)\/([\d.]+)/i)
+  if (chrome?.[1]) return browserLabel('Chrome', chrome[1])
+
+  const safari = ua.match(/Version\/([\d.]+).*Safari/i)
+  if (safari?.[1]) return browserLabel('Safari', safari[1])
+
+  const brand = brands?.find((item) => !/not|chromium/i.test(item.brand))
+  return brand ? browserLabel(brand.brand, brand.version) : null
+}
+
+function detectVisitorEnvironment(): VisitorEnvironment {
+  if (typeof navigator === 'undefined') {
+    return { system: null, browser: null }
+  }
+  const nav = navigator as NavigatorWithUserAgentData
+  const ua = nav.userAgent || ''
+  const platform = nav.userAgentData?.platform || nav.platform || ''
+  return {
+    system: detectSystem(ua, platform),
+    browser: detectBrowser(ua, nav.userAgentData?.brands),
+  }
 }
 
 function visitorCredentialStorageKey(channelKey: string): string {
   return `opendesk_visitor_${channelKey}`
 }
 
-function getVisitorPayloadKey(visitor?: EmbedVisitorPayload | null): string {
-  return JSON.stringify(visitor || null)
+// Max automatic re-mint attempts before giving up and surfacing the auth error.
+const MAX_SESSION_RECOVERIES = 3
+
+function getVisitorPayloadKey(payload?: EmbedInitPayload | null): string {
+  return JSON.stringify({
+    visitor: payload?.visitor || null,
+    contextToken: payload?.contextToken || null,
+  })
 }
 
 function readVisitorCredential(channelKey: string): VisitorCredential | null {
@@ -142,6 +259,13 @@ function mapPublicHistoryItem(item: VisitorConversationHistoryItem): VisitorConv
   }
 }
 
+function mapUnreadOfflineReplyItem(item: VisitorUnreadOfflineReplyItem): VisitorUnreadOfflineReplyItem {
+  return {
+    ...item,
+    messages: item.messages.map((message) => mapPublicMessage(message)),
+  }
+}
+
 function isHumanHandoffEventPayload(value: unknown): value is HumanHandoffEventPayload {
   return Boolean(
     isPlainRecord(value)
@@ -194,7 +318,7 @@ function restorePendingHumanHandoff(messages: Message[]) {
   return null
 }
 
-function getLocale(preferredLocale?: string | null): string {
+function getLocale(preferredLocale?: string | null): Locale {
   if (preferredLocale === 'zh' || preferredLocale === 'en') return preferredLocale
   if (typeof navigator === 'undefined') return 'en'
   const lang = navigator.language || 'en'
@@ -203,7 +327,7 @@ function getLocale(preferredLocale?: string | null): string {
 
 function postEmbedMessage(
   instanceId: string,
-  message: { type: 'ready' | 'close' | 'error'; code?: string; message?: string },
+  message: { type: 'ready' | 'close' | 'error' | 'warning'; code?: string; message?: string },
 ) {
   if (typeof window === 'undefined' || !instanceId || window.parent === window) return
   window.parent.postMessage(
@@ -250,18 +374,33 @@ const defaultConfig: ChannelConfig = {
   input_placeholder: null,
   service_hours_enabled: false,
   service_hours_id: null,
+  outside_service_hours_strategy: 'offline_message',
   offline_title: '当前客服不在线',
   offline_message: '您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。',
+  leave_message_prompt: '请留下您的问题和联系方式，我们上线后会尽快联系您。',
+  queue_message: '您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。客服接入后会立即回复您。',
+  queue_full_message: '当前排队人数较多，暂时无法进入排队。您可以稍后再试，或点击留言，我们上线后会尽快联系您。',
+  queue_full_show_leave_message_button: true,
+  queue_full_leave_message_button_label: '留言',
   open_agent_enabled: false,
   open_agent_agent_id: null,
   open_agent_agent_name: null,
   open_agent_bot_strategy: 'always',
   open_agent_bot_service_hours_id: null,
+  open_agent_avatar_url: null,
   open_agent_input_placeholder: null,
   open_agent_handoff_enabled: true,
   open_agent_handoff_label: '转人工',
   open_agent_handoff_after_messages: 2,
   open_agent_handoff_behavior: 'confirm',
+  open_agent_custom_buttons_enabled: false,
+  open_agent_custom_buttons: [],
+  human_custom_buttons_enabled: false,
+  human_custom_buttons: [],
+  assist_panel_enabled: false,
+  assist_panel_title: null,
+  assist_panel_react_code: null,
+  assist_panel_config: {},
 }
 
 function VisitorChatBootShell({
@@ -331,20 +470,30 @@ export default function VisitorChatPage() {
     () => getLocale(preferredLocale),
     [preferredLocale],
   )
+  const visitorEnvironment = useMemo(() => detectVisitorEnvironment(), [])
   const isMobile = useIsMobile()
   const [visitorExternalId, setVisitorExternalId] = useState<string | null>(null)
   const [visitorSessionToken, setVisitorSessionToken] = useState<string | null>(null)
+  const [offlineMessagePublicId, setOfflineMessagePublicId] = useState<string | null>(null)
+  const [leaveMessageMode, setLeaveMessageMode] = useState(false)
+  const [leaveMessagePrompt, setLeaveMessagePrompt] = useState('')
+  const lastSyncedContextTokenRef = useRef<string | null>(null)
+  // Bounds automatic re-mint attempts after a visitor session auth failure, so a
+  // token the server keeps rejecting (e.g. a disabled channel) can't loop.
+  const sessionRecoveryRef = useRef(0)
 
   const {
     socket,
     connected,
     connecting,
+    authFailed,
     conversationPublicId,
     messages,
     hasMore,
     satisfactionInvitation,
     pendingHumanHandoff,
     connect,
+    clearAuthFailed,
     setConversationPublicId,
     setMessages,
     prependMessages,
@@ -357,6 +506,7 @@ export default function VisitorChatPage() {
     data: channel,
     error: channelError,
   } = useChannelPublic(channelKey, visitorExternalId, conversationPublicId)
+  const { data: emojiConfig } = usePublicEmojiSettings()
 
   const [loadingMore, setLoadingMore] = useState(false)
   const [historyConversations, setHistoryConversations] = useState<VisitorConversationHistoryItem[]>([])
@@ -365,12 +515,25 @@ export default function VisitorChatPage() {
   const [historyLoaded, setHistoryLoaded] = useState(false)
   const [historyError, setHistoryError] = useState(false)
   const [historyLimitReached, setHistoryLimitReached] = useState(false)
+  const [unreadReplyConversations, setUnreadReplyConversations] = useState<VisitorUnreadOfflineReplyItem[]>([])
+  const [unreadReplyHasMore, setUnreadReplyHasMore] = useState(false)
+  const [unreadReplyError, setUnreadReplyError] = useState(false)
+  const [unreadReplyChecked, setUnreadReplyChecked] = useState(false)
+  const [currentUnreadReplyNotice, setCurrentUnreadReplyNotice] = useState<{
+    conversationPublicId: string
+    unread: boolean
+  } | null>(null)
   const [ended, setEnded] = useState(false)
   const [conversationStatus, setConversationStatus] = useState<string | null>(null)
   const [satisfactionCanInitiate, setSatisfactionCanInitiate] = useState(false)
   const [satisfactionLoading, setSatisfactionLoading] = useState(false)
   const [socketOfflineTitle, setSocketOfflineTitle] = useState('')
   const [socketOfflineMessage, setSocketOfflineMessage] = useState('')
+  const [queueFullMessage, setQueueFullMessage] = useState('')
+  const [startConversationError, setStartConversationError] = useState<string | null>(null)
+  const [queueFullShowLeaveMessageButton, setQueueFullShowLeaveMessageButton] = useState(true)
+  const [queueFullLeaveMessageButtonLabel, setQueueFullLeaveMessageButtonLabel] = useState('')
+  const [currentQueueCount, setCurrentQueueCount] = useState<number | null>(null)
   const [conversationInitializing, setConversationInitializing] = useState(true)
   const [embedReadyPosted, setEmbedReadyPosted] = useState(false)
   const [embedInitPayload, setEmbedInitPayload] = useState<EmbedInitPayload | null>(
@@ -380,15 +543,42 @@ export default function VisitorChatPage() {
     () => !embedActivationRequired,
   )
   const startedRef = useRef(false)
+  const customerReadInFlightRef = useRef<Set<string>>(new Set())
+  const lastCustomerReadMessageRef = useRef<string | null>(null)
+  const conversationPublicIdRef = useRef<string | null>(null)
   // Offline UI is driven purely by the server's start_conversation response so
   // that a visitor with an unfinished conversation can always re-enter it,
   // regardless of whether any agent is currently online. The channel-level
   // availability hint is kept only as a fallback copy for the offline screen.
-  const isOffline = !!socketOfflineMessage && !conversationPublicId
+  const isLeaveMessage = leaveMessageMode && !conversationPublicId
+  const queueFull = !!queueFullMessage && !isLeaveMessage && !startConversationError
+  const isOffline = !!socketOfflineMessage && !conversationPublicId && !isLeaveMessage && !queueFull && !startConversationError
+
+  useEffect(() => {
+    conversationPublicIdRef.current = conversationPublicId
+  }, [conversationPublicId])
+
+  const trackEvent = useCallback((
+    name: string,
+    input: Parameters<typeof telemetry.track>[1] = {},
+  ) => {
+    telemetry.track(name, {
+      ...input,
+      channel_key: channelKey,
+      conversation_external_id: input.conversation_external_id ?? conversationPublicIdRef.current,
+      props: {
+        embed: isEmbed,
+        preload: isPreload,
+        locale,
+        ...(input.props ?? {}),
+      },
+    })
+  }, [channelKey, isEmbed, isPreload, locale])
 
   const handleEmbedClose = useCallback(() => {
+    trackEvent('chat_embed_close')
     postEmbedMessage(embedInstanceId, { type: 'close' })
-  }, [embedInstanceId])
+  }, [embedInstanceId, trackEvent])
 
   useEffect(() => {
     setEmbedReadyPosted(false)
@@ -405,15 +595,21 @@ export default function VisitorChatPage() {
       if (
         !isPlainRecord(data) ||
         data.source !== 'opendesk-sdk' ||
-        (data.type !== 'init' && data.type !== 'open') ||
+        (data.type !== 'init' && data.type !== 'open' && data.type !== 'update_context') ||
         data.instanceId !== embedInstanceId
       ) {
         return
       }
 
-      setEmbedInitPayload((current) =>
-        current ?? { visitor: sanitizeEmbedVisitor(data.visitor) },
-      )
+      const nextPayload = sanitizeEmbedPayload(data)
+      if (data.type === 'update_context') {
+        setEmbedInitPayload((current) => ({
+          ...(current ?? EMPTY_EMBED_INIT_PAYLOAD),
+          ...nextPayload,
+        }))
+      } else {
+        setEmbedInitPayload((current) => current ?? nextPayload)
+      }
       if (data.type === 'open' || data.active === true || data.preload !== true) {
         setEmbedActivated(true)
       }
@@ -435,30 +631,62 @@ export default function VisitorChatPage() {
 
   useEffect(() => {
     if (!isEmbed || !embedInstanceId || !channel || embedReadyPosted) return
+    trackEvent('chat_frame_ready')
     postEmbedMessage(embedInstanceId, { type: 'ready' })
     setEmbedReadyPosted(true)
-  }, [channel, embedInstanceId, embedReadyPosted, isEmbed])
+  }, [channel, embedInstanceId, embedReadyPosted, isEmbed, trackEvent])
 
   useEffect(() => {
     if (!isEmbed || !embedInstanceId || !channelError) return
+    trackEvent('channel_load_failed', {
+      level: 'error',
+      props: { error_type: 'channel_error' },
+    })
     postEmbedMessage(embedInstanceId, {
       type: 'error',
       code: 'CONFIG_LOAD_FAILED',
       message: 'Failed to load OpenDesk channel config.',
     })
-  }, [channelError, embedInstanceId, isEmbed])
+  }, [channelError, embedInstanceId, isEmbed, trackEvent])
+
+  useEffect(() => {
+    if (!channel) return
+    trackEvent('channel_load_success', {
+      props: {
+        public_access_enabled: true,
+        open_agent_enabled: channel.config.open_agent_enabled,
+        assist_panel_enabled: channel.config.assist_panel_enabled,
+      },
+    })
+  }, [channel, trackEvent])
 
   useEffect(() => {
     let cancelled = false
     if (!channelKey || !embedActivated || (embedInitRequired && embedInitPayload === null)) return
-    const embedVisitor = embedInitPayload?.visitor
-    const visitorPayloadKey = getVisitorPayloadKey(embedVisitor)
+    const embedPayload = embedInitPayload ?? EMPTY_EMBED_INIT_PAYLOAD
+    const embedVisitor = embedPayload.visitor
+    const currentContextToken = embedPayload.contextToken || null
+    const visitorPayloadKey = getVisitorPayloadKey(embedPayload)
 
     setVisitorExternalId(null)
     setVisitorSessionToken(null)
     setConversationPublicId(null)
+    setOfflineMessagePublicId(null)
+    setLeaveMessageMode(false)
+    setLeaveMessagePrompt('')
     setMessages([])
     setHasMore(false)
+    setHistoryConversations([])
+    setHistoryHasMore(false)
+    setHistoryLoading(false)
+    setHistoryLoaded(false)
+    setHistoryError(false)
+    setHistoryLimitReached(false)
+    setUnreadReplyConversations([])
+    setUnreadReplyHasMore(false)
+    setUnreadReplyError(false)
+    setUnreadReplyChecked(false)
+    setCurrentUnreadReplyNotice(null)
     setSatisfactionInvitation(null)
     setSatisfactionCanInitiate(false)
     setPendingHumanHandoff(null)
@@ -466,11 +694,20 @@ export default function VisitorChatPage() {
     setConversationStatus(null)
     setSocketOfflineTitle('')
     setSocketOfflineMessage('')
+    setQueueFullMessage('')
+    setQueueFullShowLeaveMessageButton(true)
+    setQueueFullLeaveMessageButtonLabel('')
+    setStartConversationError(null)
+    setCurrentQueueCount(null)
     setConversationInitializing(true)
     startedRef.current = false
+    customerReadInFlightRef.current.clear()
+    lastCustomerReadMessageRef.current = null
+    lastSyncedContextTokenRef.current = null
 
     const createSession = async () => {
       const stored = readVisitorCredential(channelKey)
+      const storedForRenewal = stored?.visitorPayloadKey === visitorPayloadKey ? stored : null
       const storedToken = stored?.visitorSessionToken
       const storedSessionExpiresAt = stored?.visitorSessionExpiresAt
       const reusableToken =
@@ -499,22 +736,24 @@ export default function VisitorChatPage() {
         return {
           session: await createVisitorSession({
             channelKey,
-            visitorExternalId: stored?.visitorExternalId,
-            visitorSecret: stored?.visitorSecret,
+            visitorExternalId: storedForRenewal?.visitorExternalId,
+            visitorSecret: storedForRenewal?.visitorSecret,
             visitorName: embedVisitor?.name,
             metadata: embedVisitor?.metadata,
+            contextToken: currentContextToken,
           }),
-          stored,
+          stored: storedForRenewal,
           reused: false,
         }
       } catch (error) {
-        if (!stored) throw error
+        if (!storedForRenewal) throw error
         clearVisitorCredential(channelKey)
         return {
           session: await createVisitorSession({
             channelKey,
             visitorName: embedVisitor?.name,
             metadata: embedVisitor?.metadata,
+            contextToken: currentContextToken,
           }),
           stored: null,
           reused: false,
@@ -525,6 +764,14 @@ export default function VisitorChatPage() {
     createSession()
       .then(({ session, stored, reused }) => {
         if (cancelled) return
+        trackEvent('visitor_session_ready', {
+          props: {
+            reused,
+            has_context_token: Boolean(currentContextToken),
+            has_visitor_payload: Boolean(embedVisitor),
+            warning_count: session.context_warnings?.length ?? 0,
+          },
+        })
         const visitorSecret = session.visitor_secret || stored?.visitorSecret
         if (visitorSecret) {
           writeVisitorCredential(channelKey, {
@@ -539,9 +786,20 @@ export default function VisitorChatPage() {
         }
         setVisitorExternalId(session.visitor_external_id)
         setVisitorSessionToken(session.visitor_session_token)
+        if (session.context_warnings?.length && isEmbed && embedInstanceId) {
+          postEmbedMessage(embedInstanceId, {
+            type: 'warning',
+            code: 'CONTEXT_PARTIAL_ACCEPTED',
+            message: session.context_warnings.join(', '),
+          })
+        }
       })
       .catch(() => {
         if (!cancelled) {
+          trackEvent('visitor_session_failed', {
+            level: 'error',
+            props: { has_context_token: Boolean(currentContextToken) },
+          })
           setVisitorExternalId(null)
           setVisitorSessionToken(null)
         }
@@ -559,14 +817,30 @@ export default function VisitorChatPage() {
     setMessages,
     setSatisfactionInvitation,
     setPendingHumanHandoff,
+    isEmbed,
+    embedInstanceId,
+    trackEvent,
   ])
 
   const startConversation = useCallback(async () => {
     if (!socket || !connected || !visitorSessionToken) return
+    const startedAt = Date.now()
+    const currentContextToken = embedInitPayload?.contextToken || null
+    const startPayload = {
+      ...(currentContextToken ? { contextToken: currentContextToken } : {}),
+      ...(visitorEnvironment.system ? { system: visitorEnvironment.system } : {}),
+      ...(visitorEnvironment.browser ? { browser: visitorEnvironment.browser } : {}),
+    }
 
     if (!conversationPublicId && !socketOfflineMessage) {
       setConversationInitializing(true)
     }
+    trackEvent('conversation_start_requested', {
+      props: {
+        has_context_token: Boolean(currentContextToken),
+        has_existing_conversation: Boolean(conversationPublicId),
+      },
+    })
     await new Promise<void>((resolve) => {
       let resolved = false
       const resolveOnce = () => {
@@ -576,33 +850,96 @@ export default function VisitorChatPage() {
       }
       const timer = window.setTimeout(() => {
         setConversationInitializing(false)
+        trackEvent('conversation_start_timeout', {
+          level: 'warn',
+          metrics: { timeout_ms: 30000 },
+        })
         resolveOnce()
       }, 30000)
 
       socket.emit(
         'start_conversation',
-        {},
+        startPayload,
         async (res: {
           ok?: boolean
-          conversation?: { conversation_public_id: string; status?: string }
+          conversation?: { conversation_public_id: string; status?: string; queue_position?: number | null }
+          queue_position?: number | null
           is_new?: boolean
+          context_sync?: {
+            ok?: boolean
+            warnings?: string[]
+            customer_synced?: boolean
+            session_summary_synced?: boolean
+          }
           error?: string
           reason?: string
           offline_title?: string
           offline_message?: string
+          leave_message_prompt?: string
+          queue_full_message?: string
+          queue_full_show_leave_message_button?: boolean
+          queue_full_leave_message_button_label?: string
         }) => {
           if (res.ok && res.conversation) {
+            trackEvent('conversation_start_succeeded', {
+              conversation_external_id: res.conversation.conversation_public_id,
+              props: {
+                is_new: res.is_new === true,
+                status: res.conversation.status || 'unknown',
+                context_synced: res.context_sync?.ok !== false,
+              },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            if (currentContextToken && res.context_sync?.ok !== false) {
+              lastSyncedContextTokenRef.current = currentContextToken
+            }
+            if (res.context_sync?.ok === false && isEmbed && embedInstanceId) {
+              postEmbedMessage(embedInstanceId, {
+                type: 'error',
+                code: 'CONTEXT_SYNC_FAILED',
+                message: 'Failed to synchronize Web SDK context.',
+              })
+            } else if (res.context_sync?.warnings?.length && isEmbed && embedInstanceId) {
+              postEmbedMessage(embedInstanceId, {
+                type: 'warning',
+                code: 'CONTEXT_PARTIAL_ACCEPTED',
+                message: res.context_sync.warnings.join(', '),
+              })
+            }
             // Clear stale offline copy after a successful new or resumed conversation.
             setSocketOfflineTitle('')
             setSocketOfflineMessage('')
+            setQueueFullMessage('')
+            setQueueFullShowLeaveMessageButton(true)
+            setQueueFullLeaveMessageButtonLabel('')
+            setStartConversationError(null)
+            setOfflineMessagePublicId(null)
+            setLeaveMessageMode(false)
+            setLeaveMessagePrompt('')
             setConversationPublicId(res.conversation.conversation_public_id)
             setConversationStatus(res.conversation.status || null)
+            setCurrentQueueCount(
+              typeof res.conversation.queue_position === 'number'
+                ? res.conversation.queue_position
+                : typeof res.queue_position === 'number'
+                  ? res.queue_position
+                  : null,
+            )
             setEnded(res.conversation.status === 'closed')
             try {
+              const fetchStartedAt = Date.now()
               const data = await fetchPublicMessages({
                 conversationPublicId: res.conversation.conversation_public_id,
                 visitorSessionToken,
                 limit: 50,
+              })
+              trackEvent('conversation_messages_loaded', {
+                conversation_external_id: res.conversation.conversation_public_id,
+                props: { source: 'start_conversation' },
+                metrics: {
+                  duration_ms: Date.now() - fetchStartedAt,
+                  message_count: data.items.length,
+                },
               })
               const currentMessages = data.items.map(mapPublicMessage)
               setMessages(currentMessages)
@@ -628,13 +965,29 @@ export default function VisitorChatPage() {
                   setSatisfactionCanInitiate(false)
                 })
             } catch {
+              trackEvent('conversation_messages_load_failed', {
+                level: 'warn',
+                conversation_external_id: res.conversation.conversation_public_id,
+                props: { source: 'start_conversation' },
+              })
               setMessages([])
               setHasMore(false)
               setPendingHumanHandoff(null)
               setSatisfactionCanInitiate(false)
             }
           } else if (res.error === 'OFFLINE') {
+            trackEvent('conversation_start_offline', {
+              props: { reason: res.reason || 'offline' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
             setConversationPublicId(null)
+            setOfflineMessagePublicId(null)
+            setLeaveMessageMode(false)
+            setLeaveMessagePrompt('')
+            setQueueFullMessage('')
+            setQueueFullShowLeaveMessageButton(true)
+            setQueueFullLeaveMessageButtonLabel('')
+            setCurrentQueueCount(null)
             setMessages([])
             setHasMore(false)
             setSatisfactionInvitation(null)
@@ -643,6 +996,112 @@ export default function VisitorChatPage() {
             setConversationStatus(null)
             setSocketOfflineTitle(res.offline_title || '')
             setSocketOfflineMessage(res.offline_message || '')
+          } else if (res.error === 'LEAVE_MESSAGE') {
+            trackEvent('conversation_start_leave_message', {
+              props: { reason: res.reason || 'leave_message' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            setConversationPublicId(null)
+            setSocketOfflineTitle('')
+            setSocketOfflineMessage('')
+            setQueueFullMessage('')
+            setQueueFullShowLeaveMessageButton(true)
+            setQueueFullLeaveMessageButtonLabel('')
+            setCurrentQueueCount(null)
+            setLeaveMessageMode(true)
+            setSatisfactionInvitation(null)
+            setSatisfactionCanInitiate(false)
+            setEnded(false)
+            setConversationStatus(null)
+            setLeaveMessagePrompt(res.leave_message_prompt || channel?.config.leave_message_prompt || '')
+            try {
+              const data = await fetchCurrentOfflineMessage({ visitorSessionToken, limit: 50 })
+              if (data?.conversation_public_id) {
+                setOfflineMessagePublicId(null)
+                setLeaveMessageMode(false)
+                setConversationPublicId(data.conversation_public_id)
+                setConversationStatus('active')
+                const current = await fetchPublicMessages({
+                  conversationPublicId: data.conversation_public_id,
+                  visitorSessionToken,
+                  limit: 50,
+                })
+                setMessages(current.items.map(mapPublicMessage))
+                setHasMore(current.has_more)
+              } else if (data) {
+                setOfflineMessagePublicId(data.offline_message_public_id)
+                setMessages(data.messages.map(mapPublicMessage))
+                setHasMore(data.has_more)
+              } else {
+                setOfflineMessagePublicId(null)
+                setMessages([])
+                setHasMore(false)
+              }
+            } catch {
+              trackEvent('offline_message_load_failed', {
+                level: 'warn',
+                props: { source: 'start_conversation' },
+              })
+              setOfflineMessagePublicId(null)
+              setLeaveMessageMode(false)
+              setMessages([])
+              setHasMore(false)
+              setSocketOfflineTitle(res.offline_title || '')
+              setSocketOfflineMessage(res.offline_message || '')
+            }
+          } else if (res.error === 'NO_ASSIGNABLE_QUEUE') {
+            trackEvent('conversation_start_no_assignable_queue', {
+              props: { reason: res.reason || 'no_assignable_queue' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            setConversationPublicId(null)
+            setOfflineMessagePublicId(null)
+            setLeaveMessageMode(false)
+            setMessages([])
+            setHasMore(false)
+            setSatisfactionInvitation(null)
+            setSatisfactionCanInitiate(false)
+            setEnded(false)
+            setConversationStatus(null)
+            setSocketOfflineTitle('')
+            setSocketOfflineMessage('')
+            setCurrentQueueCount(null)
+            setQueueFullMessage('')
+            setQueueFullShowLeaveMessageButton(true)
+            setQueueFullLeaveMessageButtonLabel('')
+            setStartConversationError(t('chat.start.noAssignableQueue', locale as Locale))
+            if (isEmbed && embedInstanceId) {
+              postEmbedMessage(embedInstanceId, {
+                type: 'error',
+                code: 'NO_ASSIGNABLE_QUEUE',
+                message: t('chat.start.noAssignableQueue', locale as Locale),
+              })
+            }
+          } else if (res.error === 'QUEUE_FULL') {
+            trackEvent('conversation_start_queue_full', {
+              props: { reason: res.reason || 'queue_full' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            setConversationPublicId(null)
+            setOfflineMessagePublicId(null)
+            setLeaveMessageMode(false)
+            setLeaveMessagePrompt(res.leave_message_prompt || channel?.config.leave_message_prompt || '')
+            setMessages([])
+            setHasMore(false)
+            setSatisfactionInvitation(null)
+            setSatisfactionCanInitiate(false)
+            setEnded(false)
+            setConversationStatus(null)
+            setSocketOfflineTitle('')
+            setSocketOfflineMessage('')
+            setCurrentQueueCount(null)
+            setQueueFullMessage(res.queue_full_message || channel?.config.queue_full_message || '')
+            setQueueFullShowLeaveMessageButton(res.queue_full_show_leave_message_button !== false)
+            setQueueFullLeaveMessageButtonLabel(
+              res.queue_full_leave_message_button_label
+              || channel?.config.queue_full_leave_message_button_label
+              || '',
+            )
           }
           window.clearTimeout(timer)
           setConversationInitializing(false)
@@ -652,6 +1111,12 @@ export default function VisitorChatPage() {
     })
   }, [
     channel?.config.open_agent_handoff_behavior,
+    channel?.config.leave_message_prompt,
+    channel?.config.queue_full_leave_message_button_label,
+    channel?.config.queue_full_message,
+    embedInitPayload,
+    embedInstanceId,
+    isEmbed,
     socket,
     connected,
     conversationPublicId,
@@ -661,8 +1126,97 @@ export default function VisitorChatPage() {
     setSatisfactionInvitation,
     setPendingHumanHandoff,
     socketOfflineMessage,
+    visitorEnvironment.browser,
+    visitorEnvironment.system,
     visitorSessionToken,
+    trackEvent,
   ])
+
+  useEffect(() => {
+    let cancelled = false
+    if (!visitorSessionToken || !embedActivated) return
+
+    setUnreadReplyChecked(false)
+    setUnreadReplyError(false)
+    fetchUnreadOfflineReplies({ visitorSessionToken, limit: 3 })
+      .then((data) => {
+        if (cancelled) return
+        const items = data.items.map(mapUnreadOfflineReplyItem)
+        const current = [...items]
+          .reverse()
+          .find((item) => item.status !== 'closed')
+        const currentId = current?.conversation_public_id ?? null
+        setUnreadReplyConversations(
+          items.filter((item) => item.conversation_public_id !== currentId),
+        )
+        setUnreadReplyHasMore(data.has_more)
+        setCurrentUnreadReplyNotice(
+          current
+            ? {
+                conversationPublicId: current.conversation_public_id,
+                unread: current.offline_reply_unread,
+              }
+            : null,
+        )
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setUnreadReplyConversations([])
+          setUnreadReplyHasMore(false)
+          setUnreadReplyError(true)
+          setCurrentUnreadReplyNotice(null)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setUnreadReplyChecked(true)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [embedActivated, visitorSessionToken])
+
+  const handleUnreadReplyVisible = useCallback((conversationPublicId: string) => {
+    if (!visitorSessionToken || !conversationPublicId) return
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+    if (customerReadInFlightRef.current.has(conversationPublicId)) return
+
+    customerReadInFlightRef.current.add(conversationPublicId)
+    markConversationCustomerRead({
+      conversationPublicId,
+      visitorSessionToken,
+    })
+      .then(() => {
+        setUnreadReplyConversations((prev) =>
+          prev.map((item) =>
+            item.conversation_public_id === conversationPublicId
+              ? { ...item, offline_reply_unread: false }
+              : item,
+          ),
+        )
+        setCurrentUnreadReplyNotice((current) =>
+          current?.conversationPublicId === conversationPublicId
+            ? { ...current, unread: false }
+            : current,
+        )
+      })
+      .catch(() => {
+        // Keep the local unread display so the visitor can see it again later.
+      })
+      .finally(() => {
+        customerReadInFlightRef.current.delete(conversationPublicId)
+      })
+  }, [visitorSessionToken])
+
+  useEffect(() => {
+    if (!conversationPublicId || messages.length === 0) return
+    const latest = messages[messages.length - 1]
+    if (latest.sender_type !== 'agent') return
+    const marker = `${conversationPublicId}:${latest.id}`
+    if (lastCustomerReadMessageRef.current === marker) return
+    lastCustomerReadMessageRef.current = marker
+    handleUnreadReplyVisible(conversationPublicId)
+  }, [conversationPublicId, handleUnreadReplyVisible, messages])
 
   const handleSatisfactionInitiate = useCallback(async () => {
     if (satisfactionInvitation) return satisfactionInvitation
@@ -682,9 +1236,126 @@ export default function VisitorChatPage() {
     }
   }, [conversationPublicId, satisfactionInvitation, setSatisfactionInvitation, visitorSessionToken])
 
+  useEffect(() => {
+    const contextToken = embedInitPayload?.contextToken || null
+    if (!contextToken || !conversationPublicId || !visitorSessionToken) return
+    if (lastSyncedContextTokenRef.current === contextToken) return
+
+    let cancelled = false
+    lastSyncedContextTokenRef.current = contextToken
+    syncConversationContext({
+      conversationPublicId,
+      visitorSessionToken,
+      contextToken,
+    })
+      .then((result) => {
+        if (cancelled) return
+        trackEvent('conversation_context_sync_succeeded', {
+          conversation_external_id: conversationPublicId,
+          props: {
+            customer_synced: result.customer_synced,
+            session_summary_synced: result.session_summary_synced,
+            warning_count: result.warnings?.length ?? 0,
+          },
+        })
+        if (!result.warnings?.length || !isEmbed || !embedInstanceId) return
+        postEmbedMessage(embedInstanceId, {
+          type: 'warning',
+          code: 'CONTEXT_PARTIAL_ACCEPTED',
+          message: result.warnings.join(', '),
+        })
+      })
+      .catch(() => {
+        if (cancelled) return
+        trackEvent('conversation_context_sync_failed', {
+          level: 'error',
+          conversation_external_id: conversationPublicId,
+        })
+        lastSyncedContextTokenRef.current = null
+        if (isEmbed && embedInstanceId) {
+          postEmbedMessage(embedInstanceId, {
+            type: 'error',
+            code: 'CONTEXT_SYNC_FAILED',
+            message: 'Failed to synchronize Web SDK context.',
+          })
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [conversationPublicId, embedInitPayload?.contextToken, embedInstanceId, isEmbed, visitorSessionToken, trackEvent])
+
   const handleSatisfactionSubmitted = useCallback(() => {
     setSatisfactionCanInitiate(false)
   }, [])
+
+  const handleQueueFullLeaveMessage = useCallback(() => {
+    setQueueFullMessage('')
+    setQueueFullShowLeaveMessageButton(true)
+    setQueueFullLeaveMessageButtonLabel('')
+    setCurrentQueueCount(null)
+    setSocketOfflineTitle('')
+    setSocketOfflineMessage('')
+    setConversationPublicId(null)
+    setOfflineMessagePublicId(null)
+    setLeaveMessageMode(true)
+    setLeaveMessagePrompt((current) => current || channel?.config.leave_message_prompt || '')
+    setMessages([])
+    setHasMore(false)
+    setEnded(false)
+    setConversationStatus(null)
+  }, [channel?.config.leave_message_prompt, setConversationPublicId, setHasMore, setMessages])
+
+  const handleHandoffLeaveMessage = useCallback((prompt?: string) => {
+    setQueueFullMessage('')
+    setQueueFullShowLeaveMessageButton(true)
+    setQueueFullLeaveMessageButtonLabel('')
+    setCurrentQueueCount(null)
+    setSocketOfflineTitle('')
+    setSocketOfflineMessage('')
+    setConversationPublicId(null)
+    setOfflineMessagePublicId(null)
+    setLeaveMessageMode(true)
+    setLeaveMessagePrompt(prompt || channel?.config.leave_message_prompt || '')
+    setMessages([])
+    setHasMore(false)
+    setEnded(false)
+    setConversationStatus(null)
+    setPendingHumanHandoff(null)
+  }, [
+    channel?.config.leave_message_prompt,
+    setConversationPublicId,
+    setHasMore,
+    setMessages,
+    setPendingHumanHandoff,
+  ])
+
+  const handleHandoffQueueFull = useCallback((payload: {
+    queue_full_message?: string
+    queue_full_show_leave_message_button?: boolean
+    queue_full_leave_message_button_label?: string
+    leave_message_prompt?: string
+  }) => {
+    setSocketOfflineTitle('')
+    setSocketOfflineMessage('')
+    setCurrentQueueCount(null)
+    setLeaveMessageMode(false)
+    setLeaveMessagePrompt(payload.leave_message_prompt || channel?.config.leave_message_prompt || '')
+    setQueueFullMessage(payload.queue_full_message || channel?.config.queue_full_message || '')
+    setQueueFullShowLeaveMessageButton(payload.queue_full_show_leave_message_button !== false)
+    setQueueFullLeaveMessageButtonLabel(
+      payload.queue_full_leave_message_button_label
+      || channel?.config.queue_full_leave_message_button_label
+      || '',
+    )
+    setPendingHumanHandoff(null)
+  }, [
+    channel?.config.leave_message_prompt,
+    channel?.config.queue_full_leave_message_button_label,
+    channel?.config.queue_full_message,
+    setPendingHumanHandoff,
+  ])
 
   // ── Browser tab title & favicon (admin: document_title, favicon_url) ──
   useEffect(() => {
@@ -712,47 +1383,178 @@ export default function VisitorChatPage() {
   // the visitor is allowed in (existing conversation always wins, otherwise
   // start_conversation may return OFFLINE which we surface via isOffline).
   useEffect(() => {
-    if (!embedActivated || !channel || !visitorExternalId || !visitorSessionToken || connected || connecting) return
+    if (!embedActivated || !channel || !visitorExternalId || !visitorSessionToken || connected || connecting || authFailed) return
+    trackEvent('socket_connect_requested')
     connect(visitorSessionToken, visitorExternalId)
-  }, [channel, connected, connecting, connect, embedActivated, visitorExternalId, visitorSessionToken])
+  }, [channel, connected, connecting, authFailed, connect, embedActivated, visitorExternalId, visitorSessionToken, trackEvent])
+
+  // ── Auth-failure self-heal ──
+  // An expired visitor session token makes the socket reject every reconnect.
+  // Rather than leaving the chat dead until a manual page reload, mint a fresh
+  // token for the same stored visitor identity and let the connect effect retry.
+  // Bounded by MAX_SESSION_RECOVERIES so a token the server keeps rejecting
+  // (e.g. a disabled channel, where minting itself fails) can't loop.
+  useEffect(() => {
+    if (!authFailed || !embedActivated || !channelKey) return
+    if (sessionRecoveryRef.current >= MAX_SESSION_RECOVERIES) return
+    sessionRecoveryRef.current += 1
+
+    let cancelled = false
+    const embedPayload = embedInitPayload ?? EMPTY_EMBED_INIT_PAYLOAD
+    const stored = readVisitorCredential(channelKey)
+
+    createVisitorSession({
+      channelKey,
+      visitorExternalId: stored?.visitorExternalId,
+      visitorSecret: stored?.visitorSecret,
+      visitorName: embedPayload.visitor?.name,
+      metadata: embedPayload.visitor?.metadata,
+      contextToken: embedPayload.contextToken || null,
+    })
+      .then((session) => {
+        if (cancelled) return
+        const visitorSecret = session.visitor_secret || stored?.visitorSecret
+        if (visitorSecret) {
+          writeVisitorCredential(channelKey, {
+            visitorExternalId: session.visitor_external_id,
+            visitorSecret,
+            visitorSessionToken: session.visitor_session_token,
+            visitorSessionExpiresAt: Date.now() + session.expires_in * 1000,
+            visitorPayloadKey: getVisitorPayloadKey(embedPayload),
+          })
+        }
+        setVisitorExternalId(session.visitor_external_id)
+        setVisitorSessionToken(session.visitor_session_token)
+        // Re-enable the connect effect now that a fresh token is in place.
+        clearAuthFailed()
+      })
+      .catch(() => {
+        // Minting failed (e.g. the channel was disabled). Leave authFailed set so
+        // the page surfaces the error instead of silently retrying forever.
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [authFailed, embedActivated, channelKey, embedInitPayload, clearAuthFailed])
+
+  useEffect(() => {
+    if (!connected) return
+    // A successful connect means the current token works; reset the recovery
+    // budget so a later expiry gets a fresh set of attempts.
+    sessionRecoveryRef.current = 0
+    trackEvent('socket_connected')
+  }, [connected, trackEvent])
 
   // ── Start conversation ──
   useEffect(() => {
-    if (!embedActivated || !socket || !connected || startedRef.current) return
+    if (!embedActivated || !socket || !connected || !unreadReplyChecked || startedRef.current) return
     startedRef.current = true
     void startConversation()
-  }, [socket, connected, embedActivated, startConversation])
+  }, [socket, connected, embedActivated, startConversation, unreadReplyChecked])
 
   useEffect(() => {
     if (!socket) return
 
     const handleDisconnect = () => {
       startedRef.current = false
+      trackEvent('socket_disconnected', { level: 'warn' })
     }
 
     socket.on('disconnect', handleDisconnect)
     return () => {
       socket.off('disconnect', handleDisconnect)
     }
-  }, [socket])
+  }, [socket, trackEvent])
 
   useEffect(() => {
     if (!socket) return
     const handler = (data: { conversation_public_id?: string }) => {
       if (!data.conversation_public_id || data.conversation_public_id === conversationPublicId) {
+        trackEvent('conversation_assigned', {
+          conversation_external_id: data.conversation_public_id ?? conversationPublicId,
+        })
         setConversationStatus('active')
+        setCurrentQueueCount(null)
       }
     }
     socket.on('conversation_assigned', handler)
     return () => {
       socket.off('conversation_assigned', handler)
     }
-  }, [conversationPublicId, socket])
+  }, [conversationPublicId, socket, trackEvent])
+
+  useEffect(() => {
+    if (conversationStatus === 'queued' || conversationStatus === 'active') return
+    const hasQueueEnteredMessage = messages.some(isVisitorQueueEnteredMessage)
+    if (hasQueueEnteredMessage) {
+      setConversationStatus('queued')
+    }
+  }, [conversationStatus, messages])
+
+  useEffect(() => {
+    if (!socket || !visitorSessionToken) return
+    const handler = (data: {
+      offline_message_public_id?: string
+      conversation_public_id?: string
+      status?: string
+    }) => {
+      if (!data.conversation_public_id) return
+      if (
+        offlineMessagePublicId
+        && data.offline_message_public_id
+        && data.offline_message_public_id !== offlineMessagePublicId
+      ) {
+        return
+      }
+      setOfflineMessagePublicId(null)
+      setLeaveMessageMode(false)
+      setLeaveMessagePrompt('')
+      setSocketOfflineTitle('')
+      setSocketOfflineMessage('')
+      setQueueFullMessage('')
+      setQueueFullShowLeaveMessageButton(true)
+      setQueueFullLeaveMessageButtonLabel('')
+      setCurrentQueueCount(null)
+      setConversationPublicId(data.conversation_public_id)
+      setConversationStatus(data.status || 'active')
+      setEnded(false)
+      trackEvent('offline_message_conversation_created', {
+        conversation_external_id: data.conversation_public_id,
+        props: { status: data.status || 'active' },
+      })
+      fetchPublicMessages({
+        conversationPublicId: data.conversation_public_id,
+        visitorSessionToken,
+        limit: 50,
+      })
+        .then((res) => {
+          setMessages(res.items.map(mapPublicMessage))
+          setHasMore(res.has_more)
+        })
+        .catch(() => {
+          setMessages([])
+          setHasMore(false)
+        })
+    }
+    socket.on('offline_message_conversation_created', handler)
+    return () => {
+      socket.off('offline_message_conversation_created', handler)
+    }
+  }, [
+    offlineMessagePublicId,
+    setConversationPublicId,
+    setHasMore,
+    setMessages,
+    socket,
+    visitorSessionToken,
+  ])
 
   // ── Conversation ended listener ──
   useEffect(() => {
     if (!socket) return
     const handler = () => {
+      trackEvent('conversation_ended')
       setEnded(true)
       if (!conversationPublicId || !visitorSessionToken) return
 
@@ -786,25 +1588,45 @@ export default function VisitorChatPage() {
 
   // ── Load more messages ──
   const handleLoadMore = useCallback(async () => {
-    if (!conversationPublicId || !visitorSessionToken || loadingMore || !hasMore) return
+    if (!visitorSessionToken || loadingMore || !hasMore) return
     const oldest = messages[0]
     if (!oldest) return
     setLoadingMore(true)
     try {
-      const data = await fetchPublicMessages({
-        conversationPublicId,
-        visitorSessionToken,
-        beforeId: oldest.id,
-        limit: 20,
-      })
-      prependMessages(data.items.map(mapPublicMessage))
-      setHasMore(data.has_more)
+      if (offlineMessagePublicId && !conversationPublicId) {
+        const data = await fetchOfflineMessages({
+          offlineMessagePublicId,
+          visitorSessionToken,
+          beforeId: oldest.id,
+          limit: 50,
+        })
+        prependMessages(data.messages.map(mapPublicMessage))
+        setHasMore(data.has_more)
+      } else if (conversationPublicId) {
+        const data = await fetchPublicMessages({
+          conversationPublicId,
+          visitorSessionToken,
+          beforeId: oldest.id,
+          limit: 20,
+        })
+        prependMessages(data.items.map(mapPublicMessage))
+        setHasMore(data.has_more)
+      }
     } catch {
       // ignore
     } finally {
       setLoadingMore(false)
     }
-  }, [conversationPublicId, visitorSessionToken, loadingMore, hasMore, messages, prependMessages, setHasMore])
+  }, [
+    conversationPublicId,
+    offlineMessagePublicId,
+    visitorSessionToken,
+    loadingMore,
+    hasMore,
+    messages,
+    prependMessages,
+    setHasMore,
+  ])
 
   const handleLoadHistory = useCallback(
     async (beforeId?: string) => {
@@ -844,13 +1666,29 @@ export default function VisitorChatPage() {
 
   // ── Derived values ──
   const config = channel?.config || defaultConfig
+  const runtimeConfig = useMemo(
+    () => (
+      isLeaveMessage && leaveMessagePrompt
+        ? { ...config, leave_message_prompt: leaveMessagePrompt }
+        : config
+    ),
+    [config, isLeaveMessage, leaveMessagePrompt],
+  )
   const botMode =
+    !isLeaveMessage &&
     config.open_agent_enabled
     && (conversationStatus === 'bot' || conversationStatus === 'handoff_pending')
   const pageBg = config.page_bg_color || 'var(--color-muted)'
   const offlineTitle = socketOfflineTitle || channel?.availability?.offline_title || config.offline_title
   const offlineMessage = socketOfflineMessage || channel?.availability?.offline_message || config.offline_message
   const showConnectionStatus = Boolean(socket) && !connected && !connecting && !isOffline
+  const showAssistPanel = Boolean(
+    !isEmbed
+    && !isMobile
+    && config.assist_panel_enabled
+    && config.assist_panel_react_code?.trim(),
+  )
+  const historyAvailable = channel?.has_conversation_history === true || historyConversations.length > 0
 
   const footerLocale: Locale = locale === 'zh' ? 'zh' : 'en'
 
@@ -956,47 +1794,145 @@ export default function VisitorChatPage() {
       )}
 
       {/* ── Chat container (backed by assistant-ui runtime) ── */}
-      <div className={chatContainerClassName}>
+      {showAssistPanel ? (
         <VisitorChatRuntimeProvider
           socket={socket}
           channel={channel}
-          config={config}
+          config={runtimeConfig}
           locale={locale}
           isMobile={isMobile}
           ended={ended}
+          conversationStatus={conversationStatus}
           conversationPublicId={conversationPublicId}
+          offlineMode={isLeaveMessage}
+          offlineMessagePublicId={offlineMessagePublicId}
+          queueFull={queueFull}
+          queueFullMessage={queueFullMessage}
+          queueFullShowLeaveMessageButton={queueFullShowLeaveMessageButton}
+          queueFullLeaveMessageButtonLabel={queueFullLeaveMessageButtonLabel}
+          startConversationError={startConversationError}
+          currentQueueCount={currentQueueCount}
           visitorSessionToken={visitorSessionToken}
           hasMore={hasMore}
           loadingMore={loadingMore}
-          historyAvailable={channel.has_conversation_history || historyConversations.length > 0}
+          historyAvailable={historyAvailable}
           historyConversations={historyConversations}
           historyHasMore={historyHasMore}
           historyLoading={historyLoading}
           historyLoaded={historyLoaded}
           historyError={historyError}
           historyLimitReached={historyLimitReached}
+          unreadReplyConversations={unreadReplyConversations}
+          unreadReplyHasMore={unreadReplyHasMore}
+          unreadReplyError={unreadReplyError}
+          currentUnreadReplyNotice={currentUnreadReplyNotice}
           initializing={conversationInitializing}
           botMode={botMode}
           visitorMessageCount={messages.filter((msg) => msg.sender_type === 'visitor').length}
           pendingHumanHandoff={pendingHumanHandoff}
           satisfactionCanInitiate={satisfactionCanInitiate}
           satisfactionLoading={satisfactionLoading}
+          emojiConfig={emojiConfig ?? null}
           onLoadMore={handleLoadMore}
           onLoadHistory={handleLoadHistory}
+          onUnreadReplyVisible={handleUnreadReplyVisible}
           onTyping={handleTyping}
           onRestartConversation={startConversation}
+          onQueueFullLeaveMessage={handleQueueFullLeaveMessage}
+          onHandoffLeaveMessage={handleHandoffLeaveMessage}
+          onHandoffQueueFull={handleHandoffQueueFull}
           onConversationStatusChange={setConversationStatus}
+          onCurrentQueueCountChange={setCurrentQueueCount}
+          onOfflineMessageCreated={setOfflineMessagePublicId}
           onSatisfactionInitiate={handleSatisfactionInitiate}
           onSatisfactionSubmitted={handleSatisfactionSubmitted}
         >
-          <VisitorThread
-            offlineTitle={isOffline ? offlineTitle : undefined}
-            offlineMessage={isOffline ? offlineMessage : undefined}
-            isEmbed={isEmbed}
-            onEmbedClose={handleEmbedClose}
-          />
+          <div className="mx-auto flex min-h-0 w-full max-w-[1120px] flex-1 p-4">
+            <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-xl bg-background shadow-xl">
+              <ChatHeader
+                channel={channel}
+                isMobile={isMobile}
+                isEmbed={isEmbed}
+                onEmbedClose={handleEmbedClose}
+              />
+              <div className="flex min-h-0 flex-1">
+                <div className="flex min-h-0 min-w-[480px] flex-1 flex-col overflow-hidden">
+                  <VisitorThread
+                    offlineTitle={isOffline ? offlineTitle : undefined}
+                    offlineMessage={isOffline ? offlineMessage : undefined}
+                    isEmbed={isEmbed}
+                    showHeader={false}
+                    onEmbedClose={handleEmbedClose}
+                  />
+                </div>
+                <VisitorAssistPanel />
+              </div>
+            </div>
+          </div>
         </VisitorChatRuntimeProvider>
-      </div>
+      ) : (
+        <div className={chatContainerClassName}>
+          <VisitorChatRuntimeProvider
+            socket={socket}
+            channel={channel}
+            config={runtimeConfig}
+            locale={locale}
+            isMobile={isMobile}
+            ended={ended}
+            conversationStatus={conversationStatus}
+            conversationPublicId={conversationPublicId}
+            offlineMode={isLeaveMessage}
+            offlineMessagePublicId={offlineMessagePublicId}
+            queueFull={queueFull}
+            queueFullMessage={queueFullMessage}
+            queueFullShowLeaveMessageButton={queueFullShowLeaveMessageButton}
+            queueFullLeaveMessageButtonLabel={queueFullLeaveMessageButtonLabel}
+            startConversationError={startConversationError}
+            currentQueueCount={currentQueueCount}
+            visitorSessionToken={visitorSessionToken}
+            hasMore={hasMore}
+            loadingMore={loadingMore}
+            historyAvailable={historyAvailable}
+            historyConversations={historyConversations}
+            historyHasMore={historyHasMore}
+            historyLoading={historyLoading}
+            historyLoaded={historyLoaded}
+            historyError={historyError}
+            historyLimitReached={historyLimitReached}
+            unreadReplyConversations={unreadReplyConversations}
+            unreadReplyHasMore={unreadReplyHasMore}
+            unreadReplyError={unreadReplyError}
+            currentUnreadReplyNotice={currentUnreadReplyNotice}
+            initializing={conversationInitializing}
+            botMode={botMode}
+            visitorMessageCount={messages.filter((msg) => msg.sender_type === 'visitor').length}
+            pendingHumanHandoff={pendingHumanHandoff}
+            satisfactionCanInitiate={satisfactionCanInitiate}
+            satisfactionLoading={satisfactionLoading}
+            emojiConfig={emojiConfig ?? null}
+            onLoadMore={handleLoadMore}
+            onLoadHistory={handleLoadHistory}
+            onUnreadReplyVisible={handleUnreadReplyVisible}
+            onTyping={handleTyping}
+            onRestartConversation={startConversation}
+            onQueueFullLeaveMessage={handleQueueFullLeaveMessage}
+            onHandoffLeaveMessage={handleHandoffLeaveMessage}
+            onHandoffQueueFull={handleHandoffQueueFull}
+            onConversationStatusChange={setConversationStatus}
+            onCurrentQueueCountChange={setCurrentQueueCount}
+            onOfflineMessageCreated={setOfflineMessagePublicId}
+            onSatisfactionInitiate={handleSatisfactionInitiate}
+            onSatisfactionSubmitted={handleSatisfactionSubmitted}
+          >
+            <VisitorThread
+              offlineTitle={isOffline ? offlineTitle : undefined}
+              offlineMessage={isOffline ? offlineMessage : undefined}
+              isEmbed={isEmbed}
+              onEmbedClose={handleEmbedClose}
+            />
+          </VisitorChatRuntimeProvider>
+        </div>
+      )}
 
       {/* AGPL §13: visitors interacting with this network service must be
           offered the Corresponding Source. Compact variant keeps the chat UX

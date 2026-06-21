@@ -77,13 +77,27 @@ SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
         default_sort_order=4,
     ),
     SystemFieldDef(
+        key="level",
+        name_zh="等级",
+        name_en="Level",
+        field_type="single_select",
+        type_config={
+            "default_value": "normal",
+            "options": [
+                {"label": "普通", "label_en": "Normal", "value": "normal"},
+                {"label": "VIP", "label_en": "VIP", "value": "vip"},
+            ],
+        },
+        default_sort_order=5,
+    ),
+    SystemFieldDef(
         key="address",
         name_zh="地址",
         name_en="Address",
         field_type="single_line_text",
         type_config={"max_length": 256},
         default_show_in_workspace=False,
-        default_sort_order=5,
+        default_sort_order=6,
     ),
     SystemFieldDef(
         key="remark",
@@ -92,7 +106,7 @@ SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
         field_type="multi_line_text",
         type_config={"max_length": 2000},
         default_show_in_workspace=False,
-        default_sort_order=6,
+        default_sort_order=7,
     ),
     SystemFieldDef(
         key="organization_id",
@@ -107,7 +121,7 @@ SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
         },
         description="终端用户关联的组织",
         help_text="选择该用户所属组织（可空）",
-        default_sort_order=7,
+        default_sort_order=8,
     ),
     SystemFieldDef(
         key="created_by",
@@ -116,7 +130,7 @@ SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
         field_type="single_line_text",
         type_config={"readonly": True, "value_kind": "actor"},
         default_show_in_workspace=False,
-        default_sort_order=8,
+        default_sort_order=9,
     ),
     SystemFieldDef(
         key="updated_by",
@@ -125,7 +139,7 @@ SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
         field_type="single_line_text",
         type_config={"readonly": True, "value_kind": "actor"},
         default_show_in_workspace=False,
-        default_sort_order=9,
+        default_sort_order=10,
     ),
 )
 

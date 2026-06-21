@@ -46,6 +46,7 @@ from app.schemas.queue import (
     normalize_queue_assignment_strategy,
 )
 from app.services.queue_resource_provider import QueueResourceProviderFactory
+from app.services.queue_realtime_service import QueueRealtimeService
 from app.services.queue_strategy import QueueCandidate, QueueStrategyService
 
 
@@ -237,6 +238,7 @@ class QueueTaskService:
         )
         await db.commit()
         await db.refresh(task)
+        await QueueTaskService._emit_queue_change(task, "enqueued")
         position = await QueueTaskService.get_position_for_task(db, tenant_id, task.id)
         return QueueEnqueueResponse(accepted=True, duplicate=False, task=task, position=position)
 
@@ -262,7 +264,9 @@ class QueueTaskService:
         task_id: int,
         data: QueueTaskActionRequest,
     ) -> QueueTask:
-        task = await QueueTaskService.get_task(db, tenant_id, task_id)
+        task = await QueueTaskRepository.get_task_for_update(db, tenant_id, task_id)
+        if not task:
+            raise NotFoundError("Queue task not found")
         if task.status not in [QueueTaskStatus.QUEUED.value, QueueTaskStatus.ASSIGNING.value]:
             raise ConflictError("Queue task is not active")
         await QueueTaskRepository.mark_terminal(
@@ -275,6 +279,7 @@ class QueueTaskService:
         await QueueTaskService._record_event(db, task, "canceled", reason=data.reason)
         await db.commit()
         await db.refresh(task)
+        await QueueTaskService._emit_queue_change(task, "canceled")
         return task
 
     @staticmethod
@@ -284,7 +289,9 @@ class QueueTaskService:
         task_id: int,
         data: QueueTaskActionRequest,
     ) -> QueueTask:
-        task = await QueueTaskService.get_task(db, tenant_id, task_id)
+        task = await QueueTaskRepository.get_task_for_update(db, tenant_id, task_id)
+        if not task:
+            raise NotFoundError("Queue task not found")
         if task.status not in [QueueTaskStatus.QUEUED.value, QueueTaskStatus.ASSIGNING.value]:
             raise ConflictError("Queue task is not active")
         await QueueTaskRepository.mark_terminal(
@@ -297,6 +304,7 @@ class QueueTaskService:
         await QueueTaskService._record_event(db, task, "timeout", reason=data.reason)
         await db.commit()
         await db.refresh(task)
+        await QueueTaskService._emit_queue_change(task, "timeout")
         return task
 
     @staticmethod
@@ -411,6 +419,7 @@ class QueueTaskService:
         )
         await db.commit()
         await db.refresh(task)
+        await QueueTaskService._emit_queue_change(task, "assigned")
         return task
 
     @staticmethod
@@ -422,7 +431,9 @@ class QueueTaskService:
         task_id: int,
         data: QueueAdminAssignRequest,
     ) -> QueueTask:
-        task = await QueueTaskService.get_task(db, tenant_id, task_id)
+        task = await QueueTaskRepository.get_task_for_update(db, tenant_id, task_id)
+        if not task:
+            raise NotFoundError("Queue task not found")
         if task.channel != QueueChannel.ONLINE_CHAT.value:
             raise ValidationError("Admin assignment only supports online chat tasks")
         if task.status != QueueTaskStatus.QUEUED.value:
@@ -462,6 +473,7 @@ class QueueTaskService:
         )
         await db.commit()
         await db.refresh(task)
+        await QueueTaskService._emit_queue_change(task, "assigned")
         return task
 
     @staticmethod
@@ -552,6 +564,7 @@ class QueueTaskService:
                     )
                 await db.commit()
                 await db.refresh(task)
+                await QueueTaskService._emit_queue_change(task, "assigned")
                 return QueueDispatchResponse(
                     dispatched=True,
                     task=task,
@@ -575,6 +588,24 @@ class QueueTaskService:
             except ValueError:
                 return
             await QueueBusinessRepository.assign_conversation(db, tenant_id, conversation_id, employee_id, _now())
+            from app.services.conversation_service import ConversationService
+
+            await ConversationService.create_agent_assigned_system_message(
+                db,
+                tenant_id,
+                conversation_id,
+                employee_id,
+            )
+            await ConversationService.create_welcome_message_on_agent_assignment(
+                db,
+                tenant_id,
+                conversation_id,
+            )
+            from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
+            from app.repositories.conversation_repository import ConversationRepository
+
+            conversation = await ConversationRepository.get_by_id(db, conversation_id)
+            await VisitorTimeoutCloseService.initialize_for_conversation(db, conversation, commit=False)
         elif task.task_type == QueueTaskType.CALL.value:
             await QueueBusinessRepository.assign_call(db, tenant_id, task.task_ref_id, employee_id)
 
@@ -656,3 +687,15 @@ class QueueTaskService:
             return group.name if group else None
 
         return None
+
+    @staticmethod
+    async def _emit_queue_change(task: QueueTask, action: str) -> None:
+        if task.channel != QueueChannel.ONLINE_CHAT.value:
+            return
+        await QueueRealtimeService.emit_queue_updated(
+            task.tenant_id,
+            action=action,
+            task_id=task.id,
+            queue_type=task.queue_type,
+            queue_id=task.queue_id,
+        )

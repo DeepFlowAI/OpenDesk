@@ -10,31 +10,38 @@ import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { hasPermission } from '@/utils/permissions'
 import type { Conversation } from '@/models/conversation'
+import type { ConversationUserStatisticItem } from '@/models/conversation-user-statistics'
 import type { Ticket } from '@/models/ticket'
 import type { UnifiedField } from '@/models/field-definition'
 import type { CustomFieldValue, UpdateUserPayload, User } from '@/models/user'
 import { useUnifiedFields } from '@/service/use-field-definitions'
+import { useConversationUserStatistics } from '@/service/use-conversation-user-statistics'
 import { useUpdateUser, useUser } from '@/service/use-users'
 import { FieldValueDisplay } from '@/app/components/features/field-system/field-value-display'
 import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
 import { SessionSummaryFields } from '@/app/components/features/session-summary/session-summary-fields'
 import { ChatTicketDraftPanel, hasTicketDraft } from '@/app/components/features/chat/chat-ticket-draft-panel'
+import { KnowledgeAssistant, type KnowledgeAssistantActionContext } from '@/app/components/features/knowledge/knowledge-assistant'
 import { FieldType } from '@/types/field-enums'
+
+type AuxiliaryTab = 'basic' | 'summary' | 'ticket' | 'knowledge'
 
 type Props = {
   conversation: Conversation | null
+  connected: boolean
+  width: number
   ticketDraftOpen?: boolean
   onCloseTicketDraft?: (conversationId: number) => void
+  onKnowledgeUse?: (messageText: string) => void
+  onKnowledgeSend?: (messageText: string) => void | Promise<void>
 }
 
 const SYSTEM_KEY_ALIAS: Record<string, keyof User> = { nickname: 'name' }
-const EDITABLE_SYSTEM_KEYS = new Set(['name', 'email', 'phone', 'gender', 'address', 'remark', 'web_id', 'organization_id'])
+const EDITABLE_SYSTEM_KEYS = new Set(['name', 'email', 'phone', 'gender', 'level', 'address', 'remark', 'web_id', 'organization_id'])
 const READONLY_FIELD_KEYS = new Set(['id', 'public_id', 'external_id', 'created_at', 'updated_at', 'channel_id'])
 const INSTANT_SAVE_FIELD_TYPES = new Set<FieldType>([
   FieldType.SINGLE_SELECT,
-  FieldType.MULTI_SELECT,
   FieldType.SINGLE_SELECT_TREE,
-  FieldType.MULTI_SELECT_TREE,
   FieldType.FILE,
   FieldType.ORGANIZATION_SELECT,
 ])
@@ -45,12 +52,20 @@ function formatDateTime(dateStr: string | null): string {
   return d.toLocaleString('sv-SE').replace('T', ' ')
 }
 
-export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseTicketDraft }: Props) {
+export function AuxiliaryPanel({
+  conversation,
+  connected,
+  width,
+  ticketDraftOpen = false,
+  onCloseTicketDraft,
+  onKnowledgeUse,
+  onKnowledgeSend,
+}: Props) {
   const router = useRouter()
   const { locale } = useLocaleStore()
   const currentUser = useAuthStore((state) => state.user)
   const [copiedField, setCopiedField] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<'basic' | 'summary' | 'ticket'>('basic')
+  const [activeTab, setActiveTab] = useState<AuxiliaryTab>('basic')
   const [summaryDirty, setSummaryDirty] = useState(false)
   const [ticketNotice, setTicketNotice] = useState<{ type: 'success' | 'error'; text: string; ticket?: Ticket } | null>(null)
   const visitorId = conversation?.visitor?.id ?? 0
@@ -60,11 +75,30 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
   const canViewUsers = hasPermission(currentUser, 'crm.workspace.user.view')
   const canEditUser = hasPermission(currentUser, 'crm.workspace.user.edit')
   const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
+  const canViewKnowledge = hasPermission(currentUser, 'knowledge.workspace.view')
+  const isPeerConversation = conversation?.viewer_relation === 'peer'
+  const showSummaryTab = !!conversation && !isPeerConversation
   const showTicketTab = !!conversation && canCreateTicket && (ticketDraftOpen || hasTicketDraft(conversation.id))
+  const conversationClosed = conversation?.status === 'closed'
+  const isWebChannel = conversation?.channel?.channel_type?.toLowerCase() === 'web'
+  const knowledgeUseReason = !conversation
+    ? t('ws.knowledge.selectConversation', locale)
+    : conversationClosed
+      ? t('ws.knowledge.conversationEnded', locale)
+      : undefined
+  const knowledgeSendReason = knowledgeUseReason ?? (!connected ? t('ws.knowledge.disconnected', locale) : undefined)
+  const visibleActiveTab =
+    (activeTab === 'summary' && !showSummaryTab) || (activeTab === 'ticket' && !showTicketTab)
+      ? 'basic'
+      : activeTab
 
   const userQuery = useUser(visitorId)
   const fieldsQuery = useUnifiedFields({ domain: 'user', locale, include_metadata: true })
+  const userStatsQuery = useConversationUserStatistics(conversation?.id ?? 0, {
+    enabled: Boolean(conversation && visibleActiveTab === 'basic' && visitorId > 0),
+  })
   const updateUser = useUpdateUser()
+  const prevConversationIdRef = useRef<number | null>(null)
 
   useEffect(() => {
     if (ticketDraftOpen && showTicketTab) {
@@ -73,10 +107,30 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
   }, [ticketDraftOpen, showTicketTab])
 
   useEffect(() => {
+    const currentId = conversation?.id ?? null
+    if (currentId === prevConversationIdRef.current) return
+    prevConversationIdRef.current = currentId
+
+    if (currentId == null) return
+    if (ticketDraftOpen && showTicketTab) return
+
+    setActiveTab('basic')
+  }, [conversation?.id, ticketDraftOpen, showTicketTab])
+
+  useEffect(() => {
     if (activeTab === 'ticket' && !showTicketTab) {
-      setActiveTab('basic')
+      setActiveTab(conversation ? 'basic' : canViewKnowledge ? 'knowledge' : 'basic')
     }
-  }, [activeTab, showTicketTab])
+    if (activeTab === 'summary' && !showSummaryTab) {
+      setActiveTab(conversation ? 'basic' : canViewKnowledge ? 'knowledge' : 'basic')
+    }
+    if ((activeTab === 'basic' || activeTab === 'summary') && !conversation && canViewKnowledge) {
+      setActiveTab('knowledge')
+    }
+    if (activeTab === 'knowledge' && !canViewKnowledge) {
+      setActiveTab(conversation ? 'basic' : 'basic')
+    }
+  }, [activeTab, canViewKnowledge, conversation, showSummaryTab, showTicketTab])
 
   useEffect(() => {
     if (!ticketNotice) return
@@ -99,7 +153,7 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
     })
   }
 
-  const switchTab = (nextTab: 'basic' | 'summary' | 'ticket') => {
+  const switchTab = (nextTab: AuxiliaryTab) => {
     if (activeTab === 'summary' && nextTab !== 'summary' && summaryDirty) {
       const confirmed = window.confirm(t('ws.summary.unsavedConfirm', locale))
       if (!confirmed) return
@@ -111,8 +165,16 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
     ? `/workspace/tickets/${ticketNotice.ticket.id}?from=list`
     : null
 
+  const handleKnowledgeUse = (context: KnowledgeAssistantActionContext) => {
+    onKnowledgeUse?.(context.messageText)
+  }
+
+  const handleKnowledgeSend = async (context: KnowledgeAssistantActionContext) => {
+    await onKnowledgeSend?.(context.messageText)
+  }
+
   return (
-    <div className="relative flex w-[300px] shrink-0 flex-col border-l border-[#E5E5E5] bg-[#F5F5F5]">
+    <div className="relative flex shrink-0 flex-col bg-[#F5F5F5]" style={{ width }}>
       {ticketNotice && (
         <div
           className={cn(
@@ -141,37 +203,63 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
           )}
         </div>
       )}
-      {conversation ? (
+      {conversation || canViewKnowledge ? (
         <>
           <div className="mx-5 mb-4 mt-5 flex rounded-lg border border-border bg-background p-0.5">
-            <button
-              type="button"
-              onClick={() => switchTab('basic')}
-              className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', activeTab === 'basic' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
-            >
-              {t('ws.summary.tab.basic', locale)}
-            </button>
-            <button
-              type="button"
-              onClick={() => switchTab('summary')}
-              className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', activeTab === 'summary' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
-            >
-              {t('ws.summary.tab.summary', locale)}
-            </button>
+            {conversation && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => switchTab('basic')}
+                  className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', visibleActiveTab === 'basic' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
+                >
+                  {t('ws.summary.tab.basic', locale)}
+                </button>
+                {showSummaryTab && (
+                  <button
+                    type="button"
+                    onClick={() => switchTab('summary')}
+                    className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', visibleActiveTab === 'summary' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
+                  >
+                    {t('ws.summary.tab.summary', locale)}
+                  </button>
+                )}
+              </>
+            )}
             {showTicketTab && (
               <button
                 type="button"
                 onClick={() => switchTab('ticket')}
-                className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', activeTab === 'ticket' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
+                className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', visibleActiveTab === 'ticket' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
               >
                 {t('ws.chatTicket.tab', locale)}
               </button>
             )}
+            {canViewKnowledge && (
+              <button
+                type="button"
+                onClick={() => switchTab('knowledge')}
+                className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', visibleActiveTab === 'knowledge' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
+              >
+                {t('ws.knowledge.title', locale)}
+              </button>
+            )}
           </div>
-          <div className="flex-1 overflow-y-auto px-5 pb-5 pt-0">
-            {activeTab === 'basic' ? (
+          <div className={cn('flex-1', visibleActiveTab === 'knowledge' ? 'flex min-h-0 flex-col overflow-hidden' : 'overflow-y-auto px-5 pb-5 pt-0')}>
+            {visibleActiveTab === 'knowledge' ? (
+              <KnowledgeAssistant
+                mode="chat"
+                canUse={Boolean(conversation && !conversationClosed)}
+                useDisabledReason={knowledgeUseReason}
+                canSend={Boolean(conversation && !conversationClosed && connected)}
+                sendDisabledReason={knowledgeSendReason}
+                onUse={handleKnowledgeUse}
+                onSend={handleKnowledgeSend}
+              />
+            ) : conversation && visibleActiveTab === 'basic' ? (
               <>
                 <section className="flex flex-col gap-[14px]">
+                  <InfoRow label={t('ws.chat.startTime', locale)} value={formatDateTime(conversation.started_at || conversation.created_at)} />
                   <InfoRow
                     label={t('ws.chat.visitorId', locale)}
                     value={visitorPublicId || '-'}
@@ -179,7 +267,6 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
                     onCopy={(v) => handleCopy(v, 'visitorId')}
                     copied={copiedField === 'visitorId'}
                   />
-                  <InfoRow label={t('ws.chat.sourceChannel', locale)} value={conversation.channel?.channel_type || 'Web'} />
                   <InfoRow
                     label={t('ws.chat.shareCode', locale)}
                     value={conversationShareCode}
@@ -187,9 +274,16 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
                     onCopy={(v) => handleCopy(v, 'shareCode')}
                     copied={copiedField === 'shareCode'}
                   />
-                  <InfoRow label={t('ws.chat.startTime', locale)} value={formatDateTime(conversation.started_at || conversation.created_at)} />
+                  <InfoRow label={t('ws.chat.sourceChannel', locale)} value={conversation.channel?.channel_type || 'Web'} />
                   <InfoRow label={t('ws.chat.channelName', locale)} value={conversation.channel?.name || '-'} />
                   <InfoRow label={t('ws.chat.agentGroup', locale)} value={conversation.group?.name || '-'} />
+                  {isWebChannel && (
+                    <>
+                      <InfoRow label={t('ws.chat.visitorSystem', locale)} value={conversation.visitor_system || '-'} />
+                      <InfoRow label={t('ws.chat.visitorBrowser', locale)} value={conversation.visitor_browser || '-'} />
+                      <InfoRow label={t('ws.chat.visitorIp', locale)} value={conversation.visitor_ip || '-'} />
+                    </>
+                  )}
                 </section>
 
                 <section className="mt-5 border-t border-border pt-4">
@@ -208,6 +302,9 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
                   <UserInfoSection
                     locale={locale}
                     visitorId={visitorId}
+                    statistics={userStatsQuery.data?.items ?? []}
+                    statisticsLoading={userStatsQuery.isLoading}
+                    statisticsError={userStatsQuery.isError}
                     user={userQuery.data ?? null}
                     fields={workspaceFields}
                     isLoading={userQuery.isLoading || fieldsQuery.isLoading}
@@ -218,21 +315,29 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
                       void userQuery.refetch()
                       void fieldsQuery.refetch()
                     }}
+                    onStatisticsRetry={() => {
+                      void userStatsQuery.refetch()
+                    }}
                     onSave={(field, value) => updateUser.mutateAsync({ id: visitorId, data: buildUpdatePayload(field, value) })}
                   />
                 </section>
               </>
-            ) : activeTab === 'summary' ? (
+            ) : conversation && visibleActiveTab === 'summary' && showSummaryTab ? (
               <SessionSummaryFields conversationId={conversation.id} onDirtyChange={setSummaryDirty} />
-            ) : (
+            ) : conversation ? (
               <ChatTicketDraftPanel
                 conversation={conversation}
+                summaryEnabled={!isPeerConversation}
                 onNotice={(type, text, payload) => setTicketNotice({ type, text, ticket: payload?.ticket })}
                 onClose={() => {
                   onCloseTicketDraft?.(conversation.id)
                   setActiveTab('basic')
                 }}
               />
+            ) : (
+              <div className="flex h-full items-center justify-center px-5">
+                <p className="text-sm text-[#737373]">{t('ws.chat.selectHint', locale)}</p>
+              </div>
             )}
           </div>
         </>
@@ -248,6 +353,9 @@ export function AuxiliaryPanel({ conversation, ticketDraftOpen = false, onCloseT
 function UserInfoSection({
   locale,
   visitorId,
+  statistics,
+  statisticsLoading,
+  statisticsError,
   user,
   fields,
   isLoading,
@@ -255,10 +363,14 @@ function UserInfoSection({
   isSaving,
   canEdit,
   onRetry,
+  onStatisticsRetry,
   onSave,
 }: {
   locale: Locale
   visitorId: number
+  statistics: ConversationUserStatisticItem[]
+  statisticsLoading: boolean
+  statisticsError: boolean
   user: User | null
   fields: UnifiedField[]
   isLoading: boolean
@@ -266,27 +378,45 @@ function UserInfoSection({
   isSaving: boolean
   canEdit: boolean
   onRetry: () => void
+  onStatisticsRetry: () => void
   onSave: (field: UnifiedField, value: unknown) => Promise<unknown>
 }) {
   const [editingKey, setEditingKey] = useState<string | null>(null)
   const [draftValue, setDraftValue] = useState<unknown>(null)
   const [fieldError, setFieldError] = useState<string | null>(null)
+  const statisticsStrip = (
+    <UserStatisticsStrip
+      locale={locale}
+      items={statistics}
+      isLoading={statisticsLoading}
+      isError={statisticsError}
+      onRetry={onStatisticsRetry}
+    />
+  )
 
   if (!visitorId) {
     return <PanelStateMessage>{t('ws.chat.noLinkedUser', locale)}</PanelStateMessage>
   }
 
   if (isLoading) {
-    return <PanelStateMessage>{t('ws.chat.userInfoLoading', locale)}</PanelStateMessage>
+    return (
+      <div className="flex flex-col gap-[14px]">
+        {statisticsStrip}
+        <PanelStateMessage>{t('ws.chat.userInfoLoading', locale)}</PanelStateMessage>
+      </div>
+    )
   }
 
   if (isError) {
     return (
-      <div className="rounded-lg border border-border bg-background/70 px-3 py-4 text-center">
-        <p className="text-xs text-destructive">{t('ws.chat.userInfoLoadFailed', locale)}</p>
-        <button type="button" onClick={onRetry} className="mt-2 text-xs font-medium text-primary hover:underline">
-          {t('ws.chat.retry', locale)}
-        </button>
+      <div className="flex flex-col gap-[14px]">
+        {statisticsStrip}
+        <div className="rounded-lg border border-border bg-background/70 px-3 py-4 text-center">
+          <p className="text-xs text-destructive">{t('ws.chat.userInfoLoadFailed', locale)}</p>
+          <button type="button" onClick={onRetry} className="mt-2 text-xs font-medium text-primary hover:underline">
+            {t('ws.chat.retry', locale)}
+          </button>
+        </div>
       </div>
     )
   }
@@ -296,7 +426,12 @@ function UserInfoSection({
   }
 
   if (fields.length === 0) {
-    return <PanelStateMessage>{t('ws.chat.noWorkspaceFields', locale)}</PanelStateMessage>
+    return (
+      <div className="flex flex-col gap-[14px]">
+        {statisticsStrip}
+        <PanelStateMessage>{t('ws.chat.noWorkspaceFields', locale)}</PanelStateMessage>
+      </div>
+    )
   }
 
   const startEdit = (field: UnifiedField) => {
@@ -334,6 +469,7 @@ function UserInfoSection({
 
   return (
     <div className="flex flex-col gap-[14px]">
+      {statisticsStrip}
       {fields.map((field) => {
         const identity = getFieldIdentity(field)
         const editing = editingKey === identity
@@ -359,6 +495,75 @@ function UserInfoSection({
       <div aria-hidden className="h-[200px] shrink-0" />
     </div>
   )
+}
+
+function UserStatisticsStrip({
+  locale,
+  items,
+  isLoading,
+  isError,
+  onRetry,
+}: {
+  locale: Locale
+  items: ConversationUserStatisticItem[]
+  isLoading: boolean
+  isError: boolean
+  onRetry: () => void
+}) {
+  if (isLoading) {
+    return (
+      <div className="flex h-[54px] items-center gap-3 rounded-md border border-border bg-background/70 px-3 py-2">
+        <div className="h-8 flex-1 animate-pulse rounded bg-muted" />
+        <div className="h-8 flex-1 animate-pulse rounded bg-muted" />
+        <div className="h-8 flex-1 animate-pulse rounded bg-muted" />
+      </div>
+    )
+  }
+
+  if (isError) {
+    return (
+      <div className="rounded-md border border-border bg-background/70 px-3 py-2 text-center">
+        <p className="text-xs text-muted-foreground">{t('userStats.workspace.loadFailed', locale)}</p>
+        <button type="button" onClick={onRetry} className="mt-1 text-xs font-medium text-primary hover:underline">
+          {t('ws.chat.retry', locale)}
+        </button>
+      </div>
+    )
+  }
+
+  if (items.length === 0) return null
+
+  return (
+    <div className="flex rounded-md border border-border bg-background/70 py-2">
+      {items.map((item, index) => (
+        <div
+          key={item.key}
+          className={cn(
+            'flex min-w-0 flex-1 flex-col items-center justify-center gap-1 px-2 text-center',
+            index > 0 && 'border-l border-border',
+          )}
+        >
+          {item.key === 'tickets' ? (
+            <div className="text-sm leading-5">
+              <span className="text-destructive">{formatStatNumber(item.unresolved_value)}</span>
+              <span className="text-foreground">/</span>
+              <span className="text-foreground">{formatStatNumber(item.total_value)}</span>
+            </div>
+          ) : (
+            <div className="text-sm leading-5 text-foreground">
+              {formatStatNumber(item.value)}
+            </div>
+          )}
+          <div className="truncate text-xs text-muted-foreground">{t(`userStats.workspace.${item.key}`, locale)}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function formatStatNumber(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '—'
+  return String(value)
 }
 
 function EditableInfoRow({

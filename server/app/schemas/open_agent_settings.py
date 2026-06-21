@@ -2,9 +2,10 @@
 OpenAgent settings schemas.
 """
 from datetime import datetime
+from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 MAX_BASE_URL_LENGTH = 512
@@ -85,6 +86,46 @@ class OpenAgentAgentSummary(BaseModel):
     name: str
     description: str | None = None
     status: str
+
+
+class OpenAgentWelcomeMessageBlock(BaseModel):
+    type: Literal["markdown", "embed"]
+    content: str | None = None
+    embed_code: str | None = None
+    height: int | None = None
+
+    @model_validator(mode="after")
+    def normalize_block(self) -> "OpenAgentWelcomeMessageBlock":
+        if self.type == "markdown":
+            self.content = self.content or ""
+            self.embed_code = None
+            self.height = None
+        else:
+            self.content = None
+            self.embed_code = self.embed_code or ""
+            self.height = self.height if self.height and self.height > 0 else 360
+        return self
+
+
+class OpenAgentFAQQuestion(BaseModel):
+    text: str
+
+
+class OpenAgentFAQCategory(BaseModel):
+    name: str
+    questions: list[OpenAgentFAQQuestion] = Field(default_factory=list)
+
+
+class OpenAgentFAQ(BaseModel):
+    enabled: bool = False
+    title: str = "常见问题"
+    categories: list[OpenAgentFAQCategory] = Field(default_factory=list)
+
+
+class OpenAgentWelcomeMessage(BaseModel):
+    enabled: bool = False
+    blocks: list[OpenAgentWelcomeMessageBlock] = Field(default_factory=list)
+    faq: OpenAgentFAQ | None = None
 
 
 class OpenAgentAgentListResponse(BaseModel):

@@ -22,6 +22,7 @@ from app.repositories.satisfaction_survey_record_repository import SatisfactionS
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.satisfaction_survey_config import SatisfactionSurveyConfigPayload
 from app.schemas.satisfaction_survey_record import SatisfactionSubmissionPayload, SatisfactionSubmissionTypePayload
+from app.services.conversation_service import ConversationService
 from app.services.data_scope_service import DataScopeService
 
 logger = logging.getLogger(__name__)
@@ -376,7 +377,7 @@ class SatisfactionSurveyRecordService:
 
         actor = await EmployeeRepository.get_by_id(db, int(user["user_id"]))
         actor_name = (
-            actor.display_name or actor.name
+            ConversationService.visitor_agent_display_name(actor)
             if actor
             else str(user.get("display_name") or user.get("name") or user.get("username") or "Agent")
         )
@@ -891,6 +892,12 @@ class SatisfactionSurveyRecordService:
                     room=f"agent:{conversation.tenant_id}:{conversation.agent_id}",
                     namespace="/chat",
                 )
+            await rt.emit(
+                event_name,
+                jsonable_encoder(payload),
+                room=f"conv:{conversation.id}",
+                namespace="/chat",
+            )
             if include_visitor:
                 await rt.emit(
                     event_name,

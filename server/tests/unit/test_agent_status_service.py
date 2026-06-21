@@ -1,6 +1,8 @@
 """
 Unit tests for agent status persistence.
 """
+from unittest.mock import AsyncMock
+
 import fakeredis.aioredis
 import pytest
 
@@ -164,6 +166,37 @@ async def test_get_statuses_bulk_matches_individual_get_status(fake_redis):
     single = await AgentStatusService.get_status(fake_redis, tenant_id=2, user_id=99, max_concurrent=8)
     bulk = await AgentStatusService.get_statuses_bulk(fake_redis, tenant_id=2, users=[(99, 8)])
     assert bulk[99] == single
+
+
+@pytest.mark.asyncio
+async def test_trigger_queue_backfill_delegates_to_assign(fake_redis, monkeypatch):
+    import app.libs.realtime as realtime
+    from app.socketio import chat_handlers
+
+    rt = object()
+    backfill = AsyncMock()
+    monkeypatch.setattr(realtime, "get_realtime_transport", lambda: rt)
+    monkeypatch.setattr(chat_handlers, "_assign_queued_conversations", backfill)
+
+    await AgentStatusService.trigger_queue_backfill(fake_redis, tenant_id=1, user_id=10)
+
+    backfill.assert_awaited_once_with(rt, fake_redis, 1, 10)
+
+
+@pytest.mark.asyncio
+async def test_trigger_queue_backfill_swallows_errors(fake_redis, monkeypatch):
+    import app.libs.realtime as realtime
+    from app.socketio import chat_handlers
+
+    monkeypatch.setattr(realtime, "get_realtime_transport", lambda: object())
+    monkeypatch.setattr(
+        chat_handlers,
+        "_assign_queued_conversations",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    # Best-effort trigger: a failed backfill must not propagate to the caller.
+    await AgentStatusService.trigger_queue_backfill(fake_redis, tenant_id=1, user_id=10)
 
 
 @pytest.mark.asyncio

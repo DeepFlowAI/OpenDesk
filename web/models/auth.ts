@@ -1,3 +1,13 @@
+export type WorkspaceChatPreferences = {
+  auxiliary_panel_width?: number
+  composer_input_height?: number
+}
+
+export type UserPreferences = {
+  workspace_chat?: WorkspaceChatPreferences
+  [key: string]: unknown
+}
+
 export type LoginPayload = {
   tenant: string
   username: string
@@ -16,6 +26,7 @@ export type UserInfo = {
   data_scopes: Record<string, 'all' | 'group' | 'self'>
   is_super_admin: boolean
   group_ids: number[]
+  preferences: UserPreferences
 }
 
 export type LoginResponse = {

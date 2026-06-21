@@ -1,5 +1,6 @@
 export type EmployeeGroupMember = {
   employee_id: number
+  name?: string | null
   username: string
   display_name: string | null
 }
@@ -33,6 +34,7 @@ export type UpdateEmployeeGroupPayload = CreateEmployeeGroupPayload
 
 export type UserListItem = {
   id: number
+  name?: string | null
   username: string
   display_name: string | null
 }

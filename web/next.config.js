@@ -38,6 +38,10 @@ const browserStub = { browser: emptyStub }
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Emit a self-contained production server (.next/standalone) with only the
+  // traced runtime deps, so the Docker image ships a minimal node_modules
+  // instead of the full install. Run with `node server.js`.
+  output: 'standalone',
   turbopack: {
     resolveAlias: {
       fs: browserStub,

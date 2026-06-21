@@ -3,13 +3,16 @@ Organization service — business logic for organization CRUD + list
 """
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, ValidationError
+from app.libs.excel import build_xlsx
 from app.models.organization import Organization
 from app.models.organization_view import OrganizationView
 from app.models.fd_field_definition import FdFieldDefinition
@@ -20,11 +23,16 @@ from app.schemas.organization import (
     OrganizationUpdate,
     OrganizationQueryRequest,
     OrganizationResponse,
+    OrganizationExportRequest,
+    OrganizationExportColumn,
 )
 from app.schemas.view_group import ViewGroupRequest
 from app.services.audit_actor_service import AuditActorService
 from app.services.entity_change_service import EntityChangeService
 from app.services.fd_field_definition_service import coerce_slot_value
+
+
+ORGANIZATION_EXPORT_MAX_ROWS = 5000
 
 
 ORG_SYSTEM_FIELD_LABELS: dict[str, str] = {
@@ -33,6 +41,28 @@ ORG_SYSTEM_FIELD_LABELS: dict[str, str] = {
     "description": "描述",
     "created_by": "创建人",
     "updated_by": "更新人",
+    "created_at": "创建时间",
+    "updated_at": "更新时间",
+    "__user_count": "用户数量",
+}
+
+ORGANIZATION_EXPORT_DEFAULT_COLUMNS = [
+    OrganizationExportColumn(field_key="public_id", name="组织 ID", field_type="text"),
+    OrganizationExportColumn(field_key="name", name="名称", field_type="text"),
+    OrganizationExportColumn(field_key="__user_count", name="用户数量", field_type="number"),
+    OrganizationExportColumn(field_key="updated_at", name="更新时间", field_type="datetime"),
+]
+
+ORGANIZATION_EXPORT_SYSTEM_FIELDS = {
+    "public_id",
+    "name",
+    "description",
+    "created_by",
+    "updated_by",
+    "created_at",
+    "updated_at",
+    "__user_count",
+    "user_count",
 }
 
 
@@ -113,6 +143,46 @@ class OrganizationService:
             if row.field_key:
                 key_to_meta[row.field_key] = meta
         return key_to_meta
+
+    @staticmethod
+    async def _get_custom_field_option_lookup(
+        db: AsyncSession,
+        tenant_id: int,
+        domain: str,
+    ) -> dict[str, dict[str, str]]:
+        """Build option label lookup for select custom fields."""
+        result = await db.execute(
+            select(FdFieldDefinition)
+            .options(
+                selectinload(FdFieldDefinition.options),
+                selectinload(FdFieldDefinition.tree_nodes),
+            )
+            .where(
+                FdFieldDefinition.tenant_id == tenant_id,
+                FdFieldDefinition.domain == domain,
+                FdFieldDefinition.status == "active",
+            )
+        )
+        lookup: dict[str, dict[str, str]] = {}
+        for field in result.scalars().all():
+            value_map: dict[str, str] = {}
+            for option in field.options or []:
+                if option.is_active:
+                    value_map[option.value] = option.label
+            for node in field.tree_nodes or []:
+                if node.is_active:
+                    value_map[node.value] = node.label
+            type_options = field.type_config.get("options") if isinstance(field.type_config, dict) else None
+            if isinstance(type_options, list):
+                for option in type_options:
+                    value = option.get("value") if isinstance(option, dict) else None
+                    label = option.get("label") if isinstance(option, dict) else None
+                    if value is not None and label is not None:
+                        value_map[str(value)] = str(label)
+            if value_map:
+                lookup[field.field_key] = value_map
+                lookup[str(field.id)] = value_map
+        return lookup
 
     @staticmethod
     def _enrich_response(org: Organization, slot_to_key: dict[str, str], user_count: int = 0) -> dict:
@@ -315,6 +385,135 @@ class OrganizationService:
             "per_page": req.per_page,
             "pages": pages,
         }
+
+    @staticmethod
+    async def export_organizations(
+        db: AsyncSession,
+        tenant_id: int,
+        req: OrganizationExportRequest,
+    ) -> tuple[bytes, str]:
+        """Export organizations matching current list filters to an XLSX workbook."""
+        slot_map = await OrganizationService._get_slot_map(db, tenant_id)
+        slot_to_key = await OrganizationService._get_field_key_slot_map(db, tenant_id)
+
+        view_conditions: list[dict] = []
+        view_condition_logic = "and"
+        group_field_col: str | None = None
+
+        if req.view_id:
+            view = await db.get(OrganizationView, req.view_id)
+            if view and view.tenant_id == tenant_id and view.is_enabled:
+                view_conditions = [c if isinstance(c, dict) else dict(c) for c in (view.conditions or [])]
+                view_condition_logic = view.condition_logic or "and"
+                if view.group_field_id:
+                    group_field_col = slot_map.get(view.group_field_id)
+
+        temp_conds = [c.model_dump() for c in req.temp_conditions] if req.temp_conditions else []
+        items, total = await OrganizationRepository.query_paginated(
+            db,
+            tenant_id,
+            search=req.search,
+            view_conditions=view_conditions,
+            view_condition_logic=view_condition_logic,
+            temp_conditions=temp_conds,
+            temp_condition_logic=req.temp_condition_logic,
+            group_field_col=group_field_col,
+            group_value=req.group_value,
+            slot_map=slot_map,
+            sort_by=req.sort_by,
+            sort_order=req.sort_order,
+            page=1,
+            per_page=ORGANIZATION_EXPORT_MAX_ROWS + 1,
+        )
+        if total > ORGANIZATION_EXPORT_MAX_ROWS:
+            raise ValidationError("Too many records to export")
+
+        columns = OrganizationService._normalize_export_columns(req.columns)
+        option_lookup = await OrganizationService._get_custom_field_option_lookup(db, tenant_id, "organization")
+
+        headers = [column.name for column in columns]
+        enriched = []
+        for organization in items:
+            user_count = await OrganizationRepository.count_users(db, tenant_id, organization.id)
+            enriched.append(OrganizationService._enrich_response(organization, slot_to_key, user_count))
+        rows = [
+            [
+                OrganizationService._export_cell_value(row, column, option_lookup)
+                for column in columns
+            ]
+            for row in enriched
+        ]
+        workbook = build_xlsx(headers, rows, sheet_name="Organizations")
+        filename = f"organizations-export-{datetime.now().strftime('%Y%m%d-%H%M')}.xlsx"
+        return workbook, filename
+
+    @staticmethod
+    def _normalize_export_columns(
+        columns: list[OrganizationExportColumn],
+    ) -> list[OrganizationExportColumn]:
+        """Filter unsupported or internal columns from the client-provided list."""
+        normalized: list[OrganizationExportColumn] = []
+        for column in columns:
+            if column.field_key == "id":
+                continue
+            if column.field_key and column.field_key in ORGANIZATION_EXPORT_SYSTEM_FIELDS:
+                normalized.append(column)
+                continue
+            if column.field_id is not None or column.field_key:
+                normalized.append(column)
+        return normalized or ORGANIZATION_EXPORT_DEFAULT_COLUMNS
+
+    @staticmethod
+    def _export_cell_value(
+        row: dict,
+        column: OrganizationExportColumn,
+        option_lookup: dict[str, dict[str, str]],
+    ) -> str:
+        key = column.field_key
+        if key and key in ORGANIZATION_EXPORT_SYSTEM_FIELDS:
+            value = row.get("user_count") if key == "__user_count" else row.get(key)
+            if value is None:
+                return ""
+            if key in {"created_by", "updated_by"}:
+                return OrganizationService._format_actor_value(value)
+            return OrganizationService._format_export_value(value)
+
+        custom_key = key if key and key not in ORGANIZATION_EXPORT_SYSTEM_FIELDS else None
+        legacy_key = str(column.field_id) if column.field_id is not None else None
+        lookup_key = custom_key or legacy_key or ""
+        value = None
+        custom_fields = row.get("custom_fields") or {}
+        if isinstance(custom_fields, dict):
+            if custom_key and custom_key in custom_fields:
+                value = custom_fields[custom_key]
+            elif legacy_key and legacy_key in custom_fields:
+                value = custom_fields[legacy_key]
+        return OrganizationService._format_export_value(value, option_lookup.get(lookup_key))
+
+    @staticmethod
+    def _format_actor_value(value: object) -> str:
+        if isinstance(value, dict):
+            return str(value.get("actor_name") or "")
+        return ""
+
+    @staticmethod
+    def _format_export_value(value: object, options: dict[str, str] | None = None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, date):
+            return value.strftime("%Y-%m-%d")
+        if isinstance(value, list):
+            return ", ".join(OrganizationService._format_export_value(item, options) for item in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        text = str(value)
+        if options:
+            if "," in text:
+                return ", ".join(options.get(item.strip(), item.strip()) for item in text.split(","))
+            return options.get(text, text)
+        return text
 
     @staticmethod
     async def get_enabled_views(db: AsyncSession, tenant_id: int) -> list[OrganizationView]:

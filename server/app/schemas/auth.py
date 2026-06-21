@@ -1,6 +1,8 @@
 """
 Auth schemas
 """
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -24,9 +26,19 @@ class UserInfo(BaseModel):
     data_scopes: dict[str, str] = Field(default_factory=dict)
     is_super_admin: bool = False
     group_ids: list[int] = Field(default_factory=list)
+    preferences: dict[str, Any] = Field(default_factory=dict)
+
+
+class UserPreferencesUpdate(BaseModel):
+    preferences: dict[str, Any] = Field(default_factory=dict)
 
 
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserInfo
+
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"

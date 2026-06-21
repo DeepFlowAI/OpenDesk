@@ -55,6 +55,29 @@ class RoutingService:
 
         Returns (group_id, member_user_ids, max_concurrent_map).
         """
+        group_id, member_ids, max_map, _block_reason = await RoutingService.route_conversation_with_meta(
+            db,
+            tenant_id,
+            channel_id,
+            r,
+            visitor_id=visitor_id,
+        )
+        return group_id, member_ids, max_map
+
+    @staticmethod
+    async def route_conversation_with_meta(
+        db: AsyncSession,
+        tenant_id: int,
+        channel_id: int,
+        r: aioredis.Redis | None = None,
+        visitor_id: int | None = None,
+    ) -> tuple[int | None, list[int], dict[int, int], str | None]:
+        """Determine the target group for a new conversation.
+
+        Returns (group_id, member_user_ids, max_concurrent_map, block_reason).
+        block_reason is ``queue_limit`` when candidates exist but queue policy blocks enqueue,
+        or ``no_candidate`` when no routable queue target exists.
+        """
         result = await db.execute(
             select(SessionRoutingRule)
             .where(
@@ -64,6 +87,13 @@ class RoutingService:
             .order_by(SessionRoutingRule.priority.asc())
         )
         rules = list(result.scalars().all())
+        logger.info(
+            "route_conversation_started tenant_id=%s channel_id=%s visitor_id=%s enabled_rule_count=%s",
+            tenant_id,
+            channel_id,
+            visitor_id,
+            len(rules),
+        )
 
         channel = await ChannelRepository.get_by_id(db, channel_id)
         if not channel or channel.tenant_id != tenant_id:
@@ -75,6 +105,7 @@ class RoutingService:
             channel = None
 
         matched_rule: SessionRoutingRule | None = None
+        matched_by = "condition"
         for rule in rules:
             if await RoutingService._rule_matches(db, tenant_id, channel, rule.conditions):
                 matched_rule = rule
@@ -82,9 +113,20 @@ class RoutingService:
 
         if matched_rule is None and rules:
             matched_rule = rules[0]
+            matched_by = "fallback_first_rule"
 
         if matched_rule is not None:
-            candidate = await RoutingService._select_candidate_for_rule(
+            logger.info(
+                "route_rule_selected tenant_id=%s channel_id=%s visitor_id=%s rule_id=%s "
+                "matched_by=%s target_strategy=%s",
+                tenant_id,
+                channel_id,
+                visitor_id,
+                matched_rule.id,
+                matched_by,
+                matched_rule.target_strategy or "sequential_overflow",
+            )
+            candidate, block_reason = await RoutingService._select_candidate_for_rule(
                 db,
                 r,
                 tenant_id,
@@ -92,20 +134,45 @@ class RoutingService:
                 visitor_id=visitor_id,
             )
             if candidate is None:
-                return None, [], {}
-            return candidate.group_id, candidate.member_ids, candidate.max_concurrent_map
+                logger.warning(
+                    "route_conversation_no_candidate tenant_id=%s channel_id=%s visitor_id=%s rule_id=%s "
+                    "block_reason=%s",
+                    tenant_id,
+                    channel_id,
+                    visitor_id,
+                    matched_rule.id,
+                    block_reason,
+                )
+                return None, [], {}, block_reason
+            logger.info(
+                "route_conversation_selected tenant_id=%s channel_id=%s visitor_id=%s rule_id=%s "
+                "queue_type=%s queue_id=%s group_id=%s member_count=%s waiting_count=%s "
+                "gate_passed=%s has_available_agent=%s",
+                tenant_id,
+                channel_id,
+                visitor_id,
+                matched_rule.id,
+                candidate.queue_type,
+                candidate.queue_id,
+                candidate.group_id,
+                len(candidate.member_ids),
+                candidate.waiting_count,
+                candidate.gate_passed,
+                candidate.has_available_agent,
+            )
+            return candidate.group_id, candidate.member_ids, candidate.max_concurrent_map, None
 
         if not rules:
             logger.warning("No routing rules for tenant %d, falling back to all active agents", tenant_id)
             from app.repositories.employee_repository import EmployeeRepository
             all_users = await EmployeeRepository.get_active_by_tenant(db, tenant_id)
             if not all_users:
-                return None, [], {}
+                return None, [], {}, "no_candidate"
             member_ids = [u.id for u in all_users]
             max_map = {u.id: (u.max_concurrent or 10) for u in all_users}
-            return None, member_ids, max_map
+            return None, member_ids, max_map, None
 
-        return None, [], {}
+        return None, [], {}, "no_candidate"
 
     @staticmethod
     def _rule_queue_sources(rule: SessionRoutingRule) -> list[dict]:
@@ -242,12 +309,24 @@ class RoutingService:
     ) -> RouteQueueCandidate | None:
         exists = await QueueCandidateRepository.queue_exists(db, tenant_id, queue_type, queue_id)
         if not exists:
+            logger.warning(
+                "route_candidate_skipped tenant_id=%s queue_type=%s queue_id=%s reason=queue_missing",
+                tenant_id,
+                queue_type,
+                queue_id,
+            )
             return None
 
         employees = await QueueCandidateRepository.list_candidate_employees(
             db, tenant_id, queue_type, queue_id
         )
         if not employees:
+            logger.warning(
+                "route_candidate_skipped tenant_id=%s queue_type=%s queue_id=%s reason=no_candidate_employees",
+                tenant_id,
+                queue_type,
+                queue_id,
+            )
             return None
         member_ids = [employee.id for employee in employees]
         max_map = {employee.id: (employee.max_concurrent or 10) for employee in employees}
@@ -290,6 +369,18 @@ class RoutingService:
                 for employee_id in member_ids
             )
 
+        logger.info(
+            "route_candidate_evaluated tenant_id=%s queue_type=%s queue_id=%s member_count=%s "
+            "waiting_count=%s tail_wait_seconds=%s gate_passed=%s has_available_agent=%s",
+            tenant_id,
+            queue_type,
+            queue_id,
+            len(member_ids),
+            waiting_count,
+            tail_wait_seconds,
+            gate_passed,
+            has_available_agent,
+        )
         return RouteQueueCandidate(
             queue_type=queue_type,
             queue_id=queue_id,
@@ -315,9 +406,17 @@ class RoutingService:
         seen: set[tuple[str, int]] = set()
         order = 0
         for source in RoutingService._rule_queue_sources(rule):
-            for queue_type, queue_id in await RoutingService._source_targets(
+            targets = await RoutingService._source_targets(
                 db, tenant_id, visitor_id, source
-            ):
+            )
+            if not targets:
+                logger.warning(
+                    "route_source_resolved_empty tenant_id=%s rule_id=%s source_type=%s reason=no_targets",
+                    tenant_id,
+                    rule.id,
+                    source.get("source_type"),
+                )
+            for queue_type, queue_id in targets:
                 key = (queue_type, queue_id)
                 if key in seen:
                     continue
@@ -338,23 +437,78 @@ class RoutingService:
         rule: SessionRoutingRule,
         *,
         visitor_id: int | None = None,
-    ) -> RouteQueueCandidate | None:
+    ) -> tuple[RouteQueueCandidate | None, str | None]:
         candidates = await RoutingService._resolve_candidates_for_rule(
             db, r, tenant_id, rule, visitor_id
         )
         strategy = rule.target_strategy or "sequential_overflow"
+        logger.info(
+            "route_rule_candidates_resolved tenant_id=%s rule_id=%s target_strategy=%s candidate_count=%s",
+            tenant_id,
+            rule.id,
+            strategy,
+            len(candidates),
+        )
+        if not candidates:
+            return None, "no_candidate"
         if strategy == "sequential_overflow":
+            last_enqueueable: RouteQueueCandidate | None = None
+            saw_gate_blocked = False
             for candidate in candidates:
-                if candidate.gate_passed and candidate.has_available_agent:
-                    return candidate
-            return None
+                if not candidate.gate_passed:
+                    saw_gate_blocked = True
+                    continue
+                last_enqueueable = candidate
+                if candidate.has_available_agent:
+                    logger.info(
+                        "route_candidate_selected tenant_id=%s rule_id=%s queue_type=%s queue_id=%s "
+                        "reason=sequential_available",
+                        tenant_id,
+                        rule.id,
+                        candidate.queue_type,
+                        candidate.queue_id,
+                    )
+                    return candidate, None
+            if last_enqueueable is not None:
+                logger.info(
+                    "route_candidate_selected tenant_id=%s rule_id=%s queue_type=%s queue_id=%s "
+                    "reason=sequential_enqueueable",
+                    tenant_id,
+                    rule.id,
+                    last_enqueueable.queue_type,
+                    last_enqueueable.queue_id,
+                )
+                return last_enqueueable, None
+            if saw_gate_blocked:
+                return None, "queue_limit"
+            return None, "no_candidate"
 
         eligible = [candidate for candidate in candidates if candidate.gate_passed]
         if not eligible:
-            return None
+            if any(not candidate.gate_passed for candidate in candidates):
+                return None, "queue_limit"
+            return None, "no_candidate"
         if strategy == "shortest_tail_wait":
-            return sorted(eligible, key=lambda c: (c.tail_wait_seconds, c.waiting_count, c.order))[0]
-        return sorted(eligible, key=lambda c: (c.waiting_count, c.tail_wait_seconds, c.order))[0]
+            selected = sorted(eligible, key=lambda c: (c.tail_wait_seconds, c.waiting_count, c.order))[0]
+            logger.info(
+                "route_candidate_selected tenant_id=%s rule_id=%s queue_type=%s queue_id=%s "
+                "reason=shortest_tail_wait",
+                tenant_id,
+                rule.id,
+                selected.queue_type,
+                selected.queue_id,
+            )
+            return selected, None
+        selected = sorted(eligible, key=lambda c: (c.waiting_count, c.tail_wait_seconds, c.order))[0]
+        logger.info(
+            "route_candidate_selected tenant_id=%s rule_id=%s queue_type=%s queue_id=%s "
+            "reason=least_waiting_count",
+            tenant_id,
+            rule.id,
+            selected.queue_type,
+            selected.queue_id,
+        )
+        return selected, None
 
     @staticmethod
     async def _rule_matches(

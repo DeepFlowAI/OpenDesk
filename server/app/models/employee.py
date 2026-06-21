@@ -35,6 +35,7 @@ class Employee(Base, TimestampMixin):
     avatar: Mapped[str | None] = mapped_column(String(512), nullable=True)
     max_concurrent: Mapped[int] = mapped_column(Integer, nullable=False, server_default="10")
     default_language: Mapped[str] = mapped_column(String(10), nullable=False, server_default="system")
+    preferences: Mapped[dict] = mapped_column(JSON, nullable=False, server_default="{}")
     is_super_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     tenant: Mapped["Tenant"] = relationship("Tenant", back_populates="employees")

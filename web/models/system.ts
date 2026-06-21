@@ -12,4 +12,8 @@ export type SystemInfo = {
   /** Whether the enterprise reports module (session reports + online monitor)
    *  is available in this build. Drives the records sub-nav visibility. */
   reports_enabled: boolean
+  /** Whether the voice call center (telephony) is enabled for this deployment.
+   *  When false the agent call workspace shows a "not enabled" notice instead
+   *  of the dialer, since the backend never connects to the telephony kernel. */
+  call_center_enabled: boolean
 }

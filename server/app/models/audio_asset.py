@@ -26,4 +26,4 @@ class AudioAsset(Base, TimestampMixin, AuditActorMixin):
     mime_type: Mapped[str] = mapped_column(String(50), nullable=False)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

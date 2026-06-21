@@ -315,6 +315,28 @@ class AgentStatusService:
         return val
 
     @staticmethod
+    async def trigger_queue_backfill(
+        r: aioredis.Redis, tenant_id: int, user_id: int
+    ) -> None:
+        """Pull queued conversations to an agent that just gained capacity.
+
+        Safe to call on any capacity-gain event (agent goes online, a
+        conversation ends, a conversation is transferred away, max-concurrent
+        raised). The pull routine itself skips offline or already-full agents,
+        so callers do not need to pre-check status.
+        """
+        try:
+            from app.libs.realtime import get_realtime_transport
+            from app.socketio import chat_handlers
+
+            rt = get_realtime_transport()
+            await chat_handlers._assign_queued_conversations(rt, r, tenant_id, user_id)
+        except Exception:
+            logger.exception(
+                "Failed to backfill queued conversations for agent %s", user_id
+            )
+
+    @staticmethod
     async def find_available_agent(
         r: aioredis.Redis,
         tenant_id: int,
@@ -344,3 +366,36 @@ class AgentStatusService:
             ):
                 return uid
         return None
+
+    @staticmethod
+    async def update_own_max_concurrent(
+        db,
+        r: aioredis.Redis,
+        tenant_id: int,
+        user_id: int,
+        max_concurrent: int,
+    ) -> dict:
+        """Update the current agent's max_concurrent and refresh reception stats."""
+        from app.core.exceptions import NotFoundError
+        from app.repositories.employee_repository import EmployeeRepository
+        from app.services.agent_realtime_service import AgentRealtimeService
+
+        employee = await EmployeeRepository.get_by_id(db, user_id)
+        if not employee or employee.tenant_id != tenant_id:
+            raise NotFoundError("Employee not found")
+
+        await EmployeeRepository.update(db, employee, {"max_concurrent": max_concurrent})
+        status = await AgentStatusService.get_status(r, tenant_id, user_id, max_concurrent)
+        stats = {
+            "current_count": status["current_count"],
+            "max_concurrent": max_concurrent,
+        }
+        await AgentRealtimeService.emit_stats_updated(r, tenant_id, user_id)
+
+        if (
+            status["status"] == AgentOnlineStatus.ONLINE.value
+            and status["current_count"] < max_concurrent
+        ):
+            await AgentStatusService.trigger_queue_backfill(r, tenant_id, user_id)
+
+        return stats

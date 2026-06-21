@@ -28,10 +28,23 @@ export type QueueRecordBrief = {
   name: string
 }
 
+export type SessionRecordType = 'human' | 'bot' | 'bot_human'
+
+export type BotHandoffStatus =
+  | 'not_triggered'
+  | 'waiting_confirmation'
+  | 'handoff_in_progress'
+  | 'in_queue'
+  | 'succeeded'
+  | 'failed'
+  | 'dismissed'
+
 export type SessionRecord = {
   id: number
   public_id: string
   share_code: string
+  session_type: SessionRecordType | null
+  bot_handoff_status: BotHandoffStatus | null
   visitor: SessionRecordVisitor | null
   agent: SessionRecordAgent | null
   channel: SessionRecordChannel | null
@@ -65,7 +78,7 @@ export type SessionRecordMessage = {
   sender_id: number | null
   sender_name: string | null
   sender_avatar: string | null
-  content_type: 'text' | 'image' | 'file' | 'system' | 'welcome' | 'satisfaction_event'
+  content_type: 'text' | 'rich_text' | 'image' | 'file' | 'system' | 'welcome' | 'bot_welcome' | 'satisfaction_event' | 'internal_note'
   content: string
   metadata?: Record<string, unknown>
   created_at: string
@@ -86,6 +99,7 @@ export type SessionRecordFilters = {
   end_date?: string
   agent_id?: number
   visitor_id?: number
+  session_type?: SessionRecordType
   keyword?: string
   satisfaction_status?: string
   satisfaction_resolved?: string

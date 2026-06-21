@@ -1,22 +1,36 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { get, post, put, del } from './base'
+import { filenameFromContentDisposition, get, getBlob, post, postBlob, postForm, put, del } from './base'
 import type { EntityChange } from '@/models/entity-change'
-import type { User, CreateUserPayload, UpdateUserPayload, UserQueryPayload, ViewCountsResponse } from '@/models/user'
+import type {
+  User,
+  CreateUserPayload,
+  UpdateUserPayload,
+  UserQueryPayload,
+  UserExportPayload,
+  ViewCountsResponse,
+} from '@/models/user'
 import type { UserView } from '@/models/user-view'
 import type { PaginatedResponse } from '@/models/common'
 import type {
   ViewGroupRequestPayload,
   ViewGroupResponse,
 } from '@/models/view-group'
+import type {
+  UserImportErrorReportPayload,
+  UserImportExecuteResponse,
+  UserImportPreviewResponse,
+} from '@/models/user-import'
 
 const NS = 'users'
+
+const normalizeUserRef = (ref: string | number) => String(ref)
 
 export const userKeys = {
   all: [NS] as const,
   queries: () => [...userKeys.all, 'query'] as const,
   query: (params: UserQueryPayload) => [...userKeys.queries(), params] as const,
   details: () => [...userKeys.all, 'detail'] as const,
-  detail: (ref: string | number) => [...userKeys.details(), ref] as const,
+  detail: (ref: string | number) => [...userKeys.details(), normalizeUserRef(ref)] as const,
   changes: (id: number, params: Record<string, unknown>) =>
     [...userKeys.detail(id), 'changes', params] as const,
   enabledViews: () => [...userKeys.all, 'enabledViews'] as const,
@@ -31,6 +45,84 @@ export const useQueryUsers = (payload: UserQueryPayload) =>
     queryKey: userKeys.query(payload),
     queryFn: () => post<PaginatedResponse<User>>('v1/users/query', { json: payload }),
   })
+
+export const exportUsers = async (payload: UserExportPayload) => {
+  const { blob, headers } = await postBlob('v1/users/export', {
+    json: payload,
+    timeout: 120000,
+  })
+  return {
+    blob,
+    filename: filenameFromContentDisposition(
+      headers.get('content-disposition'),
+      'users-export.xlsx',
+    ),
+  }
+}
+
+export const useExportUsers = () =>
+  useMutation({
+    mutationFn: exportUsers,
+  })
+
+export const downloadUserImportTemplate = async (locale: string) => {
+  const { blob, headers } = await getBlob(`v1/users/import/template?locale=${encodeURIComponent(locale)}`)
+  return {
+    blob,
+    filename: filenameFromContentDisposition(
+      headers.get('content-disposition'),
+      'users-import-template.xlsx',
+    ),
+  }
+}
+
+export const previewUserImport = async (file: File, locale: string) => {
+  const formData = new FormData()
+  formData.append('file', file)
+  return postForm<UserImportPreviewResponse>(
+    `v1/users/import/preview?locale=${encodeURIComponent(locale)}`,
+    formData,
+    120000,
+  )
+}
+
+export const executeUserImport = async (previewToken: string) =>
+  post<UserImportExecuteResponse>('v1/users/import/execute', {
+    json: { preview_token: previewToken },
+    timeout: 120000,
+  })
+
+export const downloadUserImportErrorReport = async (
+  payload: UserImportErrorReportPayload,
+  locale: string,
+) => {
+  const { blob, headers } = await postBlob(`v1/users/import/error-report?locale=${encodeURIComponent(locale)}`, {
+    json: payload,
+    timeout: 120000,
+  })
+  return {
+    blob,
+    filename: filenameFromContentDisposition(
+      headers.get('content-disposition'),
+      'users-import-errors.xlsx',
+    ),
+  }
+}
+
+export const useDownloadUserImportTemplate = () =>
+  useMutation({ mutationFn: downloadUserImportTemplate })
+
+export const useExecuteUserImport = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: executeUserImport,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: userKeys.queries() })
+      qc.invalidateQueries({ queryKey: userKeys.viewCounts() })
+      qc.invalidateQueries({ queryKey: userKeys.viewGroupsRoot() })
+    },
+  })
+}
 
 export const useUser = (ref: string | number | null | undefined) => {
   const userRef = String(ref ?? '')

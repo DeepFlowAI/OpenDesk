@@ -21,6 +21,7 @@ export type AdminNavIconKey =
   | 'ticketWorkflows'
   | 'systemSettings'
   | 'serviceHours'
+  | 'apiKeys'
   | 'openAgent'
 
 export type AdminNavItem = {
@@ -28,6 +29,7 @@ export type AdminNavItem = {
   href: string
   iconKey: AdminNavIconKey
   permission: string
+  superAdminOnly?: boolean
 }
 
 export type AdminNavGroup = {
@@ -38,6 +40,7 @@ export type AdminNavGroup = {
 export type AdminRouteRule = {
   prefix: string
   permissions: string[]
+  superAdminOnly?: boolean
 }
 
 export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
@@ -90,6 +93,7 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
     labelKey: 'nav.group.globalSettings',
     items: [
       { labelKey: 'nav.systemSettings', href: '/system-settings', iconKey: 'systemSettings', permission: 'settings.system.manage' },
+      { labelKey: 'nav.apiKeys', href: '/api-keys', iconKey: 'apiKeys', permission: 'admin.access', superAdminOnly: true },
       { labelKey: 'nav.serviceHours', href: '/service-hours', iconKey: 'serviceHours', permission: 'settings.service_hours.manage' },
       { labelKey: 'nav.openAgent', href: '/open-agent-settings', iconKey: 'openAgent', permission: 'settings.open_agent.manage' },
     ],
@@ -119,6 +123,7 @@ export const ADMIN_ROUTE_RULES: AdminRouteRule[] = [
   { prefix: '/ticket-views', permissions: ['ticket.admin.view.manage'] },
   { prefix: '/ticket-workflows', permissions: ['ticket.admin.workflow.manage'] },
   { prefix: '/system-settings', permissions: ['settings.system.manage'] },
+  { prefix: '/api-keys', permissions: ['admin.access'], superAdminOnly: true },
   { prefix: '/service-hours', permissions: ['settings.service_hours.manage'] },
   { prefix: '/open-agent-settings', permissions: ['settings.open_agent.manage'] },
 ].sort((a, b) => b.prefix.length - a.prefix.length)

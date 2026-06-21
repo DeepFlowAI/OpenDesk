@@ -84,6 +84,58 @@
     return { code: code, message: message, detail: detail }
   }
 
+  function readDeviceId() {
+    var key = 'opendesk:telemetry:device_id'
+    try {
+      var existing = window.localStorage.getItem(key)
+      if (existing) return existing
+      var fresh = createInstanceId()
+      window.localStorage.setItem(key, fresh)
+      return fresh
+    } catch (_) {
+      return createInstanceId()
+    }
+  }
+
+  function trackSdkEvent(instance, name, props, level) {
+    if (!instance || !instance.channelKey || !instance.apiBaseUrl) return
+    try {
+      var batch = {
+        common: {
+          session_id: instance.instanceId,
+          device_id: readDeviceId(),
+          release: VERSION,
+          url: window.location.href,
+          user_agent: navigator.userAgent,
+          viewport: window.innerWidth + 'x' + window.innerHeight,
+          sdk_name: 'opendesk-js',
+          sdk_version: VERSION,
+          ts_offset_ms: 0,
+        },
+        events: [{
+          name: name,
+          ts: Date.now(),
+          level: level || 'info',
+          props: props || null,
+          metrics: null,
+        }],
+      }
+      var url = instance.apiBaseUrl + '/v1/public/channels/' + encodeURIComponent(instance.channelKey) + '/telemetry/events'
+      var body = JSON.stringify(batch)
+      if (navigator.sendBeacon) {
+        var ok = navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }))
+        if (ok) return
+      }
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+        credentials: 'omit',
+        keepalive: true,
+      }).catch(function () {})
+    } catch (_) {}
+  }
+
   function callSafely(fn, arg) {
     if (typeof fn !== 'function') return
     try {
@@ -96,16 +148,30 @@
   }
 
   function normalizeMetadata(value) {
+    return normalizePlainObject(value, 8192)
+  }
+
+  function normalizePlainObject(value, maxLength) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null
     try {
       var json = JSON.stringify(value)
-      if (!json || json.length > 8192) return null
+      if (!json || json.length > maxLength) return null
       var parsed = JSON.parse(json)
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
       return parsed
     } catch (_) {
       return null
     }
+  }
+
+  function normalizeContextToken(value) {
+    if (typeof value !== 'string') return null
+    var token = value.trim()
+    return token ? token : null
+  }
+
+  function normalizeContextObject(value) {
+    return normalizePlainObject(value, 16384)
   }
 
   function normalizeVisitor(value) {
@@ -115,6 +181,8 @@
       var name = value.name.trim()
       if (name) visitor.name = name.slice(0, 64)
     }
+    var customer = normalizeContextObject(value.customer)
+    if (customer) visitor.customer = customer
     var metadata = normalizeMetadata(value.metadata)
     if (metadata) visitor.metadata = metadata
     return Object.keys(visitor).length ? visitor : null
@@ -131,6 +199,8 @@
       apiBaseUrl: normalizeApiBaseUrl(options.apiBaseUrl, appBaseUrl),
       locale: options.locale || 'auto',
       visitor: normalizeVisitor(options.visitor),
+      contextToken: normalizeContextToken(options.contextToken),
+      sessionSummary: normalizeContextObject(options.sessionSummary),
       preload: options.preload !== false,
       launcher: {
         visible: launcher.visible !== false,
@@ -152,6 +222,7 @@
         onOpen: options.onOpen,
         onClose: options.onClose,
         onError: options.onError,
+        onWarning: options.onWarning,
       },
     }
   }
@@ -226,6 +297,11 @@
     this.handleResize = this.handleResize.bind(this)
     window.addEventListener('message', this.handleMessage)
     window.addEventListener('resize', this.handleResize)
+    this.track('sdk_init', {
+      preload: this.options.preload,
+      launcher_visible: this.options.launcher.visible,
+      mobile_unsupported: this.state.mobileUnsupported,
+    })
     this.load()
   }
 
@@ -239,8 +315,16 @@
     }
   }
 
+  OpenDeskInstance.prototype.track = function (name, props, level) {
+    trackSdkEvent(this, name, props, level)
+  }
+
   OpenDeskInstance.prototype.emitError = function (error) {
     callSafely(this.options.callbacks.onError, error)
+  }
+
+  OpenDeskInstance.prototype.emitWarning = function (warning) {
+    callSafely(this.options.callbacks.onWarning, warning)
   }
 
   OpenDeskInstance.prototype.fail = function (error) {
@@ -280,6 +364,10 @@
         self.channel = channel
         self.state.ready = true
         self.state.mobileUnsupported = isMobileViewport()
+        self.track('sdk_config_loaded', {
+          open_agent_enabled: Boolean(channel.config && channel.config.open_agent_enabled),
+          assist_panel_enabled: Boolean(channel.config && channel.config.assist_panel_enabled),
+        })
         if (!self.state.mobileUnsupported) self.render()
         callSafely(self.options.callbacks.onReady, self.getState())
         self.schedulePreload()
@@ -287,6 +375,9 @@
       })
       .catch(function (error) {
         if (self.destroyed) return
+        self.track('sdk_config_failed', {
+          code: error && error.code ? error.code : 'CONFIG_LOAD_FAILED',
+        }, 'error')
         if (error && error.code) {
           self.fail(error)
           return
@@ -450,6 +541,7 @@
   OpenDeskInstance.prototype.open = function () {
     if (this.destroyed || this.failed) return this
     if (isMobileViewport()) {
+      this.track('sdk_open_mobile_tab')
       window.open(this.buildChatUrl(false), '_blank', 'noopener,noreferrer')
       return this
     }
@@ -466,6 +558,7 @@
     this.panel.classList.add('od-open')
     this.applyLayout()
     this.postFrameOpen()
+    this.track('sdk_open')
     callSafely(this.options.callbacks.onOpen, this.getState())
     return this
   }
@@ -476,6 +569,7 @@
 
     this.state.open = false
     if (this.panel) this.panel.classList.remove('od-open')
+    this.track('sdk_close')
     callSafely(this.options.callbacks.onClose, this.getState())
     return this
   }
@@ -486,6 +580,29 @@
 
   OpenDeskInstance.prototype.isOpen = function () {
     return this.state.open
+  }
+
+  OpenDeskInstance.prototype.updateContext = function (context) {
+    if (!context || typeof context !== 'object') {
+      this.emitError(createSdkError('INVALID_CONTEXT', 'updateContext requires a context object.'))
+      return this
+    }
+    if (Object.prototype.hasOwnProperty.call(context, 'contextToken')) {
+      this.options.contextToken = normalizeContextToken(context.contextToken)
+    }
+    if (Object.prototype.hasOwnProperty.call(context, 'sessionSummary')) {
+      this.options.sessionSummary = normalizeContextObject(context.sessionSummary)
+    }
+    if (context.visitor && typeof context.visitor === 'object') {
+      this.options.visitor = normalizeVisitor(context.visitor)
+    }
+    this.postFrameMessage('update_context', { active: this.state.open })
+    this.track('sdk_context_updated', {
+      has_context_token: Boolean(this.options.contextToken),
+      has_session_summary: Boolean(this.options.sessionSummary),
+      has_visitor: Boolean(this.options.visitor),
+    })
+    return this
   }
 
   OpenDeskInstance.prototype.destroy = function () {
@@ -506,6 +623,7 @@
   }
 
   OpenDeskInstance.prototype.handleIframeError = function (event) {
+    this.track('sdk_iframe_failed', null, 'error')
     this.emitError(createSdkError('IFRAME_LOAD_FAILED', 'Failed to load OpenDesk chat iframe.', event))
   }
 
@@ -516,6 +634,8 @@
       type: type,
       instanceId: this.instanceId,
       visitor: this.options.visitor,
+      contextToken: this.options.contextToken,
+      sessionSummary: this.options.sessionSummary,
     }
     if (extra) {
       Object.keys(extra).forEach(function (key) {
@@ -544,15 +664,27 @@
 
     if (data.type === 'ready') {
       this.frameReady = true
+      this.track('sdk_iframe_ready')
       this.postFrameInit()
       return
     }
     if (data.type === 'close') {
+      this.track('sdk_iframe_close_requested')
       this.close()
       return
     }
     if (data.type === 'error') {
+      this.track('sdk_iframe_error', {
+        code: data.code || 'IFRAME_LOAD_FAILED',
+      }, 'error')
       this.emitError(createSdkError(data.code || 'IFRAME_LOAD_FAILED', data.message || 'OpenDesk chat iframe reported an error.', data))
+      return
+    }
+    if (data.type === 'warning') {
+      this.track('sdk_iframe_warning', {
+        code: data.code || 'CONTEXT_PARTIAL_ACCEPTED',
+      }, 'warn')
+      this.emitWarning(createSdkError(data.code || 'CONTEXT_PARTIAL_ACCEPTED', data.message || 'OpenDesk chat iframe reported a warning.', data))
     }
   }
 

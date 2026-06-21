@@ -55,6 +55,26 @@ class OrganizationQueryRequest(BaseModel):
     per_page: int = 20
 
 
+class OrganizationExportColumn(BaseModel):
+    field_key: str | None = None
+    field_id: int | None = None
+    name: str = Field(..., min_length=1, max_length=128)
+    field_type: str | None = Field(None, max_length=64)
+
+
+class OrganizationExportRequest(BaseModel):
+    """POST body for exporting organizations with current list context."""
+    view_id: int | None = None
+    search: str | None = Field(None, max_length=256)
+    temp_conditions: list[ConditionItem] = Field(default_factory=list)
+    temp_condition_logic: str = Field(default="and", max_length=8)
+    group_value: str | None = None
+    sort_by: str | None = None
+    sort_order: str = Field(default="desc", max_length=4)
+    locale: str = Field(default="zh", max_length=8)
+    columns: list[OrganizationExportColumn] = Field(default_factory=list)
+
+
 class OrgViewCountItem(BaseModel):
     view_id: int
     count: int

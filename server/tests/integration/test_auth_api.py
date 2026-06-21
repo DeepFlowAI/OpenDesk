@@ -217,3 +217,63 @@ class TestAuthAPI:
         assert user["username"] == "auth_me_refresh_user"
         assert user["role_ids"] == [role_id]
         assert user["permissions"] == ["call.workspace.use"]
+
+    @pytest.mark.asyncio
+    async def test_preferences_patch_merges_current_employee_workspace_layout(self, client: AsyncClient):
+        async with AsyncSessionLocal() as db:
+            tenant_pk = (
+                await db.execute(text("SELECT id FROM tenants WHERE tenant_id = 'test-corp'"))
+            ).scalar_one()
+            employee_id = (
+                await db.execute(
+                    text(
+                        """
+                        INSERT INTO employees (
+                            tenant_id, username, email, password_hash,
+                            display_name, name, roles, is_active, preferences
+                        )
+                        VALUES (
+                            :tid, 'auth_preferences_user', 'auth-preferences@example.com',
+                            :pw, 'Auth Preferences', 'Auth Preferences',
+                            '["agent"]'::json, true, '{}'::jsonb
+                        )
+                        ON CONFLICT ON CONSTRAINT uq_employees_tenant_username
+                        DO UPDATE SET
+                            preferences = '{}'::jsonb,
+                            is_active = true
+                        RETURNING id
+                        """
+                    ),
+                    {"tid": tenant_pk, "pw": hash_password("Test1234")},
+                )
+            ).scalar_one()
+            await db.commit()
+
+        token = create_access_token(
+            {"sub": str(employee_id), "tenant_id": tenant_pk, "roles": ["agent"]}
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        first_resp = await client.patch(
+            "/api/v1/auth/me/preferences",
+            headers=headers,
+            json={"preferences": {"workspace_chat": {"auxiliary_panel_width": 420}}},
+        )
+        second_resp = await client.patch(
+            "/api/v1/auth/me/preferences",
+            headers=headers,
+            json={"preferences": {"workspace_chat": {"composer_input_height": 88}}},
+        )
+        me_resp = await client.get("/api/v1/auth/me", headers=headers)
+
+        assert first_resp.status_code == 200
+        assert second_resp.status_code == 200
+        assert me_resp.status_code == 200
+        assert second_resp.json()["preferences"]["workspace_chat"] == {
+            "auxiliary_panel_width": 420,
+            "composer_input_height": 88,
+        }
+        assert me_resp.json()["preferences"]["workspace_chat"] == {
+            "auxiliary_panel_width": 420,
+            "composer_input_height": 88,
+        }

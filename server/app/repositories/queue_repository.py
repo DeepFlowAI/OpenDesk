@@ -94,6 +94,15 @@ class QueueTaskRepository:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def get_task_for_update(db: AsyncSession, tenant_id: int, task_id: int) -> QueueTask | None:
+        result = await db.execute(
+            select(QueueTask)
+            .where(QueueTask.tenant_id == tenant_id, QueueTask.id == task_id)
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
     async def get_active_task_by_ref(
         db: AsyncSession,
         tenant_id: int,

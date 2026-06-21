@@ -9,11 +9,12 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
 from app.models.cs_summary_config_field import CsSummaryConfigField
 from app.repositories.cs_summary_config_repository import CsSummaryConfigRepository
 from app.repositories.cs_summary_usage_repository import CsSummaryUsageRepository
 from app.schemas.cs_summary_usage import CsSummaryFieldValueUpdate
+from app.schemas.permission import EffectivePrincipal
 
 
 class CsSummaryUsageService:
@@ -84,6 +85,13 @@ class CsSummaryUsageService:
             if CsSummaryUsageService._field_matches(field, field_definition_id, field_key):
                 return field
         return None
+
+    @staticmethod
+    def _assert_owner_access(conversation, principal: EffectivePrincipal | None) -> None:
+        if principal is None:
+            return
+        if conversation.agent_id != principal.user_id:
+            raise ForbiddenError("No permission to access session summary")
 
     @staticmethod
     def _calculate_states(fields: list[CsSummaryConfigField], rules: list, values: dict[str, Any]) -> dict[str, str]:
@@ -168,10 +176,16 @@ class CsSummaryUsageService:
         return value
 
     @staticmethod
-    async def get_summary(db: AsyncSession, tenant_id: int, conversation_id: int) -> dict:
+    async def get_summary(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+        principal: EffectivePrincipal | None = None,
+    ) -> dict:
         conversation = await CsSummaryUsageRepository.get_conversation(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
+        CsSummaryUsageService._assert_owner_access(conversation, principal)
 
         config = await CsSummaryConfigRepository.get_or_create(db, tenant_id)
         fields = await CsSummaryUsageRepository.get_active_fields(db, config.id)
@@ -194,10 +208,12 @@ class CsSummaryUsageService:
         tenant_id: int,
         conversation_id: int,
         data: CsSummaryFieldValueUpdate,
+        principal: EffectivePrincipal | None = None,
     ):
         conversation = await CsSummaryUsageRepository.get_conversation(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
+        CsSummaryUsageService._assert_owner_access(conversation, principal)
 
         config = await CsSummaryConfigRepository.get_or_create(db, tenant_id)
         fields = await CsSummaryUsageRepository.get_active_fields(db, config.id)
@@ -229,3 +245,78 @@ class CsSummaryUsageService:
             field_key=data.field_key,
             value=normalized_value,
         )
+
+    @staticmethod
+    async def update_fields_by_keys(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+        fields_by_key: dict[str, Any],
+    ) -> dict:
+        conversation = await CsSummaryUsageRepository.get_conversation(db, conversation_id)
+        if not conversation or conversation.tenant_id != tenant_id:
+            raise NotFoundError("Conversation not found")
+
+        if not fields_by_key:
+            return {"updated": 0, "warnings": []}
+
+        config = await CsSummaryConfigRepository.get_or_create(db, tenant_id)
+        fields = await CsSummaryUsageRepository.get_active_fields(db, config.id)
+        field_map: dict[str, CsSummaryConfigField] = {}
+        for field in fields:
+            if field.field_key:
+                field_map[field.field_key] = field
+            elif field.field_definition and field.field_definition.field_key:
+                field_map[field.field_definition.field_key] = field
+
+        value_rows = await CsSummaryUsageRepository.get_values(db, tenant_id, conversation_id)
+        values = {
+            CsSummaryUsageService._value_key(row.field_definition_id, row.field_key): row.value
+            for row in value_rows
+        }
+        rules = await CsSummaryUsageRepository.get_enabled_rules(db, config.id)
+
+        updated = 0
+        warnings: list[str] = []
+        for field_key, raw_value in fields_by_key.items():
+            if not isinstance(field_key, str) or not field_key:
+                warnings.append("INVALID_SESSION_SUMMARY_FIELD_KEY")
+                continue
+
+            target_field = field_map.get(field_key)
+            if target_field is None:
+                warnings.append(f"UNKNOWN_SESSION_SUMMARY_FIELD:{field_key}")
+                continue
+
+            try:
+                normalized_value = CsSummaryUsageService._normalize_value(target_field, raw_value)
+            except ValidationError:
+                warnings.append(f"INVALID_SESSION_SUMMARY_VALUE:{field_key}")
+                continue
+
+            target_key = CsSummaryUsageService._value_key(
+                target_field.field_definition_id,
+                target_field.field_key,
+            )
+            next_values = {**values, target_key: normalized_value}
+            states = CsSummaryUsageService._calculate_states(fields, rules, next_values)
+            state = states.get(target_key)
+            if state in {"hidden", "readonly"}:
+                warnings.append(f"SESSION_SUMMARY_FIELD_NOT_WRITABLE:{field_key}")
+                continue
+            if state == "required" and CsSummaryUsageService._is_empty(normalized_value):
+                warnings.append(f"SESSION_SUMMARY_FIELD_REQUIRED:{field_key}")
+                continue
+
+            await CsSummaryUsageRepository.upsert_value(
+                db,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                field_definition_id=target_field.field_definition_id,
+                field_key=target_field.field_key,
+                value=normalized_value,
+            )
+            values[target_key] = normalized_value
+            updated += 1
+
+        return {"updated": updated, "warnings": warnings}

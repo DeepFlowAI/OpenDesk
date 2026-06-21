@@ -1,7 +1,11 @@
 import { useQuery } from '@tanstack/react-query'
 import ky from 'ky'
 import type { ChannelPublic } from '@/models/channel'
-import type { Message, VisitorConversationHistoryResponse } from '@/models/conversation'
+import type {
+  Message,
+  VisitorConversationHistoryResponse,
+  VisitorUnreadOfflineReplyResponse,
+} from '@/models/conversation'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? ''
 
@@ -21,6 +25,7 @@ export type VisitorSessionResponse = {
   visitor_external_id: string
   visitor_secret?: string | null
   expires_in: number
+  context_warnings?: string[]
 }
 
 export type PublicMessage = Omit<Message, 'conversation_id'> & {
@@ -32,11 +37,28 @@ export type PublicMessageListResponse = {
   has_more: boolean
 }
 
+export type PublicOfflineMessageResponse = {
+  offline_message_public_id: string
+  status: 'pending' | 'converted'
+  messages: PublicMessage[]
+  has_more: boolean
+  conversation_public_id?: string | null
+}
+
+export type PublicOfflineMessageSendResponse = {
+  ok: boolean
+  offline_message_public_id?: string
+  message?: PublicMessage
+  messages?: PublicMessage[]
+}
+
 export const visitorChatKeys = {
   channel: (key: string, visitorExternalId?: string | null, currentConversationPublicId?: string | null) =>
     ['public', 'channel', key, visitorExternalId ?? null, currentConversationPublicId ?? null] as const,
   messages: (conversationPublicId: string, beforeId?: number) =>
     ['public', 'messages', conversationPublicId, beforeId] as const,
+  offlineMessages: (offlineMessagePublicId: string, beforeId?: number) =>
+    ['public', 'offline-messages', offlineMessagePublicId, beforeId] as const,
 }
 
 export const useChannelPublic = (
@@ -72,6 +94,7 @@ export const createVisitorSession = (params: {
   visitorSecret?: string | null
   visitorName?: string | null
   metadata?: Record<string, unknown> | null
+  contextToken?: string | null
 }) =>
   publicClient
     .post(`v1/public/channels/${params.channelKey}/visitor-session`, {
@@ -80,9 +103,27 @@ export const createVisitorSession = (params: {
         ...(params.visitorSecret ? { visitor_secret: params.visitorSecret } : {}),
         ...(params.visitorName ? { visitor_name: params.visitorName } : {}),
         ...(params.metadata ? { metadata: params.metadata } : {}),
+        ...(params.contextToken ? { contextToken: params.contextToken } : {}),
       },
     })
     .json<VisitorSessionResponse>()
+
+export const syncConversationContext = (params: {
+  conversationPublicId: string
+  visitorSessionToken: string
+  contextToken: string
+}) =>
+  publicClient
+    .post(`v1/public/conversations/${params.conversationPublicId}/context`, {
+      headers: withVisitorToken(params.visitorSessionToken),
+      json: { contextToken: params.contextToken },
+    })
+    .json<{
+      ok: boolean
+      warnings: string[]
+      customer_synced: boolean
+      session_summary_synced: boolean
+    }>()
 
 export const fetchPublicMessages = (params: {
   conversationPublicId: string
@@ -100,6 +141,85 @@ export const fetchPublicMessages = (params: {
       },
     },
   )
+
+export const createOrContinueOfflineMessage = (params: {
+  visitorSessionToken: string
+  visitorName?: string | null
+  metadata?: Record<string, unknown> | null
+}) =>
+  publicClient
+    .post('v1/public/offline-messages', {
+      headers: withVisitorToken(params.visitorSessionToken),
+      json: {
+        ...(params.visitorName ? { visitor_name: params.visitorName } : {}),
+        ...(params.metadata ? { metadata: params.metadata } : {}),
+      },
+    })
+    .json<PublicOfflineMessageResponse>()
+
+export const fetchCurrentOfflineMessage = (params: {
+  visitorSessionToken: string
+  beforeId?: number | null
+  limit?: number
+}) =>
+  publicGet<PublicOfflineMessageResponse | null>(
+    'v1/public/offline-messages/current',
+    {
+      headers: withVisitorToken(params.visitorSessionToken),
+      searchParams: {
+        ...(params.beforeId ? { before_id: params.beforeId } : {}),
+        limit: params.limit ?? 50,
+      },
+    },
+  )
+
+export const fetchOfflineMessages = (params: {
+  offlineMessagePublicId: string
+  visitorSessionToken: string
+  beforeId?: number | null
+  limit?: number
+}) =>
+  publicGet<PublicOfflineMessageResponse>(
+    `v1/public/offline-messages/${params.offlineMessagePublicId}/messages`,
+    {
+      headers: withVisitorToken(params.visitorSessionToken),
+      searchParams: {
+        ...(params.beforeId ? { before_id: params.beforeId } : {}),
+        limit: params.limit ?? 50,
+      },
+    },
+  )
+
+export const createOfflineMessageWithMessage = (params: {
+  visitorSessionToken: string
+  contentType: 'text' | 'image' | 'file'
+  content: string
+}) =>
+  publicClient
+    .post('v1/public/offline-messages/messages', {
+      headers: withVisitorToken(params.visitorSessionToken),
+      json: {
+        content_type: params.contentType,
+        content: params.content,
+      },
+    })
+    .json<PublicOfflineMessageSendResponse>()
+
+export const sendOfflineMessage = (params: {
+  offlineMessagePublicId: string
+  visitorSessionToken: string
+  contentType: 'text' | 'image' | 'file'
+  content: string
+}) =>
+  publicClient
+    .post(`v1/public/offline-messages/${params.offlineMessagePublicId}/messages`, {
+      headers: withVisitorToken(params.visitorSessionToken),
+      json: {
+        content_type: params.contentType,
+        content: params.content,
+      },
+    })
+    .json<PublicOfflineMessageSendResponse>()
 
 export const fetchVisitorConversationHistory = (params: {
   visitorSessionToken: string
@@ -120,3 +240,27 @@ export const fetchVisitorConversationHistory = (params: {
       },
     },
   )
+
+export const fetchUnreadOfflineReplies = (params: {
+  visitorSessionToken: string
+  limit?: number
+}) =>
+  publicGet<VisitorUnreadOfflineReplyResponse>(
+    'v1/public/conversations/unread-offline-replies',
+    {
+      headers: withVisitorToken(params.visitorSessionToken),
+      searchParams: {
+        limit: params.limit ?? 3,
+      },
+    },
+  )
+
+export const markConversationCustomerRead = (params: {
+  conversationPublicId: string
+  visitorSessionToken: string
+}) =>
+  publicClient
+    .post(`v1/public/conversations/${params.conversationPublicId}/customer-read`, {
+      headers: withVisitorToken(params.visitorSessionToken),
+    })
+    .json<{ ok: boolean }>()

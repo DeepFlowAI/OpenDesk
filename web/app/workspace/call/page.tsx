@@ -25,6 +25,7 @@ import {
   IconPhoneIncoming,
   IconPhoneOff,
   IconPhoneOutgoing,
+  IconX,
 } from '@tabler/icons-react'
 import { toast } from 'sonner'
 
@@ -43,6 +44,7 @@ import {
 import { useAuthStore } from '@/context/auth-store'
 import { cn } from '@/lib/utils'
 import { useCallRecord } from '@/service/use-call-center'
+import { useSystemInfo } from '@/service/use-system'
 import type { AgentStatus } from '@/models/call-center'
 import { hasPermission } from '@/utils/permissions'
 
@@ -72,6 +74,7 @@ function formatDuration(ms: number | null): string {
 export default function CallWorkspacePage() {
   const router = useRouter()
   const currentUser = useAuthStore((state) => state.user)
+  const { data: systemInfo } = useSystemInfo()
   const {
     mic,
     leg,
@@ -101,6 +104,7 @@ export default function CallWorkspacePage() {
     handleDialStarted,
   } = useCallCenterRuntime()
   const [statusDropdownOpen, setStatusDropdownOpen] = useState(false)
+  const [callCenterNoticeDismissed, setCallCenterNoticeDismissed] = useState(false)
   const statusDropdownRef = useRef<HTMLDivElement>(null)
   const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
 
@@ -120,12 +124,19 @@ export default function CallWorkspacePage() {
     return () => document.removeEventListener('mousedown', handleClick)
   }, [])
 
+  const showCallCenterNotice =
+    systemInfo != null && !systemInfo.call_center_enabled && !callCenterNoticeDismissed
+
   const currentStatus = phase === 'wrap_up' ? 'after_call_work' : (status?.status ?? 'offline')
   const currentStatusOption = STATUS_OPTIONS.find((o) => o.value === currentStatus) ?? STATUS_OPTIONS[4]
   const statusSelectorDisabled = statusChangePending || mic.state === 'checking'
 
   return (
-    <div className="flex h-full">
+    <div className="flex h-full flex-col">
+      {showCallCenterNotice && (
+        <CallCenterDisabledBanner onClose={() => setCallCenterNoticeDismissed(true)} />
+      )}
+      <div className="flex min-h-0 flex-1">
       {/* ──────────────── Left panel ──────────────── */}
       <aside className="flex w-[280px] shrink-0 flex-col border-r border-border bg-white">
         <div className="p-4">
@@ -539,6 +550,7 @@ export default function CallWorkspacePage() {
           )}
         </div>
       </main>
+      </div>
     </div>
   )
 }
@@ -565,6 +577,28 @@ function Dt({ children }: { children: React.ReactNode }) {
 
 function Dd({ children }: { children: React.ReactNode }) {
   return <dd className="text-foreground">{children}</dd>
+}
+
+function CallCenterDisabledBanner({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-amber-800">
+      <IconPhoneOff size={16} className="shrink-0" />
+      <p className="min-w-0 flex-1 text-xs">
+        <span className="font-semibold">暂未启用语音内核</span>
+        <span className="ml-1.5 text-amber-700/90">
+          当前部署尚未接入语音通话服务，外呼与呼入功能暂不可用，如需开通请联系系统管理员。
+        </span>
+      </p>
+      <button
+        type="button"
+        onClick={onClose}
+        title="关闭提示"
+        className="shrink-0 rounded p-1 text-amber-700/70 transition-colors hover:bg-amber-100 hover:text-amber-900"
+      >
+        <IconX size={15} />
+      </button>
+    </div>
+  )
 }
 
 function CallWorkspaceEmptyState() {

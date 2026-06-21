@@ -47,13 +47,13 @@ import { hasPermission } from '@/utils/permissions'
 const COL_STORAGE_PREFIX = 'ws_ticket_cols_'
 const PER_PAGE_OPTIONS = [20, 50, 100]
 
-function getColStorageKey(viewId: number | null): string {
-  return `${COL_STORAGE_PREFIX}${viewId ?? 'default'}`
+function getColStorageKey(tenantId: number | null, viewId: number | null): string {
+  return `${COL_STORAGE_PREFIX}${tenantId ?? 'unknown'}_${viewId ?? 'default'}`
 }
 
-function readColsFromStorage(viewId: number | null): ColumnConfigItem[] | null {
+function readColsFromStorage(tenantId: number | null, viewId: number | null): ColumnConfigItem[] | null {
   try {
-    const raw = localStorage.getItem(getColStorageKey(viewId))
+    const raw = localStorage.getItem(getColStorageKey(tenantId, viewId))
     if (!raw) return null
     return JSON.parse(raw) as ColumnConfigItem[]
   } catch {
@@ -61,15 +61,15 @@ function readColsFromStorage(viewId: number | null): ColumnConfigItem[] | null {
   }
 }
 
-function writeColsToStorage(viewId: number | null, cols: ColumnConfigItem[]): void {
+function writeColsToStorage(tenantId: number | null, viewId: number | null, cols: ColumnConfigItem[]): void {
   try {
-    localStorage.setItem(getColStorageKey(viewId), JSON.stringify(cols))
+    localStorage.setItem(getColStorageKey(tenantId, viewId), JSON.stringify(cols))
   } catch { /* ignore */ }
 }
 
-function removeColsFromStorage(viewId: number | null): void {
+function removeColsFromStorage(tenantId: number | null, viewId: number | null): void {
   try {
-    localStorage.removeItem(getColStorageKey(viewId))
+    localStorage.removeItem(getColStorageKey(tenantId, viewId))
   } catch { /* ignore */ }
 }
 
@@ -142,7 +142,7 @@ export default function WorkspaceTicketsPage() {
   useEffect(() => {
     if (!colInitRef.current) {
       colInitRef.current = true
-      setColumnOverrides(readColsFromStorage(activeView?.id ?? null))
+      setColumnOverrides(readColsFromStorage(user?.tenant_id ?? null, activeView?.id ?? null))
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
   const hasColumnOverride = columnOverrides !== null
@@ -282,9 +282,9 @@ export default function WorkspaceTicketsPage() {
     setTempConditions([])
     setTempConditionLogic('and')
     setGroupValue(undefined)
-    setColumnOverrides(readColsFromStorage(viewId === 'all' ? null : viewId))
+    setColumnOverrides(readColsFromStorage(user?.tenant_id ?? null, viewId === 'all' ? null : viewId))
     router.replace(buildTicketsUrl(viewId, undefined), { scroll: false })
-  }, [router])
+  }, [router, user?.tenant_id])
 
   const handleSelectGroup = useCallback((value: string | undefined) => {
     setGroupValue(value)
@@ -318,16 +318,17 @@ export default function WorkspaceTicketsPage() {
   }, [])
 
   const storageViewId = selectedViewId === 'all' ? null : selectedViewId
+  const storageTenantId = user?.tenant_id ?? null
 
   const handleResetColumns = useCallback(() => {
     setColumnOverrides(null)
-    removeColsFromStorage(storageViewId)
-  }, [storageViewId])
+    removeColsFromStorage(storageTenantId, storageViewId)
+  }, [storageTenantId, storageViewId])
 
   const handleApplyColumns = useCallback((cols: ColumnConfigItem[]) => {
     setColumnOverrides(cols)
-    writeColsToStorage(storageViewId, cols)
-  }, [storageViewId])
+    writeColsToStorage(storageTenantId, storageViewId, cols)
+  }, [storageTenantId, storageViewId])
 
   const totalPages = ticketsData?.pages ?? 0
   const total = ticketsData?.total ?? 0

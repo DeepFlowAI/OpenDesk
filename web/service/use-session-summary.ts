@@ -127,10 +127,13 @@ export const useSortSessionSummaryRules = () => {
 
 // ── Usage ──
 
-export const useSessionSummaryUsage = (conversationId: number | null | undefined) =>
+export const useSessionSummaryUsage = (
+  conversationId: number | null | undefined,
+  options?: { enabled?: boolean },
+) =>
   useQuery({
     queryKey: sessionSummaryKeys.usage(conversationId),
-    enabled: !!conversationId,
+    enabled: !!conversationId && (options?.enabled ?? true),
     queryFn: () => get<CsSummaryUsageResponse>(`v1/session-summary/sessions/${conversationId}`),
   })
 

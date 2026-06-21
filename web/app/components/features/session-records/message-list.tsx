@@ -8,11 +8,23 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useSessionRecordMessages } from '@/service/use-session-records'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
-import { WelcomeMessage } from '@/app/components/features/visitor-chat/welcome-message'
+import { RichTextMessageContent } from '@/app/components/features/chat/rich-text-message-content'
+import {
+  OpenAgentWelcomeMessage,
+  WelcomeMessage,
+} from '@/app/components/features/visitor-chat/welcome-message'
 import { MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
 import type { OpenAgentTextBlock, OpenAgentThinkingBlock as OpenAgentThinkingBlockType, OpenAgentToolBlock } from '@/models/conversation'
 import type { SessionRecordMessage } from '@/models/session-record'
 import { resolveOpenAgentHandoffEventLabel } from '@/lib/open-agent-handoff-event'
+import { isLeaveMessagePromptMessage } from '@/lib/offline-message-event'
+import { getOpenAgentWelcomeBlocksFromMetadata } from '@/lib/open-agent-welcome-message'
+import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
+import {
+  getWorkspaceAgentAvatarLetter,
+  sanitizeWorkspaceAgentEventContent,
+  resolveWorkspaceSystemEventContent,
+} from '@/lib/workspace-agent-display'
 
 function formatTime(dateStr: string): string {
   const d = new Date(dateStr)
@@ -22,6 +34,17 @@ function formatTime(dateStr: string): string {
 function formatFullTime(dateStr: string): string {
   const d = new Date(dateStr)
   return d.toLocaleString('sv-SE').replace('T', ' ')
+}
+
+function EventTimestamp({ createdAt }: { createdAt: string }) {
+  return (
+    <div
+      className="mt-0.5 cursor-default text-center text-[10px] text-muted-foreground"
+      title={formatFullTime(createdAt)}
+    >
+      {formatTime(createdAt)}
+    </div>
+  )
 }
 
 const BOT_BUBBLE_CLASS = 'rounded-lg bg-secondary px-3 py-2 text-sm text-foreground break-words break-all whitespace-pre-wrap max-w-full min-w-0'
@@ -347,10 +370,15 @@ function MessageBubble({
   const hasOpenAgentTrace =
     isBot && (textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0)
 
-  if (message.content_type === 'welcome') {
+  if (isWelcomeLikeContentType(message.content_type) || isLeaveMessagePromptMessage(message)) {
+    const openAgentWelcomeBlocks = getOpenAgentWelcomeBlocksFromMetadata(message.metadata)
     return (
       <div className="my-3">
-        <WelcomeMessage content={message.content} />
+        {openAgentWelcomeBlocks.length > 0 ? (
+          <OpenAgentWelcomeMessage blocks={openAgentWelcomeBlocks} />
+        ) : (
+          <WelcomeMessage content={message.content} />
+        )}
       </div>
     )
   }
@@ -367,25 +395,34 @@ function MessageBubble({
             submitted ? 'bg-[#F0FDF4] text-[#16A34A]' : 'bg-[#EFF6FF] text-[#3B82F6]',
           )}
         >
-          {message.content}
+          {sanitizeWorkspaceAgentEventContent(message.content, locale)}
         </button>
+        <EventTimestamp createdAt={message.created_at} />
       </div>
     )
   }
 
   if (isSystem) {
     const handoffEventLabel = resolveOpenAgentHandoffEventLabel(message.metadata, locale)
+    const systemContent = handoffEventLabel || message.content
     return (
       <div className="my-3 text-center">
         <span className="rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
-          {handoffEventLabel || message.content}
+          {resolveWorkspaceSystemEventContent(systemContent, message.metadata, locale)}
         </span>
+        <EventTimestamp createdAt={message.created_at} />
       </div>
     )
   }
 
-  const senderName = message.sender_name || (isBot ? '智能助手' : isAgent ? 'A' : 'V')
-  const avatarLetter = senderName.charAt(0).toUpperCase()
+  const avatarLetter = isAssistant
+    ? getWorkspaceAgentAvatarLetter(isBot, message.sender_name)
+    : (message.sender_name || 'V').charAt(0).toUpperCase()
+  const senderLabel = isBot
+    ? (message.sender_name || '智能助手')
+    : isAgent
+      ? null
+      : (message.sender_name || 'V')
 
   return (
     <div className={cn('mb-3 flex gap-2', isOwn ? 'flex-row-reverse' : 'flex-row')}>
@@ -401,14 +438,25 @@ function MessageBubble({
 
       {/* Content */}
       <div className={cn('flex min-w-0 max-w-[70%] flex-col', isOwn ? 'items-end' : 'items-start')}>
-        <div className={cn('mb-0.5 text-xs text-muted-foreground', isOwn && 'text-right')}>
-          {senderName}
-        </div>
+        {senderLabel && (
+          <div className={cn('mb-0.5 text-xs text-muted-foreground', isOwn && 'text-right')}>
+            {senderLabel}
+          </div>
+        )}
         {message.content_type === 'image' || message.content_type === 'file' ? (
           <MessageAttachment
             conversationId={message.conversation_id}
             contentType={message.content_type}
             content={message.content}
+          />
+        ) : message.content_type === 'rich_text' ? (
+          <RichTextMessageContent
+            html={message.content}
+            conversationId={message.conversation_id}
+            className={cn(
+              'max-w-full rounded-lg px-3 py-2 text-sm break-words break-all',
+              isAgent ? 'bg-primary text-primary-foreground' : 'bg-secondary text-foreground',
+            )}
           />
         ) : hasOpenAgentTrace ? (
           <div className="w-full min-w-0 space-y-2">

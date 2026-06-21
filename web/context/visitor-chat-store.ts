@@ -12,6 +12,7 @@ type VisitorChatState = {
   socket: Socket | null
   connected: boolean
   connecting: boolean
+  authFailed: boolean
 
   conversationPublicId: string | null
   messages: Message[]
@@ -33,6 +34,7 @@ type VisitorChatState = {
 
   connect: (visitorSessionToken: string, visitorExternalId: string) => void
   disconnect: () => void
+  clearAuthFailed: () => void
 
   setConversationPublicId: (id: string | null) => void
   setMessages: (msgs: Message[]) => void
@@ -193,10 +195,16 @@ function resolveHandoffMessageUiPatch(state: VisitorChatState, msg: Message): Ha
   return null
 }
 
+function isVisitorAuthError(err: Error): boolean {
+  const msg = err.message?.toLowerCase() ?? ''
+  return msg.includes('visitor_session_token') || msg.includes('invalid visitor session')
+}
+
 export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
   socket: null,
   connected: false,
   connecting: false,
+  authFailed: false,
 
   conversationPublicId: null,
   messages: [],
@@ -218,12 +226,12 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       existing.auth = {
         visitor_session_token: visitorSessionToken,
       }
-      set({ connecting: true, visitorId: visitorExternalId })
+      set({ connecting: true, authFailed: false, visitorId: visitorExternalId })
       existing.connect()
       return
     }
 
-    set({ connecting: true, visitorId: visitorExternalId })
+    set({ connecting: true, authFailed: false, visitorId: visitorExternalId })
 
     const socket = io(`${SOCKET_URL}/visitor`, {
       auth: {
@@ -233,18 +241,26 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       reconnection: true,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
-      reconnectionAttempts: Infinity,
+      reconnectionAttempts: 10,
     })
 
     socket.on('connect', () => {
-      set({ connected: true, connecting: false })
+      set({ connected: true, connecting: false, authFailed: false })
     })
 
     socket.on('disconnect', () => {
       set({ connected: false })
     })
 
-    socket.on('connect_error', () => {
+    socket.on('connect_error', (err: Error) => {
+      // Invalid/expired visitor session: the token won't fix itself by
+      // retrying, so stop and let the page surface it instead of spinning in a
+      // reconnect loop that re-fires on every `connecting: false`.
+      if (isVisitorAuthError(err)) {
+        socket.disconnect()
+        set({ socket: null, connected: false, connecting: false, authFailed: true })
+        return
+      }
       set({ connecting: false })
     })
 
@@ -333,33 +349,14 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
 
     socket.on('conversation_assigned', (data: { conversation_public_id?: string; agent?: { id: number; name: string; avatar?: string } }) => {
       const state = get()
-      const agentLabel = data.agent?.name || '客服'
       const activeAgent = data.agent
         ? { id: data.agent.id, name: data.agent.name, avatar: data.agent.avatar ?? null }
         : state.activeAgent
 
-      // Replace "等待客服接入..." with the agent-connected message
-      const waitIdx = state.messages.findIndex(
-        (m) => (m.sender_type === 'system' || m.content_type === 'system') && m.content === '等待客服接入...',
-      )
-      if (waitIdx !== -1) {
-        const updated = [...state.messages]
-        updated[waitIdx] = { ...updated[waitIdx], content: `${agentLabel} 已接入会话` }
-        set({ messages: updated, activeAgent, ...clearedHandoffUiState })
-        return
-      }
-
-      // Fallback: append a system message
-      const sysMsg: Message = {
-        id: Date.now(),
-        conversation_id: 0,
-        conversation_public_id: data.conversation_public_id,
-        sender_type: 'system',
-        content_type: 'system',
-        content: `${agentLabel} 已接入会话`,
-        created_at: new Date().toISOString(),
-      } as Message
-      set({ messages: [...state.messages, sysMsg], activeAgent, ...clearedHandoffUiState })
+      // The "agent joined" timeline event is persisted server-side and delivered
+      // via `new_message`, preserving its own timestamp. Here we only update the
+      // active agent and clear any pending handoff UI.
+      set({ activeAgent, ...clearedHandoffUiState })
     })
 
     socket.on('messages_read', (data: { conversation_public_id?: string }) => {
@@ -390,6 +387,10 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       })
     }
   },
+
+  // Let the page retry after an auth failure: it mints a fresh visitor session
+  // token, then flips this back so the connect effect can reconnect.
+  clearAuthFailed: () => set({ authFailed: false }),
 
   setConversationPublicId: (id) => set({ conversationPublicId: id }),
   setMessages: (msgs) => set({ messages: msgs }),

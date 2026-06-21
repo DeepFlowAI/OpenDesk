@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { get, post } from '@/service/base'
-import type { LoginPayload, LoginResponse, UserInfo } from '@/models/auth'
+import { get, patch, post } from '@/service/base'
+import type { LoginPayload, LoginResponse, UserInfo, UserPreferences } from '@/models/auth'
 
 export const authKeys = {
   currentUser: ['auth', 'me'] as const,
@@ -18,4 +18,10 @@ export const useCurrentUser = (enabled = true) =>
     queryFn: () => get<UserInfo>('v1/auth/me'),
     enabled,
     staleTime: 0,
+  })
+
+export const useUpdateCurrentUserPreferences = () =>
+  useMutation({
+    mutationFn: (preferences: UserPreferences) =>
+      patch<UserInfo>('v1/auth/me/preferences', { json: { preferences } }),
   })

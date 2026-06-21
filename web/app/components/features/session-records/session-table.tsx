@@ -11,7 +11,7 @@ import { useSatisfactionFilterOptions } from '@/service/use-satisfaction-survey'
 import { useAuthStore } from '@/context/auth-store'
 import { getDataScope } from '@/utils/permissions'
 import { DateInput } from '@/components/ui/time-input'
-import type { SessionRecord, SessionRecordFilters } from '@/models/session-record'
+import type { BotHandoffStatus, SessionRecord, SessionRecordFilters, SessionRecordType } from '@/models/session-record'
 
 function formatDateTime(dateStr: string | null): string {
   if (!dateStr) return '-'
@@ -59,6 +59,50 @@ function QueueNameCell({
         </span>
       )}
     </div>
+  )
+}
+
+const sessionTypeClassName: Record<SessionRecordType, string> = {
+  human: 'bg-muted text-muted-foreground',
+  bot: 'bg-info/10 text-info',
+  bot_human: 'bg-success/10 text-success',
+}
+
+const botHandoffClassName: Record<BotHandoffStatus, string> = {
+  not_triggered: 'bg-muted text-muted-foreground',
+  waiting_confirmation: 'bg-warning/10 text-warning',
+  handoff_in_progress: 'bg-warning/10 text-warning',
+  in_queue: 'bg-warning/10 text-warning',
+  succeeded: 'bg-success/10 text-success',
+  failed: 'bg-destructive/10 text-destructive',
+  dismissed: 'bg-muted text-muted-foreground',
+}
+
+function StatusBadge({ label, className }: { label: string; className: string }) {
+  return (
+    <span className={cn('inline-flex whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium', className)}>
+      {label}
+    </span>
+  )
+}
+
+function SessionTypeBadge({ value, locale }: { value: SessionRecordType | null; locale: Locale }) {
+  if (!value) return null
+  return (
+    <StatusBadge
+      label={t(`ws.records.sessions.sessionType.${value}`, locale)}
+      className={sessionTypeClassName[value]}
+    />
+  )
+}
+
+function BotHandoffBadge({ value, locale }: { value: BotHandoffStatus | null; locale: Locale }) {
+  if (!value) return null
+  return (
+    <StatusBadge
+      label={t(`ws.records.sessions.botHandoff.${value}`, locale)}
+      className={botHandoffClassName[value]}
+    />
   )
 }
 
@@ -122,6 +166,7 @@ export function SessionTable({ onSelectRecord }: Props) {
   const [draftStartDate, setDraftStartDate] = useState(sevenDaysAgo.toISOString().slice(0, 10))
   const [draftEndDate, setDraftEndDate] = useState(now.toISOString().slice(0, 10))
   const [draftAgentId, setDraftAgentId] = useState<number | undefined>(undefined)
+  const [draftSessionType, setDraftSessionType] = useState<SessionRecordType | ''>('')
   const [draftSatisfactionStatus, setDraftSatisfactionStatus] = useState('')
   const [draftResolved, setDraftResolved] = useState('')
   const [draftServiceOption, setDraftServiceOption] = useState('')
@@ -162,6 +207,7 @@ export function SessionTable({ onSelectRecord }: Props) {
       start_date: draftStartDate ? new Date(draftStartDate + 'T00:00:00').toISOString() : undefined,
       end_date: draftEndDate ? new Date(draftEndDate + 'T23:59:59').toISOString() : undefined,
       agent_id: draftAgentId,
+      session_type: draftSessionType || undefined,
       keyword: draftKeyword || undefined,
       satisfaction_status: draftSatisfactionStatus || undefined,
       satisfaction_resolved: draftResolved || undefined,
@@ -170,7 +216,7 @@ export function SessionTable({ onSelectRecord }: Props) {
       satisfaction_product_option: draftProductOption || undefined,
       satisfaction_product_label: draftProductLabel || undefined,
     })
-  }, [filters, draftStartDate, draftEndDate, draftAgentId, draftKeyword, draftSatisfactionStatus, draftResolved, draftServiceOption, draftServiceLabel, draftProductOption, draftProductLabel])
+  }, [filters, draftStartDate, draftEndDate, draftAgentId, draftSessionType, draftKeyword, draftSatisfactionStatus, draftResolved, draftServiceOption, draftServiceLabel, draftProductOption, draftProductLabel])
 
   const handleReset = useCallback(() => {
     const resetStart = sevenDaysAgo.toISOString().slice(0, 10)
@@ -179,6 +225,7 @@ export function SessionTable({ onSelectRecord }: Props) {
     setDraftStartDate(resetStart)
     setDraftEndDate(resetEnd)
     setDraftAgentId(undefined)
+    setDraftSessionType('')
     setDraftSatisfactionStatus('')
     setDraftResolved('')
     setDraftServiceOption('')
@@ -206,6 +253,17 @@ export function SessionTable({ onSelectRecord }: Props) {
   const items = data?.items || []
   const total = data?.total || 0
   const pages = data?.pages || 0
+  const hasActiveFilters = Boolean(
+    filters.keyword
+    || filters.agent_id
+    || filters.session_type
+    || filters.satisfaction_status
+    || filters.satisfaction_resolved
+    || filters.satisfaction_service_option
+    || filters.satisfaction_service_label
+    || filters.satisfaction_product_option
+    || filters.satisfaction_product_label
+  )
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -256,6 +314,22 @@ export function SessionTable({ onSelectRecord }: Props) {
             </select>
           </div>
         )}
+
+        <div className="flex flex-col gap-1">
+          <label className="text-xs text-muted-foreground">
+            {t('ws.records.sessions.filter.sessionType', locale)}
+          </label>
+          <select
+            value={draftSessionType}
+            onChange={(e) => setDraftSessionType(e.target.value as SessionRecordType | '')}
+            className="h-9 min-w-[130px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+          >
+            <option value="">{t('ws.records.sessions.filter.all', locale)}</option>
+            <option value="human">{t('ws.records.sessions.sessionType.human', locale)}</option>
+            <option value="bot">{t('ws.records.sessions.sessionType.bot', locale)}</option>
+            <option value="bot_human">{t('ws.records.sessions.sessionType.bot_human', locale)}</option>
+          </select>
+        </div>
 
         {/* Keyword */}
         <div className="flex flex-col gap-1">
@@ -434,7 +508,7 @@ export function SessionTable({ onSelectRecord }: Props) {
             ) : items.length === 0 ? (
               <div className="flex h-full min-h-[200px] flex-col items-center justify-center gap-2 px-4 text-muted-foreground">
                 <p className="text-sm">
-                  {filters.keyword || filters.agent_id
+                  {hasActiveFilters
                     ? t('ws.records.sessions.emptyFiltered', locale)
                     : t('ws.records.sessions.empty', locale)}
                 </p>
@@ -448,6 +522,12 @@ export function SessionTable({ onSelectRecord }: Props) {
                 </th>
                 <th className="sticky top-0 z-10 w-[120px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.shareCode', locale)}
+                </th>
+                <th className="sticky top-0 z-10 w-[96px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                  {t('ws.records.sessions.col.sessionType', locale)}
+                </th>
+                <th className="sticky top-0 z-10 w-[160px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
+                  {t('ws.records.sessions.col.botHandoff', locale)}
                 </th>
                 <th className="sticky top-0 z-10 w-[100px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
                   {t('ws.records.sessions.col.channelType', locale)}
@@ -490,6 +570,12 @@ export function SessionTable({ onSelectRecord }: Props) {
                   </td>
                   <td className="border-b border-border px-3 py-3 font-mono text-sm text-muted-foreground">
                     {record.share_code || record.public_id || '-'}
+                  </td>
+                  <td className="border-b border-border px-3 py-3">
+                    <SessionTypeBadge value={record.session_type} locale={locale} />
+                  </td>
+                  <td className="border-b border-border px-3 py-3">
+                    <BotHandoffBadge value={record.bot_handoff_status} locale={locale} />
                   </td>
                   <td className="border-b border-border px-3 py-3 text-sm text-muted-foreground">
                     {record.channel?.channel_type || '-'}

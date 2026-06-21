@@ -90,7 +90,8 @@ async def test_build_status_response_returns_unknown_when_not_displayable(fake_r
 
     assert response["status"] == "unknown"
     assert response["can_display"] is False
-    assert isinstance(response["checked_at"], datetime)
+    assert isinstance(response["checked_at"], str)
+    datetime.fromisoformat(response["checked_at"])
 
 
 @pytest.mark.asyncio

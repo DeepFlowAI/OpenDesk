@@ -12,6 +12,8 @@ export const useUploadAvatar = () => {
   })
 }
 
+export const useUploadChannelBotAvatar = useUploadAvatar
+
 export const useUploadChannelLogo = () => {
   return useMutation({
     mutationFn: async (file: File) => {

@@ -8,7 +8,7 @@ import pytest
 
 from app.core.exceptions import ValidationError
 from app.services.employee_service import EmployeeService
-from app.services.permission_catalog import ALL_PERMISSION_KEYS
+from app.services.permission_catalog import ALL_PERMISSION_KEYS, RESOURCE_CHAT_QUEUE, RESOURCE_PEER_CONVERSATION
 from app.services.permission_service import PermissionService
 from app.services.role_service import RoleService
 
@@ -65,6 +65,43 @@ def test_merge_role_data_scopes_defaults_to_self_for_view_permission():
     data_scopes = PermissionService.merge_role_data_scopes(roles, ["ticket.workspace.view"])
 
     assert data_scopes == {"ticket": "self"}
+
+
+def test_merge_role_data_scopes_keeps_peer_and_queue_scopes_independent():
+    roles = [
+        _role(
+            1,
+            ["chat.workspace.use", "chat.conversation.peer.view"],
+            {RESOURCE_PEER_CONVERSATION: "group"},
+        ),
+        _role(
+            2,
+            ["chat.workspace.use", "chat.queue.view"],
+            {RESOURCE_CHAT_QUEUE: "all"},
+        ),
+    ]
+    permissions = ["chat.workspace.use", "chat.conversation.peer.view", "chat.queue.view"]
+
+    data_scopes = PermissionService.merge_role_data_scopes(roles, permissions)
+
+    assert data_scopes[RESOURCE_PEER_CONVERSATION] == "group"
+    assert data_scopes[RESOURCE_CHAT_QUEUE] == "all"
+
+
+def test_merge_role_data_scopes_falls_back_to_legacy_session_scope():
+    roles = [
+        _role(
+            1,
+            ["chat.workspace.use", "chat.conversation.peer.view", "chat.queue.view"],
+            {"session_record": "group"},
+        )
+    ]
+    permissions = ["chat.workspace.use", "chat.conversation.peer.view", "chat.queue.view"]
+
+    data_scopes = PermissionService.merge_role_data_scopes(roles, permissions)
+
+    assert data_scopes[RESOURCE_PEER_CONVERSATION] == "group"
+    assert data_scopes[RESOURCE_CHAT_QUEUE] == "group"
 
 
 @pytest.mark.asyncio
@@ -176,7 +213,10 @@ async def test_get_current_principal_super_admin_has_all_permissions():
     assert principal.is_super_admin is True
     assert set(principal.permissions) == ALL_PERMISSION_KEYS
     assert principal.data_scopes == {
+        "chat.conversation.peer.view": "all",
+        "chat.queue.view": "all",
         "call_record": "all",
+        "offline_message": "all",
         "session_record": "all",
         "ticket": "all",
     }

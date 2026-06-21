@@ -66,10 +66,7 @@ export const useChatStore = create<ChatState>()(
       setConversations: (items) =>
         set((state) => ({
           conversations: mergeUnreadOnSync(items, state.conversations, state.recentReadAt),
-          selectedConversationId:
-            state.selectedConversationId == null || items.some((item) => item.id === state.selectedConversationId)
-              ? state.selectedConversationId
-              : null,
+          selectedConversationId: state.selectedConversationId,
         })),
 
       selectConversation: (id) =>

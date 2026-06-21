@@ -20,7 +20,7 @@ class VoiceFlow(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(50), nullable=False)
     description: Mapped[str | None] = mapped_column(String(200), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Pointer to the active version row. Nullable until the first version is created.
     # ondelete="SET NULL" so dropping a version row never cascades into deleting the flow.

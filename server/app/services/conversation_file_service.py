@@ -10,8 +10,10 @@ from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, ValidationError
+from app.enums import MessageContentType
 from app.libs.storage import create_storage_client
 from app.repositories.conversation_repository import ConversationRepository
+from app.schemas.permission import EffectivePrincipal
 
 MAX_CONVERSATION_FILE_SIZE = 100 * 1024 * 1024
 TEMPORARY_URL_EXPIRES_SECONDS = 300
@@ -97,12 +99,31 @@ class ConversationFileService:
         conversation_id: int,
         tenant_id: int,
         agent_id: int,
+        principal: EffectivePrincipal | None = None,
+        action: str = "view",
     ):
         conversation = await ConversationRepository.get_by_id(db, conversation_id)
         if not conversation:
             raise NotFoundError("Conversation not found")
         if conversation.tenant_id != tenant_id:
             raise ValidationError("Conversation does not match tenant")
+        if principal is not None:
+            from app.services.conversation_service import ConversationService
+
+            if action == "send_file":
+                await ConversationService._assert_conversation_send_access(
+                    db,
+                    principal,
+                    conversation,
+                    MessageContentType.FILE.value,
+                )
+            else:
+                await ConversationService._assert_conversation_view_access(
+                    db,
+                    principal,
+                    conversation,
+                )
+            return conversation
         if conversation.agent_id != agent_id:
             raise ValidationError("Conversation does not match agent")
         return conversation
@@ -205,6 +226,7 @@ class ConversationFileService:
         tenant_id: int,
         agent_id: int,
         file: UploadFile,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         """Upload an agent conversation file and return structured metadata."""
         await ConversationFileService._get_conversation_for_agent(
@@ -212,6 +234,8 @@ class ConversationFileService:
             conversation_id=conversation_id,
             tenant_id=tenant_id,
             agent_id=agent_id,
+            principal=principal,
+            action="send_file",
         )
 
         return await ConversationFileService._upload_file(
@@ -236,7 +260,8 @@ class ConversationFileService:
 
         key = ConversationFileService.decode_file_id(file_id)
         expected_prefix = f"conversation-files/{conversation.tenant_id}/{conversation_id}/"
-        if not key.startswith(expected_prefix):
+        offline_message_prefix = f"offline-message-files/{conversation.tenant_id}/"
+        if not (key.startswith(expected_prefix) or key.startswith(offline_message_prefix)):
             raise ValidationError("File does not belong to conversation")
 
         storage = create_storage_client()
@@ -283,6 +308,7 @@ class ConversationFileService:
         file_id: str,
         download_name: str | None = None,
         download: bool = False,
+        principal: EffectivePrincipal | None = None,
     ) -> dict:
         """Create a short-lived URL for an agent-accessible conversation file."""
         await ConversationFileService._get_conversation_for_agent(
@@ -290,6 +316,8 @@ class ConversationFileService:
             conversation_id=conversation_id,
             tenant_id=tenant_id,
             agent_id=agent_id,
+            principal=principal,
+            action="view",
         )
         return await ConversationFileService.get_temporary_url(
             db,

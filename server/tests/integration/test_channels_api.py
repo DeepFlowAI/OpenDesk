@@ -38,6 +38,14 @@ SAMPLE_PAYLOAD = {
         "user_bubble_radius": [10, 10, 0, 10],
         "send_button_bg_color": "#2563eb",
         "input_placeholder": "Type a message...",
+        "assist_panel_enabled": True,
+        "assist_panel_title": "Help",
+        "assist_panel_react_code": "export default function AssistApp() { return null }",
+        "assist_panel_config": {
+            "items": [
+                {"question": "Pricing", "message": "Tell me about pricing"},
+            ],
+        },
     },
 }
 
@@ -65,6 +73,9 @@ class TestChannelAPI:
         assert data["config"]["agent_bubble_radius"] == [10, 10, 10, 0]
         assert data["config"]["use_agent_avatar"] is True
         assert data["config"]["send_button_bg_color"] == "#2563eb"
+        assert data["config"]["assist_panel_enabled"] is True
+        assert data["config"]["assist_panel_title"] == "Help"
+        assert data["config"]["assist_panel_config"]["items"][0]["question"] == "Pricing"
         assert "id" in data
 
     @pytest.mark.asyncio
@@ -138,6 +149,9 @@ class TestChannelAPI:
         assert data["config"]["use_agent_avatar"] is False
         assert data["config"]["send_button_bg_color"] is None
         assert data["config"]["input_placeholder"] is None
+        assert data["config"]["open_agent_avatar_url"] is None
+        assert data["config"]["assist_panel_enabled"] is False
+        assert data["config"]["assist_panel_config"] == {}
 
     @pytest.mark.asyncio
     async def test_create_with_open_agent_bot_config(self, client: AsyncClient, monkeypatch):
@@ -159,6 +173,7 @@ class TestChannelAPI:
                 "open_agent_enabled": True,
                 "open_agent_agent_id": 10,
                 "open_agent_bot_strategy": "always",
+                "open_agent_avatar_url": "https://cdn.example.com/bot.png",
                 "open_agent_input_placeholder": "Ask anything",
                 "open_agent_handoff_enabled": True,
                 "open_agent_handoff_label": "Human",
@@ -174,6 +189,7 @@ class TestChannelAPI:
         assert data["config"]["open_agent_enabled"] is True
         assert data["config"]["open_agent_agent_id"] == 10
         assert data["config"]["open_agent_agent_name"] == "Support Agent"
+        assert data["config"]["open_agent_avatar_url"] == "https://cdn.example.com/bot.png"
         assert data["config"]["open_agent_handoff_after_messages"] == 3
 
     @pytest.mark.asyncio

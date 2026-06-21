@@ -38,7 +38,7 @@ class EmployeeGroupMember(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     group_id: Mapped[int] = mapped_column(Integer, ForeignKey("employee_groups.id", ondelete="CASCADE"), nullable=False)
     employee_id: Mapped[int] = mapped_column(Integer, ForeignKey("employees.id", ondelete="CASCADE"), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     group: Mapped["EmployeeGroup"] = relationship("EmployeeGroup", back_populates="members")
     employee: Mapped["Employee"] = relationship("Employee", lazy="selectin")

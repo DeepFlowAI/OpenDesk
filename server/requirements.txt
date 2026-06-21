@@ -22,6 +22,13 @@ passlib[bcrypt]==1.7.4
 # Storage
 oss2==2.19.1
 
+# Observability — OpenTelemetry SDK + OTLP/HTTP exporter
+# (Vendor-neutral: works with SigNoz, Honeycomb, Tempo, GreptimeDB, etc.)
+# Only imported when OBSERVABILITY_BACKEND=otel; noop deployments don't need them.
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+
 # Testing
 httpx==0.28.1
 pytest==9.0.3

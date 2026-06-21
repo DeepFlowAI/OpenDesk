@@ -17,6 +17,7 @@ import pytest
 from app.core.exceptions import BusinessError, ForbiddenError, NotFoundError
 from app.enums import AgentOnlineStatus, ConversationStatus
 from app.models.message import Message
+from app.schemas.permission import EffectivePrincipal
 from app.services import transfer_service as ts
 from app.services.transfer_service import TransferService
 
@@ -27,6 +28,7 @@ def _make_employee(
     tenant_id: int = 7,
     name: str = "Worker",
     display_name: str | None = None,
+    nickname: str | None = None,
     roles: list[str] | None = None,
     is_active: bool = True,
 ):
@@ -36,6 +38,7 @@ def _make_employee(
         username=f"user{id}",
         name=name,
         display_name=display_name,
+        nickname=nickname,
         job_number=f"J{id}",
         avatar=None,
         max_concurrent=10,
@@ -45,15 +48,28 @@ def _make_employee(
 
 
 def _principal(user_id: int, *, tenant_id: int = 7, group_ids: list[int] | None = None):
-    """Minimal EffectivePrincipal stand-in for transfer authorization paths."""
-    return SimpleNamespace(
+    """Build an EffectivePrincipal for transfer authorization paths."""
+    return EffectivePrincipal(
         user_id=user_id,
         tenant_id=tenant_id,
-        is_super_admin=False,
-        role_ids=[],
-        legacy_roles=[],
-        permissions=[],
-        data_scopes={},
+        permissions=["chat.conversation.transfer"],
+        data_scopes={"session_record": "all"},
+        group_ids=group_ids or [],
+    )
+
+
+def _peer_principal(
+    user_id: int,
+    *,
+    tenant_id: int = 7,
+    data_scope: str = "all",
+    group_ids: list[int] | None = None,
+) -> EffectivePrincipal:
+    return EffectivePrincipal(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        permissions=["chat.conversation.peer.view"],
+        data_scopes={"chat.conversation.peer.view": data_scope},
         group_ids=group_ids or [],
     )
 
@@ -64,6 +80,7 @@ def _make_conversation(
     tenant_id: int = 7,
     agent_id: int | None = 11,
     status: str = ConversationStatus.ACTIVE.value,
+    group_id: int | None = None,
 ):
     visitor = SimpleNamespace(
         id=900,
@@ -84,6 +101,7 @@ def _make_conversation(
         visitor_id=visitor.id,
         channel=channel,
         group=None,
+        group_id=group_id,
         agent=None,
         started_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
         ended_at=None,
@@ -240,7 +258,7 @@ class TestListTargets:
             )
 
         kwargs = repo_mock.await_args.kwargs
-        assert set(kwargs["exclude_user_ids"]) == {99, 42}
+        assert set(kwargs["exclude_user_ids"]) == {42}
 
     @pytest.mark.asyncio
     async def test_cross_tenant_conversation_id_raises_not_found(
@@ -347,8 +365,8 @@ class TestTransferConversation:
     @pytest.mark.asyncio
     async def test_success_writes_system_message_and_emits_events(self, fake_db, fake_redis):
         conversation = _make_conversation(agent_id=11)
-        target = _make_employee(id=22, name="Bob", display_name="Bob 客服")
-        initiator = _make_employee(id=11, name="Alice", display_name="Alice 客服")
+        target = _make_employee(id=22, name="Bob", display_name="Bob 客服", nickname="Bob酱")
+        initiator = _make_employee(id=11, name="Alice", display_name="Alice 客服", nickname="小艾")
 
         with _TransferPatches(
             conversation, target, initiator,
@@ -374,17 +392,25 @@ class TestTransferConversation:
 
         added_messages = [obj for obj in fake_db.added if isinstance(obj, Message)]
         assert len(added_messages) == 1
-        assert "Alice 客服 将会话转接给 Bob 客服" == added_messages[0].content
+        assert "Alice 将会话转接给 Bob" == added_messages[0].content
+        assert added_messages[0].metadata_ == {
+            "event_type": "session_transfer",
+            "from_agent_name": "Alice",
+            "to_agent_name": "Bob",
+            "from_agent_nickname": "小艾",
+            "to_agent_nickname": "Bob酱",
+        }
 
         # 2) Redis side effects
         assert p.status_dec.await_count == 1
         assert p.status_inc.await_count == 1
 
-        # 3) Realtime broadcast: 2 new_message + 2 conversation_transferred
-        assert p.rt.emit.await_count == 4
+        # 3) Realtime broadcast: 3 new_message + 2 conversation_transferred + 1 list invalidation
+        assert p.rt.emit.await_count == 6
         event_names = [call.args[0] for call in p.rt.emit.await_args_list]
-        assert event_names.count("new_message") == 2
+        assert event_names.count("new_message") == 3
         assert event_names.count("conversation_transferred") == 2
+        assert event_names.count("conversation_list_updated") == 1
 
         # 4) Receiving room gets a complete conversation payload
         to_call = next(
@@ -453,7 +479,53 @@ class TestTransferConversation:
             )
 
         added_messages = [obj for obj in fake_db.added if isinstance(obj, Message)]
-        assert added_messages[0].content == "管理员 将会话转接给 Bob 客服"
+        assert added_messages[0].content == "管理员 将会话转接给 Bob"
+
+    @pytest.mark.asyncio
+    async def test_peer_view_principal_can_transfer_peer_conversation(
+        self, fake_db, fake_redis
+    ):
+        conversation = _make_conversation(agent_id=11)
+        target = _make_employee(id=22, name="Bob", display_name="Bob 客服")
+        initiator = _make_employee(id=99, name="Supervisor", display_name="Supervisor")
+
+        with _TransferPatches(
+            conversation, target, initiator,
+            target_status=AgentOnlineStatus.ONLINE.value,
+        ):
+            await TransferService.transfer_conversation(
+                db=fake_db,
+                r=fake_redis,
+                conversation_id=conversation.id,
+                target_agent_id=target.id,
+                current_user_id=99,
+                tenant_id=7,
+                principal=_peer_principal(99),
+            )
+
+        added_messages = [obj for obj in fake_db.added if isinstance(obj, Message)]
+        assert added_messages[0].content == "Supervisor 将会话转接给 Bob"
+
+    @pytest.mark.asyncio
+    async def test_peer_view_self_scope_cannot_transfer_peer_conversation(
+        self, fake_db, fake_redis
+    ):
+        conversation = _make_conversation(agent_id=11)
+        with patch.object(
+            ts.ConversationRepository,
+            "get_by_id",
+            new=AsyncMock(return_value=conversation),
+        ):
+            with pytest.raises(ForbiddenError):
+                await TransferService.transfer_conversation(
+                    db=fake_db,
+                    r=fake_redis,
+                    conversation_id=conversation.id,
+                    target_agent_id=22,
+                    current_user_id=99,
+                    tenant_id=7,
+                    principal=_peer_principal(99, data_scope="self"),
+                )
 
     @pytest.mark.asyncio
     async def test_db_failure_rolls_back_and_skips_emit(self, fake_db, fake_redis):
@@ -802,7 +874,45 @@ class TestListTargetsAuthorization:
                 principal=_principal(999),
             )
         kwargs = repo_mock.await_args.kwargs
-        assert set(kwargs["exclude_user_ids"]) == {999, 42}
+        assert set(kwargs["exclude_user_ids"]) == {42}
+
+    @pytest.mark.asyncio
+    async def test_peer_view_principal_can_inspect_peer_conversation(
+        self, fake_db, fake_redis
+    ):
+        conversation = _make_conversation(agent_id=42, tenant_id=7)
+        repo_mock = AsyncMock(return_value=[])
+        with patch.object(
+            ts.ConversationRepository,
+            "get_by_id",
+            new=AsyncMock(return_value=conversation),
+        ), patch.object(
+            ts.EmployeeRepository, "get_transfer_candidates", new=repo_mock
+        ):
+            await TransferService.list_targets(
+                db=fake_db,
+                r=fake_redis,
+                tenant_id=7,
+                current_user_id=99,
+                conversation_id=conversation.id,
+                principal=_peer_principal(99),
+            )
+
+        kwargs = repo_mock.await_args.kwargs
+        assert set(kwargs["exclude_user_ids"]) == {42}
+
+    @pytest.mark.asyncio
+    async def test_peer_view_without_conversation_context_cannot_inspect_targets(
+        self, fake_db, fake_redis
+    ):
+        with pytest.raises(ForbiddenError):
+            await TransferService.list_targets(
+                db=fake_db,
+                r=fake_redis,
+                tenant_id=7,
+                current_user_id=99,
+                principal=_peer_principal(99),
+            )
 
     @pytest.mark.asyncio
     async def test_unknown_conversation_raises_not_found(self, fake_db, fake_redis):

@@ -46,6 +46,7 @@ class EmployeeGroupService:
             emp = m.employee
             members.append(EmployeeGroupMemberInfo(
                 employee_id=m.employee_id,
+                name=emp.name if emp else "",
                 username=emp.username if emp else "",
                 display_name=emp.display_name if emp else None,
             ))
@@ -115,6 +116,7 @@ class EmployeeQueryService:
         items = [
             {
                 "id": e.id,
+                "name": e.name,
                 "username": e.username,
                 "display_name": e.display_name,
             }

@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     APP_NAME: str = Field(default="OpenDesk")
     APP_VERSION: str = Field(default="0.1.0")
     DEBUG: bool = Field(default=False)
+    LOG_FORMAT: str = Field(
+        default="text",
+        description="Log output format: 'text' (human-readable) or 'json' (structured, one JSON object per line)",
+    )
 
     DATABASE_URL: str = Field(default="postgresql+asyncpg://localhost:5432/opendesk")
     AUTO_MIGRATE: bool = Field(default=True, description="Run alembic upgrade head on startup")
@@ -66,6 +70,10 @@ class Settings(BaseSettings):
     CORS_ALLOW_ORIGINS: str = Field(default="*")
     JWT_EXPIRE_HOURS: int = Field(default=24)
     VISITOR_SESSION_EXPIRE_SECONDS: int = Field(default=86400)
+    API_CONTEXT_TOKEN_EXPIRE_SECONDS: int = Field(default=1800)
+    VISITOR_TIMEOUT_CLOSE_WORKER_ENABLED: bool = Field(default=True)
+    VISITOR_TIMEOUT_CLOSE_SCAN_INTERVAL_SECONDS: int = Field(default=60, ge=5)
+    VISITOR_TIMEOUT_CLOSE_SCAN_BATCH_SIZE: int = Field(default=100, ge=1, le=500)
 
     SMTP_HOST: str = Field(default="")
     SMTP_PORT: int = Field(default=465)
@@ -138,6 +146,30 @@ class Settings(BaseSettings):
     OSS_ADDR: str = Field(default="", description="Public access URL prefix, e.g. https://bucket.oss-cn-beijing.aliyuncs.com")
     OSS_URL: str = Field(default="", description="OSS endpoint, e.g. https://oss-cn-beijing.aliyuncs.com")
     OSS_BUCKET: str = Field(default="")
+
+    # ── Observability (vendor-neutral, OTLP/OpenTelemetry-based) ──
+    # Backend selector: "otel" → OTLP exporter; "noop" → disabled (zero overhead).
+    # Defaults to "noop" so unconfigured environments stay silent.
+    OBSERVABILITY_BACKEND: str = Field(default="noop")
+
+    # Service identity (written to every span/log as `resource_attributes`)
+    OTEL_SERVICE_NAME: str = Field(default="opendesk-api")
+    OTEL_DEPLOYMENT_ENVIRONMENT: str = Field(default="dev")
+
+    # OTLP transport (any OpenTelemetry-compatible backend works here:
+    # Grafana Cloud / Tempo, SigNoz, vendor APMs, self-hosted collectors…).
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = Field(default="")
+    # Comma-separated "k=v,k=v" — typically: Authorization=Basic <base64(user:pass)>
+    OTEL_EXPORTER_OTLP_HEADERS: str = Field(default="")
+
+    # ── Vendor-specific extras (GreptimeDB-compatible pipelines etc.) ──
+    # Extra header injected on the traces signal so GreptimeDB flattens span attrs.
+    OTEL_TRACES_PIPELINE_NAME: str = Field(default="greptime_trace_v1")
+    # Extra header injected on the logs signal so GreptimeDB writes to this table.
+    OTEL_LOGS_TABLE_NAME: str = Field(default="otel_logs")
+    # Master switch for visitor Web SDK event ingest. The endpoint still
+    # accepts valid requests when disabled, but skips log emission.
+    TELEMETRY_ENABLED: bool = Field(default=True)
 
     model_config = SettingsConfigDict(
         env_file=_server_env_file_paths(),

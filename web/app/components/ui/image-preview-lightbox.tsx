@@ -336,6 +336,7 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
     close,
     slides = [],
     index,
+    className,
     ...rest
   } = props
 
@@ -383,24 +384,20 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
     () => ({
       ...userStyles,
       root: {
-        '--yarl__color_backdrop': '#ffffff',
-        '--yarl__color_button': 'rgba(24, 24, 27, 0.72)',
-        '--yarl__color_button_active': '#18181b',
-        '--yarl__color_button_disabled': 'rgba(24, 24, 27, 0.28)',
+        '--yarl__color_backdrop': 'rgba(0, 0, 0, 0.36)',
+        '--yarl__color_button': 'rgba(255, 255, 255, 0.72)',
+        '--yarl__color_button_active': '#ffffff',
+        '--yarl__color_button_disabled': 'rgba(255, 255, 255, 0.28)',
         '--yarl__button_filter': 'none',
-        '--yarl__container_background_color': '#ffffff',
-        '--yarl__slide_icon_loading_color': 'rgba(24, 24, 27, 0.48)',
-        '--yarl__thumbnails_container_background_color': '#ffffff',
-        '--yarl__thumbnails_thumbnail_background': '#ffffff',
-        '--yarl__thumbnails_thumbnail_border_color': '#d4d4d8',
-        '--yarl__thumbnails_thumbnail_active_border_color': '#18181b',
-        '--yarl__thumbnails_thumbnail_focus_box_shadow': '#ffffff 0 0 0 2px, #18181b 0 0 0 4px',
+        '--yarl__slide_icon_loading_color': 'rgba(255, 255, 255, 0.48)',
+        '--yarl__thumbnails_container_background_color': 'rgba(0, 0, 0, 0.28)',
+        '--yarl__thumbnails_thumbnail_background': 'rgba(255, 255, 255, 0.12)',
+        '--yarl__thumbnails_thumbnail_border_color': 'rgba(255, 255, 255, 0.24)',
+        '--yarl__thumbnails_thumbnail_active_border_color': '#ffffff',
+        '--yarl__thumbnails_thumbnail_focus_box_shadow': '#000000 0 0 0 2px, #ffffff 0 0 0 4px',
         ...userStyles?.root,
       },
-      container: {
-        backgroundColor: '#ffffff',
-        ...userStyles?.container,
-      },
+      container: userStyles?.container,
       button: {
         filter: 'none',
         ...userStyles?.button,
@@ -440,6 +437,7 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
   return (
     <Lightbox
       {...rest}
+      className={['od-image-preview-lightbox', className].filter(Boolean).join(' ')}
       open={open}
       close={close}
       slides={slides}

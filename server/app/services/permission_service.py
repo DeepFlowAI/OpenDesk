@@ -13,6 +13,8 @@ from app.services.permission_catalog import (
     ADMIN_DATA_SCOPES,
     DATA_SCOPE_KEYS,
     PERMISSION_DATA_SCOPE_RESOURCES,
+    RESOURCE_CHAT_QUEUE,
+    RESOURCE_PEER_CONVERSATION,
     SYSTEM_ROLE_KEYS,
     filter_effective_permissions,
     merge_data_scope,
@@ -20,6 +22,8 @@ from app.services.permission_catalog import (
     normalize_permissions,
 )
 from app.services.role_service import RoleService
+
+LEGACY_SESSION_SCOPED_RESOURCES = {RESOURCE_PEER_CONVERSATION, RESOURCE_CHAT_QUEUE}
 
 
 class PermissionService:
@@ -104,7 +108,10 @@ class PermissionService:
             for permission, resource in PERMISSION_DATA_SCOPE_RESOURCES.items():
                 if permission not in effective_permissions or permission not in role_permissions:
                     continue
-                merged_scope = merge_data_scope(merged.get(resource), role_scopes.get(resource, "self"))
+                candidate_scope = role_scopes.get(resource)
+                if candidate_scope is None and resource in LEGACY_SESSION_SCOPED_RESOURCES:
+                    candidate_scope = role_scopes.get("session_record")
+                merged_scope = merge_data_scope(merged.get(resource), candidate_scope or "self")
                 if merged_scope:
                     merged[resource] = merged_scope
 

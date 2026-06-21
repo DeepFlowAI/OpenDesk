@@ -32,6 +32,7 @@ type SystemFormData = {
   phone: string
   email: string
   gender: string
+  level: string
   address: string
   remark: string
   organization_id: number | null
@@ -44,6 +45,11 @@ const GENDER_OPTIONS = [
   { value: 'male', zh: '男', en: 'Male' },
   { value: 'female', zh: '女', en: 'Female' },
   { value: 'other', zh: '其他', en: 'Other' },
+]
+
+const LEVEL_OPTIONS = [
+  { value: 'normal', zh: '普通', en: 'Normal' },
+  { value: 'vip', zh: 'VIP', en: 'VIP' },
 ]
 
 function customFieldKey(field: UnifiedField): string {
@@ -92,7 +98,7 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
   )
 
   const [form, setForm] = useState<SystemFormData>({
-    name: '', phone: '', email: '', gender: '', address: '', remark: '', organization_id: null,
+    name: '', phone: '', email: '', gender: '', level: 'normal', address: '', remark: '', organization_id: null,
   })
   const [errors, setErrors] = useState<Partial<Record<string, string>>>({})
   const [cfValues, setCfValues] = useState<Record<string, CustomFieldValue>>({})
@@ -120,6 +126,7 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
         phone: user.phone ?? '',
         email: user.email ?? '',
         gender: user.gender ?? '',
+        level: user.level ?? 'normal',
         address: user.address ?? '',
         remark: user.remark ?? '',
         organization_id: user.organization_id ?? null,
@@ -181,6 +188,7 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
         if (form.phone !== (user.phone ?? '')) payload.phone = form.phone || null
         if (form.email !== (user.email ?? '')) payload.email = form.email || null
         if (form.gender !== (user.gender ?? '')) payload.gender = form.gender || null
+        if (form.level !== (user.level ?? 'normal')) payload.level = form.level || 'normal'
         if (form.address !== (user.address ?? '')) payload.address = form.address || null
         if (form.remark !== (user.remark ?? '')) payload.remark = form.remark || null
         if (form.organization_id !== (user.organization_id ?? null)) {
@@ -205,6 +213,7 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
           ...(form.phone ? { phone: form.phone } : {}),
           ...(form.email ? { email: form.email } : {}),
           ...(form.gender ? { gender: form.gender } : {}),
+          level: form.level || 'normal',
           ...(form.address ? { address: form.address } : {}),
           ...(form.remark ? { remark: form.remark } : {}),
           ...(form.organization_id != null ? { organization_id: form.organization_id } : {}),
@@ -286,6 +295,20 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
                 className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
               >
                 {GENDER_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {isZh ? opt.zh : opt.en}
+                  </option>
+                ))}
+              </select>
+            </FieldRow>
+
+            <FieldRow label={isZh ? '等级' : 'Level'}>
+              <select
+                value={form.level}
+                onChange={(e) => setField('level', e.target.value)}
+                className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              >
+                {LEVEL_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {isZh ? opt.zh : opt.en}
                   </option>

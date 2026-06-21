@@ -2,8 +2,9 @@
 Session record repository — read-only queries for historical conversation data
 """
 from datetime import datetime
+from typing import Literal
 
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.elements import ColumnElement
@@ -35,6 +36,7 @@ class SessionRecordRepository:
         service_labels: list[str] | None = None,
         product_rating_options: list[str] | None = None,
         product_labels: list[str] | None = None,
+        session_type: Literal["human", "bot", "bot_human"] | None = None,
         scope_predicate: ColumnElement | None = None,
     ) -> tuple[list[Conversation], int]:
         """Paginated list of conversations with optional filters."""
@@ -64,6 +66,31 @@ class SessionRecordRepository:
                     Conversation.public_id.ilike(kw),
                 )
             )
+
+        bot_session_filter = or_(
+            Conversation.open_agent_agent_id.is_not(None),
+            Conversation.open_agent_conversation_id.is_not(None),
+            Conversation.open_agent_conversation_external_id.is_not(None),
+        )
+        if session_type == "human":
+            base_filter.append(
+                and_(
+                    Conversation.open_agent_agent_id.is_(None),
+                    Conversation.open_agent_conversation_id.is_(None),
+                    Conversation.open_agent_conversation_external_id.is_(None),
+                )
+            )
+        elif session_type == "bot":
+            base_filter.append(bot_session_filter)
+            base_filter.append(
+                or_(
+                    Conversation.open_agent_handoff_state.is_(None),
+                    Conversation.open_agent_handoff_state != "success",
+                )
+            )
+        elif session_type == "bot_human":
+            base_filter.append(bot_session_filter)
+            base_filter.append(Conversation.open_agent_handoff_state == "success")
 
         filters = SatisfactionSurveyRecordRepository.apply_filters(
             base_filter,

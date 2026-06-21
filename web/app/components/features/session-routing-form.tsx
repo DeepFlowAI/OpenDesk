@@ -443,6 +443,20 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
   const addQueueRow = () => setQueueRows((r) => [...r, defaultQueueSourceRow()])
   const removeQueueRow = (key: string) =>
     setQueueRows((r) => (r.length > 1 ? r.filter((x) => x._key !== key) : [defaultQueueSourceRow()]))
+  const [dragQueueRowKey, setDragQueueRowKey] = useState<string | null>(null)
+
+  const moveQueueRow = useCallback((fromKey: string, toKey: string) => {
+    setQueueRows((current) => {
+      const fromIndex = current.findIndex((row) => row._key === fromKey)
+      const toIndex = current.findIndex((row) => row._key === toKey)
+      if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return current
+
+      const next = [...current]
+      const [moved] = next.splice(fromIndex, 1)
+      next.splice(toIndex, 0, moved)
+      return next
+    })
+  }, [])
 
   const updateRow = useCallback((key: string, patch: Partial<RowState>) => {
     setRows((r) =>
@@ -781,10 +795,31 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                   key={row._key}
                   className={cn(
                     'flex items-start gap-2 px-4 py-2.5',
+                    dragQueueRowKey === row._key && 'bg-accent/60',
                     idx < queueRows.length - 1 && 'border-b border-border'
                   )}
+                  onDragOver={(event) => {
+                    if (!dragQueueRowKey || dragQueueRowKey === row._key) return
+                    event.preventDefault()
+                    event.dataTransfer.dropEffect = 'move'
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault()
+                    if (!dragQueueRowKey) return
+                    moveQueueRow(dragQueueRowKey, row._key)
+                    setDragQueueRowKey(null)
+                  }}
                 >
-                  <div className="flex h-9 w-6 shrink-0 items-center justify-center text-muted-foreground">
+                  <div
+                    className="flex h-9 w-6 shrink-0 cursor-grab items-center justify-center text-muted-foreground active:cursor-grabbing"
+                    draggable
+                    onDragStart={(event) => {
+                      event.dataTransfer.effectAllowed = 'move'
+                      event.dataTransfer.setData('text/plain', row._key)
+                      setDragQueueRowKey(row._key)
+                    }}
+                    onDragEnd={() => setDragQueueRowKey(null)}
+                  >
                     <IconGripVertical size={16} />
                   </div>
                   <div className="relative w-[140px] shrink-0">

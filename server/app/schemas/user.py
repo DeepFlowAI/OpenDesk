@@ -21,6 +21,7 @@ class UserResponse(TimestampSchema):
     email: str | None = None
     phone: str | None = None
     gender: str | None = None
+    level: str
     address: str | None = None
     remark: str | None = None
     web_id: str | None = None
@@ -38,6 +39,7 @@ class UserCreate(BaseModel):
     email: str | None = Field(None, max_length=254)
     phone: str | None = Field(None, max_length=32)
     gender: str | None = Field(None, max_length=16)
+    level: str | None = Field("normal", max_length=16)
     address: str | None = Field(None, max_length=256)
     remark: str | None = Field(None, max_length=2000)
     web_id: str | None = Field(None, max_length=128)
@@ -51,6 +53,7 @@ class UserUpdate(BaseModel):
     email: str | None = Field(None, max_length=254)
     phone: str | None = Field(None, max_length=32)
     gender: str | None = Field(None, max_length=16)
+    level: str | None = Field(None, max_length=16)
     address: str | None = Field(None, max_length=256)
     remark: str | None = Field(None, max_length=2000)
     web_id: str | None = Field(None, max_length=128)
@@ -73,6 +76,26 @@ class UserQueryRequest(BaseModel):
     sort_order: str = Field(default="desc", max_length=4)
     page: int = 1
     per_page: int = 20
+
+
+class UserExportColumn(BaseModel):
+    field_key: str | None = None
+    field_id: int | None = None
+    name: str = Field(..., min_length=1, max_length=128)
+    field_type: str | None = Field(None, max_length=64)
+
+
+class UserExportRequest(BaseModel):
+    """POST body for exporting users with current list context."""
+    view_id: int | None = None
+    search: str | None = Field(None, max_length=256)
+    temp_conditions: list[ConditionItem] = Field(default_factory=list)
+    temp_condition_logic: str = Field(default="and", max_length=8)
+    group_value: str | None = None
+    sort_by: str | None = None
+    sort_order: str = Field(default="desc", max_length=4)
+    locale: str = Field(default="zh", max_length=8)
+    columns: list[UserExportColumn] = Field(default_factory=list)
 
 
 class ViewCountItem(BaseModel):

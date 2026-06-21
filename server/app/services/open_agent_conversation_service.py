@@ -816,15 +816,20 @@ class OpenAgentConversationService:
                 )
         conv = result.get("conversation")
         if conv is not None:
+            status_payload = {
+                "conversation_public_id": conv.public_id,
+                "status": conv.status,
+                "ok": result.get("ok", False),
+                "reason": result.get("reason"),
+            }
+            queue_position = result.get("queue_position")
+            if queue_position is not None:
+                status_payload["queue_position"] = queue_position
+            status_payload.update(OpenAgentConversationService._handoff_unavailable_status_fields(result))
             events.append(
                 OpenAgentConversationService._sse_event(
                     "open_desk_conversation_status",
-                    {
-                        "conversation_public_id": conv.public_id,
-                        "status": conv.status,
-                        "ok": result.get("ok", False),
-                        "reason": result.get("reason"),
-                    },
+                    status_payload,
                 ),
             )
         return events
@@ -1156,6 +1161,26 @@ class OpenAgentConversationService:
         )
 
     @staticmethod
+    def _handoff_unavailable_status_fields(result: dict) -> dict:
+        availability = result.get("availability") or {}
+        fields: dict = {}
+        if result.get("leave_message"):
+            fields["leave_message"] = True
+            fields["leave_message_prompt"] = availability.get("leave_message_prompt")
+        if result.get("queue_full"):
+            fields["queue_full"] = True
+            fields["queue_full_message"] = availability.get("queue_full_message")
+            fields["queue_full_show_leave_message_button"] = availability.get(
+                "queue_full_show_leave_message_button",
+                True,
+            )
+            fields["queue_full_leave_message_button_label"] = availability.get(
+                "queue_full_leave_message_button_label",
+            )
+            fields["leave_message_prompt"] = availability.get("leave_message_prompt")
+        return fields
+
+    @staticmethod
     def _handoff_route_result_events(result: dict) -> list[bytes]:
         events: list[bytes] = []
         for route_message in result.get("messages") or []:
@@ -1170,15 +1195,20 @@ class OpenAgentConversationService:
                 )
         conv = result.get("conversation")
         if conv is not None:
+            status_payload = {
+                "conversation_public_id": conv.public_id,
+                "status": conv.status,
+                "ok": result.get("ok", False),
+                "reason": result.get("reason"),
+            }
+            queue_position = result.get("queue_position")
+            if queue_position is not None:
+                status_payload["queue_position"] = queue_position
+            status_payload.update(OpenAgentConversationService._handoff_unavailable_status_fields(result))
             events.append(
                 OpenAgentConversationService._sse_event(
                     "open_desk_conversation_status",
-                    {
-                        "conversation_public_id": conv.public_id,
-                        "status": conv.status,
-                        "ok": result.get("ok", False),
-                        "reason": result.get("reason"),
-                    },
+                    status_payload,
                 ),
             )
         return events

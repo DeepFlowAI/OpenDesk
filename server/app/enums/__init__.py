@@ -21,11 +21,14 @@ class MessageSenderType(str, enum.Enum):
 
 class MessageContentType(str, enum.Enum):
     TEXT = "text"
+    RICH_TEXT = "rich_text"
     IMAGE = "image"
     FILE = "file"
     SYSTEM = "system"
     WELCOME = "welcome"
+    BOT_WELCOME = "bot_welcome"
     SATISFACTION_EVENT = "satisfaction_event"
+    INTERNAL_NOTE = "internal_note"
 
 
 class AgentOnlineStatus(str, enum.Enum):

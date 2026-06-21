@@ -14,6 +14,66 @@ def _dt() -> datetime:
     return datetime(2026, 5, 23, 10, 0, tzinfo=timezone.utc)
 
 
+def _conversation(**overrides):
+    data = {
+        "id": 1,
+        "public_id": "conv_pub",
+        "share_code": "SC001",
+        "visitor": None,
+        "agent": None,
+        "channel": None,
+        "group": None,
+        "status": "closed",
+        "started_at": _dt(),
+        "ended_at": _dt(),
+        "ended_by": "agent",
+        "created_at": _dt(),
+        "last_message_preview": None,
+        "open_agent_agent_id": None,
+        "open_agent_conversation_id": None,
+        "open_agent_conversation_external_id": None,
+        "open_agent_handoff_state": None,
+    }
+    data.update(overrides)
+    return SimpleNamespace(**data)
+
+
+@pytest.mark.parametrize(
+    ("conversation", "session_type", "handoff_status"),
+    [
+        (_conversation(), "human", None),
+        (_conversation(open_agent_agent_id=12), "bot", "not_triggered"),
+        (
+            _conversation(open_agent_conversation_id=34, open_agent_handoff_state="pending"),
+            "bot",
+            "waiting_confirmation",
+        ),
+        (
+            _conversation(
+                open_agent_conversation_external_id="oa_1",
+                open_agent_handoff_state="requested",
+            ),
+            "bot",
+            "handoff_in_progress",
+        ),
+        (_conversation(open_agent_agent_id=12, open_agent_handoff_state="queued"), "bot", "in_queue"),
+        (_conversation(open_agent_agent_id=12, open_agent_handoff_state="success"), "bot_human", "succeeded"),
+        (_conversation(open_agent_agent_id=12, open_agent_handoff_state="failed"), "bot", "failed"),
+        (_conversation(open_agent_agent_id=12, open_agent_handoff_state="dismissed"), "bot", "dismissed"),
+        (_conversation(open_agent_agent_id=12, open_agent_handoff_state="legacy_unknown"), "bot", None),
+    ],
+)
+def test_conversation_to_response_maps_session_type_and_bot_handoff_status(
+    conversation,
+    session_type,
+    handoff_status,
+):
+    result = SessionRecordService._conversation_to_response(conversation)
+
+    assert result["session_type"] == session_type
+    assert result["bot_handoff_status"] == handoff_status
+
+
 @pytest.mark.asyncio
 async def test_get_messages_enriches_bot_sender_name(monkeypatch):
     conversation = SimpleNamespace(

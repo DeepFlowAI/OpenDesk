@@ -30,6 +30,12 @@ function scopeLabel(scope: DataScopeValue, locale: 'zh' | 'en') {
   return 'Self'
 }
 
+const sessionRecordCompatScopeResources = new Set(['chat.conversation.peer.view', 'chat.queue.view'])
+
+function scopeValue(dataScopes: Record<string, DataScopeValue>, resource: string): DataScopeValue {
+  return dataScopes[resource] ?? (sessionRecordCompatScopeResources.has(resource) ? dataScopes.session_record : undefined) ?? 'self'
+}
+
 export default function RoleForm({ initialData, readOnly = false, onSubmit }: Props) {
   const { locale } = useLocaleStore()
   const { data: treeData, isLoading } = usePermissionTree()
@@ -267,7 +273,7 @@ export default function RoleForm({ initialData, readOnly = false, onSubmit }: Pr
                               }
                               className={cn(
                                 'h-8 rounded-lg border px-3 text-xs transition-colors disabled:opacity-50',
-                                (dataScopes[scopeResource] ?? 'self') === scope
+                                scopeValue(dataScopes, scopeResource) === scope
                                   ? 'border-primary bg-primary text-primary-foreground'
                                   : 'border-border text-foreground/80 hover:bg-accent'
                               )}

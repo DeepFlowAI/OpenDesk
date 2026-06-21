@@ -20,11 +20,16 @@ const PDFViewer = dynamic(
   },
 )
 
-const attachmentCardClassName = 'rounded-[18px] border border-border bg-background p-3 text-foreground'
+const attachmentCardClassName =
+  'overflow-hidden rounded-[18px] border border-border bg-background p-3 text-foreground'
+const imageAttachmentClassName =
+  'overflow-hidden rounded-[18px] border border-border bg-muted text-foreground'
 
 type MessageAttachmentProps = {
   conversationId?: number
   conversationPublicId?: string
+  offlineMessageId?: number
+  offlineMessagePublicId?: string
   visitorSessionToken?: string
   contentType: 'image' | 'file'
   content: string
@@ -191,6 +196,8 @@ function JitDocumentViewer({ url, filename }: { url: string; filename: string })
 export function MessageAttachment({
   conversationId,
   conversationPublicId,
+  offlineMessageId,
+  offlineMessagePublicId,
   visitorSessionToken,
   contentType,
   content,
@@ -220,6 +227,8 @@ export function MessageAttachment({
     getConversationFileUrl({
       conversationId,
       conversationPublicId,
+      offlineMessageId,
+      offlineMessagePublicId,
       visitorSessionToken,
       fileId: payload.file_id,
       downloadName: payload.name,
@@ -237,7 +246,7 @@ export function MessageAttachment({
     return () => {
       alive = false
     }
-  }, [conversationId, conversationPublicId, payload, visitorSessionToken])
+  }, [conversationId, conversationPublicId, offlineMessageId, offlineMessagePublicId, payload, visitorSessionToken])
 
   const handleDownload = useCallback(async () => {
     if (!payload) {
@@ -247,13 +256,15 @@ export function MessageAttachment({
     const res = await getConversationFileUrl({
       conversationId,
       conversationPublicId,
+      offlineMessageId,
+      offlineMessagePublicId,
       visitorSessionToken,
       fileId: payload.file_id,
       downloadName: payload.name,
       download: true,
     })
     window.open(res.url, '_blank', 'noopener,noreferrer')
-  }, [conversationId, conversationPublicId, payload, url, visitorSessionToken])
+  }, [conversationId, conversationPublicId, offlineMessageId, offlineMessagePublicId, payload, url, visitorSessionToken])
 
   const handleImagePreview = useCallback(async () => {
     if (!url) return
@@ -276,6 +287,8 @@ export function MessageAttachment({
           const res = await getConversationFileUrl({
             conversationId,
             conversationPublicId,
+            offlineMessageId,
+            offlineMessagePublicId,
             visitorSessionToken,
             fileId: itemPayload.file_id,
             downloadName: itemPayload.name,
@@ -295,13 +308,13 @@ export function MessageAttachment({
       setPreviewOpen(true)
     }
     setPreviewLoading(false)
-  }, [content, conversationId, conversationPublicId, currentImageId, imageGallery, url, visitorSessionToken])
+  }, [content, conversationId, conversationPublicId, currentImageId, imageGallery, offlineMessageId, offlineMessagePublicId, url, visitorSessionToken])
 
   if (isImage) {
     if (loading) {
       return (
-        <div className={cn('inline-block max-w-full', attachmentCardClassName, className)}>
-          <div className="flex h-32 w-48 items-center justify-center rounded-lg bg-muted">
+        <div className={cn('inline-block max-w-full', imageAttachmentClassName, className)}>
+          <div className="flex h-32 w-48 items-center justify-center bg-muted">
             <IconLoader2 size={18} className="animate-spin text-muted-foreground" />
           </div>
         </div>
@@ -309,23 +322,23 @@ export function MessageAttachment({
     }
     if (error || !url) {
       return (
-        <div className={cn('inline-block max-w-full text-sm text-muted-foreground', attachmentCardClassName, className)}>
+        <div className={cn('inline-block max-w-full px-3 py-2 text-sm text-muted-foreground', imageAttachmentClassName, className)}>
           文件暂时无法访问
         </div>
       )
     }
     return (
       <>
-        <div className={cn('inline-block max-w-full', attachmentCardClassName, className)}>
+        <div className={cn('inline-block max-w-full', imageAttachmentClassName, className)}>
           <button
             type="button"
-            className="block max-w-full overflow-hidden rounded-lg bg-white disabled:cursor-wait"
+            className="block max-w-full overflow-hidden disabled:cursor-wait"
             disabled={previewLoading}
             onClick={() => {
               void handleImagePreview()
             }}
           >
-            <img src={url} alt={payload?.name || 'image'} className="max-h-60 max-w-full bg-white object-cover" />
+            <img src={url} alt={payload?.name || 'image'} className="block max-h-60 max-w-full object-cover" />
           </button>
         </div>
         <ImagePreviewLightbox

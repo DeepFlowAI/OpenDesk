@@ -1,7 +1,7 @@
 """
 AgentWebRTCSession repository.
 """
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,7 +51,7 @@ class AgentWebRTCSessionRepository:
     @staticmethod
     async def close(db: AsyncSession, row: AgentWebRTCSession) -> None:
         row.state = "disconnected"
-        row.ended_at = datetime.utcnow()
+        row.ended_at = datetime.now(timezone.utc)
         await db.commit()
 
     @staticmethod

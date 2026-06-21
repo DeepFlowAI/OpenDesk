@@ -35,6 +35,10 @@ const GENDER_LABELS: Record<string, { zh: string; en: string }> = {
   unknown: { zh: '未知', en: 'Unknown' },
   other: { zh: '其他', en: 'Other' },
 }
+const USER_LEVEL_LABELS: Record<string, { zh: string; en: string }> = {
+  normal: { zh: '普通', en: 'Normal' },
+  vip: { zh: 'VIP', en: 'VIP' },
+}
 const SELECT_TYPES = new Set(['single_select', 'multi_select', 'single_select_tree', 'multi_select_tree'])
 
 export default function UserDetailPage() {
@@ -164,6 +168,11 @@ export default function UserDetailPage() {
         if (key === 'gender') {
           const g = GENDER_LABELS[String(raw)]
           return g ? (isZh ? g.zh : g.en) : String(raw)
+        }
+
+        if (key === 'level') {
+          const level = USER_LEVEL_LABELS[String(raw)]
+          return level ? (isZh ? level.zh : level.en) : String(raw)
         }
 
         if (SELECT_TYPES.has(field.field_type)) {

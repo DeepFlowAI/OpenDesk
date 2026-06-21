@@ -2,23 +2,90 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconAlertCircle, IconArrowLeft, IconCheck, IconCopy, IconLoader2, IconRefresh, IconTrash, IconUpload } from '@tabler/icons-react'
+import { IconAlertCircle, IconArrowLeft, IconCheck, IconCopy, IconEye, IconGripVertical, IconInfoCircle, IconLoader2, IconPlus, IconRefresh, IconTrash, IconUpload } from '@tabler/icons-react'
+import { arrayMove } from '@dnd-kit/sortable'
+import CodeMirror, { type ReactCodeMirrorProps } from '@uiw/react-codemirror'
+import { javascript } from '@codemirror/lang-javascript'
+import { json } from '@codemirror/lang-json'
+import { okaidiaInit } from '@uiw/codemirror-theme-okaidia'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import type { ChannelConfig, CreateChannelPayload } from '@/models/channel'
+import type { AssistPanelConfigValue, ChannelConfig, ChannelCustomButton, CreateChannelPayload } from '@/models/channel'
 import { useChannel, useCreateChannel, useUpdateChannel } from '@/service/use-channels'
 import { useOpenAgentAgents, useOpenAgentSettings } from '@/service/use-open-agent-settings'
 import { useServiceHours } from '@/service/use-service-hours'
-import { useUploadChannelLogo, useUploadChannelFavicon } from '@/service/use-upload'
+import { useUploadChannelLogo, useUploadChannelFavicon, useUploadChannelBotAvatar } from '@/service/use-upload'
 import { CHANNEL_COLOR_PREVIEW, channelColorPreview } from '@/utils/channel-config-display'
 import { ChannelColorField } from '@/components/channel/channel-color-field'
 import { Switch } from '@/components/ui/switch'
+import { SortableFieldRowsContext, SortableFieldTableRow } from '@/components/admin/sortable-field-table'
 import { RichTextFieldEditor } from '@/app/components/features/field-system/rich-text-field-editor'
+import {
+  AssistPanelRuntime,
+  createAssistPanelError,
+  createAssistPanelOk,
+  getAssistPanelCodeError,
+  type AssistPanelApi,
+  type AssistPanelEventName,
+  type AssistPanelStatus,
+} from '@/app/components/features/visitor-chat/assist-panel-runtime'
 
 const DEFAULT_OFFLINE_TITLE = '当前客服不在线'
 const DEFAULT_OFFLINE_MESSAGE = '您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。'
+const DEFAULT_LEAVE_MESSAGE_PROMPT = '请留下您的问题和联系方式，我们上线后会尽快联系您。'
+const DEFAULT_QUEUE_MESSAGE = '您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。客服接入后会立即回复您。'
+const DEFAULT_QUEUE_FULL_MESSAGE = '当前排队人数较多，暂时无法进入排队。您可以稍后再试，或点击留言，我们上线后会尽快联系您。'
+const DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL = '留言'
+const QUEUE_COUNT_VARIABLE = '{{current_queue_count}}'
 const DEFAULT_OPEN_AGENT_INPUT_PLACEHOLDER = '输入消息...'
 const DEFAULT_OPEN_AGENT_HANDOFF_LABEL = '转人工'
+const MAX_CUSTOM_BUTTONS = 8
+const DEFAULT_ASSIST_PANEL_CODE = `export default function AssistApp({ api, status, config }) {
+  const items = Array.isArray(config.items) ? config.items : []
+  const description = typeof config.description === 'string' ? config.description : ''
+
+  return React.createElement(
+    'div',
+    { className: 'flex flex-col gap-3 text-sm' },
+    description
+      ? React.createElement('p', { className: 'leading-6 text-muted-foreground' }, description)
+      : null,
+    ...items.map((item, index) => {
+      const record = item && typeof item === 'object' ? item : {}
+      const question = record.question || record.title || ''
+      const answer = record.answer || record.description || ''
+      const message = record.message || question
+      return React.createElement(
+        'div',
+        { key: index, className: 'rounded-lg border border-border bg-background p-3' },
+        question ? React.createElement('p', { className: 'font-medium text-foreground' }, question) : null,
+        answer ? React.createElement('p', { className: 'mt-1 text-xs leading-5 text-muted-foreground' }, answer) : null,
+        message
+          ? React.createElement(
+              'button',
+              {
+                type: 'button',
+                disabled: !status.canSendMessage,
+                onClick: () => api.sendMessage(message),
+                className: 'mt-3 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-40',
+              },
+              status.canSendMessage ? '发送到会话' : '当前不可发送',
+            )
+          : null,
+      )
+    }),
+  )
+}`
+const DEFAULT_ASSIST_PANEL_CONFIG: Record<string, AssistPanelConfigValue> = {
+  description: '这里展示 PC 独立 URL 访客侧辅助信息。',
+  items: [
+    {
+      question: '常见问题',
+      answer: '可以在初始参数 JSON 中配置问题、说明和要发送到会话的文本。',
+      message: '我想了解常见问题',
+    },
+  ],
+}
 
 const DEFAULT_CONFIG: ChannelConfig = {
   title: null,
@@ -43,18 +110,33 @@ const DEFAULT_CONFIG: ChannelConfig = {
   input_placeholder: null,
   service_hours_enabled: false,
   service_hours_id: null,
+  outside_service_hours_strategy: 'offline_message',
   offline_title: DEFAULT_OFFLINE_TITLE,
   offline_message: DEFAULT_OFFLINE_MESSAGE,
+  leave_message_prompt: DEFAULT_LEAVE_MESSAGE_PROMPT,
+  queue_message: DEFAULT_QUEUE_MESSAGE,
+  queue_full_message: DEFAULT_QUEUE_FULL_MESSAGE,
+  queue_full_show_leave_message_button: true,
+  queue_full_leave_message_button_label: DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL,
   open_agent_enabled: false,
   open_agent_agent_id: null,
   open_agent_agent_name: null,
   open_agent_bot_strategy: 'always',
   open_agent_bot_service_hours_id: null,
+  open_agent_avatar_url: null,
   open_agent_input_placeholder: null,
   open_agent_handoff_enabled: true,
   open_agent_handoff_label: DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
   open_agent_handoff_after_messages: 2,
   open_agent_handoff_behavior: 'confirm',
+  open_agent_custom_buttons_enabled: false,
+  open_agent_custom_buttons: [],
+  human_custom_buttons_enabled: false,
+  human_custom_buttons: [],
+  assist_panel_enabled: false,
+  assist_panel_title: null,
+  assist_panel_react_code: null,
+  assist_panel_config: {},
 }
 
 /* ── Primitives ── */
@@ -91,8 +173,414 @@ function TextInput({ value, onChange, placeholder }: { value: string; onChange: 
   )
 }
 
+function createCustomButton(): ChannelCustomButton {
+  return {
+    label: '',
+    action_type: 'send_message',
+    message: '',
+    url: null,
+    enabled: true,
+  }
+}
+
+function normalizeCustomButton(button: ChannelCustomButton): ChannelCustomButton {
+  const label = button.label.trim()
+  if (button.action_type === 'link') {
+    return {
+      label,
+      action_type: 'link',
+      message: null,
+      url: button.url?.trim() || null,
+      enabled: true,
+    }
+  }
+  return {
+    label,
+    action_type: 'send_message',
+    message: button.message?.trim() || null,
+    url: null,
+    enabled: true,
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function validateCustomButtonGroup(buttons: ChannelCustomButton[], locale: 'zh' | 'en'): string | null {
+  if (buttons.length > MAX_CUSTOM_BUTTONS) return t('ch.form.customButtons.maxCount', locale)
+  for (let i = 0; i < buttons.length; i += 1) {
+    const button = normalizeCustomButton(buttons[i])
+    const index = i + 1
+    if (!button.label) return t('ch.form.customButtons.error.labelRequired', locale, { index })
+    if (button.label.length > 16) return t('ch.form.customButtons.error.labelMax', locale, { index })
+    if (button.action_type === 'send_message') {
+      if (!button.message) return t('ch.form.customButtons.error.messageRequired', locale, { index })
+      if (button.message.length > 500) return t('ch.form.customButtons.error.messageMax', locale, { index })
+    } else {
+      if (!button.url) return t('ch.form.customButtons.error.urlRequired', locale, { index })
+      if (button.url.length > 512) return t('ch.form.customButtons.error.urlMax', locale, { index })
+      if (!isHttpUrl(button.url)) return t('ch.form.customButtons.error.urlInvalid', locale, { index })
+    }
+  }
+  return null
+}
+
+function normalizeCustomButtonGroup(buttons: ChannelCustomButton[]): ChannelCustomButton[] {
+  return buttons.map(normalizeCustomButton)
+}
+
+function CustomButtonGroupEditor({
+  title,
+  hint,
+  enabled,
+  buttons,
+  error,
+  onEnabledChange,
+  onButtonsChange,
+  onErrorClear,
+}: {
+  title: string
+  hint: string
+  enabled: boolean
+  buttons: ChannelCustomButton[]
+  error: string
+  onEnabledChange: (enabled: boolean) => void
+  onButtonsChange: (buttons: ChannelCustomButton[]) => void
+  onErrorClear: () => void
+}) {
+  const { locale } = useLocaleStore()
+  const visibleEditor = enabled || buttons.length > 0
+  const buttonIds = useMemo(() => buttons.map((_, index) => `custom-button-${index}`), [buttons.length])
+
+  const updateButton = (index: number, patch: Partial<ChannelCustomButton>) => {
+    onButtonsChange(buttons.map((button, i) => (i === index ? { ...button, ...patch } : button)))
+    onErrorClear()
+  }
+
+  const reorderButtons = (fromIndex: number, toIndex: number) => {
+    if (fromIndex === toIndex) return
+    onButtonsChange(arrayMove(buttons, fromIndex, toIndex))
+    onErrorClear()
+  }
+
+  const deleteButton = (index: number) => {
+    const button = buttons[index]
+    const typeLabel = button.action_type === 'link'
+      ? t('ch.form.customButtons.type.link', locale)
+      : t('ch.form.customButtons.type.sendMessage', locale)
+    const ok = window.confirm(
+      `${t('ch.form.customButtons.delete.title', locale)}\n${t('ch.form.customButtons.delete.body', locale)}\n${button.label || '-'}\n${typeLabel}`,
+    )
+    if (!ok) return
+    onButtonsChange(buttons.filter((_, i) => i !== index))
+    onErrorClear()
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-white p-4">
+      <div className="flex items-start justify-between gap-6">
+        <div className="flex flex-col gap-1">
+          <FieldLabel label={title} />
+          <p className="text-xs leading-5 text-muted-foreground">{hint}</p>
+        </div>
+        <Switch
+          checked={enabled}
+          onCheckedChange={(v) => {
+            onEnabledChange(v)
+            onErrorClear()
+          }}
+        />
+      </div>
+
+      {visibleEditor && (
+        <div className="mt-4 flex flex-col gap-3">
+          {buttons.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-border bg-muted/30 px-4 py-5 text-center text-xs text-muted-foreground">
+              {t('ch.form.customButtons.empty', locale)}
+            </div>
+          ) : (
+            <div className="overflow-hidden rounded-lg border border-border bg-background">
+              <div className="grid h-9 grid-cols-[36px_minmax(120px,1fr)_108px_minmax(180px,1.35fr)_40px] items-center gap-3 border-b border-border bg-muted/30 px-3 text-xs font-medium text-muted-foreground">
+                <span />
+                <span>{t('ch.form.customButtons.label', locale)} <span className="text-destructive">*</span></span>
+                <span>{t('ch.form.customButtons.type', locale)} <span className="text-destructive">*</span></span>
+                <span>{t('ch.form.customButtons.message', locale)} <span className="text-destructive">*</span></span>
+                <span />
+              </div>
+              <SortableFieldRowsContext itemIds={buttonIds} onReorderIndices={reorderButtons}>
+                {buttons.map((button, index) => {
+                  const id = buttonIds[index]
+                  const isLink = button.action_type === 'link'
+                  return (
+                    <SortableFieldTableRow
+                      key={id}
+                      id={id}
+                      className="grid grid-cols-[36px_minmax(120px,1fr)_108px_minmax(180px,1.35fr)_40px] items-center gap-3 border-b border-border px-3 py-3 last:border-b-0"
+                      dragCell={({ attributes, listeners }) => (
+                        <div className="flex h-10 items-center">
+                          <span
+                            className="inline-flex cursor-grab touch-none select-none text-muted-foreground hover:text-foreground active:cursor-grabbing"
+                            {...attributes}
+                            {...listeners}
+                          >
+                            <IconGripVertical size={16} />
+                          </span>
+                        </div>
+                      )}
+                    >
+                      <TextInput
+                        value={button.label}
+                        onChange={(v) => updateButton(index, { label: v })}
+                        placeholder={t('ch.form.customButtons.label.placeholder', locale)}
+                      />
+                      <select
+                        value={button.action_type}
+                        onChange={(e) => updateButton(index, {
+                          action_type: e.target.value === 'link' ? 'link' : 'send_message',
+                        })}
+                        className="h-10 w-full rounded-lg border border-border bg-white px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                      >
+                        <option value="send_message">{t('ch.form.customButtons.type.sendMessage', locale)}</option>
+                        <option value="link">{t('ch.form.customButtons.type.link', locale)}</option>
+                      </select>
+                      <TextInput
+                        value={isLink ? button.url ?? '' : button.message ?? ''}
+                        onChange={(v) => updateButton(index, isLink ? { url: v } : { message: v })}
+                        placeholder={isLink ? 'https://example.com' : t('ch.form.customButtons.message.placeholder', locale)}
+                      />
+                      <div className="flex h-10 items-center justify-end">
+                        <button
+                          type="button"
+                          onClick={() => deleteButton(index)}
+                          className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+                          title={t('ch.form.customButtons.delete.action', locale)}
+                        >
+                          <IconTrash size={15} />
+                        </button>
+                      </div>
+                    </SortableFieldTableRow>
+                  )
+                })}
+              </SortableFieldRowsContext>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() => {
+              if (buttons.length >= MAX_CUSTOM_BUTTONS) return
+              onButtonsChange([...buttons, createCustomButton()])
+              onErrorClear()
+            }}
+            disabled={buttons.length >= MAX_CUSTOM_BUTTONS}
+            className="inline-flex h-9 w-fit items-center gap-1.5 rounded-lg border border-border px-3 text-xs font-medium text-foreground transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <IconPlus size={15} />
+            {buttons.length >= MAX_CUSTOM_BUTTONS
+              ? t('ch.form.customButtons.maxCount', locale)
+              : t('ch.form.customButtons.add', locale)}
+          </button>
+        </div>
+      )}
+      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+    </div>
+  )
+}
+
+const ASSIST_PANEL_CODE_BASIC_SETUP: ReactCodeMirrorProps['basicSetup'] = {
+  lineNumbers: true,
+  highlightActiveLineGutter: true,
+  foldGutter: true,
+  dropCursor: true,
+  allowMultipleSelections: true,
+  indentOnInput: true,
+  bracketMatching: true,
+  closeBrackets: true,
+  autocompletion: true,
+  rectangularSelection: true,
+  crosshairCursor: true,
+  highlightActiveLine: true,
+  highlightSelectionMatches: true,
+  searchKeymap: true,
+  foldKeymap: true,
+  completionKeymap: true,
+  lintKeymap: true,
+  tabSize: 2,
+}
+const ASSIST_PANEL_REACT_CODE_EXTENSIONS: ReactCodeMirrorProps['extensions'] = [javascript({ jsx: true })]
+const ASSIST_PANEL_JSON_CODE_EXTENSIONS: ReactCodeMirrorProps['extensions'] = [json()]
+const ASSIST_PANEL_CODE_THEME = okaidiaInit({
+  settings: {
+    background: '#0A0A0A',
+    gutterBackground: '#0A0A0A',
+    gutterForeground: '#71717A',
+    gutterBorder: '#27272A',
+    foreground: '#E5E7EB',
+    caret: '#FAFAFA',
+    selection: '#2563EB55',
+    selectionMatch: '#2563EB33',
+    lineHighlight: '#18181B',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+  },
+})
+
+function SourceCodeEditor({
+  value,
+  onChange,
+  placeholder,
+  extensions,
+  height,
+  hasError,
+}: {
+  value: string
+  onChange: (value: string) => void
+  placeholder: string
+  extensions: ReactCodeMirrorProps['extensions']
+  height: string
+  hasError?: boolean
+}) {
+  return (
+    <CodeMirror
+      value={value}
+      onChange={onChange}
+      placeholder={placeholder}
+      height={height}
+      basicSetup={ASSIST_PANEL_CODE_BASIC_SETUP}
+      extensions={extensions}
+      theme={ASSIST_PANEL_CODE_THEME}
+      indentWithTab
+      className={`overflow-hidden rounded-lg border bg-[#0A0A0A] text-[13px] shadow-sm ${
+        hasError ? 'border-destructive' : 'border-border'
+      } [&_.cm-editor]:outline-none [&_.cm-focused]:outline-none [&_.cm-scroller]:font-mono [&_.cm-scroller]:leading-5`}
+    />
+  )
+}
+
 function stripHtml(value: string): string {
   return value.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').trim()
+}
+
+function formatAssistPanelConfig(value: Record<string, AssistPanelConfigValue> | null | undefined): string {
+  return JSON.stringify(value && typeof value === 'object' ? value : {}, null, 2)
+}
+
+function isAssistPanelConfig(value: unknown): value is Record<string, AssistPanelConfigValue> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseAssistPanelConfig(text: string): { ok: true; value: Record<string, AssistPanelConfigValue> } | { ok: false } {
+  const source = text.trim() || '{}'
+  try {
+    const parsed = JSON.parse(source) as unknown
+    if (!isAssistPanelConfig(parsed)) return { ok: false }
+    return { ok: true, value: parsed }
+  } catch {
+    return { ok: false }
+  }
+}
+
+function validateAssistPanelCode(code: string): boolean {
+  return getAssistPanelCodeError(code) === null
+}
+
+const ASSIST_PANEL_PREVIEW_STATUS: AssistPanelStatus = {
+  stage: 'bot',
+  conversationStatus: 'bot',
+  connectionStatus: 'connected',
+  botRunning: false,
+  handoffRouting: false,
+  canSendMessage: true,
+  canRequestHumanHandoff: true,
+  currentAgent: null,
+}
+
+function createAssistPanelPreviewApi(status: AssistPanelStatus): AssistPanelApi {
+  return {
+    getChannel: () => ({
+      channel_key: 'preview',
+      name: 'Web SDK',
+      logo_url: null,
+      config: { assist_panel_enabled: true },
+    }),
+    getConversation: () => ({
+      public_id: 'preview',
+      status: status.conversationStatus,
+      ended: false,
+      canSendMessage: status.canSendMessage,
+    }),
+    getCurrentStatus: () => status,
+    subscribeStatus: (listener) => {
+      listener(status)
+      return () => undefined
+    },
+    subscribeEvent: (eventName: AssistPanelEventName, listener: (payload: unknown) => void) => {
+      if (eventName === 'status_changed') listener(status)
+      if (eventName === 'agent_changed') listener(status.currentAgent)
+      if (eventName === 'conversation_changed') {
+        listener({ public_id: 'preview', status: status.conversationStatus, ended: false })
+      }
+      if (eventName === 'message_created') listener(null)
+      if (eventName === 'context_changed') listener(null)
+      if (eventName === 'panel_visibility_changed') listener({ visible: true, collapsed: false })
+      return () => undefined
+    },
+    getCurrentAgent: () => status.currentAgent,
+    getVisitor: () => ({ external_id: 'preview' }),
+    getMessages: () => [],
+    sendMessage: async (text) => (
+      typeof text === 'string' && text.trim()
+        ? createAssistPanelOk()
+        : createAssistPanelError('INVALID_PAYLOAD', 'Message text is invalid')
+    ),
+    setComposerText: (text) => (
+      typeof text === 'string' && text.trim()
+        ? createAssistPanelOk()
+        : createAssistPanelError('INVALID_PAYLOAD', 'Composer text is invalid')
+    ),
+    requestHumanHandoff: async () => createAssistPanelOk(),
+    openUrl: (url) => (
+      typeof url === 'string' && (url.startsWith('/') || url.startsWith('https://'))
+        ? createAssistPanelOk()
+        : createAssistPanelError('INVALID_PAYLOAD', 'URL is invalid')
+    ),
+  }
+}
+
+function AssistPanelCodePreview({
+  title,
+  code,
+  config,
+}: {
+  title: string
+  code: string
+  config: Record<string, AssistPanelConfigValue>
+}) {
+  const { locale } = useLocaleStore()
+  const api = useMemo(() => createAssistPanelPreviewApi(ASSIST_PANEL_PREVIEW_STATUS), [])
+
+  return (
+    <div className="rounded-xl border border-border bg-card p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="truncate text-sm font-semibold text-foreground">{title}</p>
+        <span className="shrink-0 rounded-full bg-muted px-2 py-1 text-[11px] text-muted-foreground">
+          {locale === 'zh' ? '模拟预览' : 'Preview'}
+        </span>
+      </div>
+      <AssistPanelRuntime
+        code={code}
+        api={api}
+        status={ASSIST_PANEL_PREVIEW_STATUS}
+        config={config}
+        locale={locale}
+      />
+    </div>
+  )
 }
 
 function RadiusField({ label, value, onChange }: { label: string; value: [number, number, number, number]; onChange: (v: [number, number, number, number]) => void }) {
@@ -149,6 +637,7 @@ function RadiusField({ label, value, onChange }: { label: string; value: [number
 
 const MAX_LOGO_BYTES = 2 * 1024 * 1024
 const MAX_FAVICON_BYTES = 512 * 1024
+const MAX_BOT_AVATAR_BYTES = 5 * 1024 * 1024
 
 /* ── Segmented control ── */
 
@@ -318,8 +807,10 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const updateMut = useUpdateChannel()
   const logoUploadMut = useUploadChannelLogo()
   const faviconUploadMut = useUploadChannelFavicon()
+  const botAvatarUploadMut = useUploadChannelBotAvatar()
   const logoFileRef = useRef<HTMLInputElement>(null)
   const faviconFileRef = useRef<HTMLInputElement>(null)
+  const botAvatarFileRef = useRef<HTMLInputElement>(null)
 
   const [name, setName] = useState('')
   const [accessMode, setAccessMode] = useState<'url' | 'embed'>('url')
@@ -327,11 +818,12 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [logoError, setLogoError] = useState('')
   const [faviconUrl, setFaviconUrl] = useState('')
   const [faviconError, setFaviconError] = useState('')
+  const [botAvatarError, setBotAvatarError] = useState('')
   const [config, setConfig] = useState<ChannelConfig>({ ...DEFAULT_CONFIG })
   const [initialized, setInitialized] = useState(false)
   const [savedId, setSavedId] = useState<number | null>(channelId ?? null)
   const [savedChannelKey, setSavedChannelKey] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<'interface' | 'service'>('interface')
+  const [activeTab, setActiveTab] = useState<'interface' | 'service' | 'assist'>('interface')
   const [serviceConfigError, setServiceConfigError] = useState('')
   const [openAgentConfigError, setOpenAgentConfigError] = useState('')
   const [openAgentAgentError, setOpenAgentAgentError] = useState('')
@@ -339,8 +831,20 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [openAgentInputPlaceholderError, setOpenAgentInputPlaceholderError] = useState('')
   const [openAgentHandoffLabelError, setOpenAgentHandoffLabelError] = useState('')
   const [openAgentHandoffThresholdError, setOpenAgentHandoffThresholdError] = useState('')
+  const [openAgentCustomButtonsError, setOpenAgentCustomButtonsError] = useState('')
+  const [humanCustomButtonsError, setHumanCustomButtonsError] = useState('')
   const [offlineTitleError, setOfflineTitleError] = useState('')
   const [offlineMessageError, setOfflineMessageError] = useState('')
+  const [leaveMessagePromptError, setLeaveMessagePromptError] = useState('')
+  const [queueMessageError, setQueueMessageError] = useState('')
+  const [queueFullMessageError, setQueueFullMessageError] = useState('')
+  const [queueFullButtonLabelError, setQueueFullButtonLabelError] = useState('')
+  const [assistPanelTitleError, setAssistPanelTitleError] = useState('')
+  const [assistPanelCodeError, setAssistPanelCodeError] = useState('')
+  const [assistPanelConfigText, setAssistPanelConfigText] = useState(formatAssistPanelConfig({}))
+  const [assistPanelConfigError, setAssistPanelConfigError] = useState('')
+  const [assistPanelPreviewConfig, setAssistPanelPreviewConfig] = useState<Record<string, AssistPanelConfigValue>>({})
+  const [assistPanelPreviewStatus, setAssistPanelPreviewStatus] = useState('')
 
   const openAgentConfigured = Boolean(openAgentSettings?.base_url && openAgentSettings?.has_api_key)
   const {
@@ -360,6 +864,8 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     setLogoUrl(channel.logo_url ?? '')
     setFaviconUrl(channel.favicon_url ?? '')
     setConfig({ ...DEFAULT_CONFIG, ...channel.config })
+    setAssistPanelConfigText(formatAssistPanelConfig(channel.config.assist_panel_config))
+    setAssistPanelPreviewConfig(channel.config.assist_panel_config ?? {})
     setSavedChannelKey(channel.channel_key)
     setInitialized(true)
   }, [isNew, channel, initialized])
@@ -375,17 +881,18 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
           logo_url: channel.logo_url ?? null,
           favicon_url: channel.favicon_url ?? null,
           config: { ...DEFAULT_CONFIG, ...channel.config },
+          assist_panel_config_text: formatAssistPanelConfig(channel.config.assist_panel_config),
         }),
       )
     }
   }, [isNew, channel, initialized])
 
   const currentSnapshot = useMemo(
-    () => JSON.stringify({ name: name.trim(), access_mode: accessMode, logo_url: logoUrl.trim() || null, favicon_url: faviconUrl.trim() || null, config }),
-    [name, accessMode, logoUrl, faviconUrl, config],
+    () => JSON.stringify({ name: name.trim(), access_mode: accessMode, logo_url: logoUrl.trim() || null, favicon_url: faviconUrl.trim() || null, config, assist_panel_config_text: assistPanelConfigText }),
+    [name, accessMode, logoUrl, faviconUrl, config, assistPanelConfigText],
   )
 
-  const emptySnapshot = JSON.stringify({ name: '', access_mode: 'url', logo_url: null, favicon_url: null, config: DEFAULT_CONFIG })
+  const emptySnapshot = JSON.stringify({ name: '', access_mode: 'url', logo_url: null, favicon_url: null, config: DEFAULT_CONFIG, assist_panel_config_text: formatAssistPanelConfig({}) })
   const isDirty = isNew ? currentSnapshot !== emptySnapshot : currentSnapshot !== savedSnapshot
 
   const updateConfig = useCallback(<K extends keyof ChannelConfig>(key: K, val: ChannelConfig[K]) =>
@@ -437,9 +944,65 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     if (faviconFileRef.current) faviconFileRef.current.value = ''
   }
 
+  const handleBotAvatarClick = () => {
+    setBotAvatarError('')
+    botAvatarFileRef.current?.click()
+  }
+
+  const handleBotAvatarFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setBotAvatarError('')
+    if (file.size > MAX_BOT_AVATAR_BYTES) {
+      setBotAvatarError(t('ch.form.openAgent.avatar.tooLarge', locale))
+      if (botAvatarFileRef.current) botAvatarFileRef.current.value = ''
+      return
+    }
+    try {
+      const url = await botAvatarUploadMut.mutateAsync(file)
+      updateConfig('open_agent_avatar_url', url)
+    } catch {
+      setBotAvatarError(t('ch.form.openAgent.avatar.failed', locale))
+    }
+    if (botAvatarFileRef.current) botAvatarFileRef.current.value = ''
+  }
+
   const goBack = () => {
     if (isDirty && typeof window !== 'undefined' && !window.confirm(t('ch.form.leaveConfirm', locale))) return
     router.push('/channels/web')
+  }
+
+  const handleAssistPanelPreview = () => {
+    setAssistPanelTitleError('')
+    setAssistPanelCodeError('')
+    setAssistPanelConfigError('')
+    setAssistPanelPreviewStatus('')
+
+    const assistTitle = config.assist_panel_title?.trim() ?? ''
+    const assistCode = config.assist_panel_react_code?.trim() ?? ''
+    const parsed = parseAssistPanelConfig(assistPanelConfigText)
+
+    if (assistTitle.length > 40) {
+      setAssistPanelTitleError(t('ch.form.assistPanel.title.max', locale))
+      return
+    }
+    if (!assistCode) {
+      setAssistPanelCodeError(t('ch.form.assistPanel.code.required', locale))
+      return
+    }
+    if (!validateAssistPanelCode(assistCode)) {
+      setAssistPanelCodeError(t('ch.form.assistPanel.code.invalid', locale))
+      return
+    }
+    if (!parsed.ok) {
+      setAssistPanelConfigError(t('ch.form.assistPanel.config.invalid', locale))
+      return
+    }
+
+    updateConfig('assist_panel_config', parsed.value)
+    setAssistPanelConfigText(formatAssistPanelConfig(parsed.value))
+    setAssistPanelPreviewConfig(parsed.value)
+    setAssistPanelPreviewStatus(t('ch.form.assistPanel.preview.success', locale))
   }
 
   const handleSave = async () => {
@@ -452,8 +1015,18 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     setOpenAgentInputPlaceholderError('')
     setOpenAgentHandoffLabelError('')
     setOpenAgentHandoffThresholdError('')
+    setOpenAgentCustomButtonsError('')
+    setHumanCustomButtonsError('')
     setOfflineTitleError('')
     setOfflineMessageError('')
+    setLeaveMessagePromptError('')
+    setQueueMessageError('')
+    setQueueFullMessageError('')
+    setQueueFullButtonLabelError('')
+    setAssistPanelTitleError('')
+    setAssistPanelCodeError('')
+    setAssistPanelConfigError('')
+    setAssistPanelPreviewStatus('')
     if (config.service_hours_enabled && !config.service_hours_id) {
       setActiveTab('service')
       setServiceConfigError(t('ch.form.serviceHours.required', locale))
@@ -503,24 +1076,111 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
         }
       }
     }
-    if (!config.offline_title.trim()) {
+    const openAgentCustomButtonError = validateCustomButtonGroup(config.open_agent_custom_buttons, locale)
+    if (openAgentCustomButtonError) {
       setActiveTab('service')
-      setOfflineTitleError(t('ch.form.offlineTitle.required', locale))
+      setOpenAgentCustomButtonsError(openAgentCustomButtonError)
       return
     }
-    if (!stripHtml(config.offline_message)) {
+    const humanCustomButtonError = validateCustomButtonGroup(config.human_custom_buttons, locale)
+    if (humanCustomButtonError) {
       setActiveTab('service')
-      setOfflineMessageError(t('ch.form.offlineMessage.required', locale))
+      setHumanCustomButtonsError(humanCustomButtonError)
       return
     }
+    if (config.outside_service_hours_strategy === 'offline_message') {
+      if (!config.offline_title.trim()) {
+        setActiveTab('service')
+        setOfflineTitleError(t('ch.form.offlineTitle.required', locale))
+        return
+      }
+      if (!stripHtml(config.offline_message)) {
+        setActiveTab('service')
+        setOfflineMessageError(t('ch.form.offlineMessage.required', locale))
+        return
+      }
+    }
+    if (config.outside_service_hours_strategy === 'leave_message' && !stripHtml(config.leave_message_prompt)) {
+      setActiveTab('service')
+      setLeaveMessagePromptError(t('ch.form.leaveMessagePrompt.required', locale))
+      return
+    }
+    if (!stripHtml(config.queue_message)) {
+      setActiveTab('service')
+      setQueueMessageError(t('ch.form.queueMessage.required', locale))
+      return
+    }
+    if (!stripHtml(config.queue_full_message)) {
+      setActiveTab('service')
+      setQueueFullMessageError(t('ch.form.queueFullMessage.required', locale))
+      return
+    }
+    if (config.queue_full_show_leave_message_button) {
+      const label = config.queue_full_leave_message_button_label.trim()
+      if (!label) {
+        setActiveTab('service')
+        setQueueFullButtonLabelError(t('ch.form.queueFullButtonLabel.required', locale))
+        return
+      }
+      if (label.length > 16) {
+        setActiveTab('service')
+        setQueueFullButtonLabelError(t('ch.form.queueFullButtonLabel.max', locale))
+        return
+      }
+    }
+    let assistPanelConfig = config.assist_panel_config
+    if (config.assist_panel_enabled) {
+      const assistTitle = config.assist_panel_title?.trim() ?? ''
+      const assistCode = config.assist_panel_react_code?.trim() ?? ''
+      const parsed = parseAssistPanelConfig(assistPanelConfigText)
+      if (assistTitle.length > 40) {
+        setActiveTab('assist')
+        setAssistPanelTitleError(t('ch.form.assistPanel.title.max', locale))
+        return
+      }
+      if (!assistCode) {
+        setActiveTab('assist')
+        setAssistPanelCodeError(t('ch.form.assistPanel.code.required', locale))
+        return
+      }
+      if (!validateAssistPanelCode(assistCode)) {
+        setActiveTab('assist')
+        setAssistPanelCodeError(t('ch.form.assistPanel.code.invalid', locale))
+        return
+      }
+      if (!parsed.ok) {
+        setActiveTab('assist')
+        setAssistPanelConfigError(t('ch.form.assistPanel.config.invalid', locale))
+        return
+      }
+      assistPanelConfig = parsed.value
+    } else {
+      const parsed = parseAssistPanelConfig(assistPanelConfigText)
+      if (parsed.ok) assistPanelConfig = parsed.value
+    }
+    const nextAssistPanelConfigText = formatAssistPanelConfig(assistPanelConfig)
     const nextConfig = {
       ...config,
+      outside_service_hours_strategy: config.outside_service_hours_strategy,
       offline_title: config.offline_title.trim(),
+      leave_message_prompt: config.leave_message_prompt || DEFAULT_LEAVE_MESSAGE_PROMPT,
+      queue_message: config.queue_message || DEFAULT_QUEUE_MESSAGE,
+      queue_full_message: config.queue_full_message || DEFAULT_QUEUE_FULL_MESSAGE,
+      queue_full_leave_message_button_label: (
+        config.queue_full_leave_message_button_label.trim()
+        || DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL
+      ),
       open_agent_agent_name: selectedOpenAgent?.name ?? config.open_agent_agent_name,
       open_agent_bot_service_hours_id:
         config.open_agent_bot_strategy === 'service_hours' ? config.open_agent_bot_service_hours_id : null,
+      open_agent_avatar_url: config.open_agent_avatar_url?.trim() || null,
       open_agent_input_placeholder: config.open_agent_input_placeholder?.trim() || null,
       open_agent_handoff_label: config.open_agent_handoff_label.trim() || DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
+      open_agent_custom_buttons: normalizeCustomButtonGroup(config.open_agent_custom_buttons),
+      human_custom_buttons: normalizeCustomButtonGroup(config.human_custom_buttons),
+      assist_panel_title: config.assist_panel_title?.trim() || null,
+      assist_panel_react_code: config.assist_panel_react_code?.trim() || null,
+      assist_panel_config: assistPanelConfig,
     }
     const body: CreateChannelPayload = {
       name: trimmed,
@@ -530,18 +1190,22 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       favicon_url: faviconUrl.trim() || null,
       config: nextConfig,
     }
-    const snap = JSON.stringify({ name: trimmed, access_mode: accessMode, logo_url: body.logo_url ?? null, favicon_url: body.favicon_url ?? null, config: nextConfig })
+    const snap = JSON.stringify({ name: trimmed, access_mode: accessMode, logo_url: body.logo_url ?? null, favicon_url: body.favicon_url ?? null, config: nextConfig, assist_panel_config_text: nextAssistPanelConfigText })
     try {
       if (isNew || !savedId) {
         const created = await createMut.mutateAsync(body)
         setSavedId(created.id)
         setSavedChannelKey(created.channel_key)
         setConfig(nextConfig)
+        setAssistPanelConfigText(nextAssistPanelConfigText)
+        setAssistPanelPreviewConfig(assistPanelConfig)
         setSavedSnapshot(snap)
         router.replace(`/channels/web/${created.id}`)
       } else {
         await updateMut.mutateAsync({ id: savedId, data: body })
         setConfig(nextConfig)
+        setAssistPanelConfigText(nextAssistPanelConfigText)
+        setAssistPanelPreviewConfig(assistPanelConfig)
         setSavedSnapshot(snap)
       }
     } catch { /* error handled by mutation */ }
@@ -580,12 +1244,15 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
 
       {/* Scroll area — padding 32, gap 24 */}
       <div className="flex-1 overflow-y-auto p-8">
-        {/* Form — width 720, padding 24, gap 24 */}
-        <div className="flex w-[720px] flex-col gap-6 p-6">
+        {/* Form shell — padding 24, gap 24 */}
+        <div className={`flex flex-col gap-6 p-6 ${
+          activeTab === 'assist' ? 'w-full max-w-[1180px]' : 'w-[720px]'
+        }`}>
           <StandardTabSwitch
             options={[
               { value: 'interface' as const, label: t('ch.tab.interface', locale) },
               { value: 'service' as const, label: t('ch.tab.service', locale) },
+              { value: 'assist' as const, label: t('ch.tab.assist', locale) },
             ]}
             value={activeTab}
             onChange={setActiveTab}
@@ -919,6 +1586,139 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
               </div>
 
               <div className="rounded-lg border border-border bg-card p-5">
+                <div className="flex flex-col gap-2">
+                  <FieldLabel label={t('ch.form.outsideServiceHoursStrategy', locale)} required />
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {t('ch.form.outsideServiceHoursStrategy.hint', locale)}
+                  </p>
+                  <SegmentedControl
+                    options={[
+                      { value: 'offline_message' as const, label: t('ch.form.outsideServiceHoursStrategy.offline', locale) },
+                      { value: 'leave_message' as const, label: t('ch.form.outsideServiceHoursStrategy.leaveMessage', locale) },
+                    ]}
+                    value={config.outside_service_hours_strategy}
+                    onChange={(v) => {
+                      updateConfig('outside_service_hours_strategy', v)
+                      setOfflineTitleError('')
+                      setOfflineMessageError('')
+                      setLeaveMessagePromptError('')
+                    }}
+                  />
+                </div>
+
+                {config.outside_service_hours_strategy === 'leave_message' && (
+                  <div className="mt-5 flex flex-col gap-2">
+                    <FieldLabel label={t('ch.form.leaveMessagePrompt', locale)} required />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {t('ch.form.leaveMessagePrompt.hint', locale)}
+                    </p>
+                    <RichTextFieldEditor
+                      value={config.leave_message_prompt}
+                      onChange={(v) => {
+                        updateConfig('leave_message_prompt', v ?? '')
+                        setLeaveMessagePromptError('')
+                      }}
+                      placeholder={t('ch.form.leaveMessagePrompt.placeholder', locale)}
+                    />
+                    {leaveMessagePromptError && <p className="text-xs text-destructive">{leaveMessagePromptError}</p>}
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-lg border border-border bg-card p-5">
+                <div className="flex flex-col gap-5">
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <FieldLabel label={t('ch.form.queueMessage', locale)} required />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          updateConfig('queue_message', `${config.queue_message || ''}${QUEUE_COUNT_VARIABLE}`)
+                          setQueueMessageError('')
+                        }}
+                        className="rounded-md border border-border bg-white px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-accent"
+                      >
+                        {t('ch.form.queueMessage.insertVariable', locale)}
+                      </button>
+                    </div>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {t('ch.form.queueMessage.hint', locale)}
+                    </p>
+                    <RichTextFieldEditor
+                      value={config.queue_message}
+                      onChange={(v) => {
+                        updateConfig('queue_message', v ?? '')
+                        setQueueMessageError('')
+                      }}
+                      placeholder={DEFAULT_QUEUE_MESSAGE}
+                    />
+                    {queueMessageError && <p className="text-xs text-destructive">{queueMessageError}</p>}
+                  </div>
+
+                  <div className="flex flex-col gap-2">
+                    <FieldLabel label={t('ch.form.queueFullMessage', locale)} required />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {t('ch.form.queueFullMessage.hint', locale)}
+                    </p>
+                    <RichTextFieldEditor
+                      value={config.queue_full_message}
+                      onChange={(v) => {
+                        updateConfig('queue_full_message', v ?? '')
+                        setQueueFullMessageError('')
+                      }}
+                      placeholder={DEFAULT_QUEUE_FULL_MESSAGE}
+                    />
+                    {queueFullMessageError && <p className="text-xs text-destructive">{queueFullMessageError}</p>}
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-white p-4">
+                    <div className="flex items-start justify-between gap-6">
+                      <div className="flex flex-col gap-1">
+                        <FieldLabel label={t('ch.form.queueFullButton', locale)} />
+                        <p className="text-xs leading-5 text-muted-foreground">
+                          {t('ch.form.queueFullButton.hint', locale)}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={config.queue_full_show_leave_message_button}
+                        onCheckedChange={(v) => {
+                          updateConfig('queue_full_show_leave_message_button', v)
+                          setQueueFullButtonLabelError('')
+                        }}
+                      />
+                    </div>
+                    {config.queue_full_show_leave_message_button && (
+                      <div className="mt-4 flex flex-col gap-2">
+                        <FieldLabel label={t('ch.form.queueFullButtonLabel', locale)} required />
+                        <TextInput
+                          value={config.queue_full_leave_message_button_label}
+                          onChange={(v) => {
+                            updateConfig('queue_full_leave_message_button_label', v)
+                            setQueueFullButtonLabelError('')
+                          }}
+                          placeholder={DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL}
+                        />
+                        {queueFullButtonLabelError && <p className="text-xs text-destructive">{queueFullButtonLabelError}</p>}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-border bg-card p-5">
+                <CustomButtonGroupEditor
+                  title={t('ch.form.humanCustomButtons', locale)}
+                  hint={t('ch.form.humanCustomButtons.hint', locale)}
+                  enabled={config.human_custom_buttons_enabled}
+                  buttons={config.human_custom_buttons}
+                  error={humanCustomButtonsError}
+                  onEnabledChange={(v) => updateConfig('human_custom_buttons_enabled', v)}
+                  onButtonsChange={(buttons) => updateConfig('human_custom_buttons', buttons)}
+                  onErrorClear={() => setHumanCustomButtonsError('')}
+                />
+              </div>
+
+              <div className="rounded-lg border border-border bg-card p-5">
                 <div className="flex items-start justify-between gap-6">
                   <div className="flex flex-col gap-1">
                     <FieldLabel label={t('ch.form.openAgent.enabled', locale)} />
@@ -1063,6 +1863,60 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                     )}
 
                     <div className="flex flex-col gap-2">
+                      <FieldLabel label={t('ch.form.openAgent.avatar', locale)} />
+                      <input
+                        ref={botAvatarFileRef}
+                        type="file"
+                        accept="image/jpeg,image/png,image/gif,image/webp"
+                        onChange={handleBotAvatarFileChange}
+                        className="hidden"
+                      />
+                      <div className="flex items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={handleBotAvatarClick}
+                          disabled={botAvatarUploadMut.isPending}
+                          className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full border border-dashed border-border bg-white transition-colors hover:bg-accent/50 disabled:opacity-50"
+                        >
+                          {botAvatarUploadMut.isPending ? (
+                            <IconLoader2 size={20} className="animate-spin text-muted-foreground" />
+                          ) : config.open_agent_avatar_url ? (
+                            <img src={config.open_agent_avatar_url} alt="" className="h-full w-full object-cover" />
+                          ) : (
+                            <IconUpload size={20} className="text-border" />
+                          )}
+                        </button>
+                        {config.open_agent_avatar_url && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              updateConfig('open_agent_avatar_url', null)
+                              setBotAvatarError('')
+                            }}
+                            className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+                          >
+                            <IconTrash size={16} />
+                          </button>
+                        )}
+                      </div>
+                      {botAvatarError
+                        ? <span className="text-xs text-destructive">{botAvatarError}</span>
+                        : <span className="text-xs text-muted-foreground">{t('ch.form.openAgent.avatar.hint', locale)}</span>
+                      }
+                    </div>
+
+                    <CustomButtonGroupEditor
+                      title={t('ch.form.openAgent.customButtons', locale)}
+                      hint={t('ch.form.openAgent.customButtons.hint', locale)}
+                      enabled={config.open_agent_custom_buttons_enabled}
+                      buttons={config.open_agent_custom_buttons}
+                      error={openAgentCustomButtonsError}
+                      onEnabledChange={(v) => updateConfig('open_agent_custom_buttons_enabled', v)}
+                      onButtonsChange={(buttons) => updateConfig('open_agent_custom_buttons', buttons)}
+                      onErrorClear={() => setOpenAgentCustomButtonsError('')}
+                    />
+
+                    <div className="flex flex-col gap-2">
                       <FieldLabel label={t('ch.form.openAgent.inputPlaceholder', locale)} />
                       <TextInput
                         value={config.open_agent_input_placeholder ?? ''}
@@ -1137,38 +1991,168 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                 )}
               </div>
 
-              <div className="flex flex-col gap-2">
-                <FieldLabel label={t('ch.form.offlineTitle', locale)} required />
-                <p className="text-xs leading-5 text-muted-foreground">
-                  {t('ch.form.offlineTitle.hint', locale)}
-                </p>
-                <TextInput
-                  value={config.offline_title}
-                  onChange={(v) => {
-                    updateConfig('offline_title', v)
-                    setOfflineTitleError('')
-                  }}
-                  placeholder={t('ch.form.offlineTitle.placeholder', locale)}
-                />
-                {offlineTitleError && <p className="text-xs text-destructive">{offlineTitleError}</p>}
+              {config.outside_service_hours_strategy === 'offline_message' && (
+                <>
+                  <div className="flex flex-col gap-2">
+                    <FieldLabel label={t('ch.form.offlineTitle', locale)} required />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {t('ch.form.offlineTitle.hint', locale)}
+                    </p>
+                    <TextInput
+                      value={config.offline_title}
+                      onChange={(v) => {
+                        updateConfig('offline_title', v)
+                        setOfflineTitleError('')
+                      }}
+                      placeholder={t('ch.form.offlineTitle.placeholder', locale)}
+                    />
+                    {offlineTitleError && <p className="text-xs text-destructive">{offlineTitleError}</p>}
+                  </div>
+
+                  <div className="flex flex-col gap-2">
+                    <FieldLabel label={t('ch.form.offlineMessage', locale)} required />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {t('ch.form.offlineMessage.hint', locale)}
+                    </p>
+                    <RichTextFieldEditor
+                      value={config.offline_message}
+                      onChange={(v) => {
+                        updateConfig('offline_message', v ?? '')
+                        setOfflineMessageError('')
+                      }}
+                      placeholder={t('ch.form.offlineMessage.placeholder', locale)}
+                    />
+                    {offlineMessageError && <p className="text-xs text-destructive">{offlineMessageError}</p>}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {activeTab === 'assist' && (
+            <div className="flex flex-col gap-6 xl:flex-row xl:items-start">
+              <div className="flex min-w-0 flex-1 flex-col gap-6 xl:max-w-[720px]">
+                <SectionTitle>{t('ch.section.assistPanel', locale)}</SectionTitle>
+
+                <div className="rounded-lg border border-border bg-card p-5">
+                  <div className="flex items-start justify-between gap-6">
+                    <div className="flex flex-col gap-1">
+                      <FieldLabel label={t('ch.form.assistPanel.enabled', locale)} />
+                      <p className="text-xs leading-5 text-muted-foreground">
+                        {t('ch.form.assistPanel.enabled.hint', locale)}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={config.assist_panel_enabled}
+                      onCheckedChange={(v) => {
+                        updateConfig('assist_panel_enabled', v)
+                        setAssistPanelTitleError('')
+                        setAssistPanelCodeError('')
+                        setAssistPanelConfigError('')
+                        setAssistPanelPreviewStatus('')
+                        if (v && !config.assist_panel_react_code) {
+                          updateConfig('assist_panel_react_code', DEFAULT_ASSIST_PANEL_CODE)
+                        }
+                        if (v && assistPanelConfigText === formatAssistPanelConfig({})) {
+                          const nextText = formatAssistPanelConfig(DEFAULT_ASSIST_PANEL_CONFIG)
+                          setAssistPanelConfigText(nextText)
+                          updateConfig('assist_panel_config', DEFAULT_ASSIST_PANEL_CONFIG)
+                          setAssistPanelPreviewConfig(DEFAULT_ASSIST_PANEL_CONFIG)
+                        }
+                      }}
+                    />
+                  </div>
+
+                  <div className="mt-4 flex items-start gap-3 rounded-lg border border-border bg-background p-3">
+                    <IconInfoCircle size={18} className="mt-0.5 shrink-0 text-muted-foreground" />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {t('ch.form.assistPanel.modeHint', locale)}
+                    </p>
+                  </div>
+                </div>
+
+                {config.assist_panel_enabled && (
+                  <>
+                    <div className="flex flex-col gap-2">
+                      <FieldLabel label={t('ch.form.assistPanel.title', locale)} />
+                      <TextInput
+                        value={config.assist_panel_title ?? ''}
+                        onChange={(v) => {
+                          updateConfig('assist_panel_title', v || null)
+                          setAssistPanelTitleError('')
+                        }}
+                        placeholder={t('ch.form.assistPanel.title.placeholder', locale)}
+                      />
+                      {assistPanelTitleError && <p className="text-xs text-destructive">{assistPanelTitleError}</p>}
+                    </div>
+
+                    <div className="flex flex-col gap-2">
+                      <FieldLabel label={t('ch.form.assistPanel.code', locale)} required />
+                      <SourceCodeEditor
+                        value={config.assist_panel_react_code ?? ''}
+                        onChange={(value) => {
+                          updateConfig('assist_panel_react_code', value || null)
+                          setAssistPanelCodeError('')
+                          setAssistPanelPreviewStatus('')
+                        }}
+                        placeholder={DEFAULT_ASSIST_PANEL_CODE}
+                        extensions={ASSIST_PANEL_REACT_CODE_EXTENSIONS}
+                        height="280px"
+                        hasError={Boolean(assistPanelCodeError)}
+                      />
+                      {assistPanelCodeError
+                        ? <p className="text-xs text-destructive">{assistPanelCodeError}</p>
+                        : <p className="text-xs leading-5 text-muted-foreground">{t('ch.form.assistPanel.code.hint', locale)}</p>
+                      }
+                    </div>
+
+                    <div className="flex flex-col gap-2">
+                      <FieldLabel label={t('ch.form.assistPanel.config', locale)} />
+                      <SourceCodeEditor
+                        value={assistPanelConfigText}
+                        onChange={(value) => {
+                          setAssistPanelConfigText(value)
+                          setAssistPanelConfigError('')
+                          setAssistPanelPreviewStatus('')
+                        }}
+                        placeholder={formatAssistPanelConfig(DEFAULT_ASSIST_PANEL_CONFIG)}
+                        extensions={ASSIST_PANEL_JSON_CODE_EXTENSIONS}
+                        height="220px"
+                        hasError={Boolean(assistPanelConfigError)}
+                      />
+                      {assistPanelConfigError
+                        ? <p className="text-xs text-destructive">{assistPanelConfigError}</p>
+                        : <p className="text-xs leading-5 text-muted-foreground">{t('ch.form.assistPanel.config.hint', locale)}</p>
+                      }
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={handleAssistPanelPreview}
+                        className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-border bg-white px-4 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+                      >
+                        <IconEye size={16} />
+                        {t('ch.form.assistPanel.preview', locale)}
+                      </button>
+                      {assistPanelPreviewStatus && (
+                        <span className="text-xs text-success">{assistPanelPreviewStatus}</span>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
 
-              <div className="flex flex-col gap-2">
-                <FieldLabel label={t('ch.form.offlineMessage', locale)} required />
-                <p className="text-xs leading-5 text-muted-foreground">
-                  {t('ch.form.offlineMessage.hint', locale)}
-                </p>
-                <RichTextFieldEditor
-                  value={config.offline_message}
-                  onChange={(v) => {
-                    updateConfig('offline_message', v ?? '')
-                    setOfflineMessageError('')
-                  }}
-                  placeholder={t('ch.form.offlineMessage.placeholder', locale)}
-                />
-                {offlineMessageError && <p className="text-xs text-destructive">{offlineMessageError}</p>}
-              </div>
-            </>
+              {config.assist_panel_enabled && (
+                <aside className="w-full shrink-0 xl:ml-auto xl:w-[360px] xl:sticky xl:top-20">
+                  <AssistPanelCodePreview
+                    title={config.assist_panel_title?.trim() || t('chat.assistPanel.defaultTitle', locale)}
+                    code={config.assist_panel_react_code ?? ''}
+                    config={assistPanelPreviewConfig}
+                  />
+                </aside>
+              )}
+            </div>
           )}
         </div>
       </div>

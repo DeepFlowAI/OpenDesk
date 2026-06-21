@@ -157,7 +157,7 @@ function HumanHandoffConfirmCard({
         <button
           type="button"
           disabled={isDisabled}
-          className="h-10 rounded-md bg-[#1A1A1A] px-3 text-sm font-medium text-[var(--opendesk-send-button-bg)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+          className="h-10 rounded-md bg-[var(--opendesk-send-button-bg)] px-3 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
           onClick={onConfirm}
         >
           {isConfirming

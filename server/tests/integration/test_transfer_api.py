@@ -292,10 +292,10 @@ class TestListTransferTargets:
             headers={"Authorization": f"Bearer {_admin_token()}"},
         )
         ids = [item["id"] for item in resp.json()["items"]]
-        # admin_agent (the requester) is excluded by the self-exclude rule;
-        # target_id (the conversation owner) is excluded by the new rule.
+        # Conversation owner cannot be a transfer target; the admin requester may
+        # still appear so they can take the session themselves.
         assert _STATE["target_id"] not in ids
-        assert _STATE["admin_agent_id"] not in ids
+        assert _STATE["admin_agent_id"] in ids
 
     @pytest.mark.asyncio
     async def test_non_owner_agent_cannot_inspect_conversation(self, client: AsyncClient):

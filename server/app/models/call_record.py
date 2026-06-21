@@ -53,9 +53,9 @@ class CallRecord(Base, TimestampMixin):
         Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
-    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
-    answered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     ring_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     talk_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

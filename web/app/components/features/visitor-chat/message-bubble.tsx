@@ -11,6 +11,7 @@ import {
   type ToolCallMessagePartProps,
 } from '@assistant-ui/react'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
+import { RichTextMessageContent } from '@/app/components/features/chat/rich-text-message-content'
 import {
   getOpenAgentThinkingBlocks,
   getOpenAgentTextBlocks,
@@ -21,6 +22,7 @@ import { AssistantMarkdownText, MarkdownText, markdownTextRootClass } from '@/co
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { cn } from '@/lib/utils'
 import { IconChevronRight, IconLoader2, IconTool } from '@tabler/icons-react'
+import { getAssistantAvatarSrc } from './avatar'
 
 const DEFAULT_AGENT_AVATAR_SRC = '/default-avatar.jpg'
 
@@ -117,7 +119,8 @@ function OpenAgentThinkingBlock({
   active?: boolean
   content?: string
 }) {
-  const [expanded, setExpanded] = useState(true)
+  const [manualExpanded, setManualExpanded] = useState<boolean | null>(() => (active ? true : null))
+  const expanded = manualExpanded ?? active
   const label = locale === 'zh' ? '思考' : 'Thinking'
   const hasContent = content.trim().length > 0
 
@@ -129,10 +132,10 @@ function OpenAgentThinkingBlock({
       <button
         type="button"
         className="flex min-h-9 w-full items-center justify-between gap-2 px-3 py-2 text-left"
-        onClick={() => setExpanded((value) => !value)}
+        onClick={() => setManualExpanded(expanded ? false : true)}
         aria-expanded={expanded}
       >
-        <span className="flex min-w-0 items-center gap-2 font-medium">
+        <span className="flex min-w-0 items-center gap-2 font-normal">
           <IconChevronRight
             size={16}
             className={cn('shrink-0 transition-transform', expanded && 'rotate-90')}
@@ -157,6 +160,21 @@ function OpenAgentThinkingBlock({
   )
 }
 
+function OpenAgentFakeThinkingBubble() {
+  return (
+    <div
+      className="inline-flex min-h-10 items-center gap-1 rounded-lg bg-[#F6F6F6] px-4 py-3 text-[#71717A]"
+      role="status"
+      aria-live="polite"
+      aria-label="正在思考中"
+    >
+      <span className="inline-block h-1.5 w-1.5 rounded-full bg-current opacity-70 motion-safe:animate-bounce [animation-delay:0ms] [animation-duration:900ms]" />
+      <span className="inline-block h-1.5 w-1.5 rounded-full bg-current opacity-70 motion-safe:animate-bounce [animation-delay:150ms] [animation-duration:900ms]" />
+      <span className="inline-block h-1.5 w-1.5 rounded-full bg-current opacity-70 motion-safe:animate-bounce [animation-delay:300ms] [animation-duration:900ms]" />
+    </div>
+  )
+}
+
 function OpenAgentToolSurface({
   label,
   executing,
@@ -168,11 +186,11 @@ function OpenAgentToolSurface({
 }) {
   return (
     <div
-      className="flex min-h-10 w-full items-center gap-2 rounded-lg border border-[#E5E7EB] bg-white px-3 py-2 text-sm text-[#27272A] shadow-sm"
+      className="flex min-h-10 w-full items-center gap-2 rounded-lg border border-[#E5E7EB] bg-white px-3 py-2 text-sm font-normal text-[#27272A]"
       data-open-agent-tool-call
     >
       <IconTool size={16} className="shrink-0 text-[#71717A]" aria-hidden />
-      <span className="min-w-0 flex-1 truncate">
+      <span className="min-w-0 flex-1 truncate font-normal">
         {label || (locale === 'zh' ? '工具调用' : 'Tool call')}
       </span>
       {executing && (
@@ -215,40 +233,83 @@ function StaticToolCallBlock({
   )
 }
 
-function StaticOpenAgentTraceBlocks({
-  textBlocks,
+function OpenAgentTraceSummary({
+  thinkingCount,
+  toolCount,
+  locale,
+}: {
+  thinkingCount: number
+  toolCount: number
+  locale: string
+}) {
+  const parts: string[] = []
+  if (thinkingCount > 0) {
+    parts.push(locale === 'zh' ? '已思考' : 'Thought')
+  }
+  if (toolCount > 0) {
+    parts.push(locale === 'zh' ? `调用了 ${toolCount} 个工具` : `Used ${toolCount} tool${toolCount > 1 ? 's' : ''}`)
+  }
+  return <span className="font-normal">{parts.join(' · ') || (locale === 'zh' ? '查看过程' : 'View steps')}</span>
+}
+
+function OpenAgentProcessBlocks({
   thinkingBlocks,
   toolBlocks,
   locale,
-  bubbleStyle,
+  isStreaming,
 }: {
-  textBlocks: OpenAgentTextBlock[]
   thinkingBlocks: ReturnType<typeof getOpenAgentThinkingBlocks>
   toolBlocks: OpenAgentToolBlock[]
   locale: string
-  bubbleStyle: CSSProperties
+  isStreaming: boolean
 }) {
-  const traceBlocks = [
-    ...textBlocks.map((block) => ({ type: 'text' as const, block, timelineIndex: block.timelineIndex })),
+  const [manualOpen, setManualOpen] = useState<boolean | null>(null)
+  const entries = [
     ...thinkingBlocks.map((block) => ({ type: 'thinking' as const, block, timelineIndex: block.timelineIndex })),
     ...toolBlocks.map((block) => ({ type: 'tool' as const, block, timelineIndex: block.timelineIndex })),
   ].sort((a, b) => a.timelineIndex - b.timelineIndex)
 
-  if (traceBlocks.length === 0 && toolBlocks.length === 0) return null
+  if (entries.length === 0) return null
+
+  const open = manualOpen ?? isStreaming
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setManualOpen(true)}
+        className="flex min-h-9 w-full items-center gap-2 rounded-lg border border-[#E5E7EB] bg-white px-3 py-2 text-sm font-normal text-[#71717A] transition-colors hover:text-[#27272A]"
+        aria-expanded={false}
+      >
+        <IconChevronRight size={16} className="shrink-0" aria-hidden />
+        <OpenAgentTraceSummary
+          thinkingCount={thinkingBlocks.length}
+          toolCount={toolBlocks.length}
+          locale={locale}
+        />
+      </button>
+    )
+  }
 
   return (
     <div className="space-y-2">
-      {textBlocks.length === 0 && thinkingBlocks.length === 0 && toolBlocks.length > 0 && (
-        <OpenAgentThinkingBlock locale={locale} />
-      )}
-      {traceBlocks.map((item) => (
-        item.type === 'text' ? (
-          <StaticOpenAgentTextBlock
-            key={item.block.id}
-            content={item.block.content}
-            bubbleStyle={bubbleStyle}
+      {!isStreaming && (
+        <button
+          type="button"
+          onClick={() => setManualOpen(false)}
+          className="flex min-h-7 items-center gap-1.5 text-xs font-normal text-[#A1A1AA] transition-colors hover:text-[#71717A]"
+          aria-expanded={true}
+        >
+          <IconChevronRight size={14} className="shrink-0 rotate-90" aria-hidden />
+          <OpenAgentTraceSummary
+            thinkingCount={thinkingBlocks.length}
+            toolCount={toolBlocks.length}
+            locale={locale}
           />
-        ) : item.type === 'thinking' ? (
+        </button>
+      )}
+      {entries.map((item) => (
+        item.type === 'thinking' ? (
           <OpenAgentThinkingBlock
             key={item.block.id}
             locale={locale}
@@ -258,6 +319,44 @@ function StaticOpenAgentTraceBlocks({
         ) : (
           <StaticToolCallBlock key={item.block.id} block={item.block} locale={locale} />
         )
+      ))}
+    </div>
+  )
+}
+
+function StaticOpenAgentTraceBlocks({
+  textBlocks,
+  thinkingBlocks,
+  toolBlocks,
+  locale,
+  bubbleStyle,
+  isStreaming,
+}: {
+  textBlocks: OpenAgentTextBlock[]
+  thinkingBlocks: ReturnType<typeof getOpenAgentThinkingBlocks>
+  toolBlocks: OpenAgentToolBlock[]
+  locale: string
+  bubbleStyle: CSSProperties
+  isStreaming: boolean
+}) {
+  const sortedTextBlocks = [...textBlocks].sort((a, b) => a.timelineIndex - b.timelineIndex)
+
+  if (sortedTextBlocks.length === 0 && thinkingBlocks.length === 0 && toolBlocks.length === 0) return null
+
+  return (
+    <div className="space-y-2">
+      <OpenAgentProcessBlocks
+        thinkingBlocks={thinkingBlocks}
+        toolBlocks={toolBlocks}
+        locale={locale}
+        isStreaming={isStreaming}
+      />
+      {sortedTextBlocks.map((block) => (
+        <StaticOpenAgentTextBlock
+          key={block.id}
+          content={block.content}
+          bubbleStyle={bubbleStyle}
+        />
       ))}
     </div>
   )
@@ -326,6 +425,7 @@ export function MessageBubble({
   const isUser = message.sender_type === 'visitor'
   const isAssistant = message.sender_type === 'agent' || message.sender_type === 'bot'
   const isBot = message.sender_type === 'bot'
+  const assistantAvatarSrc = getAssistantAvatarSrc(message, config) || (!isBot ? DEFAULT_AGENT_AVATAR_SRC : null)
   const visitorChat = useVisitorChatConfig()
   const statusText = isUser ? statusLabel(messageStatus || message.status, locale) : null
   const textBlocks = isBot ? getOpenAgentTextBlocks(message.metadata) : []
@@ -335,10 +435,14 @@ export function MessageBubble({
   const hasMessageText = message.content.trim().length > 0
   const hasVisibleOpenAgentBlocks =
     textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0
+  const openAgentTraceStreaming =
+    message.metadata?.streaming === true
+    || thinkingBlocks.some((block) => block.isStreaming)
+    || visibleToolBlocks.some((block) => block.isExecuting)
+    || textBlocks.some((block) => block.isStreaming)
   const isThinking =
     isBot
     && message.metadata?.streaming === true
-    && !renderAssistantParts
     && !hasMessageText
     && visibleToolBlocks.length === 0
 
@@ -392,6 +496,11 @@ export function MessageBubble({
 
   const attachmentContentType =
     message.content_type === 'image' ? 'image' : message.content_type === 'file' ? 'file' : null
+  const isRichText = message.content_type === 'rich_text'
+  const offlineMessagePublicId =
+    typeof message.metadata?.offline_message_public_id === 'string'
+      ? message.metadata.offline_message_public_id
+      : undefined
   const isEmptyBotBubble =
     isBot
     && !attachmentContentType
@@ -406,12 +515,12 @@ export function MessageBubble({
 
   if (isEmptyBotBubble || isEmptyAssistantBubble) return null
 
-  if (isBot && !attachmentContentType && renderAssistantParts) {
+  if (isBot && !attachmentContentType && renderAssistantParts && !hasVisibleOpenAgentBlocks && !isThinking) {
     return (
       <div className="flex flex-row items-start gap-2 px-5">
-        {showAvatar && (
+        {showAvatar && assistantAvatarSrc && (
           <img
-            src={message.sender_avatar || DEFAULT_AGENT_AVATAR_SRC}
+            src={assistantAvatarSrc}
             alt={message.sender_name || ''}
             className="h-9 w-9 shrink-0 rounded-full object-cover"
           />
@@ -445,9 +554,9 @@ export function MessageBubble({
   ) {
     return (
       <div className="flex flex-row items-start gap-2 px-5">
-        {showAvatar && (
+        {showAvatar && assistantAvatarSrc && (
           <img
-            src={message.sender_avatar || DEFAULT_AGENT_AVATAR_SRC}
+            src={assistantAvatarSrc}
             alt={message.sender_name || ''}
             className="h-9 w-9 shrink-0 rounded-full object-cover"
           />
@@ -462,7 +571,7 @@ export function MessageBubble({
 
           <div className="w-full min-w-0 space-y-2">
             {isThinking && thinkingBlocks.length === 0 && visibleToolBlocks.length === 0 && (
-              <OpenAgentThinkingBlock locale={locale} active={isThinking} />
+              <OpenAgentFakeThinkingBubble />
             )}
             <StaticOpenAgentTraceBlocks
               textBlocks={textBlocks}
@@ -470,6 +579,7 @@ export function MessageBubble({
               toolBlocks={visibleToolBlocks}
               locale={locale}
               bubbleStyle={bubbleStyle}
+              isStreaming={openAgentTraceStreaming}
             />
             {textBlocks.length === 0 && (
               <StaticOpenAgentTextBlock content={message.content} bubbleStyle={bubbleStyle} />
@@ -489,9 +599,9 @@ export function MessageBubble({
   return (
     <div className={`flex ${isUser ? 'flex-row-reverse' : 'flex-row'} items-end gap-2 px-5`}>
       {/* Avatar */}
-      {showAvatar && !isUser && (
+      {showAvatar && !isUser && assistantAvatarSrc && (
         <img
-          src={message.sender_avatar || DEFAULT_AGENT_AVATAR_SRC}
+          src={assistantAvatarSrc}
           alt={message.sender_name || ''}
           className="h-9 w-9 shrink-0 rounded-full object-cover"
         />
@@ -509,19 +619,37 @@ export function MessageBubble({
           <MessageAttachment
             conversationId={message.conversation_id}
             conversationPublicId={message.conversation_public_id}
+            offlineMessagePublicId={offlineMessagePublicId}
             visitorSessionToken={visitorChat.visitorSessionToken}
             contentType={attachmentContentType}
             content={message.content}
           />
+        ) : isRichText ? (
+          <RichTextMessageContent
+            html={message.content}
+            conversationId={message.conversation_id}
+            conversationPublicId={message.conversation_public_id}
+            visitorSessionToken={visitorChat.visitorSessionToken}
+            className={cn('max-w-full px-3 py-2 text-sm break-words break-all', !isUser && 'min-h-[42px]')}
+            style={bubbleStyle}
+          />
         ) : (
           <div
             className={cn(
-              'min-h-[42px] max-w-full break-words break-all px-3 py-2 text-sm whitespace-pre-wrap',
+              'min-h-[42px] max-w-full px-3 py-2 text-sm',
+              !isBot && 'flex items-center',
+              isBot && 'break-words break-all whitespace-pre-wrap',
               isBot && [markdownTextRootClass, richTextListStyleClass],
             )}
             style={bubbleStyle}
           >
-            {isBot ? <MarkdownText>{message.content}</MarkdownText> : message.content}
+            {isBot ? (
+              <MarkdownText>{message.content}</MarkdownText>
+            ) : (
+              <span className="min-w-0 break-words break-all whitespace-pre-wrap leading-5">
+                {message.content}
+              </span>
+            )}
           </div>
         )}
 

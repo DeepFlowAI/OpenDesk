@@ -107,6 +107,20 @@ class TestFieldDefinitionCRUD:
         assert data["items"] == []
 
     @pytest.mark.asyncio
+    async def test_unified_user_fields_include_level_system_field(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        resp = await client.get("/api/v1/field-definitions/unified?domain=user", headers=headers)
+        assert resp.status_code == 200
+        fields = {item["key"]: item for item in resp.json()["items"]}
+
+        level = fields["level"]
+        assert level["source"] == "system"
+        assert level["name"] == "等级"
+        assert level["field_type"] == "single_select"
+        assert level["type_config"]["default_value"] == "normal"
+        assert [option["value"] for option in level["options"]] == ["normal", "vip"]
+
+    @pytest.mark.asyncio
     async def test_create_text_field_returns_201(self, client: AsyncClient):
         headers = await _setup_tenant_and_auth(client)
         resp = await client.post("/api/v1/field-definitions", json=SAMPLE_FIELD, headers=headers)

@@ -3,7 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { type ComponentType } from 'react'
-import { IconActivity, IconChartBar, IconHeadset, IconMessageCircle, IconPhone } from '@tabler/icons-react'
+import { IconActivity, IconChartBar, IconHeadset, IconInbox, IconMessageCircle, IconPhone } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
@@ -30,6 +30,7 @@ type SubNavGroup = {
 const RECORD_NAV_ICONS: Record<WorkspaceRecordIconKey, ComponentType<{ size?: number; className?: string }>> = {
   onlineMonitor: IconActivity,
   sessions: IconMessageCircle,
+  offlineMessages: IconInbox,
   sessionReports: IconChartBar,
   callMonitor: IconHeadset,
   calls: IconPhone,

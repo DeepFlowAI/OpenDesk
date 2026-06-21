@@ -4,6 +4,7 @@ export type WorkspaceNavIconKey =
   | 'call'
   | 'records'
   | 'contacts'
+  | 'knowledge'
 
 export type WorkspaceNavItem = {
   labelKey: string
@@ -15,6 +16,7 @@ export type WorkspaceNavItem = {
 export type WorkspaceRecordIconKey =
   | 'onlineMonitor'
   | 'sessions'
+  | 'offlineMessages'
   | 'sessionReports'
   | 'callMonitor'
   | 'calls'
@@ -62,6 +64,7 @@ export const WORKSPACE_NAV_ITEMS: WorkspaceNavItem[] = [
     iconKey: 'records',
     permissions: [
       'chat.session_record.view',
+      'chat.offline_message.view',
       'chat.online_monitor.view',
       'chat.session_report.view',
       'call.monitor.view',
@@ -74,6 +77,12 @@ export const WORKSPACE_NAV_ITEMS: WorkspaceNavItem[] = [
     href: '/workspace/users',
     iconKey: 'contacts',
     permissions: ['crm.workspace.user.view', 'crm.workspace.org.view'],
+  },
+  {
+    labelKey: 'ws.nav.knowledge',
+    href: '/workspace/knowledge',
+    iconKey: 'knowledge',
+    permissions: ['knowledge.workspace.view'],
   },
 ]
 
@@ -92,6 +101,12 @@ export const WORKSPACE_RECORD_NAV_GROUPS: WorkspaceRecordNavGroup[] = [
         href: '/workspace/records/sessions',
         iconKey: 'sessions',
         permissions: ['chat.session_record.view'],
+      },
+      {
+        labelKey: 'ws.records.nav.offlineMessages',
+        href: '/workspace/records/offline-messages',
+        iconKey: 'offlineMessages',
+        permissions: ['chat.offline_message.view'],
       },
       {
         labelKey: 'ws.records.nav.sessionReports',
@@ -131,6 +146,7 @@ export const WORKSPACE_RECORD_NAV_GROUPS: WorkspaceRecordNavGroup[] = [
 export const WORKSPACE_ROUTE_RULES: WorkspaceRouteRule[] = [
   { prefix: '/workspace/records/online-monitor', permissions: ['chat.online_monitor.view'] },
   { prefix: '/workspace/records/session-reports', permissions: ['chat.session_report.view'] },
+  { prefix: '/workspace/records/offline-messages', permissions: ['chat.offline_message.view'] },
   { prefix: '/workspace/records/call-monitor', permissions: ['call.monitor.view'] },
   { prefix: '/workspace/records/call-reports', permissions: ['call.report.view'] },
   { prefix: '/workspace/records/sessions', permissions: ['chat.session_record.view'] },
@@ -139,6 +155,7 @@ export const WORKSPACE_ROUTE_RULES: WorkspaceRouteRule[] = [
     prefix: '/workspace/records',
     permissions: [
       'chat.session_record.view',
+      'chat.offline_message.view',
       'chat.online_monitor.view',
       'chat.session_report.view',
       'call.monitor.view',
@@ -149,6 +166,7 @@ export const WORKSPACE_ROUTE_RULES: WorkspaceRouteRule[] = [
   { prefix: '/workspace/chat', permissions: ['chat.workspace.use'] },
   { prefix: '/workspace/call', permissions: ['call.workspace.use'] },
   { prefix: '/workspace/tickets', permissions: ['ticket.workspace.view'] },
+  { prefix: '/workspace/knowledge', permissions: ['knowledge.workspace.view'] },
   { prefix: '/workspace/organizations', permissions: ['crm.workspace.org.view'] },
   { prefix: '/workspace/users', permissions: ['crm.workspace.user.view'] },
 ].sort((a, b) => b.prefix.length - a.prefix.length)

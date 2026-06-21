@@ -39,14 +39,31 @@ export type Conversation = {
   ended_by: string | null
   last_message_at: string | null
   last_message_preview: string | null
+  visitor_system: string | null
+  visitor_browser: string | null
+  visitor_ip: string | null
   unread_count: number
   has_history_conversations?: boolean
+  viewer_relation?: 'own' | 'peer' | null
+  collaborated_by_current_user?: boolean
   created_at: string | null
 }
 
 export type ConversationListResponse = {
   items: Conversation[]
   total: number
+}
+
+export type ConversationHistoryListResponse = {
+  items: Conversation[]
+  total: number
+  has_more: boolean
+}
+
+export type StartConversationFromHistoryResponse = {
+  conversation: Conversation
+  is_new: boolean
+  already_active: boolean
 }
 
 export type VisitorWebStatus = 'online' | 'offline' | 'unknown'
@@ -96,7 +113,7 @@ export type Message = {
   sender_id: number | null
   sender_name: string | null
   sender_avatar: string | null
-  content_type: 'text' | 'image' | 'file' | 'system' | 'welcome' | 'satisfaction_event'
+  content_type: 'text' | 'rich_text' | 'image' | 'file' | 'system' | 'welcome' | 'bot_welcome' | 'satisfaction_event' | 'internal_note'
   content: string
   metadata?: Record<string, unknown>
   created_at: string
@@ -134,6 +151,18 @@ export type VisitorConversationHistoryResponse = {
   has_more: boolean
 }
 
+export type VisitorUnreadOfflineReplyItem = VisitorConversationHistoryItem & {
+  offline_message_public_id: string
+  customer_unread_at: string
+  customer_unread_message_id: number | null
+  offline_reply_unread: boolean
+}
+
+export type VisitorUnreadOfflineReplyResponse = {
+  items: VisitorUnreadOfflineReplyItem[]
+  has_more: boolean
+}
+
 export type WorkspaceConversationHistoryItem = {
   id: number
   status: 'queued' | 'active' | 'bot' | 'handoff_pending' | 'closed'
@@ -149,6 +178,33 @@ export type WorkspaceConversationHistoryItem = {
 
 export type WorkspaceConversationHistoryResponse = {
   items: WorkspaceConversationHistoryItem[]
+  has_more: boolean
+}
+
+export type WorkspaceMessageSearchConversation = {
+  id: number
+  share_code: string
+  status: 'queued' | 'active' | 'bot' | 'handoff_pending' | 'closed'
+  started_at: string | null
+  channel: ChannelBrief | null
+}
+
+export type WorkspaceMessageSearchResult = {
+  id: number
+  conversation_id: number
+  sender_type: Message['sender_type']
+  sender_id: number | null
+  sender_name: string | null
+  sender_avatar: string | null
+  content_type: Message['content_type']
+  content: string
+  created_at: string
+  conversation: WorkspaceMessageSearchConversation
+}
+
+export type WorkspaceMessageSearchResponse = {
+  items: WorkspaceMessageSearchResult[]
+  total: number
   has_more: boolean
 }
 

@@ -86,6 +86,20 @@ def create_visitor_session_token(data: dict, expires_seconds: int | None = None)
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
+def create_context_token(data: dict, expires_seconds: int | None = None) -> str:
+    """Create a signed Web SDK context JWT."""
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(
+        seconds=expires_seconds or settings.API_CONTEXT_TOKEN_EXPIRE_SECONDS
+    )
+    to_encode.update({
+        "typ": "context_token",
+        "iat": datetime.now(timezone.utc),
+        "exp": expire,
+    })
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
 def decode_access_token(token: str) -> dict | None:
     """Decode and validate a JWT access token. Returns payload or None."""
     try:
@@ -98,5 +112,13 @@ def decode_visitor_session_token(token: str) -> dict | None:
     """Decode and validate a visitor session JWT."""
     payload = decode_access_token(token)
     if not payload or payload.get("typ") != "visitor_session":
+        return None
+    return payload
+
+
+def decode_context_token(token: str) -> dict | None:
+    """Decode and validate a Web SDK context token."""
+    payload = decode_access_token(token)
+    if not payload or payload.get("typ") != "context_token":
         return None
     return payload

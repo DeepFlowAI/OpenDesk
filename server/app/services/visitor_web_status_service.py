@@ -106,7 +106,7 @@ class VisitorWebStatusService:
             "conversation_id": conversation_id,
             "status": status,
             "can_display": can_display,
-            "checked_at": datetime.now(timezone.utc),
+            "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 
     @staticmethod

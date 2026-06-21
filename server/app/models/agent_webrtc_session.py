@@ -36,5 +36,5 @@ class AgentWebRTCSession(Base):
     )
     webrtc_call_id: Mapped[str] = mapped_column(String(80), nullable=False)
     state: Mapped[str] = mapped_column(String(24), nullable=False)
-    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

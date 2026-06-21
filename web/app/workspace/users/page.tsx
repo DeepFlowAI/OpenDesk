@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import {
   IconPlus,
+  IconUpload,
   IconFilter,
   IconColumns3,
   IconSearch,
@@ -22,17 +23,19 @@ import {
   useEnabledUserViews,
   useUserViewCounts,
   useUserViewGroups,
+  useExportUsers,
 } from '@/service/use-users'
 import { useEnabledOrgViews, useOrgViewCounts } from '@/service/use-organizations'
 import { useSystemSettings } from '@/service/use-system-settings'
 import { useUnifiedFields } from '@/service/use-field-definitions'
 import type { UserView, ConditionItem, ColumnConfigItem } from '@/models/user-view'
-import type { User, UserQueryPayload } from '@/models/user'
+import type { User, UserExportColumn, UserQueryPayload } from '@/models/user'
 import type { UnifiedField } from '@/models/field-definition'
 import type { ViewGroupRequestPayload } from '@/models/view-group'
 import { FilterDrawer } from './filter-drawer'
 import { ColumnsDrawer } from './columns-drawer'
 import { UserFormModal } from './user-form-modal'
+import { UserImportModal } from './user-import-modal'
 import { GroupBar } from '@/components/workspace/group-bar'
 import {
   formatActorFieldValue,
@@ -40,19 +43,20 @@ import {
 } from '@/app/components/features/field-system/field-value-display'
 import { formatDatetimeForDisplay } from '@/lib/datetime-display'
 import { hasPermission } from '@/utils/permissions'
+import { WorkspaceListExport } from '@/app/components/features/workspace-list-export'
 
 // ── localStorage helpers for column config persistence ──
 
 const COL_STORAGE_PREFIX = 'ws_user_cols_'
 const PER_PAGE_OPTIONS = [20, 50, 100]
 
-function getColStorageKey(viewId: number | null): string {
-  return `${COL_STORAGE_PREFIX}${viewId ?? 'default'}`
+function getColStorageKey(tenantId: number | null, viewId: number | null): string {
+  return `${COL_STORAGE_PREFIX}${tenantId ?? 'unknown'}_${viewId ?? 'default'}`
 }
 
-function readColsFromStorage(viewId: number | null): ColumnConfigItem[] | null {
+function readColsFromStorage(tenantId: number | null, viewId: number | null): ColumnConfigItem[] | null {
   try {
-    const raw = localStorage.getItem(getColStorageKey(viewId))
+    const raw = localStorage.getItem(getColStorageKey(tenantId, viewId))
     if (!raw) return null
     return JSON.parse(raw) as ColumnConfigItem[]
   } catch {
@@ -60,15 +64,15 @@ function readColsFromStorage(viewId: number | null): ColumnConfigItem[] | null {
   }
 }
 
-function writeColsToStorage(viewId: number | null, cols: ColumnConfigItem[]): void {
+function writeColsToStorage(tenantId: number | null, viewId: number | null, cols: ColumnConfigItem[]): void {
   try {
-    localStorage.setItem(getColStorageKey(viewId), JSON.stringify(cols))
+    localStorage.setItem(getColStorageKey(tenantId, viewId), JSON.stringify(cols))
   } catch { /* quota exceeded – ignore */ }
 }
 
-function removeColsFromStorage(viewId: number | null): void {
+function removeColsFromStorage(tenantId: number | null, viewId: number | null): void {
   try {
-    localStorage.removeItem(getColStorageKey(viewId))
+    localStorage.removeItem(getColStorageKey(tenantId, viewId))
   } catch { /* ignore */ }
 }
 
@@ -146,7 +150,7 @@ export default function WorkspaceUsersPage() {
   useEffect(() => {
     if (!colInitRef.current) {
       colInitRef.current = true
-      setColumnOverrides(readColsFromStorage(activeView?.id ?? null))
+      setColumnOverrides(readColsFromStorage(user?.tenant_id ?? null, activeView?.id ?? null))
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
   const hasColumnOverride = columnOverrides !== null
@@ -155,7 +159,9 @@ export default function WorkspaceUsersPage() {
   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false)
   const [columnsDrawerOpen, setColumnsDrawerOpen] = useState(false)
   const [createModalOpen, setCreateModalOpen] = useState(false)
+  const [importModalOpen, setImportModalOpen] = useState(false)
   const canCreateUser = hasPermission(user, 'crm.workspace.user.create')
+  const canImportUsers = hasPermission(user, 'crm.workspace.user.import')
   const canViewOrganizations = hasPermission(user, 'crm.workspace.org.view')
 
   // Sidebar groups
@@ -222,6 +228,7 @@ export default function WorkspaceUsersPage() {
   )
 
   const { data: usersData, isLoading: usersLoading } = useQueryUsers(queryPayload)
+  const { mutateAsync: exportUsersAsync } = useExportUsers()
 
   // Resolve visible columns
   const visibleColumns = useMemo(() => {
@@ -283,6 +290,33 @@ export default function WorkspaceUsersPage() {
     return [...configurable, ...pinnedMetadataCols]
   }, [visibleColumns, allFields, pinnedMetadataCols])
 
+  const exportColumns: UserExportColumn[] = useMemo(
+    () => displayColumns.map((column) => ({
+      field_key: column.field_key,
+      field_id: column.field_id,
+      name: column.name,
+      field_type: column.field_type,
+    })),
+    [displayColumns],
+  )
+
+  const canExportUsers = hasPermission(user, 'crm.workspace.user.export')
+
+  const handleExportUsers = useCallback(
+    () => exportUsersAsync({
+      view_id: queryPayload.view_id,
+      search: queryPayload.search,
+      temp_conditions: queryPayload.temp_conditions,
+      temp_condition_logic: queryPayload.temp_condition_logic,
+      group_value: queryPayload.group_value,
+      sort_by: queryPayload.sort_by,
+      sort_order: queryPayload.sort_order,
+      locale,
+      columns: exportColumns,
+    }),
+    [exportColumns, exportUsersAsync, locale, queryPayload],
+  )
+
   // Build a value→label lookup map for select-type fields
   const fieldLookup = useMemo(() => buildFieldLookup(allFieldsRaw, locale), [allFieldsRaw, locale])
 
@@ -295,9 +329,9 @@ export default function WorkspaceUsersPage() {
     setTempConditions([])
     setTempConditionLogic('and')
     setGroupValue(undefined)
-    setColumnOverrides(readColsFromStorage(viewId === 'all' ? null : viewId))
+    setColumnOverrides(readColsFromStorage(user?.tenant_id ?? null, viewId === 'all' ? null : viewId))
     router.replace(buildUsersUrl(viewId, undefined), { scroll: false })
-  }, [router])
+  }, [router, user?.tenant_id])
 
   const handleSelectGroup = useCallback((value: string | undefined) => {
     setGroupValue(value)
@@ -331,16 +365,17 @@ export default function WorkspaceUsersPage() {
   }, [])
 
   const storageViewId = selectedViewId === 'all' ? null : selectedViewId
+  const storageTenantId = user?.tenant_id ?? null
 
   const handleResetColumns = useCallback(() => {
     setColumnOverrides(null)
-    removeColsFromStorage(storageViewId)
-  }, [storageViewId])
+    removeColsFromStorage(storageTenantId, storageViewId)
+  }, [storageTenantId, storageViewId])
 
   const handleApplyColumns = useCallback((cols: ColumnConfigItem[]) => {
     setColumnOverrides(cols)
-    writeColsToStorage(storageViewId, cols)
-  }, [storageViewId])
+    writeColsToStorage(storageTenantId, storageViewId, cols)
+  }, [storageTenantId, storageViewId])
 
   const totalPages = usersData?.pages ?? 0
   const total = usersData?.total ?? 0
@@ -453,16 +488,28 @@ export default function WorkspaceUsersPage() {
               ? (locale === 'zh' ? '全部' : 'All')
               : activeView?.name ?? ''}
           </h3>
-          {canCreateUser && (
-            <button
-              type="button"
-              onClick={() => setCreateModalOpen(true)}
-              className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
-            >
-              <IconPlus size={16} />
-              {locale === 'zh' ? '新建用户' : 'Create User'}
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {canImportUsers && (
+              <button
+                type="button"
+                onClick={() => setImportModalOpen(true)}
+                className="flex h-9 items-center gap-1.5 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 transition-colors hover:bg-accent"
+              >
+                <IconUpload size={16} />
+                {t('ws.users.importUsers', locale)}
+              </button>
+            )}
+            {canCreateUser && (
+              <button
+                type="button"
+                onClick={() => setCreateModalOpen(true)}
+                className="flex h-9 items-center gap-1.5 rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
+              >
+                <IconPlus size={16} />
+                {t('ws.users.createUser', locale)}
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Toolbar: search + filter + columns only */}
@@ -533,6 +580,43 @@ export default function WorkspaceUsersPage() {
             <IconColumns3 size={16} />
             {locale === 'zh' ? '列字段' : 'Columns'}
           </button>
+
+          <WorkspaceListExport
+            allowed={canExportUsers}
+            locale={locale}
+            buttonLabel={locale === 'zh' ? '导出' : 'Export'}
+            title={locale === 'zh' ? '导出用户' : 'Export users'}
+            description={
+              locale === 'zh'
+                ? '将导出当前列表条件下的全部用户，不受当前页码限制。'
+                : 'All users matching the current list conditions will be exported, regardless of the current page.'
+            }
+            scopeLabel={
+              selectedViewId === 'all'
+                ? (locale === 'zh' ? '全部' : 'All')
+                : activeView?.name ?? (locale === 'zh' ? '当前视图' : 'Current view')
+            }
+            totalLabel={
+              locale === 'zh'
+                ? `${total} 条用户`
+                : `${total} users`
+            }
+            columnsLabel={
+              locale === 'zh'
+                ? `当前表格可见列（${exportColumns.length} 列）`
+                : `Current visible table columns (${exportColumns.length} columns)`
+            }
+            formatLabel="Excel .xlsx"
+            confirmLabel={locale === 'zh' ? '确认导出' : 'Export'}
+            cancelLabel={locale === 'zh' ? '取消' : 'Cancel'}
+            successMessage={locale === 'zh' ? '已导出用户' : 'Users exported'}
+            errorMessage={
+              locale === 'zh'
+                ? '导出失败，请稍后重试'
+                : 'Export failed. Please try again later.'
+            }
+            onExport={handleExportUsers}
+          />
         </div>
 
         {groupsEnabled && (
@@ -704,6 +788,15 @@ export default function WorkspaceUsersPage() {
           onSuccess={() => setCreateModalOpen(false)}
         />
       )}
+
+      {canImportUsers && (
+        <UserImportModal
+          locale={locale}
+          open={importModalOpen}
+          onClose={() => setImportModalOpen(false)}
+          onCompleted={() => setImportModalOpen(false)}
+        />
+      )}
     </div>
   )
 }
@@ -721,7 +814,7 @@ function buildUsersUrl(
 
 const SYSTEM_KEYS = new Set([
   'public_id', 'name', 'nickname', 'external_id', 'avatar_color', 'channel_id', 'organization_id',
-  'email', 'phone', 'web_id', 'gender', 'address', 'remark',
+  'email', 'phone', 'web_id', 'gender', 'level', 'address', 'remark',
   'created_by', 'updated_by', 'created_at', 'updated_at',
 ])
 
@@ -736,6 +829,11 @@ const GENDER_LABELS: Record<string, { zh: string; en: string }> = {
   female: { zh: '女', en: 'Female' },
   unknown: { zh: '未知', en: 'Unknown' },
   other: { zh: '其他', en: 'Other' },
+}
+
+const USER_LEVEL_LABELS: Record<string, { zh: string; en: string }> = {
+  normal: { zh: '普通', en: 'Normal' },
+  vip: { zh: 'VIP', en: 'VIP' },
 }
 
 type FieldValueLookup = Map<string, Map<string, string>>
@@ -801,6 +899,11 @@ function getCellValue(
     if (field_key === 'gender') {
       const g = GENDER_LABELS[String(raw)]
       return g ? (locale === 'zh' ? g.zh : g.en) : String(raw)
+    }
+
+    if (field_key === 'level') {
+      const level = USER_LEVEL_LABELS[String(raw)]
+      return level ? (locale === 'zh' ? level.zh : level.en) : String(raw)
     }
 
     // System select fields with type_config options

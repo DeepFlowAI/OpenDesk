@@ -1,9 +1,12 @@
 'use client'
 
-import type { CSSProperties } from 'react'
-import type { ChannelConfig } from '@/models/channel'
+import { useState, type CSSProperties } from 'react'
+import type { ChannelConfig, OpenAgentFAQ, OpenAgentWelcomeMessageBlock } from '@/models/channel'
+import { MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
+import { buildOpenAgentWelcomeEmbedSrcDoc } from '@/lib/open-agent-welcome-message'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { SafeHtml } from '@/components/safe-html'
+import { cn } from '@/lib/utils'
 
 const DEFAULT_AGENT_AVATAR_SRC = '/default-avatar.jpg'
 
@@ -12,6 +15,23 @@ type WelcomeMessageProps = {
   config?: ChannelConfig
   showAvatar?: boolean
   avatarSrc?: string | null
+  contentFormat?: 'html' | 'markdown'
+}
+
+type OpenAgentWelcomeMessageProps = {
+  blocks: OpenAgentWelcomeMessageBlock[]
+  config?: ChannelConfig
+  showAvatar?: boolean
+  avatarSrc?: string | null
+}
+
+type OpenAgentFAQMessageProps = {
+  faq: OpenAgentFAQ
+  config?: ChannelConfig
+  showAvatar?: boolean
+  avatarSrc?: string | null
+  faqDisabled?: boolean
+  onFAQQuestionClick?: (text: string) => Promise<boolean> | boolean
 }
 
 function toCssBorderRadius(radius: [number, number, number, number]): string {
@@ -36,7 +56,14 @@ export function WelcomeMessage({
   config,
   showAvatar = false,
   avatarSrc,
+  contentFormat = 'html',
 }: WelcomeMessageProps) {
+  const bubbleClassName = cn(
+    'min-h-[42px] max-w-[75%] min-w-0 whitespace-pre-wrap break-words break-all px-3 py-2 text-sm leading-6',
+    richTextListStyleClass,
+    contentFormat === 'markdown' && markdownTextRootClass,
+  )
+
   return (
     <div className="flex flex-row items-end gap-2 px-5">
       {showAvatar && (
@@ -46,11 +73,145 @@ export function WelcomeMessage({
           className="h-9 w-9 shrink-0 rounded-full object-cover"
         />
       )}
-      <SafeHtml
-        html={content}
-        className={`min-h-[42px] max-w-[75%] min-w-0 whitespace-pre-wrap break-words break-all px-3 py-2 text-sm leading-6 ${richTextListStyleClass}`}
+      {contentFormat === 'markdown' ? (
+        <div className={bubbleClassName} style={getAgentBubbleStyle(config)}>
+          <MarkdownText>{content}</MarkdownText>
+        </div>
+      ) : (
+        <SafeHtml
+          html={content}
+          className={bubbleClassName}
+          style={getAgentBubbleStyle(config)}
+        />
+      )}
+    </div>
+  )
+}
+
+export function OpenAgentWelcomeMessage({
+  blocks,
+  config,
+  showAvatar = false,
+  avatarSrc,
+}: OpenAgentWelcomeMessageProps) {
+  return (
+    <div className="flex flex-row items-end gap-2 px-5">
+      {showAvatar && (
+        <img
+          src={avatarSrc || DEFAULT_AGENT_AVATAR_SRC}
+          alt=""
+          className="h-9 w-9 shrink-0 rounded-full object-cover"
+        />
+      )}
+      <div
+        className={cn(
+          'min-h-[42px] max-w-[75%] min-w-0 break-words break-all px-3 py-2 text-sm leading-6',
+          markdownTextRootClass,
+          richTextListStyleClass,
+        )}
         style={getAgentBubbleStyle(config)}
-      />
+      >
+        <div className="space-y-3">
+          {blocks.map((block, index) => (
+            block.type === 'markdown' ? (
+              <MarkdownText key={`open-agent-welcome-md-${index}`}>
+                {block.content}
+              </MarkdownText>
+            ) : (
+              <iframe
+                key={`open-agent-welcome-embed-${index}`}
+                title={`open agent welcome embed ${index + 1}`}
+                srcDoc={buildOpenAgentWelcomeEmbedSrcDoc(block.embed_code)}
+                sandbox="allow-scripts allow-forms allow-popups allow-presentation"
+                allow="autoplay; fullscreen; picture-in-picture"
+                className="block w-full rounded-lg border border-border bg-white"
+                style={{ height: block.height, maxHeight: '45vh' }}
+              />
+            )
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function OpenAgentFAQMessage({
+  faq,
+  config,
+  showAvatar = false,
+  avatarSrc,
+  faqDisabled = false,
+  onFAQQuestionClick,
+}: OpenAgentFAQMessageProps) {
+  const [activeCategoryIndex, setActiveCategoryIndex] = useState(0)
+  const [pendingQuestion, setPendingQuestion] = useState<string | null>(null)
+  const activeCategory = faq.categories[activeCategoryIndex] || faq.categories[0]
+  const buttonStyle = {
+    '--opendesk-faq-button-bg': config?.send_button_bg_color || 'var(--color-primary)',
+  } as CSSProperties
+
+  async function handleQuestionClick(text: string) {
+    if (!onFAQQuestionClick || faqDisabled || pendingQuestion) return
+    setPendingQuestion(text)
+    try {
+      await onFAQQuestionClick(text)
+    } finally {
+      setPendingQuestion(null)
+    }
+  }
+
+  return (
+    <div className="flex flex-row items-end gap-2 px-5">
+      {showAvatar && (
+        <img
+          src={avatarSrc || DEFAULT_AGENT_AVATAR_SRC}
+          alt=""
+          className="h-9 w-9 shrink-0 rounded-full object-cover"
+        />
+      )}
+      <div
+        className="min-h-[42px] max-w-[75%] min-w-0 break-words break-all px-4 py-3 text-sm leading-6"
+        style={{ ...getAgentBubbleStyle(config), ...buttonStyle }}
+      >
+        <div className="mb-3 text-sm font-semibold">{faq.title}</div>
+        {faq.categories.length > 1 && (
+          <div className="mb-3 flex flex-wrap gap-2">
+            {faq.categories.map((category, index) => {
+              const active = index === activeCategoryIndex
+              return (
+                <button
+                  key={`${category.name}-${index}`}
+                  type="button"
+                  className={cn(
+                    'rounded-full border px-3 py-1.5 text-sm font-medium leading-5 transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                    active
+                      ? 'border-[var(--opendesk-faq-button-bg)] bg-[var(--opendesk-faq-button-bg)] text-white'
+                      : 'border-[var(--opendesk-faq-button-bg)] bg-white text-[var(--opendesk-faq-button-bg)] hover:opacity-90',
+                  )}
+                  onClick={() => setActiveCategoryIndex(index)}
+                  disabled={faqDisabled || Boolean(pendingQuestion)}
+                >
+                  {category.name}
+                </button>
+              )
+            })}
+          </div>
+        )}
+        <div className="flex flex-col gap-1">
+          {activeCategory.questions.map((question, index) => (
+            <button
+              key={`${question.text}-${index}`}
+              type="button"
+              className="flex w-full items-center justify-between gap-3 rounded-md py-1.5 text-left text-sm leading-6 transition-colors hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={() => void handleQuestionClick(question.text)}
+              disabled={faqDisabled || Boolean(pendingQuestion)}
+            >
+              <span className="min-w-0 flex-1 break-words">{question.text}</span>
+              <span className="shrink-0 text-lg leading-none opacity-45">&gt;</span>
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   )
 }

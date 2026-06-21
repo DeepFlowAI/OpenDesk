@@ -1,11 +1,12 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { get, post, put } from './base'
+import { filenameFromContentDisposition, get, getBlob, post, postBlob, postForm, put } from './base'
 import type { EntityChange } from '@/models/entity-change'
 import type {
   Organization,
   CreateOrganizationPayload,
   UpdateOrganizationPayload,
   OrganizationQueryPayload,
+  OrganizationExportPayload,
   OrgViewCountsResponse,
 } from '@/models/organization'
 import type { OrganizationView } from '@/models/organization-view'
@@ -15,6 +16,11 @@ import type {
   ViewGroupRequestPayload,
   ViewGroupResponse,
 } from '@/models/view-group'
+import type {
+  OrgImportErrorReportPayload,
+  OrgImportExecuteResponse,
+  OrgImportPreviewResponse,
+} from '@/models/org-import'
 
 const NS = 'organizations'
 
@@ -42,6 +48,86 @@ export const useQueryOrganizations = (payload: OrganizationQueryPayload, enabled
       post<PaginatedResponse<Organization>>('v1/organizations/query', { json: payload }),
     enabled,
   })
+
+export const exportOrganizations = async (payload: OrganizationExportPayload) => {
+  const { blob, headers } = await postBlob('v1/organizations/export', {
+    json: payload,
+    timeout: 120000,
+  })
+  return {
+    blob,
+    filename: filenameFromContentDisposition(
+      headers.get('content-disposition'),
+      'organizations-export.xlsx',
+    ),
+  }
+}
+
+export const useExportOrganizations = () =>
+  useMutation({
+    mutationFn: exportOrganizations,
+  })
+
+export const downloadOrganizationImportTemplate = async (locale: string) => {
+  const { blob, headers } = await getBlob(
+    `v1/organizations/import/template?locale=${encodeURIComponent(locale)}`,
+  )
+  return {
+    blob,
+    filename: filenameFromContentDisposition(
+      headers.get('content-disposition'),
+      'organizations-import-template.xlsx',
+    ),
+  }
+}
+
+export const previewOrganizationImport = async (file: File, locale: string) => {
+  const formData = new FormData()
+  formData.append('file', file)
+  return postForm<OrgImportPreviewResponse>(
+    `v1/organizations/import/preview?locale=${encodeURIComponent(locale)}`,
+    formData,
+    120000,
+  )
+}
+
+export const executeOrganizationImport = async (previewToken: string) =>
+  post<OrgImportExecuteResponse>('v1/organizations/import/execute', {
+    json: { preview_token: previewToken },
+    timeout: 120000,
+  })
+
+export const downloadOrganizationImportErrorReport = async (
+  payload: OrgImportErrorReportPayload,
+  locale: string,
+) => {
+  const { blob, headers } = await postBlob(
+    `v1/organizations/import/error-report?locale=${encodeURIComponent(locale)}`,
+    {
+      json: payload,
+      timeout: 120000,
+    },
+  )
+  return {
+    blob,
+    filename: filenameFromContentDisposition(
+      headers.get('content-disposition'),
+      'organizations-import-errors.xlsx',
+    ),
+  }
+}
+
+export const useExecuteOrganizationImport = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: executeOrganizationImport,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: orgKeys.queries() })
+      qc.invalidateQueries({ queryKey: orgKeys.viewCounts() })
+      qc.invalidateQueries({ queryKey: orgKeys.viewGroupsRoot() })
+    },
+  })
+}
 
 export const useOrganization = (
   ref: string | number | null | undefined,

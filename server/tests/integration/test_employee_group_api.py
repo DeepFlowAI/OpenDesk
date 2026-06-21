@@ -77,6 +77,41 @@ class TestEmployeeGroupAPI:
         assert "members" in data
 
     @pytest.mark.asyncio
+    async def test_get_by_id_returns_member_name(self, client: AsyncClient):
+        """Group detail members should include the employee name."""
+        headers = _auth_header()
+        token = uuid.uuid4().hex[:8]
+        employee_resp = await client.post(
+            "/api/v1/employees",
+            json={
+                "name": f"Member Name {token}",
+                "username": f"group_member_{token}",
+                "email": f"group_member_{token}@example.com",
+                "password": "Test1234abc",
+            },
+            headers=headers,
+        )
+        assert employee_resp.status_code == 201
+        employee_id = employee_resp.json()["id"]
+
+        create_resp = await client.post(
+            "/api/v1/employee-groups",
+            json={
+                "name": _unique_name("Named Member Group"),
+                "member_ids": [employee_id],
+            },
+            headers=headers,
+        )
+        assert create_resp.status_code == 201
+        created_id = create_resp.json()["id"]
+
+        resp = await client.get(f"/api/v1/employee-groups/{created_id}", headers=headers)
+        assert resp.status_code == 200
+        member = resp.json()["members"][0]
+        assert member["employee_id"] == employee_id
+        assert member["name"] == f"Member Name {token}"
+
+    @pytest.mark.asyncio
     async def test_get_nonexistent_returns_404(self, client: AsyncClient):
         """Get non-existing group should return 404."""
         headers = _auth_header()
@@ -197,3 +232,29 @@ class TestEmployeeSelectAPI:
         assert "total" in data
         assert "page" in data
         assert "per_page" in data
+
+    @pytest.mark.asyncio
+    async def test_list_employees_for_selection_includes_and_searches_name(self, client: AsyncClient):
+        """Employee selection should expose and search by employee name."""
+        headers = _auth_header()
+        token = uuid.uuid4().hex[:8]
+        employee_name = f"Selectable Name {token}"
+        create_resp = await client.post(
+            "/api/v1/employees",
+            json={
+                "name": employee_name,
+                "username": f"selectable_{token}",
+                "email": f"selectable_{token}@example.com",
+                "password": "Test1234abc",
+            },
+            headers=headers,
+        )
+        assert create_resp.status_code == 201
+        employee_id = create_resp.json()["id"]
+
+        resp = await client.get(f"/api/v1/system-users?keyword={employee_name}", headers=headers)
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        matching = [item for item in items if item["id"] == employee_id]
+        assert matching
+        assert matching[0]["name"] == employee_name

@@ -349,6 +349,9 @@ export function PillMultiSelectField({
         return (
           <label
             key={opt.value}
+            onMouseDown={(event) => {
+              if (!disabled) event.preventDefault()
+            }}
             className={cn(
               'inline-flex cursor-pointer items-center text-sm transition-colors',
               withColor

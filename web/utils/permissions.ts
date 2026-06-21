@@ -1,7 +1,13 @@
 import type { UserInfo } from '@/models/auth'
 import { ADMIN_NAV_GROUPS } from '@/config/admin-permissions'
 
-export type DataScopeResource = 'ticket' | 'session_record' | 'call_record'
+export type DataScopeResource =
+  | 'ticket'
+  | 'session_record'
+  | 'call_record'
+  | 'offline_message'
+  | 'chat.conversation.peer.view'
+  | 'chat.queue.view'
 export type DataScopeValue = 'all' | 'group' | 'self'
 
 type PermissionUser = Pick<UserInfo, 'is_super_admin' | 'permissions' | 'data_scopes'>
@@ -10,6 +16,7 @@ const DEFAULT_HOME_PRIORITY: Array<{ permissions: string[]; path: string }> = [
   { permissions: ['chat.workspace.use'], path: '/workspace/chat' },
   { permissions: ['call.workspace.use'], path: '/workspace/call' },
   { permissions: ['ticket.workspace.view', 'ticket.workspace.create'], path: '/workspace/tickets' },
+  { permissions: ['knowledge.workspace.view'], path: '/workspace/knowledge' },
   { permissions: ['crm.workspace.user.view'], path: '/workspace/users' },
   { permissions: ['crm.workspace.org.view'], path: '/workspace/organizations' },
   { permissions: ['admin.access'], path: 'admin' },
@@ -54,7 +61,9 @@ export function getDefaultAccessiblePath(user: PermissionUser | null | undefined
 export function getDefaultAdminPath(user: PermissionUser | null | undefined): string {
   if (!hasPermission(user, 'admin.access')) return '/403'
   for (const group of ADMIN_NAV_GROUPS) {
-    const item = group.items.find((navItem) => hasPermission(user, navItem.permission))
+    const item = group.items.find((navItem) => (
+      navItem.superAdminOnly ? Boolean(user?.is_super_admin) : hasPermission(user, navItem.permission)
+    ))
     if (item) return item.href
   }
   return '/403'

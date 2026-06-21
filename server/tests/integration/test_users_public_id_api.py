@@ -62,6 +62,7 @@ class TestUsersPublicIdAPI:
         created = create_resp.json()
         assert created["public_id"].startswith("usr_")
         assert re.fullmatch(r"usr_[A-Za-z0-9_-]{16}", created["public_id"])
+        assert created["level"] == "normal"
 
         detail_resp = await client.get(
             f"/api/v1/users/{created['public_id']}",
@@ -69,6 +70,26 @@ class TestUsersPublicIdAPI:
         )
         assert detail_resp.status_code == 200
         assert detail_resp.json()["id"] == created["id"]
+        assert detail_resp.json()["level"] == "normal"
+
+    @pytest.mark.asyncio
+    async def test_update_user_level(self, client: AsyncClient):
+        headers = await _setup_tenant_and_auth(client)
+        create_resp = await client.post(
+            "/api/v1/users",
+            headers=headers,
+            json={"name": "VIP User"},
+        )
+        created = create_resp.json()
+
+        update_resp = await client.put(
+            f"/api/v1/users/{created['id']}",
+            headers=headers,
+            json={"level": "vip"},
+        )
+
+        assert update_resp.status_code == 200
+        assert update_resp.json()["level"] == "vip"
 
     @pytest.mark.asyncio
     async def test_numeric_user_id_route_stays_compatible(self, client: AsyncClient):

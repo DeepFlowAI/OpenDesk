@@ -30,5 +30,5 @@ class AgentStatus(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(24), nullable=False)
     reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
     status_changed_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )

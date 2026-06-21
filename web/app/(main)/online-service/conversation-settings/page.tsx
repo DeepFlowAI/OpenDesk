@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconGripVertical, IconHistory, IconPencil, IconPlus, IconSettings, IconTrash } from '@tabler/icons-react'
+import { IconClock, IconGripVertical, IconHistory, IconMoodSmile, IconPencil, IconPlus, IconSettings, IconTrash } from '@tabler/icons-react'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { Switch } from '@/components/ui/switch'
@@ -17,9 +17,21 @@ import {
   usePatchSatisfactionSurveyEnabled,
   useSatisfactionSurveyConfig,
 } from '@/service/use-satisfaction-survey'
+import { useEmojiSettings } from '@/service/use-emoji-settings'
+import {
+  useSaveUserStatFieldSettings,
+  useUserStatFieldSettings,
+} from '@/service/use-conversation-user-statistics'
+import { useVisitorTimeoutCloseSettings } from '@/service/use-visitor-timeout-close'
 import type { Channel } from '@/models/channel'
+import type {
+  UserStatFieldSettings,
+  UserStatFieldSettingsPayload,
+} from '@/models/conversation-user-statistics'
+import type { EmojiTargetPayload } from '@/models/emoji-setting'
 import type { SatisfactionSurveyConfig, SatisfactionSurveyType } from '@/models/satisfaction-survey'
 import { getActiveTriggerModes } from '@/models/satisfaction-survey'
+import type { VisitorTimeoutCloseConfig } from '@/models/visitor-timeout-close'
 import type {
   WelcomeMessageCondition,
   WelcomeMessageRuleListItem,
@@ -96,6 +108,45 @@ function satisfactionSummary(config: SatisfactionSurveyConfig, locale: Locale) {
   return { types, ratingModes, triggers }
 }
 
+function emojiTargetSummary(config: EmojiTargetPayload, locale: Locale): string {
+  const status = config.enabled ? t('emoji.enabled.on', locale) : t('emoji.enabled.off', locale)
+  return `${status} · ${t('emoji.summary.count', locale, { count: config.emojis.length })}`
+}
+
+function visitorTimeoutSummary(config: VisitorTimeoutCloseConfig, locale: Locale) {
+  const targets = []
+  if (config.notify_agent) targets.push(t('visitorTimeout.summary.targetAgent', locale))
+  if (config.notify_visitor) targets.push(t('visitorTimeout.summary.targetVisitor', locale))
+  return {
+    status: config.enabled ? t('visitorTimeout.enabled.on', locale) : t('visitorTimeout.enabled.off', locale),
+    vipRule: config.vip_enabled ? t('visitorTimeout.enabled.on', locale) : t('visitorTimeout.enabled.off', locale),
+    updatedAt: formatDate(config.updated_at, locale),
+    normalFirst: t('visitorTimeout.summary.firstChip', locale, { minutes: config.first_normal_minutes }),
+    normalClose: t('visitorTimeout.summary.closeChip', locale, { minutes: config.close_normal_minutes }),
+    vipFirst: t('visitorTimeout.summary.firstChip', locale, { minutes: config.first_vip_minutes }),
+    vipClose: t('visitorTimeout.summary.closeChip', locale, { minutes: config.close_vip_minutes }),
+    targets: targets.join(' / ') || '—',
+  }
+}
+
+type UserStatFieldKey = keyof UserStatFieldSettingsPayload
+
+const USER_STAT_FIELD_KEYS: UserStatFieldKey[] = [
+  'show_call_count',
+  'show_session_count',
+  'show_unresolved_ticket_count',
+  'show_total_ticket_count',
+]
+
+function userStatPayload(settings: UserStatFieldSettings): UserStatFieldSettingsPayload {
+  return {
+    show_session_count: settings.show_session_count,
+    show_call_count: settings.show_call_count,
+    show_unresolved_ticket_count: settings.show_unresolved_ticket_count,
+    show_total_ticket_count: settings.show_total_ticket_count,
+  }
+}
+
 function DeleteModal({
   item,
   onCancel,
@@ -151,11 +202,30 @@ export default function ConversationSettingsPage() {
     isError: satisfactionError,
     refetch: refetchSatisfaction,
   } = useSatisfactionSurveyConfig()
+  const {
+    data: emojiSettings,
+    isPending: emojiPending,
+    isError: emojiError,
+    refetch: refetchEmojiSettings,
+  } = useEmojiSettings()
+  const {
+    data: userStatSettings,
+    isPending: userStatPending,
+    isError: userStatError,
+    refetch: refetchUserStatSettings,
+  } = useUserStatFieldSettings()
+  const {
+    data: visitorTimeoutSettings,
+    isPending: visitorTimeoutPending,
+    isError: visitorTimeoutError,
+    refetch: refetchVisitorTimeoutSettings,
+  } = useVisitorTimeoutCloseSettings()
   const { data: channelsData } = useChannels()
   const deleteMut = useDeleteWelcomeMessageRule()
   const reorderMut = useReorderWelcomeMessageRules()
   const patchEnabledMut = usePatchWelcomeMessageRuleEnabled()
   const patchSatisfactionMut = usePatchSatisfactionSurveyEnabled()
+  const saveUserStatMut = useSaveUserStatFieldSettings()
 
   const items = useMemo(() => data?.items ?? [], [data?.items])
   const channels = (channelsData ?? []) as Channel[]
@@ -232,7 +302,25 @@ export default function ConversationSettingsPage() {
     }
   }
 
+  const handleToggleUserStatField = async (key: UserStatFieldKey) => {
+    if (!userStatSettings) return
+    const next = {
+      ...userStatPayload(userStatSettings),
+      [key]: !userStatSettings[key],
+    }
+    try {
+      await saveUserStatMut.mutateAsync(next)
+      showToast('success', t('userStats.settings.saveSuccess', locale))
+    } catch {
+      showToast('error', t('userStats.settings.saveFailed', locale))
+      refetchUserStatSettings()
+    }
+  }
+
   const satisfactionMeta = satisfaction?.configured ? satisfactionSummary(satisfaction, locale) : null
+  const visitorTimeoutMeta = visitorTimeoutSettings
+    ? visitorTimeoutSummary(visitorTimeoutSettings, locale)
+    : null
 
   return (
     <div className="flex flex-col gap-6">
@@ -446,6 +534,221 @@ export default function ConversationSettingsPage() {
             </div>
           </div>
         )}
+      </section>
+
+      <section className="flex flex-col gap-4 border-t border-border pt-6">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">{t('emoji.summary.title', locale)}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">{t('emoji.summary.description', locale)}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => router.push('/online-service/conversation-settings/emojis')}
+            className="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm font-medium text-foreground hover:bg-accent"
+          >
+            <IconMoodSmile size={17} />
+            {t('emoji.summary.edit', locale)}
+          </button>
+        </div>
+
+        {emojiPending ? (
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="h-28 animate-pulse rounded-md border border-border bg-muted/50" />
+            <div className="h-28 animate-pulse rounded-md border border-border bg-muted/50" />
+          </div>
+        ) : emojiError ? (
+          <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border py-12">
+            <p className="text-sm text-muted-foreground">{t('emoji.loadFailed', locale)}</p>
+            <button
+              type="button"
+              onClick={() => refetchEmojiSettings()}
+              className="inline-flex h-9 items-center rounded-md border border-border px-4 text-sm font-medium text-foreground hover:bg-accent"
+            >
+              {t('vc.retry', locale)}
+            </button>
+          </div>
+        ) : emojiSettings ? (
+          <div className="grid gap-4 md:grid-cols-2">
+            {(['user', 'agent'] as const).map((target) => {
+              const config = emojiSettings[target]
+              return (
+                <div key={target} className="rounded-md border border-border p-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-foreground">{t(`emoji.target.${target}`, locale)}</h3>
+                      <p className="mt-1 text-sm text-muted-foreground">{emojiTargetSummary(config, locale)}</p>
+                    </div>
+                    <span
+                      className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+                        config.enabled ? 'bg-green-50 text-green-700' : 'bg-muted text-muted-foreground'
+                      }`}
+                    >
+                      {config.enabled ? t('emoji.enabled.on', locale) : t('emoji.enabled.off', locale)}
+                    </span>
+                  </div>
+                  <div className="mt-4 flex min-h-9 flex-wrap gap-1.5">
+                    {config.emojis.slice(0, 12).map((item) => (
+                      <span
+                        key={item.emoji}
+                        className="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-lg leading-none"
+                        title={locale === 'en' ? item.name_en || item.name : item.name}
+                      >
+                        {item.emoji}
+                      </span>
+                    ))}
+                    {config.emojis.length > 12 && (
+                      <span className="flex h-8 items-center rounded-md bg-muted px-2 text-xs text-muted-foreground">
+                        +{config.emojis.length - 12}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        ) : null}
+      </section>
+
+      <section className="flex flex-col gap-4 border-t border-border pt-6">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">{t('visitorTimeout.summary.title', locale)}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">{t('visitorTimeout.summary.description', locale)}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => router.push('/online-service/conversation-settings/visitor-timeout-close')}
+            className="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm font-medium text-foreground hover:bg-accent"
+          >
+            <IconClock size={17} />
+            {t('visitorTimeout.summary.edit', locale)}
+          </button>
+        </div>
+
+        {visitorTimeoutPending ? (
+          <div className="grid gap-4 md:grid-cols-4">
+            {[0, 1, 2, 3].map((item) => (
+              <div key={item} className="h-24 animate-pulse rounded-md border border-border bg-muted/50" />
+            ))}
+          </div>
+        ) : visitorTimeoutError ? (
+          <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border py-12">
+            <p className="text-sm text-muted-foreground">{t('visitorTimeout.loadFailed', locale)}</p>
+            <button
+              type="button"
+              onClick={() => refetchVisitorTimeoutSettings()}
+              className="inline-flex h-9 items-center rounded-md border border-border px-4 text-sm font-medium text-foreground hover:bg-accent"
+            >
+              {t('vc.retry', locale)}
+            </button>
+          </div>
+        ) : visitorTimeoutSettings && visitorTimeoutMeta ? (
+          visitorTimeoutSettings.configured ? (
+            <div className="rounded-md border border-border p-5">
+              <div className="grid gap-6 md:grid-cols-3">
+                <div className="flex min-w-0 flex-col gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">{t('visitorTimeout.summary.status', locale)}</span>
+                  <span className="w-fit rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-foreground">
+                    {visitorTimeoutMeta.status}
+                  </span>
+                </div>
+                <div className="flex min-w-0 flex-col gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">{t('visitorTimeout.summary.vipRule', locale)}</span>
+                  <span className="w-fit rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-foreground">
+                    {visitorTimeoutMeta.vipRule}
+                  </span>
+                </div>
+                <div className="flex min-w-0 flex-col gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">{t('visitorTimeout.summary.updatedAt', locale)}</span>
+                  <span className="truncate text-sm text-foreground">{visitorTimeoutMeta.updatedAt}</span>
+                </div>
+              </div>
+              <div className="mt-5 flex flex-col gap-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="w-24 shrink-0 text-xs font-medium text-muted-foreground">{t('visitorTimeout.summary.normal', locale)}</span>
+                  <span className="rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-foreground">{visitorTimeoutMeta.normalFirst}</span>
+                  <span className="rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-foreground">{visitorTimeoutMeta.normalClose}</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="w-24 shrink-0 text-xs font-medium text-muted-foreground">{t('visitorTimeout.summary.vip', locale)}</span>
+                  {visitorTimeoutSettings.vip_enabled ? (
+                    <>
+                      <span className="rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-foreground">{visitorTimeoutMeta.vipFirst}</span>
+                      <span className="rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-foreground">{visitorTimeoutMeta.vipClose}</span>
+                    </>
+                  ) : (
+                    <span className="rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-foreground">{t('visitorTimeout.summary.vipOff', locale)}</span>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="w-24 shrink-0 text-xs font-medium text-muted-foreground">{t('visitorTimeout.summary.targets', locale)}</span>
+                  <span className="rounded-md bg-muted px-2.5 py-1 text-xs font-medium text-foreground">{visitorTimeoutMeta.targets}</span>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center gap-4 rounded-md border border-border px-6 py-12 text-center">
+              <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-muted text-muted-foreground">
+                <IconClock size={24} />
+              </div>
+              <div>
+                <p className="text-sm font-medium text-foreground">{t('visitorTimeout.summary.emptyTitle', locale)}</p>
+                <p className="mt-2 text-sm text-muted-foreground">{t('visitorTimeout.summary.emptyDescription', locale)}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => router.push('/online-service/conversation-settings/visitor-timeout-close')}
+                className="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/80"
+              >
+                <IconClock size={17} />
+                {t('visitorTimeout.summary.emptyAction', locale)}
+              </button>
+            </div>
+          )
+        ) : null}
+      </section>
+
+      <section className="flex flex-col gap-4 border-t border-border pt-6">
+        <div>
+          <h2 className="text-lg font-semibold text-foreground">{t('userStats.settings.title', locale)}</h2>
+        </div>
+
+        {userStatPending ? (
+          <div className="grid grid-cols-4 overflow-hidden rounded-md border border-border bg-background">
+            {USER_STAT_FIELD_KEYS.map((key) => (
+              <div key={key} className="h-16 animate-pulse border-l border-border first:border-l-0 bg-muted/50" />
+            ))}
+          </div>
+        ) : userStatError ? (
+          <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border py-12">
+            <p className="text-sm text-muted-foreground">{t('userStats.settings.loadFailed', locale)}</p>
+            <button
+              type="button"
+              onClick={() => refetchUserStatSettings()}
+              className="inline-flex h-9 items-center rounded-md border border-border px-4 text-sm font-medium text-foreground hover:bg-accent"
+            >
+              {t('vc.retry', locale)}
+            </button>
+          </div>
+        ) : userStatSettings ? (
+          <div className="grid grid-cols-4 overflow-hidden rounded-md border border-border bg-background">
+            {USER_STAT_FIELD_KEYS.map((key) => {
+              const checked = userStatSettings[key]
+              return (
+                <div key={key} className="flex min-w-0 items-center justify-between gap-3 border-l border-border px-5 py-4 first:border-l-0">
+                  <span className="truncate text-sm font-medium text-foreground">{t(`userStats.settings.field.${key}`, locale)}</span>
+                  <Switch
+                    checked={checked}
+                    disabled={saveUserStatMut.isPending}
+                    aria-label={t(`userStats.settings.field.${key}`, locale)}
+                    onCheckedChange={() => handleToggleUserStatField(key)}
+                  />
+                </div>
+              )
+            })}
+          </div>
+        ) : null}
       </section>
 
       {deleteTarget && (

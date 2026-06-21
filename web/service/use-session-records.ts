@@ -29,6 +29,7 @@ export const useSessionRecords = (filters: SessionRecordFilters) =>
       if (filters.end_date) params.end_date = filters.end_date
       if (filters.agent_id) params.agent_id = filters.agent_id
       if (filters.visitor_id) params.visitor_id = filters.visitor_id
+      if (filters.session_type) params.session_type = filters.session_type
       if (filters.keyword) params.keyword = filters.keyword
       if (filters.satisfaction_status) params.satisfaction_status = filters.satisfaction_status
       if (filters.satisfaction_resolved) params.satisfaction_resolved = filters.satisfaction_resolved

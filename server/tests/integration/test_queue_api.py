@@ -8,11 +8,21 @@ import pytest_asyncio
 from httpx import AsyncClient
 
 from app.core.security import create_access_token
+from app.db.session import AsyncSessionLocal
+from app.models.employee import Employee
+from app.models.employee_group import EmployeeGroup, EmployeeGroupMember
 from tests.integration.rbac_helpers import auth_headers_for_seeded_admin, ensure_admin_principals
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def seed_admin_principals():
+async def seed_admin_principals(monkeypatch):
+    async def skip_queue_realtime(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.queue_realtime_service.QueueRealtimeService.emit_queue_updated",
+        skip_queue_realtime,
+    )
     await ensure_admin_principals([7])
 
 
@@ -24,30 +34,42 @@ def _auth_header(tenant_id: int = 7, user_id: int | None = None, role: str = "ad
 
 
 async def _create_agent_and_group(client: AsyncClient, tenant_id: int = 7) -> tuple[int, int]:
-    headers = _auth_header(tenant_id=tenant_id)
-    ts = time.time_ns()
-    employee_resp = await client.post(
-        "/api/v1/employees",
-        json={
-            "name": f"Queue Agent {ts}",
-            "username": f"queue_agent_{ts}",
-            "email": f"queue_agent_{ts}@example.com",
-            "password": "Test1234abc",
-            "roles": ["agent"],
-            "max_concurrent": 2,
-        },
-        headers=headers,
-    )
-    assert employee_resp.status_code == 201, employee_resp.text
-    employee_id = employee_resp.json()["id"]
+    agent_ids, group_id = await _create_agents_and_group(client, max_concurrents=[2], tenant_id=tenant_id)
+    return agent_ids[0], group_id
 
-    group_resp = await client.post(
-        "/api/v1/employee-groups",
-        json={"name": f"Queue Group {ts}", "member_ids": [employee_id]},
-        headers=headers,
-    )
-    assert group_resp.status_code == 201, group_resp.text
-    return employee_id, group_resp.json()["id"]
+
+async def _create_agents_and_group(
+    _client: AsyncClient,
+    *,
+    max_concurrents: list[int],
+    tenant_id: int = 7,
+) -> tuple[list[int], int]:
+    ts = time.time_ns()
+    employee_ids: list[int] = []
+    async with AsyncSessionLocal() as db:
+        for index, max_concurrent in enumerate(max_concurrents, start=1):
+            employee = Employee(
+                tenant_id=tenant_id,
+                username=f"qagt{index}_{ts}",
+                email=f"queue-agent-{index}-{ts}@example.com",
+                password_hash="test-password-hash",
+                display_name=f"Queue Agent {index} {ts}",
+                name=f"Queue Agent {index} {ts}",
+                roles=["agent"],
+                max_concurrent=max_concurrent,
+                is_active=True,
+            )
+            db.add(employee)
+            await db.flush()
+            employee_ids.append(employee.id)
+
+        group = EmployeeGroup(tenant_id=tenant_id, name=f"Queue Group {ts}")
+        db.add(group)
+        await db.flush()
+        for employee_id in employee_ids:
+            db.add(EmployeeGroupMember(group_id=group.id, employee_id=employee_id))
+        await db.commit()
+        return employee_ids, group.id
 
 
 class TestQueueAPI:

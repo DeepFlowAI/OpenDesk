@@ -114,7 +114,7 @@ export const useDeleteFieldDefinition = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => del(`v1/field-definitions/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: fieldDefinitionKeys.lists() }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: fieldDefinitionKeys.all }),
   })
 }
 

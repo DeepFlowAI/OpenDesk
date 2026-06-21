@@ -1,0 +1,19 @@
+/* Semi-transparent dark overlay for image preview (YARL uses .yarl__container as the backdrop) */
+.od-image-preview-lightbox .yarl__container {
+  background-color: rgba(0, 0, 0, 0.36);
+}
+
+.od-image-preview-lightbox .yarl__slide {
+  box-sizing: border-box;
+  padding: 72px 72px 24px;
+}
+
+.od-image-preview-lightbox .yarl__thumbnails_container {
+  background-color: rgba(0, 0, 0, 0.28);
+}
+
+@media (max-width: 640px) {
+  .od-image-preview-lightbox .yarl__slide {
+    padding: 64px 20px 20px;
+  }
+}

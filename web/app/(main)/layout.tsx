@@ -12,6 +12,7 @@ import {
   IconGitBranch,
   IconSettings,
   IconClock,
+  IconKey,
   IconPlugConnected,
   IconAddressBook,
   IconBuilding,
@@ -67,6 +68,7 @@ const ADMIN_NAV_ICONS: Record<AdminNavIconKey, ComponentType<{ size?: number; cl
   ticketWorkflows: IconGitBranch,
   systemSettings: IconSettings,
   serviceHours: IconClock,
+  apiKeys: IconKey,
   openAgent: IconPlugConnected,
 }
 
@@ -81,7 +83,9 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
     () => ADMIN_NAV_GROUPS
       .map((group) => ({
         ...group,
-        items: group.items.filter((item) => hasPermission(user, item.permission)),
+        items: group.items.filter((item) => (
+          item.superAdminOnly ? Boolean(user?.is_super_admin) : hasPermission(user, item.permission)
+        )),
       }))
       .filter((group) => group.items.length > 0),
     [user]
@@ -106,6 +110,10 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
   useEffect(() => {
     if (!mounted || !token || !user || authRefreshing || !hasPermission(user, 'admin.access')) return
     const routeRule = getAdminRouteRule(pathname)
+    if (routeRule?.superAdminOnly && !user.is_super_admin) {
+      router.replace('/403')
+      return
+    }
     if (routeRule && !hasAllPermissions(user, routeRule.permissions)) {
       router.replace(getDefaultAdminPath(user))
     }
@@ -114,6 +122,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
   if (!mounted || authRefreshing || !token || !user) return null
   if (!hasPermission(user, 'admin.access')) return null
   const routeRule = getAdminRouteRule(pathname)
+  if (routeRule?.superAdminOnly && !user.is_super_admin) return null
   if (routeRule && !hasAllPermissions(user, routeRule.permissions)) return null
   if (visibleNavGroups.length === 0) return null
 

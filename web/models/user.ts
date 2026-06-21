@@ -12,6 +12,7 @@ export type User = {
   email: string | null
   phone: string | null
   gender: string | null
+  level: string
   address: string | null
   remark: string | null
   web_id: string | null
@@ -36,6 +37,7 @@ export type CreateUserPayload = {
   email?: string | null
   phone?: string | null
   gender?: string | null
+  level?: string | null
   address?: string | null
   remark?: string | null
   web_id?: string | null
@@ -48,6 +50,7 @@ export type UpdateUserPayload = {
   email?: string | null
   phone?: string | null
   gender?: string | null
+  level?: string | null
   address?: string | null
   remark?: string | null
   web_id?: string | null
@@ -65,6 +68,18 @@ export type UserQueryPayload = {
   sort_order?: 'asc' | 'desc'
   page?: number
   per_page?: number
+}
+
+export type UserExportColumn = {
+  field_key: string | null
+  field_id: number | null
+  name: string
+  field_type?: string | null
+}
+
+export type UserExportPayload = Omit<UserQueryPayload, 'page' | 'per_page'> & {
+  locale?: string
+  columns: UserExportColumn[]
 }
 
 export type ViewCountItem = {

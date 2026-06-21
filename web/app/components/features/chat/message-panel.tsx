@@ -7,12 +7,14 @@ import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
 import { useChatStore } from '@/context/chat-store'
 import { useMessages, conversationKeys, fetchConversationHistory } from '@/service/use-conversations'
+import { useAgentEmojiSettings } from '@/service/use-emoji-settings'
 import { useConversationSatisfaction, useSendSatisfactionInvitation } from '@/service/use-satisfaction-survey'
 import { AgentChatRuntimeProvider } from '@/components/assistant-ui/agent-chat-runtime'
 import { AgentThread } from '@/components/assistant-ui/agent-thread'
+import type { ComposerInsertRequest } from '@/components/assistant-ui/agent-composer'
 import { t } from '@/utils/i18n'
-import { hasPermission } from '@/utils/permissions'
-import type { Conversation, WorkspaceConversationHistoryItem } from '@/models/conversation'
+import { getDataScope, hasPermission } from '@/utils/permissions'
+import type { AgentStatus, Conversation, WorkspaceConversationHistoryItem } from '@/models/conversation'
 import type { Socket } from 'socket.io-client'
 
 const HISTORY_PAGE_SIZE = 10
@@ -30,16 +32,38 @@ type Props = {
   conversation: Conversation | null
   socket: Socket | null
   connected: boolean
+  agentStatus: AgentStatus | null
   onCreateTicket?: (conversationId: number) => void
+  onStartNewConversation?: (conversationId: number) => void | Promise<void>
+  startingNewConversation?: boolean
   onTransferred?: (toName: string) => void
+  composerInsertRequest?: ComposerInsertRequest | null
+  composerInputHeight?: number
+  onComposerInputHeightCommit?: (height: number) => void
+  messageSearchOpen?: boolean
+  onOpenMessageSearch?: () => void
+  messageSearchTarget?: {
+    conversationId: number
+    messageId: number
+    requestId: number
+  } | null
 }
 
 export function MessagePanel({
   conversation,
   socket,
   connected,
+  agentStatus,
   onCreateTicket,
+  onStartNewConversation,
+  startingNewConversation,
   onTransferred,
+  composerInsertRequest,
+  composerInputHeight,
+  onComposerInputHeightCommit,
+  messageSearchOpen,
+  onOpenMessageSearch,
+  messageSearchTarget,
 }: Props) {
   const { locale } = useLocaleStore()
   const currentUser = useAuthStore((state) => state.user)
@@ -61,8 +85,50 @@ export function MessagePanel({
   const isTyping = visitorTyping.get(convId) || false
   const typingContent = visitorTypingContent.get(convId) || ''
   const isClosed = conversation?.status === 'closed'
+  const isPeerConversation = Boolean(
+    conversation
+    && (
+      conversation.viewer_relation === 'peer'
+      || (
+        conversation.agent?.id != null
+        && currentUser?.id != null
+        && conversation.agent.id !== currentUser.id
+      )
+    ),
+  )
   const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
-  const canTransfer = hasPermission(currentUser, 'chat.conversation.transfer')
+  const canTransferPeerConversation =
+    hasPermission(currentUser, 'chat.conversation.transfer')
+    || (
+      hasPermission(currentUser, 'chat.conversation.peer.view')
+      && getDataScope(currentUser, 'chat.conversation.peer.view') !== 'self'
+    )
+  const canTransferCurrentConversation = isPeerConversation
+    ? canTransferPeerConversation
+    : hasPermission(currentUser, 'chat.conversation.transfer')
+  const canTransfer = Boolean(
+    conversation?.agent
+    && !isClosed
+    && canTransferCurrentConversation,
+  )
+  const canSendPublicReply =
+    !isClosed && (!isPeerConversation || hasPermission(currentUser, 'chat.conversation.peer_message.send'))
+  const canCreateInternalNote =
+    !isClosed
+    && isPeerConversation
+    && hasPermission(currentUser, 'chat.conversation.internal_note.create')
+  const canEndConversation = !isClosed && !isPeerConversation
+  const startNewDisabledReason = !isClosed
+    ? null
+    : agentStatus?.status !== 'online'
+      ? t('ws.chat.startNewDisabledOffline', locale)
+      : !conversation?.visitor || !conversation.channel
+        ? t('ws.chat.startNewDisabledMissingVisitor', locale)
+        : null
+  const canStartNewConversation = Boolean(isClosed && !startNewDisabledReason)
+  const composerReadOnlyReason = !isClosed && !canSendPublicReply && !canCreateInternalNote
+    ? t('ws.chat.peerReadOnly', locale)
+    : null
 
   // Force refetch when switching conversations
   useLayoutEffect(() => {
@@ -82,6 +148,7 @@ export function MessagePanel({
   // Fetch initial messages
   const { data: msgData } = useMessages(convId)
   const { data: satisfactionState, isLoading: satisfactionLoading } = useConversationSatisfaction(convId)
+  const { data: emojiConfig } = useAgentEmojiSettings(hasPermission(currentUser, 'chat.workspace.use'))
   const sendSatisfaction = useSendSatisfactionInvitation(convId)
 
   const handleSendSatisfaction = useCallback(async () => {
@@ -113,9 +180,10 @@ export function MessagePanel({
   // the server-side reset cannot revive the unread badge.
   useEffect(() => {
     if (!socket || !convId || !connected) return
+    if (isPeerConversation) return
     socket.emit('mark_read', { conversation_id: convId })
     markConversationRead(convId)
-  }, [socket, convId, connected, markConversationRead])
+  }, [socket, convId, connected, markConversationRead, isPeerConversation])
 
   // Load more messages
   const handleLoadMore = useCallback(async () => {
@@ -235,14 +303,33 @@ export function MessagePanel({
         onCreateTicket={() => onCreateTicket?.(convId)}
         canCreateTicket={canCreateTicket}
         canTransfer={canTransfer}
+        canEndConversation={canEndConversation}
+        canSendPublicReply={canSendPublicReply}
+        canCreateInternalNote={canCreateInternalNote}
+        composerReadOnlyReason={composerReadOnlyReason}
+        canStartNewConversation={canStartNewConversation}
+        startNewConversationDisabledReason={startNewDisabledReason}
+        startingNewConversation={Boolean(startingNewConversation)}
+        onStartNewConversation={() => {
+          if (convId) void onStartNewConversation?.(convId)
+        }}
         onTransferred={(toName) => onTransferred?.(toName)}
         satisfactionState={satisfactionState ?? null}
         satisfactionLoading={satisfactionLoading}
         satisfactionSending={sendSatisfaction.isPending}
         onSendSatisfaction={handleSendSatisfaction}
+        emojiConfig={emojiConfig ?? null}
       >
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
-          <AgentThread socket={socket} />
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-[#FAFAFA]">
+          <AgentThread
+            socket={socket}
+            composerInsertRequest={composerInsertRequest}
+            composerInputHeight={composerInputHeight}
+            onComposerInputHeightCommit={onComposerInputHeightCommit}
+            messageSearchOpen={messageSearchOpen}
+            onOpenMessageSearch={onOpenMessageSearch}
+            messageSearchTarget={messageSearchTarget}
+          />
         </div>
       </AgentChatRuntimeProvider>
     </div>

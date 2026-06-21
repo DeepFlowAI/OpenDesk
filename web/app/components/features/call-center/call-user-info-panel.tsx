@@ -29,13 +29,11 @@ type Props = {
 }
 
 const SYSTEM_KEY_ALIAS: Record<string, keyof User> = { nickname: 'name' }
-const EDITABLE_SYSTEM_KEYS = new Set(['name', 'email', 'phone', 'gender', 'address', 'remark', 'web_id', 'organization_id'])
+const EDITABLE_SYSTEM_KEYS = new Set(['name', 'email', 'phone', 'gender', 'level', 'address', 'remark', 'web_id', 'organization_id'])
 const READONLY_FIELD_KEYS = new Set(['id', 'public_id', 'external_id', 'created_at', 'updated_at', 'channel_id'])
 const INSTANT_SAVE_FIELD_TYPES = new Set<FieldType>([
   FieldType.SINGLE_SELECT,
-  FieldType.MULTI_SELECT,
   FieldType.SINGLE_SELECT_TREE,
-  FieldType.MULTI_SELECT_TREE,
   FieldType.FILE,
   FieldType.ORGANIZATION_SELECT,
 ])

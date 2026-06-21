@@ -32,6 +32,7 @@ class User(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
     email: Mapped[str | None] = mapped_column(String(254), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     gender: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    level: Mapped[str] = mapped_column(String(16), nullable=False, default="normal", server_default="normal")
     address: Mapped[str | None] = mapped_column(String(256), nullable=True)
     remark: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     web_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

@@ -9,6 +9,7 @@ import pytest
 from app.core.exceptions import ValidationError
 from app.core.secret_store import decrypt_secret, encrypt_secret
 from app.libs.open_agent.base import (
+    OpenAgentAgentDetail,
     OpenAgentAgentListResult,
     OpenAgentAgentSummary,
     OpenAgentConnectionResult,
@@ -31,6 +32,7 @@ class FakeOpenAgentClient:
         self.ok = ok
         self.calls: list[tuple[str, str]] = []
         self.agent_calls: list[tuple[str, str, str, int, int]] = []
+        self.agent_detail_calls: list[tuple[str, str, int]] = []
 
     async def test_connection(self, base_url: str, api_key: str) -> OpenAgentConnectionResult:
         self.calls.append((base_url, api_key))
@@ -54,6 +56,37 @@ class FakeOpenAgentClient:
             page=page,
             per_page=per_page,
             pages=1,
+        )
+
+    async def get_agent(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: int,
+    ) -> OpenAgentAgentDetail:
+        self.agent_detail_calls.append((base_url, api_key, agent_id))
+        return OpenAgentAgentDetail(
+            id=agent_id,
+            name="Support Agent",
+            description=None,
+            status="active",
+            welcome_message={
+                "enabled": True,
+                "blocks": [
+                    {"type": "markdown", "content": "Hi **there**"},
+                    {"type": "embed", "embed_code": "<div>Card</div>", "height": 240},
+                ],
+            },
+            faq={
+                "enabled": True,
+                "title": "常见问题",
+                "categories": [
+                    {
+                        "name": "账户",
+                        "questions": [{"text": "怎么重置密码？"}],
+                    }
+                ],
+            },
         )
 
 
@@ -215,3 +248,36 @@ async def test_list_active_agents_requires_saved_credentials(monkeypatch):
 
     with pytest.raises(ValidationError):
         await OpenAgentSettingsService.list_active_agents(object(), 1)
+
+
+@pytest.mark.asyncio
+async def test_get_agent_welcome_message_uses_agent_detail(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url="https://new.example.com/api/v1",
+        api_key_ciphertext=encrypt_secret("sk-saved"),
+    )
+    client = FakeOpenAgentClient()
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    response = await OpenAgentSettingsService.get_agent_welcome_message(
+        object(),
+        1,
+        10,
+        open_agent_client=client,
+    )
+
+    assert response is not None
+    assert response.enabled is True
+    assert response.blocks[0].type == "markdown"
+    assert response.blocks[0].content == "Hi **there**"
+    assert response.blocks[1].type == "embed"
+    assert response.blocks[1].height == 240
+    assert response.faq is not None
+    assert response.faq.title == "常见问题"
+    assert response.faq.categories[0].questions[0].text == "怎么重置密码？"
+    assert client.agent_detail_calls == [("https://new.example.com/api/v1", "sk-saved", 10)]
