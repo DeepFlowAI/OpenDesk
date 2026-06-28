@@ -2,10 +2,10 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconPencil, IconPlus, IconTrash } from '@tabler/icons-react'
+import { IconCopy, IconPencil, IconPlus, IconTrash } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import { useChannels, useDeleteChannel } from '@/service/use-channels'
+import { useChannels, useCopyChannel, useDeleteChannel } from '@/service/use-channels'
 import type { Channel } from '@/models/channel'
 
 function formatDate(iso: string): string {
@@ -58,27 +58,87 @@ function DeleteModal({
   )
 }
 
+function CopyModal({
+  item,
+  onCancel,
+  onConfirm,
+  loading,
+}: {
+  item: Channel
+  onCancel: () => void
+  onConfirm: () => void
+  loading: boolean
+}) {
+  const { locale } = useLocaleStore()
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="w-[420px] rounded-xl bg-white p-6">
+        <h2 className="text-lg font-semibold text-foreground">{t('ch.copy.title', locale)}</h2>
+        <p className="mt-3 text-sm text-muted-foreground">
+          {t('ch.copy.confirm', locale)}
+        </p>
+        <div className="mt-3 rounded-lg border border-border p-3">
+          <p className="text-sm font-medium text-foreground">{item.name}</p>
+        </div>
+        <div className="mt-6 flex justify-end gap-3">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="h-9 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 hover:bg-accent"
+          >
+            {t('ch.copy.cancel', locale)}
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={loading}
+            className="h-9 rounded-lg bg-primary px-4 text-sm font-medium text-white hover:bg-primary/80 disabled:opacity-50"
+          >
+            {loading ? '...' : t('ch.copy.ok', locale)}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function ChannelWebListPage() {
   const router = useRouter()
   const { locale } = useLocaleStore()
   const { data, isLoading } = useChannels()
   const deleteMut = useDeleteChannel()
+  const copyMut = useCopyChannel()
 
   const items = (data ?? []) as Channel[]
 
   const [deleteTarget, setDeleteTarget] = useState<Channel | null>(null)
+  const [copyTarget, setCopyTarget] = useState<Channel | null>(null)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+
+  const showToast = (type: 'success' | 'error', text: string) => {
+    setToast({ type, text })
+    setTimeout(() => setToast(null), 3000)
+  }
 
   const handleDelete = async () => {
     if (!deleteTarget) return
     try {
       await deleteMut.mutateAsync(deleteTarget.id)
       setDeleteTarget(null)
-      setToast({ type: 'success', text: t('ch.deleteSuccess', locale) })
-      setTimeout(() => setToast(null), 3000)
+      showToast('success', t('ch.deleteSuccess', locale))
     } catch {
-      setToast({ type: 'error', text: t('ch.deleteFailed', locale) })
-      setTimeout(() => setToast(null), 3000)
+      showToast('error', t('ch.deleteFailed', locale))
+    }
+  }
+
+  const handleCopy = async () => {
+    if (!copyTarget) return
+    try {
+      await copyMut.mutateAsync(copyTarget.id)
+      setCopyTarget(null)
+      showToast('success', t('ch.copySuccess', locale))
+    } catch {
+      showToast('error', t('ch.copyFailed', locale))
     }
   }
 
@@ -127,7 +187,7 @@ export default function ChannelWebListPage() {
           <div className="flex h-12 items-center gap-6 rounded-t-lg border-b border-border bg-muted px-6 text-sm font-semibold text-foreground/80">
             <div className="min-w-0 flex-1">{t('ch.col.name', locale)}</div>
             <div className="w-[160px] shrink-0">{t('ch.col.updatedAt', locale)}</div>
-            <div className="w-[100px] shrink-0">{t('ch.col.actions', locale)}</div>
+            <div className="w-[120px] shrink-0">{t('ch.col.actions', locale)}</div>
           </div>
           {/* Data rows: h-14 (56px), border-bottom */}
           {items.map((row) => (
@@ -139,7 +199,7 @@ export default function ChannelWebListPage() {
               <div className="w-[160px] shrink-0 text-sm text-muted-foreground">
                 {formatDate(row.updated_at)}
               </div>
-              <div className="flex w-[100px] shrink-0 items-center gap-4">
+              <div className="flex w-[120px] shrink-0 items-center gap-4">
                 <button
                   type="button"
                   onClick={() => router.push(`/channels/web/${row.id}`)}
@@ -147,6 +207,14 @@ export default function ChannelWebListPage() {
                   aria-label={t('ch.action.edit', locale)}
                 >
                   <IconPencil size={18} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCopyTarget(row)}
+                  className="text-foreground/80 transition-colors hover:text-foreground"
+                  aria-label={t('ch.action.copy', locale)}
+                >
+                  <IconCopy size={18} />
                 </button>
                 <button
                   type="button"
@@ -160,6 +228,15 @@ export default function ChannelWebListPage() {
             </div>
           ))}
         </div>
+      )}
+
+      {copyTarget && (
+        <CopyModal
+          item={copyTarget}
+          onCancel={() => setCopyTarget(null)}
+          onConfirm={handleCopy}
+          loading={copyMut.isPending}
+        />
       )}
 
       {deleteTarget && (

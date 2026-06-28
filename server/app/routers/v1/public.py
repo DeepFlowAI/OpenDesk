@@ -6,7 +6,7 @@ Used by the visitor-facing chat widget to fetch channel config, messages, and fi
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from fastapi import Header
 from fastapi.routing import APIRoute
 from starlette.responses import StreamingResponse
@@ -15,12 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ValidationError
 from app.db.deps import get_db, get_redis
+from app.db.session import AsyncSessionLocal
 from app.schemas.channel import ChannelPublicResponse
 from app.schemas.conversation_file import ConversationFileAccessResponse, ConversationFileUploadResponse
 from app.schemas.emoji_setting import EmojiTargetConfigResponse
 from app.schemas.message import (
     CustomerReadResponse,
     PublicMessageListResponse,
+    PublicMessageResponse,
     VisitorConversationHistoryResponse,
     VisitorUnreadOfflineReplyResponse,
 )
@@ -29,7 +31,11 @@ from app.schemas.offline_message import (
     OfflineMessageSendRequest,
     PublicOfflineMessageResponse,
 )
-from app.schemas.open_agent_conversation import OpenAgentChatRequest
+from app.schemas.open_agent_conversation import (
+    OpenAgentChatRequest,
+    OpenAgentFeedbackRequest,
+    OpenAgentFeedbackResponse,
+)
 from app.schemas.satisfaction_survey_record import (
     PublicSatisfactionInvitation,
     PublicSatisfactionSubmitResponse,
@@ -92,7 +98,23 @@ class _TelemetryRoute(APIRoute):
 _telemetry_router = APIRouter(route_class=_TelemetryRoute)
 
 
+def _first_client_ip(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    first = value.split(",", 1)[0].strip()
+    return first or None
+
+
+def _client_ip_from_request(request: Request) -> str | None:
+    for key in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
+        ip = _first_client_ip(request.headers.get(key))
+        if ip:
+            return ip
+    return _first_client_ip(request.client.host if request.client else None)
+
+
 async def get_visitor_context(
+    request: Request,
     authorization: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -100,7 +122,27 @@ async def get_visitor_context(
 
     if not authorization or not authorization.startswith("Bearer "):
         raise UnauthorizedError("Missing or invalid visitor session")
-    return await ChannelService.validate_visitor_session_token(db, authorization[7:])
+    context = await ChannelService.validate_visitor_session_token(db, authorization[7:])
+    visitor_ip = _client_ip_from_request(request)
+    if visitor_ip:
+        context["visitor_ip"] = visitor_ip
+    return context
+
+
+async def get_visitor_context_short_session(
+    request: Request,
+    authorization: str | None,
+) -> dict:
+    from app.core.exceptions import UnauthorizedError
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise UnauthorizedError("Missing or invalid visitor session")
+    async with AsyncSessionLocal() as db:
+        context = await ChannelService.validate_visitor_session_token(db, authorization[7:])
+    visitor_ip = _client_ip_from_request(request)
+    if visitor_ip:
+        context["visitor_ip"] = visitor_ip
+    return context
 
 
 @router.get("/channels/{channel_key}", response_model=ChannelPublicResponse)
@@ -171,6 +213,8 @@ async def create_offline_message_public(
         visitor_context,
         visitor_name=payload.visitor_name,
         metadata=payload.metadata,
+        visitor_system=payload.system,
+        visitor_browser=payload.browser,
     )
 
 
@@ -204,6 +248,8 @@ async def create_and_send_offline_message_public(
         visitor_context,
         content_type=body.content_type,
         content=body.content,
+        visitor_system=body.system,
+        visitor_browser=body.browser,
     )
 
 
@@ -239,6 +285,8 @@ async def send_offline_message_public(
         visitor_context,
         content_type=body.content_type,
         content=body.content,
+        visitor_system=body.system,
+        visitor_browser=body.browser,
     )
     return {"ok": True, "message": message}
 
@@ -321,6 +369,32 @@ async def get_conversation_messages_public(
 
 
 @router.post(
+    "/conversations/{conversation_public_id}/messages/{message_id}/recall",
+    response_model=PublicMessageResponse,
+)
+async def recall_conversation_message_public(
+    conversation_public_id: str,
+    message_id: int,
+    db: AsyncSession = Depends(get_db),
+    visitor_context: dict = Depends(get_visitor_context),
+):
+    """Recall a visitor-owned public message in the current Web conversation."""
+    msg, conversation, _conversation_update = await ConversationService.recall_visitor_message_for_session(
+        db,
+        conversation_public_id=conversation_public_id,
+        visitor_context=visitor_context,
+        message_id=message_id,
+    )
+    return ConversationService._message_response_payload(
+        msg,
+        conversation_public_id=conversation.public_id,
+        sender_name=conversation.visitor.name if conversation.visitor else None,
+        sender_avatar=None,
+        visitor_facing=True,
+    )
+
+
+@router.post(
     "/conversations/{conversation_public_id}/customer-read",
     response_model=CustomerReadResponse,
 )
@@ -341,13 +415,13 @@ async def mark_conversation_customer_read_public(
 async def chat_open_agent_public(
     conversation_public_id: str,
     body: OpenAgentChatRequest,
-    db: AsyncSession = Depends(get_db),
-    visitor_context: dict = Depends(get_visitor_context),
+    request: Request,
+    authorization: str | None = Header(None),
     redis: aioredis.Redis = Depends(get_redis),
 ):
     """Proxy OpenAgent chat SSE for a visitor-owned bot conversation."""
-    stream = OpenAgentConversationService.stream_chat_for_session(
-        db,
+    visitor_context = await get_visitor_context_short_session(request, authorization)
+    stream = OpenAgentConversationService.stream_chat_for_session_managed(
         conversation_public_id=conversation_public_id,
         visitor_context=visitor_context,
         body=body,
@@ -360,6 +434,25 @@ async def chat_open_agent_public(
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@router.post(
+    "/conversations/{conversation_public_id}/open-agent/feedback",
+    response_model=OpenAgentFeedbackResponse,
+)
+async def submit_open_agent_feedback_public(
+    conversation_public_id: str,
+    body: OpenAgentFeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+    visitor_context: dict = Depends(get_visitor_context),
+):
+    """Submit visitor feedback for a bot answer owned by this visitor session."""
+    return await OpenAgentConversationService.submit_feedback_for_session(
+        db,
+        conversation_public_id=conversation_public_id,
+        visitor_context=visitor_context,
+        body=body,
     )
 
 
@@ -438,6 +531,8 @@ async def upload_conversation_file_public(
 @router.post("/offline-messages/files")
 async def create_and_send_offline_message_file_public(
     file: UploadFile = File(...),
+    system: str | None = Form(None, max_length=64),
+    browser: str | None = Form(None, max_length=128),
     db: AsyncSession = Depends(get_db),
     r: aioredis.Redis = Depends(get_redis),
     visitor_context: dict = Depends(get_visitor_context),
@@ -448,6 +543,8 @@ async def create_and_send_offline_message_file_public(
         r,
         visitor_context,
         file,
+        visitor_system=system,
+        visitor_browser=browser,
     )
 
 

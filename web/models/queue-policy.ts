@@ -37,6 +37,12 @@ export function isQueueAssignmentStrategySupported(
   return !!strategy && QUEUE_ASSIGNMENT_STRATEGIES_BY_CHANNEL[channel].includes(strategy)
 }
 
+export type QueuePolicyConfig = {
+  returning_agent_priority_enabled?: boolean
+  returning_agent_window_hours?: number
+  [key: string]: unknown
+}
+
 export type QueuePolicy = {
   id: number
   tenant_id: number
@@ -47,7 +53,7 @@ export type QueuePolicy = {
   assignment_strategy: QueueAssignmentStrategy | null
   max_waiting_count: number | null
   max_wait_seconds: number | null
-  config: Record<string, unknown>
+  config: QueuePolicyConfig
   created_at: string | null
   updated_at: string | null
 }
@@ -62,7 +68,7 @@ export type QueuePolicyUpsertPayload = {
   assignment_strategy?: QueueAssignmentStrategy | null
   max_waiting_count?: number | null
   max_wait_seconds?: number | null
-  config?: Record<string, unknown>
+  config?: QueuePolicyConfig
 }
 
 export type QueuePolicyListParams = {

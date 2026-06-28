@@ -4,7 +4,7 @@ Workspace queue schemas.
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.conversation import AgentBrief, ChannelBrief, GroupBrief, VisitorBrief
 from app.schemas.message import MessageResponse
@@ -88,3 +88,20 @@ class QueueAssignmentWorkspaceResponse(BaseModel):
     conversation_id: int | None = None
     assigned_agent: AgentBrief | None = None
     assigned_to_current_user: bool
+
+
+class QueueAssignAndSendRequest(BaseModel):
+    content: str = Field(..., max_length=5000)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        content = value.strip()
+        if not content:
+            raise ValueError("Message content is required")
+        return content
+
+
+class QueueAssignAndSendResponse(QueueAssignmentWorkspaceResponse):
+    message: MessageResponse | None = None
+    message_sent: bool

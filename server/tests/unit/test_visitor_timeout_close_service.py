@@ -94,6 +94,10 @@ async def test_reset_on_visitor_message_upserts_next_check(monkeypatch):
         staticmethod(setting_or_default),
     )
     monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.get_by_conversation",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
         "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.upsert_for_conversation",
         upsert_for_conversation,
     )
@@ -120,6 +124,45 @@ async def test_reset_on_visitor_message_upserts_next_check(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_initialize_for_conversation_can_anchor_at_assignment_time(monkeypatch):
+    captured: dict = {}
+    conversation_started_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    assigned_at = datetime.now(timezone.utc)
+
+    async def setting_or_default(_db, _tenant_id):
+        return _enabled_payload(first_normal_minutes=5, close_normal_minutes=8), 7
+
+    async def upsert_for_conversation(_db, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(
+        VisitorTimeoutCloseService,
+        "_setting_or_default",
+        staticmethod(setting_or_default),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.get_by_conversation",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.upsert_for_conversation",
+        upsert_for_conversation,
+    )
+
+    result = await VisitorTimeoutCloseService.initialize_for_conversation(
+        AsyncMock(),
+        _conversation(started_at=conversation_started_at),
+        anchor_at=assigned_at,
+    )
+
+    assert result is not None
+    assert captured["anchor_at"] == assigned_at
+    assert captured["next_check_at"] == assigned_at + timedelta(minutes=5)
+    assert captured["config_version"] == 7
+
+
+@pytest.mark.asyncio
 async def test_process_state_sends_first_reminder(monkeypatch):
     called: dict = {}
     now = datetime.now(timezone.utc)
@@ -129,6 +172,7 @@ async def test_process_state_sends_first_reminder(monkeypatch):
         anchor_at=now - timedelta(minutes=11),
         anchor_message_id=None,
         first_reminded_at=None,
+        timeout_locked_at=None,
     )
     conversation = _conversation()
 
@@ -142,6 +186,10 @@ async def test_process_state_sends_first_reminder(monkeypatch):
         called["timeout_minutes"] = timeout_minutes
         called["now"] = now_arg
 
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.get_by_conversation",
+        AsyncMock(return_value=state),
+    )
     monkeypatch.setattr(
         "app.services.visitor_timeout_close_service.ConversationRepository.get_by_id",
         AsyncMock(return_value=conversation),
@@ -180,6 +228,7 @@ async def test_process_state_auto_closes_after_close_threshold(monkeypatch):
         anchor_at=now - timedelta(minutes=21),
         anchor_message_id=None,
         first_reminded_at=now - timedelta(minutes=10),
+        timeout_locked_at=None,
     )
     conversation = _conversation()
 
@@ -194,6 +243,10 @@ async def test_process_state_auto_closes_after_close_threshold(monkeypatch):
         called["now"] = now_arg
         called["redis"] = redis
 
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.get_by_conversation",
+        AsyncMock(return_value=state),
+    )
     monkeypatch.setattr(
         "app.services.visitor_timeout_close_service.ConversationRepository.get_by_id",
         AsyncMock(return_value=conversation),
@@ -232,6 +285,7 @@ async def test_process_state_clears_next_check_when_config_disabled(monkeypatch)
         anchor_at=now - timedelta(minutes=30),
         anchor_message_id=None,
         first_reminded_at=None,
+        timeout_locked_at=None,
     )
 
     async def setting_or_default(_db, _tenant_id):
@@ -243,6 +297,10 @@ async def test_process_state_clears_next_check_when_config_disabled(monkeypatch)
         captured["commit"] = commit
         return state_arg
 
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.get_by_conversation",
+        AsyncMock(return_value=state),
+    )
     monkeypatch.setattr(
         "app.services.visitor_timeout_close_service.ConversationRepository.get_by_id",
         AsyncMock(return_value=_conversation()),
@@ -262,6 +320,149 @@ async def test_process_state_clears_next_check_when_config_disabled(monkeypatch)
     assert outcome == "skipped"
     assert captured["state"] is state
     assert captured["data"] == {"next_check_at": None, "config_version": 2}
+
+
+@pytest.mark.asyncio
+async def test_reset_on_visitor_message_keeps_locked_state_paused(monkeypatch):
+    locked_at = datetime.now(timezone.utc)
+    locked_state = SimpleNamespace(
+        tenant_id=1,
+        conversation_id=100,
+        timeout_locked_at=locked_at,
+        timeout_locked_by_id=20,
+        next_check_at=None,
+    )
+    upsert = AsyncMock()
+
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.get_by_conversation",
+        AsyncMock(return_value=locked_state),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.upsert_for_conversation",
+        upsert,
+    )
+
+    result = await VisitorTimeoutCloseService.reset_on_visitor_message(
+        AsyncMock(),
+        _conversation(),
+        SimpleNamespace(
+            id=56,
+            content_type=MessageContentType.TEXT.value,
+            created_at=datetime.now(timezone.utc),
+        ),
+    )
+
+    assert result is locked_state
+    upsert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unlock_conversation_restarts_timer_from_unlock_time(monkeypatch):
+    captured: dict = {}
+    now = datetime(2026, 6, 28, 8, 0, tzinfo=timezone.utc)
+    locked_state = SimpleNamespace(
+        tenant_id=1,
+        conversation_id=100,
+        timeout_locked_at=now - timedelta(minutes=5),
+        timeout_locked_by_id=20,
+    )
+
+    async def setting_or_default(_db, _tenant_id):
+        return _enabled_payload(first_normal_minutes=7, close_normal_minutes=9), 5
+
+    async def update(_db, state_arg, data, *, commit=True):
+        captured["state"] = state_arg
+        captured["data"] = data
+        captured["commit"] = commit
+        return SimpleNamespace(**{**state_arg.__dict__, **data})
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.datetime",
+        FixedDatetime,
+    )
+    monkeypatch.setattr(
+        VisitorTimeoutCloseService,
+        "_setting_or_default",
+        staticmethod(setting_or_default),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.get_by_conversation",
+        AsyncMock(return_value=locked_state),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.update",
+        update,
+    )
+
+    result = await VisitorTimeoutCloseService.unlock_conversation_timeout(
+        AsyncMock(),
+        _conversation(),
+    )
+
+    assert result.timeout_locked_at is None
+    assert captured["data"]["anchor_at"] == now
+    assert captured["data"]["anchor_message_id"] is None
+    assert captured["data"]["first_reminded_at"] is None
+    assert captured["data"]["closed_at"] is None
+    assert captured["data"]["next_check_at"] == now + timedelta(minutes=7)
+    assert captured["data"]["config_version"] == 5
+    assert captured["data"]["timeout_locked_by_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_process_state_skips_locked_state_after_refetch(monkeypatch):
+    captured: dict = {}
+    now = datetime.now(timezone.utc)
+    stale_state = SimpleNamespace(
+        tenant_id=1,
+        conversation_id=100,
+        anchor_at=now - timedelta(minutes=30),
+        anchor_message_id=None,
+        first_reminded_at=None,
+        timeout_locked_at=None,
+    )
+    locked_state = SimpleNamespace(
+        tenant_id=1,
+        conversation_id=100,
+        anchor_at=stale_state.anchor_at,
+        anchor_message_id=None,
+        first_reminded_at=None,
+        timeout_locked_at=now,
+        next_check_at=now,
+    )
+
+    async def update(_db, state_arg, data, *, commit=True):
+        captured["state"] = state_arg
+        captured["data"] = data
+        captured["commit"] = commit
+        return state_arg
+
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.get_by_conversation",
+        AsyncMock(return_value=locked_state),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseStateRepository.update",
+        update,
+    )
+    get_conversation = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.ConversationRepository.get_by_id",
+        get_conversation,
+    )
+
+    outcome = await VisitorTimeoutCloseService.process_state(AsyncMock(), stale_state, now=now)
+
+    assert outcome == "skipped"
+    assert captured["state"] is locked_state
+    assert captured["data"] == {"next_check_at": None}
+    get_conversation.assert_not_called()
 
 
 @pytest.mark.asyncio

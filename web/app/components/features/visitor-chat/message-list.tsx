@@ -18,7 +18,9 @@ import {
 import { TypingIndicator } from './typing-indicator'
 import { IconLoader2 } from '@tabler/icons-react'
 import {
+  getAgentAvatarUrl,
   getOpenAgentAvatarUrl,
+  shouldShowAgentAvatar,
   shouldShowAssistantAvatar,
 } from './avatar'
 import { isLeaveMessagePromptMessage } from '@/lib/offline-message-event'
@@ -99,7 +101,8 @@ function VisitorWelcomeBubble({
     <WelcomeMessage
       content={message.content}
       config={config}
-      showAvatar={config.use_agent_avatar === true}
+      showAvatar={shouldShowAgentAvatar(null, config)}
+      avatarSrc={getAgentAvatarUrl(null, config)}
     />
   )
 }
@@ -149,7 +152,8 @@ export function MessageList({
           <WelcomeMessage
             content={welcomeMessage}
             config={config}
-            showAvatar={config.use_agent_avatar === true}
+            showAvatar={shouldShowAgentAvatar(null, config)}
+            avatarSrc={getAgentAvatarUrl(null, config)}
           />
         )}
       </div>
@@ -183,7 +187,8 @@ export function MessageList({
             <WelcomeMessage
               content={welcomeMessage}
               config={config}
-              showAvatar={config.use_agent_avatar === true}
+              showAvatar={shouldShowAgentAvatar(null, config)}
+              avatarSrc={getAgentAvatarUrl(null, config)}
             />
           )}
         </div>
@@ -222,7 +227,8 @@ export function MessageList({
                 <WelcomeMessage
                   content={msg.content}
                   config={config}
-                  showAvatar={config.use_agent_avatar === true}
+                  showAvatar={shouldShowAgentAvatar(null, config)}
+                  avatarSrc={getAgentAvatarUrl(null, config)}
                 />
               ) : isOpenAgentHandoffEventMessage(msg) ? (
                 <HumanHandoffEventMessage
@@ -239,7 +245,7 @@ export function MessageList({
         }
 
         const showAvatar = msg.sender_type === 'agent' || msg.sender_type === 'bot'
-          ? shouldShowAssistantAvatar(msg.sender_type, config)
+          ? shouldShowAssistantAvatar(msg, config)
           : shouldShowAvatar(msg, next)
 
         return (
@@ -266,8 +272,8 @@ export function MessageList({
           agentBubbleTextColor={config.agent_bubble_text_color || undefined}
           agentBubbleRadius={config.agent_bubble_radius}
           agentBubbleBorder={config.agent_bubble_border_color || undefined}
-          showAvatar={config.use_agent_avatar === true}
-          agentAvatar={latestAgentMessage?.sender_avatar}
+          showAvatar={shouldShowAgentAvatar(latestAgentMessage?.sender_avatar, config)}
+          agentAvatar={getAgentAvatarUrl(latestAgentMessage?.sender_avatar, config)}
           agentName={latestAgentMessage?.sender_name}
           locale={locale}
         />

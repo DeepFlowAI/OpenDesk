@@ -48,12 +48,68 @@ OFFLINE_MESSAGE_CONVERSATION_CREATED_EVENT = "offline_message_conversation_creat
 OFFLINE_MESSAGE_PROMPT_EVENT = "leave_message_prompt"
 OFFLINE_MESSAGE_ASSIGN_SELF_PERMISSION = "chat.queue.assign_self"
 OFFLINE_MESSAGE_ASSIGN_OTHER_PERMISSION = "chat.queue.assign_other"
+VISITOR_ENVIRONMENT_METADATA_KEY = "visitor_environment"
 
 
 class OfflineMessageService:
     @staticmethod
     def _metadata(row) -> dict:
         return getattr(row, "metadata_", None) or {}
+
+    @staticmethod
+    def _visitor_environment_metadata(
+        *,
+        visitor_system: object = None,
+        visitor_browser: object = None,
+        visitor_ip: object = None,
+    ) -> dict:
+        data = ConversationService._visitor_environment_data(
+            visitor_system=visitor_system,
+            visitor_browser=visitor_browser,
+            visitor_ip=visitor_ip,
+        )
+        environment = {
+            "system": data.get("visitor_system"),
+            "browser": data.get("visitor_browser"),
+            "ip": data.get("visitor_ip"),
+        }
+        return {key: value for key, value in environment.items() if value is not None}
+
+    @staticmethod
+    def _merge_visitor_environment_metadata(
+        metadata: dict | None,
+        *,
+        visitor_system: object = None,
+        visitor_browser: object = None,
+        visitor_ip: object = None,
+    ) -> dict:
+        base = dict(metadata) if isinstance(metadata, dict) else {}
+        environment = OfflineMessageService._visitor_environment_metadata(
+            visitor_system=visitor_system,
+            visitor_browser=visitor_browser,
+            visitor_ip=visitor_ip,
+        )
+        if not environment:
+            return base
+        existing = base.get(VISITOR_ENVIRONMENT_METADATA_KEY)
+        base[VISITOR_ENVIRONMENT_METADATA_KEY] = {
+            **(existing if isinstance(existing, dict) else {}),
+            **environment,
+        }
+        return base
+
+    @staticmethod
+    def _conversation_environment_from_metadata(metadata: dict | None) -> dict:
+        if not isinstance(metadata, dict):
+            return {}
+        environment = metadata.get(VISITOR_ENVIRONMENT_METADATA_KEY)
+        if not isinstance(environment, dict):
+            return {}
+        return ConversationService._visitor_environment_data(
+            visitor_system=environment.get("system"),
+            visitor_browser=environment.get("browser"),
+            visitor_ip=environment.get("ip"),
+        )
 
     @staticmethod
     def _brief(row: OfflineMessage) -> dict:
@@ -300,6 +356,8 @@ class OfflineMessageService:
         *,
         visitor_name: str | None = None,
         metadata: dict | None = None,
+        visitor_system: object = None,
+        visitor_browser: object = None,
     ) -> dict:
         tenant_id, channel_id, visitor_external_id, visitor, group_id, row_metadata, _leave_message_prompt = (
             await OfflineMessageService._prepare_leave_message_session(
@@ -308,6 +366,8 @@ class OfflineMessageService:
                 visitor_context,
                 visitor_name=visitor_name,
                 metadata=metadata,
+                visitor_system=visitor_system,
+                visitor_browser=visitor_browser,
             )
         )
 
@@ -328,6 +388,20 @@ class OfflineMessageService:
                 "status": "pending",
                 "metadata_": row_metadata,
             })
+        else:
+            existing_metadata = {
+                **OfflineMessageService._metadata(row),
+                **(metadata if isinstance(metadata, dict) else {}),
+            }
+            updated_metadata = OfflineMessageService._merge_visitor_environment_metadata(
+                existing_metadata,
+                visitor_system=visitor_system,
+                visitor_browser=visitor_browser,
+                visitor_ip=visitor_context.get("visitor_ip"),
+            )
+            if OfflineMessageService._metadata(row) != updated_metadata:
+                row.metadata_ = updated_metadata
+                await db.commit()
         return await OfflineMessageService.get_public_response(
             db,
             row.public_id,
@@ -343,12 +417,20 @@ class OfflineMessageService:
         *,
         visitor_name: str | None = None,
         metadata: dict | None = None,
+        visitor_system: object = None,
+        visitor_browser: object = None,
     ) -> tuple[int, int, str, object, int | None, dict, str]:
         tenant_id = int(visitor_context["tenant_id"])
         channel_id = int(visitor_context["channel_id"])
         visitor_external_id = visitor_context["visitor_external_id"]
         auto_name = visitor_name or visitor_context.get("visitor_name") or f"访客 {visitor_external_id[:6]}"
-        row_metadata = metadata or visitor_context.get("metadata") or {}
+        base_metadata = metadata or visitor_context.get("metadata") or {}
+        row_metadata = OfflineMessageService._merge_visitor_environment_metadata(
+            base_metadata,
+            visitor_system=visitor_system,
+            visitor_browser=visitor_browser,
+            visitor_ip=visitor_context.get("visitor_ip"),
+        )
 
         visitor, _ = await UserRepository.get_or_create(
             db,
@@ -358,13 +440,13 @@ class OfflineMessageService:
                 "name": auto_name,
                 "avatar_color": random.choice(_AVATAR_COLORS),
                 "channel_id": channel_id,
-                "metadata_": row_metadata,
+                "metadata_": base_metadata,
             },
         )
         update_data = {}
         if auto_name and visitor.name != auto_name:
             update_data["name"] = auto_name
-        merged_metadata = metadata or visitor_context.get("metadata")
+        merged_metadata = base_metadata
         if merged_metadata:
             update_data["metadata_"] = {**(visitor.metadata_ or {}), **merged_metadata}
         if update_data:
@@ -410,12 +492,20 @@ class OfflineMessageService:
         *,
         content_type: str,
         content: str,
+        visitor_system: object = None,
+        visitor_browser: object = None,
     ) -> dict:
         if content_type not in {MessageContentType.TEXT.value, MessageContentType.IMAGE.value, MessageContentType.FILE.value}:
             raise ValidationError("Unsupported message type")
         normalized_content = ConversationService.validate_message_content(content_type, content)
         tenant_id, channel_id, visitor_external_id, visitor, group_id, row_metadata, leave_message_prompt = (
-            await OfflineMessageService._prepare_leave_message_session(db, r, visitor_context)
+            await OfflineMessageService._prepare_leave_message_session(
+                db,
+                r,
+                visitor_context,
+                visitor_system=visitor_system,
+                visitor_browser=visitor_browser,
+            )
         )
         row = await OfflineMessageRepository.get_pending_by_visitor_for_update(
             db,
@@ -443,6 +533,15 @@ class OfflineMessageService:
                 created = True
             elif row.status != "pending":
                 raise BusinessError("Offline message has already been converted")
+            else:
+                updated_metadata = OfflineMessageService._merge_visitor_environment_metadata(
+                    OfflineMessageService._metadata(row),
+                    visitor_system=visitor_system,
+                    visitor_browser=visitor_browser,
+                    visitor_ip=visitor_context.get("visitor_ip"),
+                )
+                if OfflineMessageService._metadata(row) != updated_metadata:
+                    row.metadata_ = updated_metadata
 
             created_entries: list[OfflineMessageEntry] = []
             if created:
@@ -499,9 +598,18 @@ class OfflineMessageService:
         r: aioredis.Redis,
         visitor_context: dict,
         file: UploadFile,
+        *,
+        visitor_system: object = None,
+        visitor_browser: object = None,
     ) -> dict:
         tenant_id, channel_id, visitor_external_id, visitor, group_id, row_metadata, leave_message_prompt = (
-            await OfflineMessageService._prepare_leave_message_session(db, r, visitor_context)
+            await OfflineMessageService._prepare_leave_message_session(
+                db,
+                r,
+                visitor_context,
+                visitor_system=visitor_system,
+                visitor_browser=visitor_browser,
+            )
         )
         row = await OfflineMessageRepository.get_pending_by_visitor_for_update(
             db,
@@ -529,6 +637,15 @@ class OfflineMessageService:
                 created = True
             elif row.status != "pending":
                 raise BusinessError("Offline message has already been converted")
+            else:
+                updated_metadata = OfflineMessageService._merge_visitor_environment_metadata(
+                    OfflineMessageService._metadata(row),
+                    visitor_system=visitor_system,
+                    visitor_browser=visitor_browser,
+                    visitor_ip=visitor_context.get("visitor_ip"),
+                )
+                if OfflineMessageService._metadata(row) != updated_metadata:
+                    row.metadata_ = updated_metadata
 
             created_entries: list[OfflineMessageEntry] = []
             if created:
@@ -621,6 +738,8 @@ class OfflineMessageService:
         *,
         content_type: str,
         content: str,
+        visitor_system: object = None,
+        visitor_browser: object = None,
     ) -> dict:
         if content_type not in {MessageContentType.TEXT.value, MessageContentType.IMAGE.value, MessageContentType.FILE.value}:
             raise ValidationError("Unsupported message type")
@@ -630,6 +749,14 @@ class OfflineMessageService:
             row = await OfflineMessageService._get_for_session_for_update(db, public_id, visitor_context)
             if row.status != "pending":
                 raise BusinessError("Offline message has already been converted")
+            row_metadata = OfflineMessageService._merge_visitor_environment_metadata(
+                OfflineMessageService._metadata(row),
+                visitor_system=visitor_system,
+                visitor_browser=visitor_browser,
+                visitor_ip=visitor_context.get("visitor_ip"),
+            )
+            if OfflineMessageService._metadata(row) != row_metadata:
+                row.metadata_ = row_metadata
 
             msg = OfflineMessageEntry(
                 tenant_id=row.tenant_id,
@@ -795,21 +922,41 @@ class OfflineMessageService:
             if not row.visitor_id:
                 raise ValidationError("Offline message visitor is missing")
 
-            now = datetime.now(timezone.utc)
-            conversation = Conversation(
-                public_id=await ConversationRepository.generate_unique_public_id(db),
-                share_code=await ConversationRepository.generate_unique_share_code(db),
+            existing = await ConversationRepository.get_active_visitor_conversation(
+                db,
                 tenant_id=row.tenant_id,
                 visitor_id=row.visitor_id,
                 channel_id=row.channel_id,
-                group_id=row.target_group_id,
-                agent_id=agent_id,
-                status=ConversationStatus.ACTIVE.value,
-                started_at=now,
-                unread_count=1,
             )
-            db.add(conversation)
-            await db.flush()
+            reused_existing_conversation = existing is not None
+            if existing:
+                if existing.agent_id != agent_id:
+                    raise BusinessError("Visitor already has an active conversation")
+                conversation = existing
+            else:
+                now = datetime.now(timezone.utc)
+                environment_data = (
+                    OfflineMessageService._conversation_environment_from_metadata(
+                        OfflineMessageService._metadata(row)
+                    )
+                    if ConversationService._is_web_channel(getattr(row, "channel", None))
+                    else {}
+                )
+                conversation = Conversation(
+                    public_id=await ConversationRepository.generate_unique_public_id(db),
+                    share_code=await ConversationRepository.generate_unique_share_code(db),
+                    tenant_id=row.tenant_id,
+                    visitor_id=row.visitor_id,
+                    channel_id=row.channel_id,
+                    group_id=row.target_group_id,
+                    agent_id=agent_id,
+                    status=ConversationStatus.ACTIVE.value,
+                    started_at=now,
+                    unread_count=1,
+                    **environment_data,
+                )
+                db.add(conversation)
+                await db.flush()
 
             for entry in row.messages:
                 metadata = {
@@ -870,7 +1017,8 @@ class OfflineMessageService:
             await db.rollback()
             raise
 
-        await AgentStatusService.increment_count(r, row.tenant_id, agent_id)
+        if not reused_existing_conversation:
+            await AgentStatusService.increment_count(r, row.tenant_id, agent_id)
         row = await OfflineMessageRepository.get_by_id(db, offline_message_id)
         conversation = await ConversationRepository.get_by_id(db, conversation.id)
         if not row or not conversation:
@@ -878,13 +1026,14 @@ class OfflineMessageService:
         await OfflineMessageRealtimeService.emit_updated(row, action="converted")
         logger.info(
             "offline_message_converted tenant_id=%s user_id=%s target_agent_id=%s offline_message_id=%s "
-            "conversation_id=%s copied_messages=%d",
+            "conversation_id=%s copied_messages=%d reused_existing=%s",
             row.tenant_id,
             principal.user_id,
             agent_id,
             row.id,
             conversation.id,
             len(copied_messages),
+            reused_existing_conversation,
         )
         assigned_employee = await EmployeeRepository.get_by_id(db, agent_id)
         message_payloads = []
@@ -913,6 +1062,7 @@ class OfflineMessageService:
             "messages": message_payloads,
             "assigned_to_current_user": agent_id == principal.user_id,
             "assigned_agent": assigned_employee,
+            "reused_existing_conversation": reused_existing_conversation,
         }
 
     @staticmethod

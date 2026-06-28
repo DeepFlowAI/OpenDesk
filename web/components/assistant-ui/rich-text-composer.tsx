@@ -38,8 +38,11 @@ type RichTextComposerProps = {
   locale: 'zh' | 'en'
   editorHeight?: number
   editorMaxHeight?: number
+  endSafeArea?: boolean
+  autoFocusKey?: number | string | null
   onChange: (html: string) => void
   onImageUpload: (file: File) => Promise<ConversationFileUploadResponse>
+  onAttachmentPaste?: (file: File) => void
   onUploadingChange?: (uploading: boolean) => void
   emojiConfig?: EmojiTargetConfig | null
 }
@@ -327,6 +330,20 @@ async function imageSourceToFile(source: HtmlImageSource): Promise<File> {
   })
 }
 
+function getClipboardAttachmentFile(data: DataTransfer): File | null {
+  for (const item of Array.from(data.items)) {
+    if (item.kind !== 'file') continue
+    const file = item.getAsFile()
+    if (file && !file.type.startsWith('image/')) return file
+  }
+
+  for (const file of Array.from(data.files)) {
+    if (!file.type.startsWith('image/')) return file
+  }
+
+  return null
+}
+
 function clampEditorHeight(height: number, maxHeight: number): number {
   return Math.min(maxHeight, Math.max(RICH_TEXT_EDITOR_DEFAULT_HEIGHT, height))
 }
@@ -338,14 +355,18 @@ export function RichTextComposer({
   locale,
   editorHeight: editorHeightProp,
   editorMaxHeight = RICH_TEXT_EDITOR_MAX_HEIGHT,
+  endSafeArea = false,
+  autoFocusKey = null,
   onChange,
   onImageUpload,
+  onAttachmentPaste,
   onUploadingChange,
   emojiConfig,
 }: RichTextComposerProps) {
   const editorHeight = clampEditorHeight(editorHeightProp ?? RICH_TEXT_EDITOR_DEFAULT_HEIGHT, editorMaxHeight)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const editorRef = useRef<Editor | null>(null)
+  const lastAutoFocusKeyRef = useRef<number | string | null>(null)
   const [imageError, setImageError] = useState<string | null>(null)
   const [showBlockMenu, setShowBlockMenu] = useState(false)
   const placeholder = locale === 'zh'
@@ -444,6 +465,16 @@ export function RichTextComposer({
           return true
         }
 
+        const attachmentPasteHandler = onAttachmentPaste
+        if (event.clipboardData && attachmentPasteHandler) {
+          const attachment = getClipboardAttachmentFile(event.clipboardData)
+          if (attachment) {
+            event.preventDefault()
+            attachmentPasteHandler(attachment)
+            return true
+          }
+        }
+
         const htmlImages = event.clipboardData
           ? getClipboardHtmlImageSources(event.clipboardData)
           : []
@@ -474,6 +505,16 @@ export function RichTextComposer({
     if (!editor || editor.isDestroyed) return
     editor.setEditable(!disabled)
   }, [disabled, editor])
+
+  useEffect(() => {
+    if (autoFocusKey == null || disabled || !editor || editor.isDestroyed) return
+    if (lastAutoFocusKeyRef.current === autoFocusKey) return
+    lastAutoFocusKeyRef.current = autoFocusKey
+    window.requestAnimationFrame(() => {
+      if (editor.isDestroyed || !editor.isEditable) return
+      editor.commands.focus('end')
+    })
+  }, [autoFocusKey, disabled, editor])
 
   useEffect(() => {
     if (!editor || editor.isDestroyed || value === editor.getHTML()) return
@@ -541,14 +582,14 @@ export function RichTextComposer({
   }
 
   return (
-    <div className="relative" onKeyDown={handleKeyDown}>
+    <div className={cn('relative', endSafeArea && 'pr-9')} onKeyDown={handleKeyDown}>
       {(uploading || imageError) && (
         <div className="mb-2 rounded-md bg-muted px-2 py-1 text-xs">
           {uploading ? <span className="text-muted-foreground">{labels.uploading}</span> : <span className="text-destructive">{imageError}</span>}
         </div>
       )}
       <div
-        className="overflow-y-auto"
+        className={cn('overflow-y-auto', endSafeArea && '[scrollbar-gutter:stable]')}
         style={{ height: editorHeight, maxHeight: editorMaxHeight }}
       >
         <EditorContent editor={editor} />

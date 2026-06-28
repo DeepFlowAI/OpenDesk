@@ -21,5 +21,7 @@ class OpenAgentSettings(Base, TimestampMixin):
         ForeignKey("tenants.id", ondelete="CASCADE"),
         nullable=False,
     )
-    base_url: Mapped[str] = mapped_column(String(512), nullable=False)
-    api_key_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    api_key_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    voice_speed_base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    voice_speed_api_key_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)

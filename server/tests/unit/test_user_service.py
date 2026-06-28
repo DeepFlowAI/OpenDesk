@@ -33,6 +33,15 @@ class TestUserServiceOrganizationAssociation:
         with pytest.raises(ValidationError):
             UserService._normalize_level("gold")
 
+    def test_normalize_blacklist_accepts_only_blocked_or_empty(self):
+        assert UserService._normalize_blacklist(None) is None
+        assert UserService._normalize_blacklist("") is None
+        assert UserService._normalize_blacklist("  ") is None
+        assert UserService._normalize_blacklist("blocked") == "blocked"
+
+        with pytest.raises(ValidationError):
+            UserService._normalize_blacklist("banned")
+
     @pytest.mark.asyncio
     async def test_update_user_allows_clearing_organization(self, monkeypatch):
         user = SimpleNamespace(id=1, tenant_id=10, organization_id=5)

@@ -78,9 +78,27 @@ async def get_current_principal(
     return await PermissionService.get_current_principal(db, current_user)
 
 
+async def get_current_principal_short_session(
+    current_user: dict = Depends(get_current_user),
+) -> EffectivePrincipal:
+    async with AsyncSessionLocal() as db:
+        return await PermissionService.get_current_principal(db, current_user)
+
+
 def require_permission(permission: str):
     async def dependency(
         principal: EffectivePrincipal = Depends(get_current_principal),
+    ) -> EffectivePrincipal:
+        if not principal.has_permission(permission):
+            raise ForbiddenError("Permission denied")
+        return principal
+
+    return dependency
+
+
+def require_permission_short_session(permission: str):
+    async def dependency(
+        principal: EffectivePrincipal = Depends(get_current_principal_short_session),
     ) -> EffectivePrincipal:
         if not principal.has_permission(permission):
             raise ForbiddenError("Permission denied")

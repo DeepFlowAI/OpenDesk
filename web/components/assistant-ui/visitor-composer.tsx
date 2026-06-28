@@ -11,20 +11,23 @@ import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
-import { ComposerPrimitive } from '@assistant-ui/react'
+import { ComposerPrimitive, useComposerRuntime } from '@assistant-ui/react'
 import { useVisitorChatConfig } from './visitor-chat-runtime'
 import { EmojiPicker } from './emoji-picker'
 import { IconArrowUp, IconLoader2, IconPaperclip, IconPlayerStop, IconStar } from '@tabler/icons-react'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogTitle } from '@/components/ui/dialog'
 import { t } from '@/utils/i18n'
+import { MessageQuotePreview } from '@/app/components/features/chat/message-quote'
+import type { Message } from '@/models/conversation'
+import { quoteFromMessage } from '@/lib/message-quote'
 
 const MAX_ROWS = 3
 const LINE_HEIGHT = 22
 
-type PastedImagePreview = {
+type PastedAttachmentPreview = {
   file: File
-  previewUrl: string
+  previewUrl: string | null
 }
 
 const IMAGE_MIME_EXTENSIONS: Record<string, string> = {
@@ -45,18 +48,47 @@ function normalizeClipboardImageFile(file: File, fallbackType: string): File {
   })
 }
 
-function getClipboardImageFile(data: DataTransfer): File | null {
+function normalizeClipboardFile(file: File, fallbackType: string): File {
+  if (file.name) return file
+  if ((file.type || fallbackType).startsWith('image/')) return normalizeClipboardImageFile(file, fallbackType)
+
+  return new File([file], 'clipboard-attachment', {
+    type: file.type || fallbackType || 'application/octet-stream',
+    lastModified: file.lastModified || Date.now(),
+  })
+}
+
+function getClipboardAttachmentFile(data: DataTransfer): File | null {
   for (const item of Array.from(data.items)) {
-    if (item.kind !== 'file' || !item.type.startsWith('image/')) continue
+    if (item.kind !== 'file') continue
     const file = item.getAsFile()
-    if (file) return normalizeClipboardImageFile(file, item.type)
+    if (file) return normalizeClipboardFile(file, item.type)
   }
 
   for (const file of Array.from(data.files)) {
-    if (file.type.startsWith('image/')) return normalizeClipboardImageFile(file, file.type)
+    return normalizeClipboardFile(file, file.type)
   }
 
   return null
+}
+
+function getPastedAttachmentPreviewUrl(file: File): string | null {
+  return file.type.startsWith('image/') ? URL.createObjectURL(file) : null
+}
+
+function formatAttachmentSize(size: number): string {
+  if (!Number.isFinite(size) || size <= 0) return '0 B'
+
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = size
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+
+  const digits = unitIndex === 0 || value >= 10 ? 0 : 1
+  return `${value.toFixed(digits)} ${units[unitIndex]}`
 }
 
 function focusComposerTextarea(e: ReactPointerEvent<HTMLElement>) {
@@ -83,15 +115,24 @@ type VisitorComposerProps = {
   disabled: boolean
   isMobile: boolean
   isEmbed?: boolean
+  insertRequest?: VisitorComposerInsertRequest | null
   showSatisfactionButton?: boolean
   satisfactionLoading?: boolean
   onSatisfactionClick?: () => void
+}
+
+export type VisitorComposerInsertRequest = {
+  id: number
+  text: string
+  contentType?: 'text' | 'rich_text'
+  quotedMessage?: Message | null
 }
 
 export function VisitorComposer({
   disabled,
   isMobile,
   isEmbed = false,
+  insertRequest,
   showSatisfactionButton = false,
   satisfactionLoading = false,
   onSatisfactionClick,
@@ -110,13 +151,28 @@ export function VisitorComposer({
     onFileSend,
     onAssistSendMessage,
     onRequestHumanHandoff,
+    quotedMessage,
+    onQuoteMessage,
+    onClearQuote,
+    visitorSessionToken,
   } = useVisitorChatConfig()
+  const composer = useComposerRuntime()
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [customButtonPendingIndex, setCustomButtonPendingIndex] = useState<number | null>(null)
-  const [pastedImage, setPastedImage] = useState<PastedImagePreview | null>(null)
+  const [pastedAttachment, setPastedAttachment] = useState<PastedAttachmentPreview | null>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastInsertIdRef = useRef<number | null>(null)
+
+  // Enter-to-send should only fall back to newline on real touch devices
+  // (phone/tablet soft keyboards), not on narrow desktop windows. Viewport
+  // width alone misclassifies a narrow embedded widget as "mobile".
+  const [isTouchDevice, setIsTouchDevice] = useState(false)
+  useEffect(() => {
+    setIsTouchDevice(window.matchMedia?.('(pointer: coarse)').matches ?? false)
+  }, [])
 
   const placeholder =
     (offlineMode ? (locale === 'zh' ? '请输入留言...' : 'Leave a message...') : null) ||
@@ -134,10 +190,85 @@ export function VisitorComposer({
     typingTimerRef.current = setTimeout(() => onTyping(content), 300)
   }, [onTyping])
 
+  // When the input transitions to empty (message sent or draft cleared), cancel
+  // any pending typing emit and immediately tell the agent to stop the "visitor
+  // typing" preview — otherwise a debounced typing event can land after the
+  // message and leave a stale preview lingering next to the delivered message.
+  const prevComposerTextRef = useRef('')
   useEffect(() => {
-    if (!pastedImage) return
-    return () => URL.revokeObjectURL(pastedImage.previewUrl)
-  }, [pastedImage])
+    return composer.subscribe(() => {
+      const text = composer.getState().text
+      const wasNonEmpty = prevComposerTextRef.current.length > 0
+      prevComposerTextRef.current = text
+      if (wasNonEmpty && text.length === 0) {
+        if (typingTimerRef.current) {
+          clearTimeout(typingTimerRef.current)
+          typingTimerRef.current = null
+        }
+        onTyping('')
+      }
+    })
+  }, [composer, onTyping])
+
+  useEffect(() => {
+    const previewUrl = pastedAttachment?.previewUrl
+    if (!previewUrl) return
+    return () => URL.revokeObjectURL(previewUrl)
+  }, [pastedAttachment])
+
+  // Move focus into the composer right after a message is quoted, so the
+  // visitor can start typing immediately instead of clicking the input first.
+  const prevQuotedIdRef = useRef<number | null>(null)
+  useEffect(() => {
+    const quotedId = quotedMessage?.id ?? null
+    const becameQuoted = quotedId !== null && prevQuotedIdRef.current !== quotedId
+    prevQuotedIdRef.current = quotedId
+    if (!becameQuoted || disabled || offlineMode) return
+    window.requestAnimationFrame(() => {
+      const textarea =
+        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
+        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
+      if (!textarea || textarea.disabled) return
+      textarea.focus({ preventScroll: true })
+      const len = textarea.value.length
+      try {
+        textarea.setSelectionRange(len, len)
+      } catch {
+        // Some hosts leave selection APIs unavailable; focus alone is enough.
+      }
+    })
+  }, [disabled, offlineMode, quotedMessage])
+
+  useEffect(() => {
+    if (!insertRequest || disabled || lastInsertIdRef.current === insertRequest.id) return
+
+    lastInsertIdRef.current = insertRequest.id
+    const restoreQuote = () => {
+      if (!Object.prototype.hasOwnProperty.call(insertRequest, 'quotedMessage')) return
+      if (insertRequest.quotedMessage) onQuoteMessage(insertRequest.quotedMessage)
+      else onClearQuote()
+    }
+    const currentText = composer.getState().text
+    if (currentText.trim()) {
+      const confirmed = window.confirm(t('ws.chat.recall.replaceDraftConfirm', locale))
+      if (!confirmed) return
+      composer.setText('')
+    }
+
+    composer.setText(insertRequest.text)
+    restoreQuote()
+    const textarea =
+      rootRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
+      rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
+    window.requestAnimationFrame(() => {
+      textarea?.focus({ preventScroll: true })
+      try {
+        textarea?.setSelectionRange(insertRequest.text.length, insertRequest.text.length)
+      } catch {
+        // Ignore host selection limitations.
+      }
+    })
+  }, [composer, disabled, insertRequest, locale, onClearQuote, onQuoteMessage])
 
   const handleImageSelect = useCallback(() => {
     fileInputRef.current?.click()
@@ -166,38 +297,38 @@ export function VisitorComposer({
     (e: ReactClipboardEvent<HTMLTextAreaElement>) => {
       if (disabled || uploading || botMode || botRunning) return
 
-      const imageFile = getClipboardImageFile(e.clipboardData)
-      if (!imageFile) return
+      const attachmentFile = getClipboardAttachmentFile(e.clipboardData)
+      if (!attachmentFile) return
 
       e.preventDefault()
       setUploadError(null)
-      setPastedImage({
-        file: imageFile,
-        previewUrl: URL.createObjectURL(imageFile),
+      setPastedAttachment({
+        file: attachmentFile,
+        previewUrl: getPastedAttachmentPreviewUrl(attachmentFile),
       })
     },
     [botMode, botRunning, disabled, uploading],
   )
 
-  const handlePastedImageCancel = useCallback(() => {
+  const handlePastedAttachmentCancel = useCallback(() => {
     if (uploading) return
-    setPastedImage(null)
+    setPastedAttachment(null)
   }, [uploading])
 
-  const handlePastedImageSend = useCallback(async () => {
-    if (!pastedImage || uploading) return
+  const handlePastedAttachmentSend = useCallback(async () => {
+    if (!pastedAttachment || uploading) return
 
     setUploading(true)
     setUploadError(null)
     try {
-      await onFileSend(pastedImage.file)
-      setPastedImage(null)
+      await onFileSend(pastedAttachment.file)
+      setPastedAttachment(null)
     } catch {
       setUploadError(t('ws.chat.attachmentUploadFailed', locale))
     } finally {
       setUploading(false)
     }
-  }, [locale, onFileSend, pastedImage, uploading])
+  }, [locale, onFileSend, pastedAttachment, uploading])
 
   const showHandoffButton =
     botMode
@@ -221,6 +352,9 @@ export function VisitorComposer({
     offlineMode,
   ])
   const showCustomButtonBar = customButtons.length > 0 || showHandoffButton
+  const quotePreview = quotedMessage && !offlineMode
+    ? quoteFromMessage(quotedMessage, locale)
+    : null
 
   const handleCustomButtonClick = useCallback(async (buttonIndex: number) => {
     const button = customButtons[buttonIndex]
@@ -242,7 +376,7 @@ export function VisitorComposer({
   }, [botRunning, customButtons, handoffRouting, onAssistSendMessage])
 
   return (
-    <div className="shrink-0 bg-background px-3 py-2 sm:px-4 sm:py-3">
+    <div ref={rootRef} className="shrink-0 bg-background px-3 py-2 sm:px-4 sm:py-3">
       {handoffRouting && (
         <div className="mb-2 rounded-lg bg-primary/10 px-3 py-2 text-center text-xs font-medium text-primary">
           {locale === 'zh' ? '正在为您转接人工客服' : 'Connecting you to a human agent…'}
@@ -284,11 +418,26 @@ export function VisitorComposer({
         </div>
       )}
       <ComposerPrimitive.Root className="rounded-[14px] border border-border bg-background sm:rounded-2xl">
+        {quotePreview && quotedMessage && (
+          <MessageQuotePreview
+            quote={quotePreview}
+            locale={locale}
+            original={quotedMessage}
+            onRemove={onClearQuote}
+            audience="visitor"
+            attachmentContext={{
+              conversationId: quotedMessage.conversation_id,
+              conversationPublicId: quotedMessage.conversation_public_id,
+              visitorSessionToken,
+            }}
+            className="mx-2 mt-2 sm:mx-3 sm:mt-3 [&>:first-child]:bg-primary/50"
+          />
+        )}
         {/* Text input */}
         <ComposerPrimitive.Input
           placeholder={disabled ? disabledText : placeholder}
           disabled={disabled}
-          submitMode={isMobile && !isEmbed ? 'none' : 'enter'}
+          submitMode={isTouchDevice && !isEmbed ? 'none' : 'enter'}
           rows={1}
           maxRows={MAX_ROWS}
           onChange={handleTypingDebounce}
@@ -371,21 +520,41 @@ export function VisitorComposer({
           </div>
         )}
       </ComposerPrimitive.Root>
-      <Dialog open={pastedImage != null} onOpenChange={(open) => !open && handlePastedImageCancel()}>
+      <Dialog open={pastedAttachment != null} onOpenChange={(open) => !open && handlePastedAttachmentCancel()}>
         <DialogContent
           className="w-[520px] max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-2xl border border-border bg-background p-0 shadow-lg ring-0"
           showCloseButton={false}
         >
-          <DialogTitle className="sr-only">{t('ws.chat.pastedImagePreviewTitle', locale)}</DialogTitle>
-          {pastedImage && (
+          <DialogTitle className="sr-only">
+            {t(pastedAttachment?.previewUrl ? 'ws.chat.pastedImagePreviewTitle' : 'ws.chat.pastedAttachmentPreviewTitle', locale)}
+          </DialogTitle>
+          {pastedAttachment && (
             <>
-              <div className="max-h-[70vh] overflow-hidden rounded-t-2xl bg-muted p-4">
-                <img
-                  src={pastedImage.previewUrl}
-                  alt={t('ws.chat.pastedImagePreviewAlt', locale)}
-                  className="max-h-[60vh] w-full rounded-xl bg-background object-contain"
-                />
-              </div>
+              {pastedAttachment.previewUrl ? (
+                <div className="max-h-[70vh] overflow-hidden rounded-t-2xl bg-muted p-4">
+                  <img
+                    src={pastedAttachment.previewUrl}
+                    alt={t('ws.chat.pastedImagePreviewAlt', locale)}
+                    className="max-h-[60vh] w-full rounded-xl bg-background object-contain"
+                  />
+                </div>
+              ) : (
+                <div className="rounded-t-2xl bg-muted p-4">
+                  <div className="flex items-center gap-3 rounded-xl bg-background p-4">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                      <IconPaperclip size={20} stroke={1.7} />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-foreground">
+                        {pastedAttachment.file.name || t('ws.chat.pastedAttachmentFallbackName', locale)}
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {formatAttachmentSize(pastedAttachment.file.size)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
               {uploadError && (
                 <div className="border-t border-border px-4 py-2 text-xs text-destructive">
                   {uploadError}
@@ -395,14 +564,14 @@ export function VisitorComposer({
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={handlePastedImageCancel}
+                  onClick={handlePastedAttachmentCancel}
                   disabled={uploading}
                 >
                   {t('ws.common.cancel', locale)}
                 </Button>
                 <Button
                   type="button"
-                  onClick={() => void handlePastedImageSend()}
+                  onClick={() => void handlePastedAttachmentSend()}
                   disabled={uploading}
                   className="bg-[var(--opendesk-send-button-bg)] text-primary-foreground hover:opacity-90"
                   style={sendButtonStyle}

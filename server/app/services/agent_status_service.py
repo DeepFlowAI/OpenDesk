@@ -135,19 +135,26 @@ class AgentStatusService:
 
     @staticmethod
     async def set_status(
-        r: aioredis.Redis, tenant_id: int, user_id: int, status: str
+        r: aioredis.Redis,
+        tenant_id: int,
+        user_id: int,
+        status: str,
+        current_count: int | None = None,
     ) -> None:
         key = AgentStatusService._key(tenant_id, user_id)
+        mapping = {
+            "status": status,
+            _DESIRED_STATUS_FIELD: status,
+        }
+        if current_count is not None:
+            mapping["current_count"] = max(0, current_count)
         await r.hset(
             key,
-            mapping={
-                "status": status,
-                _DESIRED_STATUS_FIELD: status,
-            },
+            mapping=mapping,
         )
-        if status == AgentOnlineStatus.OFFLINE.value:
-            await r.hset(key, "current_count", 0)
         await r.hdel(key, _PENDING_OFFLINE_FIELD)
+        if current_count is not None:
+            await AgentStatusService._notify_stats_changed(r, tenant_id, user_id)
         logger.info("Agent %d status -> %s", user_id, status)
 
     @staticmethod
@@ -257,7 +264,6 @@ class AgentStatusService:
             redis.call('HDEL', KEYS[1], ARGV[1], ARGV[3])
             redis.call('HSET', KEYS[1], 'status', ARGV[4])
             redis.call('HSET', KEYS[1], ARGV[5], ARGV[4])
-            redis.call('HSET', KEYS[1], 'current_count', 0)
             return 1
         end
         return 0

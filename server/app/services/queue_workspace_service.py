@@ -11,7 +11,7 @@ from typing import Any
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import BusinessError, ForbiddenError, NotFoundError
 from app.enums import (
     AgentOnlineStatus,
     MessageContentType,
@@ -31,6 +31,8 @@ from app.repositories.queue_workspace_repository import QueueWorkspaceRepository
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.queue import QueueAdminAssignRequest, QueueEnqueueRequest
 from app.schemas.queue_workspace import (
+    QueueAssignAndSendRequest,
+    QueueAssignAndSendResponse,
     QueueAssignableAgentListResponse,
     QueueAssignRequest,
     QueueAssignSelfRequest,
@@ -267,6 +269,79 @@ class QueueWorkspaceService:
             task_id,
             principal.user_id,
             reason=body.reason,
+        )
+
+    @staticmethod
+    async def assign_self_and_send(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        principal: EffectivePrincipal,
+        task_id: int,
+        body: QueueAssignAndSendRequest,
+    ) -> QueueAssignAndSendResponse:
+        if not principal.has_permission(QUEUE_ASSIGN_SELF_PERMISSION):
+            raise ForbiddenError("Permission denied")
+
+        assignment = await QueueWorkspaceService._assign_to_agent(
+            db,
+            r,
+            principal,
+            task_id,
+            principal.user_id,
+        )
+        conversation_id = assignment.conversation_id
+        if conversation_id is None:
+            return QueueAssignAndSendResponse(
+                **assignment.model_dump(),
+                message=None,
+                message_sent=False,
+            )
+
+        conversation = await ConversationRepository.get_by_id(db, conversation_id)
+        try:
+            message = await ConversationService.send_message(
+                db,
+                conversation_id=conversation_id,
+                sender_type=MessageSenderType.AGENT.value,
+                sender_id=principal.user_id,
+                content_type=MessageContentType.TEXT.value,
+                content=body.content,
+                tenant_id=principal.tenant_id,
+                principal=principal,
+            )
+        except BusinessError:
+            logger.warning(
+                "queue_task_assign_send_message_failed tenant_id=%s user_id=%s queue_task_id=%s conversation_id=%s",
+                principal.tenant_id,
+                principal.user_id,
+                task_id,
+                conversation_id,
+            )
+            return QueueAssignAndSendResponse(
+                **assignment.model_dump(),
+                message=None,
+                message_sent=False,
+            )
+
+        if conversation is not None:
+            await QueueWorkspaceService._emit_sent_message_events(
+                conversation,
+                message,
+                principal.user_id,
+            )
+
+        logger.info(
+            "queue_task_assigned_and_sent tenant_id=%s user_id=%s queue_task_id=%s conversation_id=%s message_id=%s",
+            principal.tenant_id,
+            principal.user_id,
+            task_id,
+            conversation_id,
+            message.id,
+        )
+        return QueueAssignAndSendResponse(
+            **assignment.model_dump(),
+            message=QueueWorkspaceService._message_response_item(message, conversation),
+            message_sent=True,
         )
 
     @staticmethod
@@ -681,19 +756,13 @@ class QueueWorkspaceService:
                     sender_avatar = agent.avatar
             elif msg.sender_type == "bot":
                 sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
-            items.append({
-                "id": msg.id,
-                "conversation_id": msg.conversation_id,
-                "sender_type": msg.sender_type,
-                "sender_id": msg.sender_id,
-                "sender_name": sender_name,
-                "sender_avatar": sender_avatar,
-                "content_type": msg.content_type,
-                "content": msg.content,
-                "metadata": metadata,
-                "created_at": msg.created_at,
-                **ConversationService._message_event_overlay(msg),
-            })
+            items.append(ConversationService._message_response_payload(
+                msg,
+                conversation_id=msg.conversation_id,
+                sender_name=sender_name,
+                sender_avatar=sender_avatar,
+                visitor_facing=False,
+            ))
         return items
 
     @staticmethod
@@ -852,3 +921,35 @@ class QueueWorkspaceService:
             await rt.emit("conversation_updated", conversation_updated_payload, room=agent_room, namespace="/chat")
         await rt.emit("new_message", agent_payload, room=conv_room, namespace="/chat")
         await rt.emit("conversation_updated", conversation_updated_payload, room=conv_room, namespace="/chat")
+
+    @staticmethod
+    async def _emit_sent_message_events(
+        conversation: Conversation,
+        message,
+        agent_id: int,
+    ) -> None:
+        try:
+            rt = get_realtime_transport()
+            await QueueWorkspaceService._emit_message_events(
+                rt,
+                conversation,
+                message,
+                {agent_id},
+            )
+        except Exception:
+            logger.exception("Failed to emit queue assign-and-send message events for conversation %s", conversation.id)
+
+    @staticmethod
+    def _message_response_item(message, conversation: Conversation | None) -> dict[str, Any]:
+        sender_name = None
+        sender_avatar = None
+        if conversation is not None and message.sender_type == MessageSenderType.AGENT.value and conversation.agent:
+            sender_name = conversation.agent.display_name or conversation.agent.name
+            sender_avatar = conversation.agent.avatar
+        return ConversationService._message_response_payload(
+            message,
+            conversation_id=message.conversation_id,
+            sender_name=sender_name,
+            sender_avatar=sender_avatar,
+            visitor_facing=False,
+        )

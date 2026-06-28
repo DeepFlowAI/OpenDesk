@@ -2,6 +2,10 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { Conversation, Message } from '@/models/conversation'
 
+export type WorkspaceConversationScope = 'my' | 'peers'
+export type WorkspaceMyConversationView = 'current' | 'collaborating' | 'history'
+export type WorkspaceChatTab = 'messages' | 'offline' | 'queue'
+
 // Window during which a conversation that was recently marked-read locally
 // should NOT have its unread_count overridden by stale HTTP responses. This
 // shields the local "just read" state from a polling GET that races with the
@@ -11,6 +15,9 @@ const RECENT_READ_WINDOW_MS = 10_000
 type ChatState = {
   conversations: Conversation[]
   selectedConversationId: number | null
+  conversationScope: WorkspaceConversationScope
+  myConversationView: WorkspaceMyConversationView
+  workspaceChatTab: WorkspaceChatTab
   messages: Map<number, Message[]>
   visitorTyping: Map<number, boolean>
   visitorTypingContent: Map<number, string>
@@ -18,6 +25,9 @@ type ChatState = {
 
   setConversations: (items: Conversation[]) => void
   selectConversation: (id: number | null) => void
+  setConversationScope: (scope: WorkspaceConversationScope) => void
+  setMyConversationView: (view: WorkspaceMyConversationView) => void
+  setWorkspaceChatTab: (tab: WorkspaceChatTab) => void
   addConversation: (conv: Conversation) => void
   updateConversation: (id: number, updates: Partial<Conversation>) => void
   removeConversation: (id: number) => void
@@ -26,6 +36,8 @@ type ChatState = {
   setMessages: (conversationId: number, msgs: Message[]) => void
   prependMessages: (conversationId: number, msgs: Message[]) => void
   addMessage: (conversationId: number, msg: Message) => void
+  updateMessage: (conversationId: number, msg: Message) => void
+  markAgentMessagesReadByVisitor: (conversationId: number, messageIds?: number[]) => void
 
   setVisitorTyping: (conversationId: number, typing: boolean, content?: string) => void
 }
@@ -58,6 +70,9 @@ export const useChatStore = create<ChatState>()(
     (set) => ({
       conversations: [],
       selectedConversationId: null,
+      conversationScope: 'my',
+      myConversationView: 'current',
+      workspaceChatTab: 'messages',
       messages: new Map(),
       visitorTyping: new Map(),
       visitorTypingContent: new Map(),
@@ -65,7 +80,14 @@ export const useChatStore = create<ChatState>()(
 
       setConversations: (items) =>
         set((state) => ({
-          conversations: mergeUnreadOnSync(items, state.conversations, state.recentReadAt),
+          // Drop closed conversations defensively: a stale list refetch that
+          // races a just-ended conversation must not resurrect it into the
+          // active list.
+          conversations: mergeUnreadOnSync(
+            items,
+            state.conversations,
+            state.recentReadAt,
+          ).filter((conversation) => conversation.status !== 'closed'),
           selectedConversationId: state.selectedConversationId,
         })),
 
@@ -82,6 +104,10 @@ export const useChatStore = create<ChatState>()(
             ),
           }
         }),
+
+      setConversationScope: (scope) => set({ conversationScope: scope }),
+      setMyConversationView: (view) => set({ myConversationView: view }),
+      setWorkspaceChatTab: (tab) => set({ workspaceChatTab: tab }),
 
       markConversationRead: (id) =>
         set((state) => {
@@ -142,6 +168,34 @@ export const useChatStore = create<ChatState>()(
           return { messages: map }
         }),
 
+      updateMessage: (conversationId, msg) =>
+        set((state) => {
+          const map = new Map(state.messages)
+          const existing = map.get(conversationId) || []
+          map.set(
+            conversationId,
+            existing.map((message) => (message.id === msg.id ? { ...message, ...msg } : message)),
+          )
+          return { messages: map }
+        }),
+
+      markAgentMessagesReadByVisitor: (conversationId, messageIds) =>
+        set((state) => {
+          const map = new Map(state.messages)
+          const existing = map.get(conversationId) || []
+          if (existing.length === 0) return state
+          const idSet = messageIds && messageIds.length > 0 ? new Set(messageIds) : null
+          map.set(
+            conversationId,
+            existing.map((message) => {
+              if (message.sender_type !== 'agent') return message
+              if (idSet && !idSet.has(message.id)) return message
+              return message.status === 'read' ? message : { ...message, status: 'read' }
+            }),
+          )
+          return { messages: map }
+        }),
+
       setVisitorTyping: (conversationId, typing, content) =>
         set((state) => {
           const typingMap = new Map(state.visitorTyping)
@@ -157,7 +211,12 @@ export const useChatStore = create<ChatState>()(
     }),
     {
       name: 'workspace-chat',
-      partialize: (state) => ({ selectedConversationId: state.selectedConversationId }),
+      partialize: (state) => ({
+        selectedConversationId: state.selectedConversationId,
+        conversationScope: state.conversationScope,
+        myConversationView: state.myConversationView,
+        workspaceChatTab: state.workspaceChatTab,
+      }),
     }
   )
 )

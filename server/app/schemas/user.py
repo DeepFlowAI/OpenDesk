@@ -25,9 +25,12 @@ class UserResponse(TimestampSchema):
     address: str | None = None
     remark: str | None = None
     web_id: str | None = None
+    blacklist: str | None = None
     avatar_color: str | None = None
     channel_id: int | None = None
     organization_id: int | None = None
+    agent_id: int | None = None
+    assignee_group_id: int | None = None
     created_by: dict | None = None
     updated_by: dict | None = None
     custom_fields: dict[str, CustomFieldValue] = Field(default_factory=dict)
@@ -43,7 +46,10 @@ class UserCreate(BaseModel):
     address: str | None = Field(None, max_length=256)
     remark: str | None = Field(None, max_length=2000)
     web_id: str | None = Field(None, max_length=128)
+    blacklist: str | None = Field(None, max_length=32)
     organization_id: int | None = None
+    agent_id: int | None = None
+    assignee_group_id: int | None = None
     custom_fields: dict[str, CustomFieldValue] = Field(default_factory=dict)
 
 
@@ -57,7 +63,10 @@ class UserUpdate(BaseModel):
     address: str | None = Field(None, max_length=256)
     remark: str | None = Field(None, max_length=2000)
     web_id: str | None = Field(None, max_length=128)
+    blacklist: str | None = Field(None, max_length=32)
     organization_id: int | None = None
+    agent_id: int | None = None
+    assignee_group_id: int | None = None
     custom_fields: dict[str, CustomFieldValue] | None = None
 
 

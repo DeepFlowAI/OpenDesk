@@ -7,7 +7,14 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
-from app.db.deps import get_db, get_redis, get_current_user, get_current_principal, require_permission
+from app.db.deps import (
+    get_current_principal,
+    get_current_user,
+    get_db,
+    get_redis,
+    require_permission,
+    require_permission_short_session,
+)
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.conversation import (
     ConversationResponse,
@@ -48,6 +55,11 @@ router = APIRouter(
     prefix="/conversations",
     tags=["Conversations"],
     dependencies=[Depends(require_permission("chat.workspace.use"))],
+)
+
+file_router = APIRouter(
+    prefix="/conversations",
+    tags=["Conversations"],
 )
 
 
@@ -155,6 +167,62 @@ async def end_conversation(
         r,
         conversation_id,
         ended_by="agent",
+        principal=principal,
+    )
+
+
+@router.post("/{conversation_id}/pin", response_model=ConversationResponse)
+async def pin_conversation(
+    conversation_id: int,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+):
+    """Pin a workspace conversation for the current agent."""
+    return await ConversationService.pin_agent_conversation(
+        db,
+        conversation_id=conversation_id,
+        principal=principal,
+    )
+
+
+@router.delete("/{conversation_id}/pin", response_model=ConversationResponse)
+async def unpin_conversation(
+    conversation_id: int,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+):
+    """Unpin a workspace conversation for the current agent."""
+    return await ConversationService.unpin_agent_conversation(
+        db,
+        conversation_id=conversation_id,
+        principal=principal,
+    )
+
+
+@router.post("/{conversation_id}/timeout-lock", response_model=ConversationResponse)
+async def lock_conversation_timeout(
+    conversation_id: int,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(require_permission("chat.conversation.lock")),
+):
+    """Pause visitor timeout auto-close for the current agent's conversation."""
+    return await ConversationService.lock_agent_conversation_timeout(
+        db,
+        conversation_id=conversation_id,
+        principal=principal,
+    )
+
+
+@router.delete("/{conversation_id}/timeout-lock", response_model=ConversationResponse)
+async def unlock_conversation_timeout(
+    conversation_id: int,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(require_permission("chat.conversation.lock")),
+):
+    """Unlock a conversation and restart visitor timeout auto-close timing."""
+    return await ConversationService.unlock_agent_conversation_timeout(
+        db,
+        conversation_id=conversation_id,
         principal=principal,
     )
 
@@ -275,19 +343,19 @@ async def send_satisfaction_invitation(
     )
 
 
-@router.post(
+@file_router.post(
     "/{conversation_id}/files",
     response_model=ConversationFileUploadResponse,
 )
 async def upload_conversation_file(
     conversation_id: int,
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    principal: EffectivePrincipal = Depends(get_current_principal),
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("chat.workspace.use"),
+    ),
 ):
     """Upload an agent file bound to a conversation."""
-    return await ConversationFileService.upload_agent_file(
-        db,
+    return await ConversationFileService.upload_agent_file_managed(
         conversation_id=conversation_id,
         tenant_id=principal.tenant_id,
         agent_id=principal.user_id,
@@ -321,6 +389,32 @@ async def get_conversation_file_url(
     )
 
 
+@router.post("/{conversation_id}/messages/{message_id}/recall", response_model=MessageResponse)
+async def recall_message(
+    conversation_id: int,
+    message_id: int,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+):
+    """Recall an agent-owned public message in a Web conversation."""
+    msg, _conversation, _conversation_update = await ConversationService.recall_agent_message(
+        db,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        tenant_id=principal.tenant_id,
+        principal=principal,
+    )
+    from app.repositories.employee_repository import EmployeeRepository
+    employee = await EmployeeRepository.get_by_id(db, principal.user_id)
+    return ConversationService._message_response_payload(
+        msg,
+        conversation_id=msg.conversation_id,
+        sender_name=employee.display_name or employee.name if employee else None,
+        sender_avatar=employee.avatar if employee else None,
+        viewer_agent_id=principal.user_id,
+    )
+
+
 @router.post("/{conversation_id}/messages", response_model=MessageResponse, status_code=201)
 async def send_message(
     conversation_id: int,
@@ -338,21 +432,17 @@ async def send_message(
         content=body.content,
         tenant_id=principal.tenant_id,
         principal=principal,
+        quoted_message_id=body.quoted_message_id,
     )
     from app.repositories.employee_repository import EmployeeRepository
     employee = await EmployeeRepository.get_by_id(db, principal.user_id)
-    return {
-        "id": msg.id,
-        "conversation_id": msg.conversation_id,
-        "sender_type": msg.sender_type,
-        "sender_id": msg.sender_id,
-        "sender_name": employee.display_name or employee.name if employee else None,
-        "sender_avatar": employee.avatar if employee else None,
-        "content_type": msg.content_type,
-        "content": msg.content,
-        "created_at": msg.created_at,
-        **ConversationService._message_event_overlay(msg),
-    }
+    return ConversationService._message_response_payload(
+        msg,
+        conversation_id=msg.conversation_id,
+        sender_name=employee.display_name or employee.name if employee else None,
+        sender_avatar=employee.avatar if employee else None,
+        viewer_agent_id=principal.user_id,
+    )
 
 
 # -- Agent status endpoints (grouped under /conversations for convenience) --
@@ -385,13 +475,26 @@ async def update_agent_status(
     user: dict = Depends(get_current_user),
 ):
     """Update agent online status (online/busy/offline)."""
-    await AgentStatusService.set_status(r, user["tenant_id"], user["user_id"], body.status)
+    from app.repositories.conversation_repository import ConversationRepository
+    from app.repositories.employee_repository import EmployeeRepository
+
+    active_count = await ConversationRepository.count_active_by_agent(
+        db,
+        user["tenant_id"],
+        user["user_id"],
+    )
+    await AgentStatusService.set_status(
+        r,
+        user["tenant_id"],
+        user["user_id"],
+        body.status,
+        current_count=active_count,
+    )
     # Becoming online is a capacity-gain event: pull any queued work the agent
     # is now eligible for, mirroring the Socket.IO update_status backfill so
     # agents who toggle online via REST also receive queued conversations.
     if body.status == AgentOnlineStatus.ONLINE.value:
         await AgentStatusService.trigger_queue_backfill(r, user["tenant_id"], user["user_id"])
-    from app.repositories.employee_repository import EmployeeRepository
     u = await EmployeeRepository.get_by_id(db, user["user_id"])
     max_c = u.max_concurrent if u else 10
     return await AgentStatusService.get_status(r, user["tenant_id"], user["user_id"], max_c)

@@ -10,6 +10,7 @@ from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, ValidationError
+from app.db.session import AsyncSessionLocal
 from app.enums import MessageContentType
 from app.libs.storage import create_storage_client
 from app.repositories.conversation_repository import ConversationRepository
@@ -130,7 +131,6 @@ class ConversationFileService:
 
     @staticmethod
     async def _upload_file(
-        db: AsyncSession,
         conversation_id: int,
         tenant_id: int,
         file: UploadFile,
@@ -154,22 +154,19 @@ class ConversationFileService:
         content_type = file.content_type or "application/octet-stream"
         ConversationFileService._validate_magic_number(content_type, data)
         await storage.upload(key, data, content_type=content_type)
+        access_url = await storage.get_temporary_url(
+            key,
+            expires_seconds=TEMPORARY_URL_EXPIRES_SECONDS,
+        )
 
         file_id = ConversationFileService.encode_file_id(key)
-        access_url = await ConversationFileService.get_temporary_url(
-            db,
-            conversation_id=conversation_id,
-            file_id=file_id,
-            download_name=raw_name,
-            download=False,
-        )
         return {
             "schema_version": 1,
             "file_id": file_id,
             "name": raw_name,
             "size": len(data),
             "mime_type": content_type,
-            "access_url": access_url["url"],
+            "access_url": access_url,
         }
 
     @staticmethod
@@ -189,7 +186,6 @@ class ConversationFileService:
         )
 
         return await ConversationFileService._upload_file(
-            db,
             conversation_id=conversation_id,
             tenant_id=tenant_id,
             file=file,
@@ -213,7 +209,6 @@ class ConversationFileService:
             visitor_external_id=visitor_context["visitor_external_id"],
         )
         return await ConversationFileService._upload_file(
-            db,
             conversation_id=conversation.id,
             tenant_id=conversation.tenant_id,
             file=file,
@@ -239,7 +234,31 @@ class ConversationFileService:
         )
 
         return await ConversationFileService._upload_file(
-            db,
+            conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            file=file,
+        )
+
+    @staticmethod
+    async def upload_agent_file_managed(
+        conversation_id: int,
+        tenant_id: int,
+        agent_id: int,
+        file: UploadFile,
+        principal: EffectivePrincipal,
+    ) -> dict:
+        """Upload an agent file without holding a DB session during file I/O."""
+        async with AsyncSessionLocal() as db:
+            await ConversationFileService._get_conversation_for_agent(
+                db,
+                conversation_id=conversation_id,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                principal=principal,
+                action="send_file",
+            )
+
+        return await ConversationFileService._upload_file(
             conversation_id=conversation_id,
             tenant_id=tenant_id,
             file=file,
@@ -263,6 +282,16 @@ class ConversationFileService:
         offline_message_prefix = f"offline-message-files/{conversation.tenant_id}/"
         if not (key.startswith(expected_prefix) or key.startswith(offline_message_prefix)):
             raise ValidationError("File does not belong to conversation")
+
+        from app.repositories.message_repository import MessageRepository
+        message = await MessageRepository.get_file_message_by_file_id(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation_id,
+            file_id=file_id,
+        )
+        if message and getattr(message, "is_recalled", False):
+            raise NotFoundError("File not found")
 
         storage = create_storage_client()
         url = await storage.get_temporary_url(

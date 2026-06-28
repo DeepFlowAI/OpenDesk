@@ -120,6 +120,15 @@ class TestFieldDefinitionCRUD:
         assert level["type_config"]["default_value"] == "normal"
         assert [option["value"] for option in level["options"]] == ["normal", "vip"]
 
+        assignee_group = fields["assignee_group"]
+        assert assignee_group["source"] == "system"
+        assert assignee_group["field_type"] == "group_select"
+
+        assignee = fields["assignee"]
+        assert assignee["source"] == "system"
+        assert assignee["field_type"] == "employee_select"
+        assert assignee["type_config"]["filter_by_group"] is True
+
     @pytest.mark.asyncio
     async def test_create_text_field_returns_201(self, client: AsyncClient):
         headers = await _setup_tenant_and_auth(client)

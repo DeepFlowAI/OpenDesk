@@ -1,7 +1,12 @@
 'use client'
 
+import { useEffect, useState } from 'react'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
+
+const HIDDEN_HOSTNAME = (process.env.NEXT_PUBLIC_HIDE_LEGAL_FOOTER_HOSTNAME ?? '')
+  .trim()
+  .toLowerCase()
 
 interface LegalFooterProps {
   /**
@@ -26,6 +31,14 @@ interface LegalFooterProps {
 export function LegalFooter({ locale: localeProp, compact = false }: LegalFooterProps = {}) {
   const { locale: storeLocale } = useLocaleStore()
   const locale = localeProp ?? storeLocale
+  const [isVisible, setIsVisible] = useState(!HIDDEN_HOSTNAME)
+
+  useEffect(() => {
+    if (!HIDDEN_HOSTNAME) return
+    setIsVisible(window.location.hostname.toLowerCase() !== HIDDEN_HOSTNAME)
+  }, [])
+
+  if (!isVisible) return null
 
   if (compact) {
     return (

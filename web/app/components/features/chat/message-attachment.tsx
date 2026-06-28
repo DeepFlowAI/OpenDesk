@@ -36,6 +36,7 @@ type MessageAttachmentProps = {
   className?: string
   imageGallery?: MessageAttachmentGalleryItem[]
   currentImageId?: string | number
+  compact?: boolean
 }
 
 export type MessageAttachmentGalleryItem = {
@@ -204,6 +205,7 @@ export function MessageAttachment({
   className,
   imageGallery,
   currentImageId,
+  compact = false,
 }: MessageAttachmentProps) {
   const payload = useMemo(() => parsePayload(content), [content])
   const [url, setUrl] = useState<string | null>(payload ? null : content)
@@ -218,9 +220,11 @@ export function MessageAttachment({
   const fileName = payload?.name || '附件'
   const fileIconSrc = getFileIconSrc(payload?.mime_type, fileName)
 
+  const skipUrlFetch = compact && !isImage
+
   useEffect(() => {
     let alive = true
-    if (!payload) return
+    if (!payload || skipUrlFetch) return
 
     setLoading(true)
     setError(false)
@@ -246,7 +250,7 @@ export function MessageAttachment({
     return () => {
       alive = false
     }
-  }, [conversationId, conversationPublicId, offlineMessageId, offlineMessagePublicId, payload, visitorSessionToken])
+  }, [conversationId, conversationPublicId, offlineMessageId, offlineMessagePublicId, payload, skipUrlFetch, visitorSessionToken])
 
   const handleDownload = useCallback(async () => {
     if (!payload) {
@@ -309,6 +313,45 @@ export function MessageAttachment({
     }
     setPreviewLoading(false)
   }, [content, conversationId, conversationPublicId, currentImageId, imageGallery, offlineMessageId, offlineMessagePublicId, url, visitorSessionToken])
+
+  if (compact) {
+    if (isImage) {
+      if (loading) {
+        return (
+          <div className={cn('flex h-14 w-14 items-center justify-center overflow-hidden rounded-md border border-border/60 bg-muted', className)}>
+            <IconLoader2 size={14} className="animate-spin text-muted-foreground" />
+          </div>
+        )
+      }
+      if (error || !url) {
+        return (
+          <div className={cn('flex h-14 w-14 items-center justify-center overflow-hidden rounded-md border border-border/60 bg-muted text-muted-foreground', className)}>
+            <IconFile size={16} />
+          </div>
+        )
+      }
+      return (
+        <div className={cn('inline-block overflow-hidden rounded-md border border-border/60 bg-muted', className)}>
+          <img
+            src={url}
+            alt={payload?.name || 'image'}
+            className="block max-h-14 max-w-[120px] object-contain"
+          />
+        </div>
+      )
+    }
+    return (
+      <div className={cn('flex max-w-full items-center gap-2 rounded-md border border-border/60 bg-background/60 px-2 py-1.5', className)}>
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center text-muted-foreground">
+          {fileIconSrc ? <img src={fileIconSrc} alt="" className="h-6 w-6" /> : <IconFile size={16} />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-medium text-foreground" title={fileName}>{fileName}</div>
+          {payload && <div className="text-[11px] text-muted-foreground">{formatSize(payload.size)}</div>}
+        </div>
+      </div>
+    )
+  }
 
   if (isImage) {
     if (loading) {

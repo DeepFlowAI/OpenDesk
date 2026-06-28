@@ -4,6 +4,7 @@ Unit tests for conversation file service helpers.
 import pytest
 
 from app.core.exceptions import ValidationError
+from app.schemas.permission import EffectivePrincipal
 from app.services.conversation_file_service import ConversationFileService
 
 
@@ -32,3 +33,84 @@ def test_safe_download_name_strips_header_breaking_characters():
 def test_validate_image_magic_number_rejects_mismatch():
     with pytest.raises(ValidationError):
         ConversationFileService._validate_magic_number("image/png", b"not-a-png")
+
+
+@pytest.mark.asyncio
+async def test_managed_agent_upload_closes_db_session_before_file_io(monkeypatch):
+    class SessionTracker:
+        active = False
+        opens = 0
+        closes = 0
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            assert SessionTracker.active is False
+            SessionTracker.active = True
+            SessionTracker.opens += 1
+            return object()
+
+        async def __aexit__(self, *_exc_info):
+            SessionTracker.active = False
+            SessionTracker.closes += 1
+
+    class SessionAwareUploadFile:
+        filename = "demo.txt"
+        content_type = "text/plain"
+
+        def __init__(self):
+            self.active_states: list[bool] = []
+
+        async def read(self):
+            self.active_states.append(SessionTracker.active)
+            return b"hello"
+
+    class SessionAwareStorage:
+        def __init__(self):
+            self.active_states: list[bool] = []
+
+        async def upload(self, *_args, **_kwargs):
+            self.active_states.append(SessionTracker.active)
+            return "https://storage.example.com/demo.txt"
+
+        async def get_temporary_url(self, *_args, **_kwargs):
+            self.active_states.append(SessionTracker.active)
+            return "https://storage.example.com/demo.txt?signature=1"
+
+    async def fake_get_conversation_for_agent(*_args, **_kwargs):
+        assert SessionTracker.active is True
+        return object()
+
+    storage = SessionAwareStorage()
+    file = SessionAwareUploadFile()
+    monkeypatch.setattr(
+        "app.services.conversation_file_service.AsyncSessionLocal",
+        lambda: FakeSessionContext(),
+    )
+    monkeypatch.setattr(
+        ConversationFileService,
+        "_get_conversation_for_agent",
+        fake_get_conversation_for_agent,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_file_service.create_storage_client",
+        lambda: storage,
+    )
+
+    result = await ConversationFileService.upload_agent_file_managed(
+        conversation_id=2,
+        tenant_id=1,
+        agent_id=3,
+        file=file,
+        principal=EffectivePrincipal(
+            user_id=3,
+            tenant_id=1,
+            permissions=["chat.workspace.use"],
+        ),
+    )
+
+    assert result["name"] == "demo.txt"
+    assert result["access_url"] == "https://storage.example.com/demo.txt?signature=1"
+    assert file.active_states == [False]
+    assert storage.active_states == [False, False]
+    assert SessionTracker.opens == 1
+    assert SessionTracker.opens == SessionTracker.closes

@@ -37,6 +37,8 @@ from app.enums import (
     ConversationStatus,
     MessageContentType,
     MessageSenderType,
+    ReceptionEventReason,
+    ReceptionEventType,
 )
 from app.libs.realtime import get_realtime_transport
 from app.models.conversation import Conversation
@@ -49,6 +51,7 @@ from app.services.agent_status_service import AgentStatusService
 from app.services.conversation_realtime_service import ConversationRealtimeService
 from app.services.data_scope_service import DataScopeService, RESOURCE_PEER_CONVERSATION
 from app.services.permission_service import PermissionService
+from app.services.reception_event_service import ReceptionEventService
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +459,22 @@ class TransferService:
                 metadata_=transfer_metadata,
             )
             db.add(system_message)
+
+            # Structured reception event (agent-id accurate) for post-end segment
+            # generation; written in the same transaction as the reassign + audit
+            # message so the three never diverge.
+            await ReceptionEventService.record(
+                db,
+                tenant_id=tenant_id,
+                conversation_id=conversation.id,
+                event_type=ReceptionEventType.TRANSFERRED.value,
+                occurred_at=now,
+                agent_id=target.id,
+                group_id=conversation.group_id,
+                from_agent_id=from_agent_id,
+                to_agent_id=target.id,
+                reason=ReceptionEventReason.TRANSFER.value,
+            )
 
             await db.flush()
             await db.commit()

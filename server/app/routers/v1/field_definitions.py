@@ -8,7 +8,8 @@ Provides two listing approaches:
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, get_current_user
+from app.db.deps import get_db, get_current_principal, get_current_user
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.fd_field_definition import (
     FdFieldDefinitionCreate,
     FdFieldDefinitionUpdate,
@@ -25,7 +26,14 @@ from app.schemas.fd_field_definition import (
     SortRequest,
     SystemFieldOverrideUpdate,
 )
+from app.schemas.fd_field_reference_option import (
+    FieldReferenceEmployeeOption,
+    FieldReferenceEmployeeOptionList,
+    FieldReferenceEmployeeGroupOption,
+    FieldReferenceEmployeeGroupOptionList,
+)
 from app.services.fd_field_definition_service import FdFieldDefinitionService
+from app.services.fd_field_reference_option_service import FdFieldReferenceOptionService
 
 router = APIRouter(prefix="/field-definitions", tags=["FieldDefinitions"])
 
@@ -75,6 +83,91 @@ async def update_system_field_override(
     """Update per-tenant override for a system field (show_in_workspace, sort_order, status)."""
     return await FdFieldDefinitionService.update_system_field_override(
         db, tenant_id=user["tenant_id"], domain=domain, field_key=field_key, data=body,
+    )
+
+
+# ── Reference options for field value editors ──
+
+
+@router.get(
+    "/reference-options/employee-groups",
+    response_model=FieldReferenceEmployeeGroupOptionList,
+)
+async def list_reference_employee_groups(
+    page: int = 1,
+    per_page: int = 20,
+    keyword: str | None = None,
+    q: str | None = None,
+    member_id: int | None = None,
+    principal: EffectivePrincipal = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    """List employee groups for group-select fields."""
+    return await FdFieldReferenceOptionService.list_employee_groups(
+        db,
+        tenant_id=principal.tenant_id,
+        page=page,
+        per_page=per_page,
+        keyword=keyword or q,
+        member_id=member_id,
+    )
+
+
+@router.get(
+    "/reference-options/employee-groups/{group_id}",
+    response_model=FieldReferenceEmployeeGroupOption,
+)
+async def get_reference_employee_group(
+    group_id: int,
+    principal: EffectivePrincipal = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get one employee group option for display."""
+    return await FdFieldReferenceOptionService.get_employee_group(
+        db,
+        tenant_id=principal.tenant_id,
+        group_id=group_id,
+    )
+
+
+@router.get(
+    "/reference-options/employees",
+    response_model=FieldReferenceEmployeeOptionList,
+)
+async def list_reference_employees(
+    page: int = 1,
+    per_page: int = 20,
+    keyword: str | None = None,
+    q: str | None = None,
+    group_id: int | None = None,
+    principal: EffectivePrincipal = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    """List employees for employee-select fields."""
+    return await FdFieldReferenceOptionService.list_employees(
+        db,
+        tenant_id=principal.tenant_id,
+        page=page,
+        per_page=per_page,
+        keyword=keyword or q,
+        group_id=group_id,
+    )
+
+
+@router.get(
+    "/reference-options/employees/{employee_id}",
+    response_model=FieldReferenceEmployeeOption,
+)
+async def get_reference_employee(
+    employee_id: int,
+    principal: EffectivePrincipal = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get one employee option for display."""
+    return await FdFieldReferenceOptionService.get_employee(
+        db,
+        tenant_id=principal.tenant_id,
+        employee_id=employee_id,
     )
 
 

@@ -20,17 +20,18 @@ export default function EditEmployeeGroupPage() {
   const { locale } = useLocaleStore()
   const user = useAuthStore((state) => state.user)
   const { data, isLoading } = useEmployeeGroup(id)
+  const canManage = hasPermission(user, 'org.group.manage')
+  const canManageQueue = hasPermission(user, 'org.queue.manage')
   const { data: defaultQueuePolicies, isLoading: isDefaultQueuePoliciesLoading } = useQueuePolicies({
     scope_type: 'global',
-  })
+  }, { enabled: canManageQueue })
   const { data: groupQueuePolicies, isLoading: isGroupQueuePoliciesLoading } = useQueuePolicies(
     { scope_type: 'employee_group', scope_id: id },
-    { enabled: !!id }
+    { enabled: !!id && canManageQueue }
   )
   const updateMutation = useUpdateEmployeeGroup()
   const upsertQueuePolicyMutation = useUpsertQueuePolicy()
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-  const canManage = hasPermission(user, 'org.group.manage')
 
   const handleSave = async (
     payload: UpdateEmployeeGroupPayload,
@@ -39,7 +40,7 @@ export default function EditEmployeeGroupPage() {
     if (!canManage) return
     try {
       await updateMutation.mutateAsync({ id, data: payload })
-      if (queuePolicyPayloads.length > 0) {
+      if (canManageQueue && queuePolicyPayloads.length > 0) {
         await Promise.all(queuePolicyPayloads.map((queuePayload) => upsertQueuePolicyMutation.mutateAsync(queuePayload)))
       }
       setToast({ type: 'success', text: t('eg.saveSuccess', locale) })
@@ -52,7 +53,7 @@ export default function EditEmployeeGroupPage() {
 
   const saving = updateMutation.isPending || upsertQueuePolicyMutation.isPending
 
-  if (isLoading || isDefaultQueuePoliciesLoading || isGroupQueuePoliciesLoading) {
+  if (isLoading || (canManageQueue && (isDefaultQueuePoliciesLoading || isGroupQueuePoliciesLoading))) {
     return (
       <div className="flex h-full items-center justify-center">
         <p className="text-sm text-muted-foreground">{t('eg.loading', locale)}</p>
@@ -111,10 +112,12 @@ export default function EditEmployeeGroupPage() {
           initialData={data}
           onSubmit={handleSave}
           saving={saving}
-          queueSettings={{
-            defaultPolicies: defaultQueuePolicies?.items ?? [],
-            scopedPolicies: groupQueuePolicies?.items ?? [],
-          }}
+          queueSettings={canManageQueue
+            ? {
+                defaultPolicies: defaultQueuePolicies?.items ?? [],
+                scopedPolicies: groupQueuePolicies?.items ?? [],
+              }
+            : undefined}
         />
       </div>
     </div>

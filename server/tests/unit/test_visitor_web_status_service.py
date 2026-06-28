@@ -11,6 +11,7 @@ import pytest
 from app.core.exceptions import ForbiddenError
 from app.services.visitor_web_status_service import (
     CHAT_NAMESPACE,
+    VISITOR_WEB_CONNECTION_KEY_TTL_SECONDS,
     VISITOR_WEB_STATUS_EVENT,
     VisitorWebStatusService,
 )
@@ -79,6 +80,77 @@ async def test_connection_status_stays_online_until_all_sids_disconnect(fake_red
         sid="sid-2",
     ) == "offline"
     assert await VisitorWebStatusService.get_status(fake_redis, 7, 9, "visitor-1") == "offline"
+
+
+@pytest.mark.asyncio
+async def test_stale_connection_expires_without_disconnect(monkeypatch, fake_redis):
+    monkeypatch.setattr("app.services.visitor_web_status_service.time.time", lambda: 1_000.0)
+    await VisitorWebStatusService.mark_connected(
+        fake_redis,
+        tenant_id=7,
+        channel_id=9,
+        visitor_external_id="visitor-1",
+        sid="sid-1",
+    )
+
+    monkeypatch.setattr("app.services.visitor_web_status_service.time.time", lambda: 1_025.0)
+
+    assert await VisitorWebStatusService.get_status(fake_redis, 7, 9, "visitor-1") == "offline"
+
+
+@pytest.mark.asyncio
+async def test_refresh_connection_reports_offline_to_online_transition(monkeypatch, fake_redis):
+    monkeypatch.setattr("app.services.visitor_web_status_service.time.time", lambda: 1_000.0)
+    assert await VisitorWebStatusService.refresh_connection(
+        fake_redis,
+        tenant_id=7,
+        channel_id=9,
+        visitor_external_id="visitor-1",
+        sid="sid-1",
+    ) is True
+
+    monkeypatch.setattr("app.services.visitor_web_status_service.time.time", lambda: 1_008.0)
+    assert await VisitorWebStatusService.refresh_connection(
+        fake_redis,
+        tenant_id=7,
+        channel_id=9,
+        visitor_external_id="visitor-1",
+        sid="sid-1",
+    ) is False
+
+    monkeypatch.setattr("app.services.visitor_web_status_service.time.time", lambda: 1_033.0)
+    assert await VisitorWebStatusService.refresh_connection(
+        fake_redis,
+        tenant_id=7,
+        channel_id=9,
+        visitor_external_id="visitor-1",
+        sid="sid-1",
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_set_key_is_cleared_instead_of_read_as_online(fake_redis):
+    key = VisitorWebStatusService._key(7, 9, "visitor-1")
+    await fake_redis.sadd(key, "legacy-sid")
+
+    assert await VisitorWebStatusService.get_status(fake_redis, 7, 9, "visitor-1") == "offline"
+    assert await fake_redis.type(key) == "none"
+
+
+@pytest.mark.asyncio
+async def test_connection_key_gets_ttl(fake_redis):
+    key = VisitorWebStatusService._key(7, 9, "visitor-1")
+
+    await VisitorWebStatusService.mark_connected(
+        fake_redis,
+        tenant_id=7,
+        channel_id=9,
+        visitor_external_id="visitor-1",
+        sid="sid-1",
+    )
+
+    ttl = await fake_redis.ttl(key)
+    assert 0 < ttl <= VISITOR_WEB_CONNECTION_KEY_TTL_SECONDS
 
 
 @pytest.mark.asyncio

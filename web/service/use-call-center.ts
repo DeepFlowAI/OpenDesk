@@ -138,7 +138,7 @@ export const cancelOutboundCall = (callId: string) =>
     json: { call_id: callId },
   })
 
-export const useCallRecords = (params?: {
+type CallRecordsParams = {
   page?: number
   per_page?: number
   direction?: string
@@ -147,13 +147,24 @@ export const useCallRecords = (params?: {
   keyword?: string
   start_time?: string
   end_time?: string
-}) =>
+}
+
+type CallRecordsQueryOptions = {
+  enabled?: boolean
+}
+
+export const useCallRecords = (
+  params?: CallRecordsParams,
+  options?: CallRecordsQueryOptions,
+) =>
   useQuery({
     queryKey: keys.records(params ?? {}),
     queryFn: () =>
-      get<CallRecordListResponse>('v1/call-center/call-records', {
-        searchParams: params as Record<string, string | number>,
-      }),
+      get<CallRecordListResponse>(
+        'v1/call-center/call-records',
+        params ? { searchParams: params as Record<string, string | number> } : undefined,
+      ),
+    enabled: options?.enabled ?? true,
   })
 
 export const useCallRecord = (id: number | null | undefined) =>

@@ -4,6 +4,7 @@ import { singleAvatarLetter } from '@/lib/avatar-fallback'
 
 const SATISFACTION_INVITE_ZH = /^.+发送了满意度邀请$/
 export const SESSION_TRANSFER_EVENT_TYPE = 'session_transfer'
+export const COLLABORATOR_JOINED_EVENT_TYPE = 'collaborator_joined'
 
 function normalizeLocale(locale: string): Locale {
   return locale === 'en' ? 'en' : 'zh'
@@ -11,6 +12,10 @@ function normalizeLocale(locale: string): Locale {
 
 function isSessionTransferMetadata(metadata: Record<string, unknown> | undefined): boolean {
   return metadata?.event_type === SESSION_TRANSFER_EVENT_TYPE
+}
+
+function isCollaboratorJoinedMetadata(metadata: Record<string, unknown> | undefined): boolean {
+  return metadata?.event_type === COLLABORATOR_JOINED_EVENT_TYPE
 }
 
 /** Workspace transfer audit copy uses legal employee names. */
@@ -37,6 +42,17 @@ export function resolveVisitorSessionTransferContent(
   const to = metadata?.to_agent_nickname
   if (typeof from !== 'string' || typeof to !== 'string' || !from || !to) return null
   return t('ws.chat.event.sessionTransferredDetail', normalizeLocale(locale), { from, to })
+}
+
+export function resolveVisitorCollaboratorJoinedContent(
+  content: string,
+  metadata: Record<string, unknown> | undefined,
+  locale: string,
+): string | null {
+  if (!isCollaboratorJoinedMetadata(metadata)) return null
+  const name = metadata?.collaborator_nickname
+  if (typeof name !== 'string' || !name.trim()) return null
+  return t('ws.chat.event.collaboratorJoinedDetail', normalizeLocale(locale), { name: name.trim() })
 }
 
 /** Strip human agent names from satisfaction event copy in workspace views. */
@@ -66,7 +82,11 @@ export function resolveVisitorSystemEventContent(
   metadata: Record<string, unknown> | undefined,
   locale: string,
 ): string {
-  return resolveVisitorSessionTransferContent(content, metadata, locale) ?? content
+  return (
+    resolveVisitorSessionTransferContent(content, metadata, locale)
+    ?? resolveVisitorCollaboratorJoinedContent(content, metadata, locale)
+    ?? content
+  )
 }
 
 export function getWorkspaceHumanAgentLabel(locale: string): string {

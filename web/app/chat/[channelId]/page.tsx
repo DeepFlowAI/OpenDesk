@@ -42,6 +42,8 @@ import { isVisitorQueueEnteredMessage } from '@/lib/visitor-queue-notice'
 
 const HISTORY_PAGE_SIZE = 10
 const HISTORY_CLIENT_LIMIT = 200
+const READ_RECEIPT_ACK_TIMEOUT_MS = 5000
+const READ_RECEIPT_RETRY_DELAY_MS = 1200
 
 // ─── Utilities ───────────────────────────────────────────────────
 
@@ -65,9 +67,17 @@ type EmbedInitPayload = {
   sessionSummary?: Record<string, unknown> | null
 }
 
+type SearchParamsReader = Pick<URLSearchParams, 'get' | 'has'>
+
 type UserAgentBrand = {
   brand: string
   version: string
+}
+
+type MarkReadAck = {
+  ok?: boolean
+  message_ids?: number[]
+  error?: string
 }
 
 type NavigatorWithUserAgentData = Navigator & {
@@ -83,6 +93,7 @@ type VisitorEnvironment = {
 }
 
 const EMPTY_EMBED_INIT_PAYLOAD: EmbedInitPayload = {}
+const URL_CONTEXT_TOKEN_PARAMS = ['contextToken', 'context_token'] as const
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -112,6 +123,37 @@ function sanitizeContextToken(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const token = value.trim()
   return token || null
+}
+
+function readUrlContextToken(searchParams: SearchParamsReader): string | null {
+  for (const name of URL_CONTEXT_TOKEN_PARAMS) {
+    const token = sanitizeContextToken(searchParams.get(name))
+    if (token) return token
+  }
+  return null
+}
+
+function hasUrlContextTokenParam(searchParams: SearchParamsReader): boolean {
+  return URL_CONTEXT_TOKEN_PARAMS.some((name) => searchParams.has(name))
+}
+
+function stripUrlContextTokenParams() {
+  if (typeof window === 'undefined') return
+  try {
+    const url = new URL(window.location.href)
+    let changed = false
+    for (const name of URL_CONTEXT_TOKEN_PARAMS) {
+      if (url.searchParams.has(name)) {
+        url.searchParams.delete(name)
+        changed = true
+      }
+    }
+    if (changed) {
+      window.history.replaceState(window.history.state, document.title, `${url.pathname}${url.search}${url.hash}`)
+    }
+  } catch {
+    // Keep the chat usable even if the browser refuses history replacement.
+  }
 }
 
 function sanitizeEmbedVisitor(value: unknown): EmbedVisitorPayload | null {
@@ -196,6 +238,9 @@ function visitorCredentialStorageKey(channelKey: string): string {
 // Max automatic re-mint attempts before giving up and surfacing the auth error.
 const MAX_SESSION_RECOVERIES = 3
 
+// Max retries for a transient (non-auth) context-sync failure before giving up.
+const MAX_CONTEXT_SYNC_RETRIES = 3
+
 function getVisitorPayloadKey(payload?: EmbedInitPayload | null): string {
   return JSON.stringify({
     visitor: payload?.visitor || null,
@@ -250,6 +295,18 @@ function mapPublicMessage(message: PublicMessage | Message): Message {
       ? message.conversation_id
       : 0,
   }
+}
+
+function isReadableAgentMessage(message: Message): boolean {
+  return (
+    message.sender_type === 'agent'
+    && (
+      message.content_type === 'text'
+      || message.content_type === 'rich_text'
+      || message.content_type === 'image'
+      || message.content_type === 'file'
+    )
+  )
 }
 
 function mapPublicHistoryItem(item: VisitorConversationHistoryItem): VisitorConversationHistoryItem {
@@ -327,7 +384,7 @@ function getLocale(preferredLocale?: string | null): Locale {
 
 function postEmbedMessage(
   instanceId: string,
-  message: { type: 'ready' | 'close' | 'error' | 'warning'; code?: string; message?: string },
+  message: { type: 'ready' | 'close' | 'error' | 'warning'; code?: string; message?: string; reason?: string },
 ) {
   if (typeof window === 'undefined' || !instanceId || window.parent === window) return
   window.parent.postMessage(
@@ -364,6 +421,7 @@ const defaultConfig: ChannelConfig = {
   agent_bubble_border_color: null,
   agent_bubble_radius: [10, 10, 0, 10],
   use_agent_avatar: false,
+  agent_default_avatar_url: null,
   user_bubble_bg_color: null,
   user_bubble_text_color: null,
   user_bubble_border_color: null,
@@ -378,6 +436,7 @@ const defaultConfig: ChannelConfig = {
   offline_title: '当前客服不在线',
   offline_message: '您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。',
   leave_message_prompt: '请留下您的问题和联系方式，我们上线后会尽快联系您。',
+  restricted_service_message: '抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。',
   queue_message: '您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。客服接入后会立即回复您。',
   queue_full_message: '当前排队人数较多，暂时无法进入排队。您可以稍后再试，或点击留言，我们上线后会尽快联系您。',
   queue_full_show_leave_message_button: true,
@@ -393,6 +452,7 @@ const defaultConfig: ChannelConfig = {
   open_agent_handoff_label: '转人工',
   open_agent_handoff_after_messages: 2,
   open_agent_handoff_behavior: 'confirm',
+  open_agent_feedback_enabled: false,
   open_agent_custom_buttons_enabled: false,
   open_agent_custom_buttons: [],
   human_custom_buttons_enabled: false,
@@ -470,6 +530,14 @@ export default function VisitorChatPage() {
     () => getLocale(preferredLocale),
     [preferredLocale],
   )
+  const urlContextToken = useMemo(
+    () => embedInitRequired ? null : readUrlContextToken(searchParams),
+    [embedInitRequired, searchParams],
+  )
+  const standaloneInitPayload = useMemo<EmbedInitPayload>(
+    () => urlContextToken ? { contextToken: urlContextToken } : EMPTY_EMBED_INIT_PAYLOAD,
+    [urlContextToken],
+  )
   const visitorEnvironment = useMemo(() => detectVisitorEnvironment(), [])
   const isMobile = useIsMobile()
   const [visitorExternalId, setVisitorExternalId] = useState<string | null>(null)
@@ -481,6 +549,12 @@ export default function VisitorChatPage() {
   // Bounds automatic re-mint attempts after a visitor session auth failure, so a
   // token the server keeps rejecting (e.g. a disabled channel) can't loop.
   const sessionRecoveryRef = useRef(0)
+  // Tracks transient context-sync failures per token to cap backoff retries.
+  const contextSyncFailureRef = useRef<{ token: string | null; failures: number }>({
+    token: null,
+    failures: 0,
+  })
+  const [contextSyncRetryNonce, setContextSyncRetryNonce] = useState(0)
 
   const {
     socket,
@@ -527,6 +601,7 @@ export default function VisitorChatPage() {
   const [conversationStatus, setConversationStatus] = useState<string | null>(null)
   const [satisfactionCanInitiate, setSatisfactionCanInitiate] = useState(false)
   const [satisfactionLoading, setSatisfactionLoading] = useState(false)
+  const [readReceiptVisibilityNonce, setReadReceiptVisibilityNonce] = useState(0)
   const [socketOfflineTitle, setSocketOfflineTitle] = useState('')
   const [socketOfflineMessage, setSocketOfflineMessage] = useState('')
   const [queueFullMessage, setQueueFullMessage] = useState('')
@@ -537,7 +612,7 @@ export default function VisitorChatPage() {
   const [conversationInitializing, setConversationInitializing] = useState(true)
   const [embedReadyPosted, setEmbedReadyPosted] = useState(false)
   const [embedInitPayload, setEmbedInitPayload] = useState<EmbedInitPayload | null>(
-    () => embedInitRequired ? null : EMPTY_EMBED_INIT_PAYLOAD,
+    () => embedInitRequired ? null : standaloneInitPayload,
   )
   const [embedActivated, setEmbedActivated] = useState(
     () => !embedActivationRequired,
@@ -545,6 +620,9 @@ export default function VisitorChatPage() {
   const startedRef = useRef(false)
   const customerReadInFlightRef = useRef<Set<string>>(new Set())
   const lastCustomerReadMessageRef = useRef<string | null>(null)
+  const readReceiptConfirmedIdsRef = useRef<Map<string, Set<number>>>(new Map())
+  const readReceiptInFlightKeysRef = useRef<Set<string>>(new Set())
+  const readReceiptRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const conversationPublicIdRef = useRef<string | null>(null)
   // Offline UI is driven purely by the server's start_conversation response so
   // that a visitor with an unfinished conversation can always re-enter it,
@@ -581,10 +659,15 @@ export default function VisitorChatPage() {
   }, [embedInstanceId, trackEvent])
 
   useEffect(() => {
+    if (!hasUrlContextTokenParam(searchParams)) return
+    stripUrlContextTokenParams()
+  }, [searchParams])
+
+  useEffect(() => {
     setEmbedReadyPosted(false)
     setEmbedActivated(!embedActivationRequired)
-    setEmbedInitPayload(embedInitRequired ? null : EMPTY_EMBED_INIT_PAYLOAD)
-  }, [channelKey, embedActivationRequired, embedInstanceId, embedInitRequired])
+    setEmbedInitPayload(embedInitRequired ? null : standaloneInitPayload)
+  }, [channelKey, embedActivationRequired, embedInstanceId, embedInitRequired, standaloneInitPayload])
 
   useEffect(() => {
     if (!embedInitRequired) return
@@ -876,6 +959,8 @@ export default function VisitorChatPage() {
           offline_title?: string
           offline_message?: string
           leave_message_prompt?: string
+          restricted_service_title?: string
+          restricted_service_message?: string
           queue_full_message?: string
           queue_full_show_leave_message_button?: boolean
           queue_full_leave_message_button_label?: string
@@ -975,6 +1060,38 @@ export default function VisitorChatPage() {
               setPendingHumanHandoff(null)
               setSatisfactionCanInitiate(false)
             }
+          } else if (res.error === 'RESTRICTED') {
+            trackEvent('conversation_start_restricted', {
+              props: { reason: res.reason || 'restricted' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            setConversationPublicId(null)
+            setOfflineMessagePublicId(null)
+            setLeaveMessageMode(false)
+            setLeaveMessagePrompt('')
+            setQueueFullMessage('')
+            setQueueFullShowLeaveMessageButton(true)
+            setQueueFullLeaveMessageButtonLabel('')
+            setCurrentQueueCount(null)
+            setMessages([])
+            setHasMore(false)
+            setPendingHumanHandoff(null)
+            setSatisfactionInvitation(null)
+            setSatisfactionCanInitiate(false)
+            setEnded(false)
+            setConversationStatus(null)
+            setStartConversationError(null)
+            setSocketOfflineTitle(
+              res.restricted_service_title
+              || (locale === 'zh' ? '当前暂时无法提供在线咨询' : 'Chat is temporarily unavailable'),
+            )
+            setSocketOfflineMessage(
+              res.restricted_service_message
+              || channel?.config.restricted_service_message
+              || (locale === 'zh'
+                ? '抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。'
+                : 'Sorry, online support is temporarily unavailable. If you need help, please contact the service provider through another published channel.'),
+            )
           } else if (res.error === 'OFFLINE') {
             trackEvent('conversation_start_offline', {
               props: { reason: res.reason || 'offline' },
@@ -1112,6 +1229,7 @@ export default function VisitorChatPage() {
   }, [
     channel?.config.open_agent_handoff_behavior,
     channel?.config.leave_message_prompt,
+    channel?.config.restricted_service_message,
     channel?.config.queue_full_leave_message_button_label,
     channel?.config.queue_full_message,
     embedInitPayload,
@@ -1218,6 +1336,117 @@ export default function VisitorChatPage() {
     handleUnreadReplyVisible(conversationPublicId)
   }, [conversationPublicId, handleUnreadReplyVisible, messages])
 
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+
+    const handleVisible = () => {
+      if (document.visibilityState === 'visible') {
+        setReadReceiptVisibilityNonce((value) => value + 1)
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisible)
+    window.addEventListener('focus', handleVisible)
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisible)
+      window.removeEventListener('focus', handleVisible)
+    }
+  }, [])
+
+  const scheduleReadReceiptRetry = useCallback(() => {
+    if (readReceiptRetryTimerRef.current) return
+    readReceiptRetryTimerRef.current = setTimeout(() => {
+      readReceiptRetryTimerRef.current = null
+      setReadReceiptVisibilityNonce((value) => value + 1)
+    }, READ_RECEIPT_RETRY_DELAY_MS)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (readReceiptRetryTimerRef.current) {
+        clearTimeout(readReceiptRetryTimerRef.current)
+        readReceiptRetryTimerRef.current = null
+      }
+    }
+  }, [])
+
+  const agentReadableMessageIds = useMemo(
+    () => messages
+      .filter((message) => message.conversation_public_id === conversationPublicId && isReadableAgentMessage(message))
+      .map((message) => message.id),
+    [conversationPublicId, messages],
+  )
+
+  useEffect(() => {
+    if (!socket || !connected || !conversationPublicId || agentReadableMessageIds.length === 0) return
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+
+    const confirmedIds = readReceiptConfirmedIdsRef.current.get(conversationPublicId) ?? new Set<number>()
+    const pendingIds = agentReadableMessageIds.filter((id) => !confirmedIds.has(id))
+    if (pendingIds.length === 0) return
+
+    const requestKey = `${conversationPublicId}:${pendingIds.join(',')}`
+    if (readReceiptInFlightKeysRef.current.has(requestKey)) return
+    readReceiptInFlightKeysRef.current.add(requestKey)
+
+    trackEvent('read_receipt_mark_read_requested', {
+      conversation_external_id: conversationPublicId,
+      props: {
+        source: 'visible_chat_page',
+        visibility_state: typeof document !== 'undefined' ? document.visibilityState : 'unknown',
+      },
+      metrics: {
+        pending_message_count: pendingIds.length,
+        latest_message_id: pendingIds[pendingIds.length - 1] ?? 0,
+      },
+    })
+
+    socket.timeout(READ_RECEIPT_ACK_TIMEOUT_MS).emit(
+      'mark_read',
+      { conversation_public_id: conversationPublicId },
+      (error: Error | null, response?: MarkReadAck) => {
+        readReceiptInFlightKeysRef.current.delete(requestKey)
+        if (error || response?.ok === false) {
+          trackEvent('read_receipt_mark_read_failed', {
+            level: 'warn',
+            conversation_external_id: conversationPublicId,
+            props: {
+              source: 'visible_chat_page',
+              reason: error ? 'ack_timeout_or_error' : response?.error || 'server_rejected',
+            },
+            metrics: {
+              pending_message_count: pendingIds.length,
+              latest_message_id: pendingIds[pendingIds.length - 1] ?? 0,
+            },
+          })
+          scheduleReadReceiptRetry()
+          return
+        }
+
+        const nextConfirmed = new Set(readReceiptConfirmedIdsRef.current.get(conversationPublicId) ?? [])
+        pendingIds.forEach((id) => nextConfirmed.add(id))
+        readReceiptConfirmedIdsRef.current.set(conversationPublicId, nextConfirmed)
+        trackEvent('read_receipt_mark_read_succeeded', {
+          conversation_external_id: conversationPublicId,
+          props: { source: 'visible_chat_page' },
+          metrics: {
+            pending_message_count: pendingIds.length,
+            read_message_count: response?.message_ids?.length ?? 0,
+            latest_message_id: pendingIds[pendingIds.length - 1] ?? 0,
+          },
+        })
+      },
+    )
+  }, [
+    agentReadableMessageIds,
+    connected,
+    conversationPublicId,
+    readReceiptVisibilityNonce,
+    scheduleReadReceiptRetry,
+    socket,
+    trackEvent,
+  ])
+
   const handleSatisfactionInitiate = useCallback(async () => {
     if (satisfactionInvitation) return satisfactionInvitation
     if (!conversationPublicId || !visitorSessionToken) return null
@@ -1250,6 +1479,7 @@ export default function VisitorChatPage() {
     })
       .then((result) => {
         if (cancelled) return
+        contextSyncFailureRef.current = { token: null, failures: 0 }
         trackEvent('conversation_context_sync_succeeded', {
           conversation_external_id: conversationPublicId,
           props: {
@@ -1265,30 +1495,94 @@ export default function VisitorChatPage() {
           message: result.warnings.join(', '),
         })
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (cancelled) return
+        const status = (error as { response?: { status?: number } })?.response?.status
+        // 401/403 means the context token itself is invalid/expired. Retrying the
+        // same token always fails, so don't — wait for the host to push a fresh
+        // one via updateContext (a new token value re-triggers this effect).
+        const isAuthError = status === 401 || status === 403
         trackEvent('conversation_context_sync_failed', {
           level: 'error',
           conversation_external_id: conversationPublicId,
+          props: { auth_error: isAuthError, ...(typeof status === 'number' ? { status } : {}) },
         })
-        lastSyncedContextTokenRef.current = null
         if (isEmbed && embedInstanceId) {
           postEmbedMessage(embedInstanceId, {
             type: 'error',
             code: 'CONTEXT_SYNC_FAILED',
-            message: 'Failed to synchronize Web SDK context.',
+            reason: isAuthError ? 'context_token_expired' : 'sync_failed',
+            message: isAuthError
+              ? 'Web SDK context token expired; provide a fresh token via updateContext.'
+              : 'Failed to synchronize Web SDK context.',
           })
+        }
+        if (isAuthError) return
+
+        // Transient failure: keep the token pinned but schedule a bounded,
+        // backing-off retry of the same token.
+        const prev = contextSyncFailureRef.current
+        const failures = prev.token === contextToken ? prev.failures + 1 : 1
+        contextSyncFailureRef.current = { token: contextToken, failures }
+        if (failures <= MAX_CONTEXT_SYNC_RETRIES) {
+          const delay = Math.min(1000 * 2 ** (failures - 1), 8000)
+          lastSyncedContextTokenRef.current = null
+          window.setTimeout(() => {
+            if (!cancelled) setContextSyncRetryNonce((n) => n + 1)
+          }, delay)
         }
       })
 
     return () => {
       cancelled = true
     }
-  }, [conversationPublicId, embedInitPayload?.contextToken, embedInstanceId, isEmbed, visitorSessionToken, trackEvent])
+  }, [conversationPublicId, embedInitPayload?.contextToken, embedInstanceId, isEmbed, visitorSessionToken, trackEvent, contextSyncRetryNonce])
 
   const handleSatisfactionSubmitted = useCallback(() => {
     setSatisfactionCanInitiate(false)
   }, [])
+
+  const handleRestartConversation = useCallback(async () => {
+    if (!socket || !connected || !visitorSessionToken) {
+      await startConversation()
+      return
+    }
+    setConversationInitializing(true)
+    // Reset the loaded history so the "view previous conversations" entry
+    // reappears: the conversation that just closed is no longer the current
+    // one, so a fresh history fetch will surface it as a past conversation.
+    setHistoryConversations([])
+    setHistoryHasMore(false)
+    setHistoryLoaded(false)
+    setHistoryError(false)
+    setHistoryLimitReached(false)
+    setConversationPublicId(null)
+    setMessages([])
+    setHasMore(false)
+    setSatisfactionInvitation(null)
+    setSatisfactionCanInitiate(false)
+    setPendingHumanHandoff(null)
+    setEnded(false)
+    setConversationStatus(null)
+    setSocketOfflineTitle('')
+    setSocketOfflineMessage('')
+    setQueueFullMessage('')
+    setQueueFullShowLeaveMessageButton(true)
+    setQueueFullLeaveMessageButtonLabel('')
+    setCurrentQueueCount(null)
+    setStartConversationError(null)
+    await startConversation()
+  }, [
+    connected,
+    setConversationPublicId,
+    setHasMore,
+    setMessages,
+    setPendingHumanHandoff,
+    setSatisfactionInvitation,
+    socket,
+    startConversation,
+    visitorSessionToken,
+  ])
 
   const handleQueueFullLeaveMessage = useCallback(() => {
     setQueueFullMessage('')
@@ -1449,9 +1743,15 @@ export default function VisitorChatPage() {
   // ── Start conversation ──
   useEffect(() => {
     if (!embedActivated || !socket || !connected || !unreadReplyChecked || startedRef.current) return
+    // After the conversation has ended, a reconnect (e.g. the server restarting
+    // during a deploy) must not silently spin up a brand-new conversation: the
+    // closed one can't be resumed server-side, so auto-starting would create an
+    // unwanted session. A fresh conversation only happens when the visitor taps
+    // the restart button (handleRestartConversation).
+    if (ended) return
     startedRef.current = true
     void startConversation()
-  }, [socket, connected, embedActivated, startConversation, unreadReplyChecked])
+  }, [socket, connected, embedActivated, startConversation, unreadReplyChecked, ended])
 
   useEffect(() => {
     if (!socket) return
@@ -1813,6 +2113,7 @@ export default function VisitorChatPage() {
           startConversationError={startConversationError}
           currentQueueCount={currentQueueCount}
           visitorSessionToken={visitorSessionToken}
+          visitorEnvironment={visitorEnvironment}
           hasMore={hasMore}
           loadingMore={loadingMore}
           historyAvailable={historyAvailable}
@@ -1837,7 +2138,7 @@ export default function VisitorChatPage() {
           onLoadHistory={handleLoadHistory}
           onUnreadReplyVisible={handleUnreadReplyVisible}
           onTyping={handleTyping}
-          onRestartConversation={startConversation}
+          onRestartConversation={handleRestartConversation}
           onQueueFullLeaveMessage={handleQueueFullLeaveMessage}
           onHandoffLeaveMessage={handleHandoffLeaveMessage}
           onHandoffQueueFull={handleHandoffQueueFull}
@@ -1890,6 +2191,7 @@ export default function VisitorChatPage() {
             startConversationError={startConversationError}
             currentQueueCount={currentQueueCount}
             visitorSessionToken={visitorSessionToken}
+            visitorEnvironment={visitorEnvironment}
             hasMore={hasMore}
             loadingMore={loadingMore}
             historyAvailable={historyAvailable}
@@ -1914,7 +2216,7 @@ export default function VisitorChatPage() {
             onLoadHistory={handleLoadHistory}
             onUnreadReplyVisible={handleUnreadReplyVisible}
             onTyping={handleTyping}
-            onRestartConversation={startConversation}
+            onRestartConversation={handleRestartConversation}
             onQueueFullLeaveMessage={handleQueueFullLeaveMessage}
             onHandoffLeaveMessage={handleHandoffLeaveMessage}
             onHandoffQueueFull={handleHandoffQueueFull}

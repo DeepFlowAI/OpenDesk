@@ -14,6 +14,7 @@ from app.libs.open_agent.base import (
     OpenAgentAgentSummary,
     OpenAgentClientError,
     OpenAgentConnectionResult,
+    OpenAgentFeedbackResult,
 )
 
 
@@ -125,6 +126,7 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
             status=parsed.status,
             welcome_message=self._parse_agent_welcome_message(payload),
             faq=self._parse_agent_faq(payload),
+            ai_disclaimer=self._parse_agent_ai_disclaimer(payload),
         )
 
     async def stream_chat(
@@ -186,6 +188,41 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
         except httpx.RequestError as exc:
             raise OpenAgentClientError(f"OpenAgent tool result failed: {exc}") from exc
 
+    async def submit_feedback(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: int,
+        conversation_id: int,
+        step_id: int,
+        payload: dict[str, Any],
+    ) -> OpenAgentFeedbackResult:
+        url = self._build_step_feedback_url(base_url, agent_id, conversation_id, step_id)
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(url, headers=headers, json=payload)
+        except httpx.RequestError as exc:
+            raise OpenAgentClientError(f"OpenAgent feedback submit failed: {exc}") from exc
+
+        if not 200 <= response.status_code < 300:
+            message = self._extract_error_message(response)
+            if response.status_code in {401, 403}:
+                message = message or "OpenAgent API key is invalid or unauthorized"
+            raise OpenAgentClientError(message or "OpenAgent feedback submit failed")
+
+        data = self._parse_json_object(response)
+        feedback = data.get("feedback") if isinstance(data.get("feedback"), dict) else data
+        raw_comment = feedback.get("feedback_comment", feedback.get("comment"))
+        raw_updated_at = feedback.get("feedback_updated_at") or feedback.get("updated_at")
+        return OpenAgentFeedbackResult(
+            step_id=self._safe_int(feedback.get("step_id"), step_id),
+            rating=str(feedback.get("feedback_rating") or feedback.get("rating") or payload.get("rating") or ""),
+            comment=raw_comment if isinstance(raw_comment, str) or raw_comment is None else payload.get("comment"),
+            updated_at=raw_updated_at if isinstance(raw_updated_at, str) else None,
+        )
+
     @staticmethod
     def _build_agents_url(base_url: str) -> str:
         parsed = urlparse(base_url)
@@ -215,6 +252,15 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
         if parsed.path.rstrip("/").endswith("/api/v1"):
             return f"{base}/agents/{agent_id}/conversations/{conversation_id}/tool-results"
         return f"{base}/api/v1/agents/{agent_id}/conversations/{conversation_id}/tool-results"
+
+    @staticmethod
+    def _build_step_feedback_url(base_url: str, agent_id: int, conversation_id: int, step_id: int) -> str:
+        parsed = urlparse(base_url)
+        base = base_url.rstrip("/")
+        path = f"/agents/{agent_id}/conversations/{conversation_id}/steps/{step_id}/feedback"
+        if parsed.path.rstrip("/").endswith("/api/v1"):
+            return f"{base}{path}"
+        return f"{base}/api/v1{path}"
 
     @staticmethod
     def _extract_error_message(response: httpx.Response) -> str | None:
@@ -361,6 +407,24 @@ class HTTPOpenAgentClient(BaseOpenAgentClient):
             "enabled": bool(faq.get("enabled")),
             "title": title.strip() if isinstance(title, str) and title.strip() else "常见问题",
             "categories": categories,
+        }
+
+    @staticmethod
+    def _parse_agent_ai_disclaimer(raw: dict[str, Any]) -> dict[str, Any] | None:
+        engine_config = raw.get("engine_config")
+        if not isinstance(engine_config, dict):
+            return None
+        conversation_settings = engine_config.get("conversation_settings")
+        if not isinstance(conversation_settings, dict):
+            return None
+        disclaimer = conversation_settings.get("ai_disclaimer")
+        if not isinstance(disclaimer, dict):
+            return None
+
+        content = disclaimer.get("content")
+        return {
+            "enabled": bool(disclaimer.get("enabled")),
+            "content": content.strip() if isinstance(content, str) else "",
         }
 
     @staticmethod

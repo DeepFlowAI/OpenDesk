@@ -181,10 +181,15 @@ class VisitorTimeoutCloseService:
         return anchor_at + timedelta(minutes=target_minutes)
 
     @staticmethod
+    def _is_locked(state: VisitorTimeoutCloseState | None) -> bool:
+        return bool(state and getattr(state, "timeout_locked_at", None) is not None)
+
+    @staticmethod
     async def initialize_for_conversation(
         db: AsyncSession,
         conversation,
         *,
+        anchor_at: datetime | None = None,
         commit: bool = True,
     ) -> VisitorTimeoutCloseState | None:
         if not conversation or conversation.status != ConversationStatus.ACTIVE.value or not conversation.agent_id:
@@ -193,14 +198,17 @@ class VisitorTimeoutCloseService:
             conversation = await ConversationRepository.get_by_id(db, conversation.id)
             if not conversation:
                 return None
+        existing = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, conversation.id)
+        if VisitorTimeoutCloseService._is_locked(existing):
+            return existing
         payload, version = await VisitorTimeoutCloseService._setting_or_default(db, conversation.tenant_id)
-        anchor_at = conversation.started_at or datetime.now(timezone.utc)
-        next_check_at = VisitorTimeoutCloseService._next_check_at(payload, conversation, anchor_at, None)
+        effective_anchor_at = anchor_at or conversation.started_at or datetime.now(timezone.utc)
+        next_check_at = VisitorTimeoutCloseService._next_check_at(payload, conversation, effective_anchor_at, None)
         return await VisitorTimeoutCloseStateRepository.upsert_for_conversation(
             db,
             tenant_id=conversation.tenant_id,
             conversation_id=conversation.id,
-            anchor_at=anchor_at,
+            anchor_at=effective_anchor_at,
             anchor_message_id=None,
             first_reminded_at=None,
             closed_at=None,
@@ -225,6 +233,9 @@ class VisitorTimeoutCloseService:
             conversation = await ConversationRepository.get_by_id(db, conversation.id)
             if not conversation:
                 return None
+        existing = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, conversation.id)
+        if VisitorTimeoutCloseService._is_locked(existing):
+            return existing
         payload, version = await VisitorTimeoutCloseService._setting_or_default(db, conversation.tenant_id)
         anchor_at = message.created_at or datetime.now(timezone.utc)
         next_check_at = VisitorTimeoutCloseService._next_check_at(payload, conversation, anchor_at, None)
@@ -256,6 +267,67 @@ class VisitorTimeoutCloseService:
         return await VisitorTimeoutCloseService.initialize_for_conversation(db, conversation, commit=commit)
 
     @staticmethod
+    async def lock_conversation_timeout(
+        db: AsyncSession,
+        conversation,
+        *,
+        actor_id: int,
+        commit: bool = True,
+    ) -> VisitorTimeoutCloseState | None:
+        state = await VisitorTimeoutCloseService.ensure_for_agent_message(db, conversation, commit=commit)
+        if state is None:
+            return None
+        if getattr(state, "timeout_locked_at", None) is not None:
+            return state
+        return await VisitorTimeoutCloseStateRepository.update(
+            db,
+            state,
+            {
+                "timeout_locked_at": datetime.now(timezone.utc),
+                "timeout_locked_by_id": actor_id,
+                "next_check_at": None,
+            },
+            commit=commit,
+        )
+
+    @staticmethod
+    async def unlock_conversation_timeout(
+        db: AsyncSession,
+        conversation,
+        *,
+        commit: bool = True,
+    ) -> VisitorTimeoutCloseState | None:
+        if not conversation or conversation.status != ConversationStatus.ACTIVE.value or not conversation.agent_id:
+            return None
+        if getattr(conversation, "visitor", None) is None:
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            if not conversation:
+                return None
+        state = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, conversation.id)
+        if state is None:
+            state = await VisitorTimeoutCloseService.initialize_for_conversation(db, conversation, commit=commit)
+            if state is None:
+                return None
+        payload, version = await VisitorTimeoutCloseService._setting_or_default(db, conversation.tenant_id)
+        anchor_at = datetime.now(timezone.utc)
+        next_check_at = VisitorTimeoutCloseService._next_check_at(payload, conversation, anchor_at, None)
+        return await VisitorTimeoutCloseStateRepository.update(
+            db,
+            state,
+            {
+                "anchor_at": anchor_at,
+                "anchor_message_id": None,
+                "first_reminded_at": None,
+                "closed_at": None,
+                "next_check_at": next_check_at,
+                "config_version": version,
+                "timeout_locked_at": None,
+                "timeout_locked_by_id": None,
+            },
+            commit=commit,
+        )
+
+    @staticmethod
     async def mark_inactive(
         db: AsyncSession,
         conversation_id: int,
@@ -265,7 +337,12 @@ class VisitorTimeoutCloseService:
         state = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, conversation_id)
         if not state:
             return
-        await VisitorTimeoutCloseStateRepository.update(db, state, {"next_check_at": None}, commit=commit)
+        await VisitorTimeoutCloseStateRepository.update(
+            db,
+            state,
+            {"next_check_at": None, "timeout_locked_at": None, "timeout_locked_by_id": None},
+            commit=commit,
+        )
 
     @staticmethod
     async def process_due_states(
@@ -301,6 +378,13 @@ class VisitorTimeoutCloseService:
         now: datetime | None = None,
     ) -> str:
         checked_at = now or datetime.now(timezone.utc)
+        fresh_state = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, state.conversation_id)
+        if fresh_state is None:
+            return "skipped"
+        state = fresh_state
+        if VisitorTimeoutCloseService._is_locked(state):
+            await VisitorTimeoutCloseStateRepository.update(db, state, {"next_check_at": None})
+            return "skipped"
         conversation = await ConversationRepository.get_by_id(db, state.conversation_id)
         if (
             not conversation
@@ -513,6 +597,10 @@ class VisitorTimeoutCloseService:
             await SatisfactionSurveyRecordService.send_session_end_invitation(db, conversation)
         except Exception:
             logger.exception("Failed to send timeout session-end satisfaction invitation for conversation %s", conversation.id)
+
+        from app.services.reception_segment_service import ReceptionSegmentService
+
+        await ReceptionSegmentService.generate_for_conversation(db, conversation.id)
 
         await VisitorTimeoutCloseService._emit_timeout_message(conversation, message, payload)
         await VisitorTimeoutCloseService._emit_conversation_ended(conversation)

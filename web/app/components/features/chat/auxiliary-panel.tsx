@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useRouter } from 'next/navigation'
-import { IconCopy, IconCheck, IconLoader2 } from '@tabler/icons-react'
+import { IconBan, IconCheck, IconCircleCheck, IconCopy, IconLoader2 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
@@ -22,7 +22,9 @@ import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/
 import { SessionSummaryFields } from '@/app/components/features/session-summary/session-summary-fields'
 import { ChatTicketDraftPanel, hasTicketDraft } from '@/app/components/features/chat/chat-ticket-draft-panel'
 import { KnowledgeAssistant, type KnowledgeAssistantActionContext } from '@/app/components/features/knowledge/knowledge-assistant'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { FieldType } from '@/types/field-enums'
+import { getLinkedSelectTypeConfig } from '@/lib/field-linked-select-config'
 
 type AuxiliaryTab = 'basic' | 'summary' | 'ticket' | 'knowledge'
 
@@ -36,14 +38,33 @@ type Props = {
   onKnowledgeSend?: (messageText: string) => void | Promise<void>
 }
 
-const SYSTEM_KEY_ALIAS: Record<string, keyof User> = { nickname: 'name' }
-const EDITABLE_SYSTEM_KEYS = new Set(['name', 'email', 'phone', 'gender', 'level', 'address', 'remark', 'web_id', 'organization_id'])
+const SYSTEM_KEY_ALIAS: Record<string, keyof User> = {
+  nickname: 'name',
+  assignee: 'agent_id',
+  assignee_group: 'assignee_group_id',
+}
+const EDITABLE_SYSTEM_KEYS = new Set([
+  'name',
+  'email',
+  'phone',
+  'gender',
+  'level',
+  'address',
+  'remark',
+  'web_id',
+  'blacklist',
+  'organization_id',
+  'agent_id',
+  'assignee_group_id',
+])
 const READONLY_FIELD_KEYS = new Set(['id', 'public_id', 'external_id', 'created_at', 'updated_at', 'channel_id'])
 const INSTANT_SAVE_FIELD_TYPES = new Set<FieldType>([
   FieldType.SINGLE_SELECT,
   FieldType.SINGLE_SELECT_TREE,
   FieldType.FILE,
   FieldType.ORGANIZATION_SELECT,
+  FieldType.EMPLOYEE_SELECT,
+  FieldType.GROUP_SELECT,
 ])
 
 function formatDateTime(dateStr: string | null): string {
@@ -67,6 +88,7 @@ export function AuxiliaryPanel({
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<AuxiliaryTab>('basic')
   const [summaryDirty, setSummaryDirty] = useState(false)
+  const [blacklistConfirmOpen, setBlacklistConfirmOpen] = useState(false)
   const [ticketNotice, setTicketNotice] = useState<{ type: 'success' | 'error'; text: string; ticket?: Ticket } | null>(null)
   const visitorId = conversation?.visitor?.id ?? 0
   const visitorPublicId = conversation?.visitor?.public_id ?? ''
@@ -76,7 +98,7 @@ export function AuxiliaryPanel({
   const canEditUser = hasPermission(currentUser, 'crm.workspace.user.edit')
   const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
   const canViewKnowledge = hasPermission(currentUser, 'knowledge.workspace.view')
-  const isPeerConversation = conversation?.viewer_relation === 'peer'
+  const isPeerConversation = conversation?.viewer_relation === 'peer' || conversation?.viewer_relation === 'collaborator'
   const showSummaryTab = !!conversation && !isPeerConversation
   const showTicketTab = !!conversation && canCreateTicket && (ticketDraftOpen || hasTicketDraft(conversation.id))
   const conversationClosed = conversation?.status === 'closed'
@@ -173,6 +195,34 @@ export function AuxiliaryPanel({
     await onKnowledgeSend?.(context.messageText)
   }
 
+  const handleToggleBlacklist = () => {
+    if (!userQuery.data || visitorId <= 0 || updateUser.isPending) return
+    setBlacklistConfirmOpen(true)
+  }
+
+  const handleConfirmBlacklist = async () => {
+    const user = userQuery.data
+    if (!user || visitorId <= 0 || updateUser.isPending) return
+    const isBlocked = user.blacklist === 'blocked'
+    try {
+      await updateUser.mutateAsync({
+        id: visitorId,
+        data: { blacklist: isBlocked ? null : 'blocked' },
+      })
+      setBlacklistConfirmOpen(false)
+      setTicketNotice({
+        type: 'success',
+        text: isBlocked ? t('ws.chat.unblockUserSuccess', locale) : t('ws.chat.blockUserSuccess', locale),
+      })
+    } catch {
+      setBlacklistConfirmOpen(false)
+      setTicketNotice({
+        type: 'error',
+        text: isBlocked ? t('ws.chat.unblockUserFailed', locale) : t('ws.chat.blockUserFailed', locale),
+      })
+    }
+  }
+
   return (
     <div className="relative flex shrink-0 flex-col bg-[#F5F5F5]" style={{ width }}>
       {ticketNotice && (
@@ -249,10 +299,12 @@ export function AuxiliaryPanel({
             {visibleActiveTab === 'knowledge' ? (
               <KnowledgeAssistant
                 mode="chat"
+                conversationId={conversation?.id ?? null}
                 canUse={Boolean(conversation && !conversationClosed)}
                 useDisabledReason={knowledgeUseReason}
                 canSend={Boolean(conversation && !conversationClosed && connected)}
                 sendDisabledReason={knowledgeSendReason}
+                showRecommendations
                 onUse={handleKnowledgeUse}
                 onSend={handleKnowledgeSend}
               />
@@ -288,7 +340,33 @@ export function AuxiliaryPanel({
 
                 <section className="mt-5 border-t border-border pt-4">
                   <div className="mb-3 flex items-center justify-between gap-3">
-                    <h3 className="text-sm font-semibold text-[#1a1a1a]">{t('ws.chat.userInfo', locale)}</h3>
+                    <div className="flex min-w-0 items-center gap-2">
+                      <h3 className="shrink-0 text-sm font-semibold text-[#1a1a1a]">{t('ws.chat.userInfo', locale)}</h3>
+                      {canEditUser && userQuery.data && visitorId > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleToggleBlacklist}
+                          disabled={updateUser.isPending}
+                          className={cn(
+                            'inline-flex h-7 shrink-0 items-center gap-1 rounded-md border px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                            'border-transparent bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground',
+                          )}
+                        >
+                          {updateUser.isPending ? (
+                            <IconLoader2 size={13} className="animate-spin" />
+                          ) : userQuery.data.blacklist === 'blocked' ? (
+                            <IconCircleCheck size={13} />
+                          ) : (
+                            <IconBan size={13} />
+                          )}
+                          <span>
+                            {userQuery.data.blacklist === 'blocked'
+                              ? t('ws.chat.unblockUser', locale)
+                              : t('ws.chat.blockUser', locale)}
+                          </span>
+                        </button>
+                      )}
+                    </div>
                     {canViewUsers && visitorDetailRef && (
                       <button
                         type="button"
@@ -346,6 +424,18 @@ export function AuxiliaryPanel({
           <p className="text-sm text-[#737373]">{t('ws.chat.selectHint', locale)}</p>
         </div>
       )}
+      <ConfirmDialog
+        open={blacklistConfirmOpen}
+        title={userQuery.data?.blacklist === 'blocked' ? t('ws.chat.unblockUser', locale) : t('ws.chat.blockUser', locale)}
+        message={userQuery.data?.blacklist === 'blocked' ? t('ws.chat.unblockUserConfirm', locale) : t('ws.chat.blockUserConfirm', locale)}
+        confirmLabel={t('ws.common.confirm', locale)}
+        cancelLabel={t('ws.common.cancel', locale)}
+        loading={updateUser.isPending}
+        onCancel={() => {
+          if (!updateUser.isPending) setBlacklistConfirmOpen(false)
+        }}
+        onConfirm={handleConfirmBlacklist}
+      />
     </div>
   )
 }
@@ -474,11 +564,14 @@ function UserInfoSection({
         const identity = getFieldIdentity(field)
         const editing = editingKey === identity
         const editable = canEdit && isFieldEditable(field)
+        const resolveFieldValue = (targetField: UnifiedField) =>
+          editingKey === getFieldIdentity(targetField) ? draftValue : getFieldRawValue(user, targetField)
         return (
           <EditableInfoRow
             key={identity}
             field={field}
             value={editing ? draftValue : getFieldRawValue(user, field)}
+            typeConfig={getLinkedSelectTypeConfig(field, fields, resolveFieldValue)}
             editing={editing}
             editable={editable}
             saving={editing && isSaving}
@@ -569,6 +662,7 @@ function formatStatNumber(value: number | null | undefined): string {
 function EditableInfoRow({
   field,
   value,
+  typeConfig,
   editing,
   editable,
   saving,
@@ -582,6 +676,7 @@ function EditableInfoRow({
 }: {
   field: UnifiedField
   value: unknown
+  typeConfig: Record<string, unknown>
   editing: boolean
   editable: boolean
   saving: boolean
@@ -624,6 +719,7 @@ function EditableInfoRow({
             <UnifiedFieldValueEditor
               field={field}
               value={value}
+              typeConfig={typeConfig}
               onChange={(nextValue) => {
                 onChange(nextValue)
                 if (shouldSaveOnChange) void onSaveValue(nextValue)

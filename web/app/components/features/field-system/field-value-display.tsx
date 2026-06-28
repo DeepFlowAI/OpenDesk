@@ -8,8 +8,10 @@ import { FieldOptionPill, coalescePillOptions } from '@/app/components/features/
 import { formatDatetimeForDisplay } from '@/lib/datetime-display'
 import { useUser } from '@/service/use-users'
 import { useOrganization } from '@/service/use-organizations'
-import { useEmployee } from '@/service/use-employees'
-import { useEmployeeGroup } from '@/service/use-employee-groups'
+import {
+  useFieldReferenceEmployee,
+  useFieldReferenceEmployeeGroup,
+} from '@/service/use-field-reference-options'
 import { FieldFileDisplay } from '@/app/components/features/field-system/field-file-display'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { SafeHtml } from '@/components/safe-html'
@@ -21,6 +23,17 @@ type FieldValueDisplayProps = {
   options?: FdFieldOption[]
   treeNodes?: FdTreeNode[]
   className?: string
+}
+
+const ENTITY_SELECT_FIELD_TYPES = new Set<string>([
+  FieldType.USER_SELECT,
+  FieldType.ORGANIZATION_SELECT,
+  FieldType.EMPLOYEE_SELECT,
+  FieldType.GROUP_SELECT,
+])
+
+export function isEntitySelectFieldType(fieldType: string): fieldType is FieldType {
+  return ENTITY_SELECT_FIELD_TYPES.has(fieldType)
 }
 
 /**
@@ -236,14 +249,14 @@ function UserValueDisplay({ value, className }: { value: unknown; className?: st
 
 function EmployeeValueDisplay({ value, className }: { value: unknown; className?: string }) {
   const employeeId = typeof value === 'number' ? value : Number(value)
-  const { data: employee } = useEmployee(Number.isFinite(employeeId) ? employeeId : 0)
+  const { data: employee } = useFieldReferenceEmployee(Number.isFinite(employeeId) ? employeeId : 0)
   const label = employee?.nickname || employee?.name || employee?.username || String(value)
   return <span className={className}>{label}</span>
 }
 
 function EmployeeGroupValueDisplay({ value, className }: { value: unknown; className?: string }) {
   const groupId = typeof value === 'number' ? value : Number(value)
-  const { data: group } = useEmployeeGroup(Number.isFinite(groupId) ? groupId : 0)
+  const { data: group } = useFieldReferenceEmployeeGroup(Number.isFinite(groupId) ? groupId : 0)
   return <span className={className}>{group?.name ?? String(value)}</span>
 }
 

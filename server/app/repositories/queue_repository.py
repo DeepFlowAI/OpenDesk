@@ -8,8 +8,11 @@ from datetime import datetime
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import delete
+
 from app.enums import QueueTaskStatus
 from app.models.conversation import Conversation
+from app.models.conversation_queue_summary import ConversationQueueSummary
 from app.models.call_record import CallRecord
 from app.models.employee import Employee
 from app.models.employee_group import EmployeeGroup, EmployeeGroupMember
@@ -431,6 +434,89 @@ class QueueCandidateRepository:
         return list(result.scalars().all())
 
 
+class QueueReturningAgentRepository:
+    @staticmethod
+    async def find_recent_online_chat_agent(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        conversation_id: int,
+        cutoff: datetime,
+    ) -> int | None:
+        current = await db.get(Conversation, conversation_id)
+        if current is None or current.tenant_id != tenant_id or current.visitor_id is None:
+            return None
+
+        history_at = func.coalesce(
+            Conversation.ended_at,
+            Conversation.last_message_at,
+            Conversation.started_at,
+            Conversation.created_at,
+        )
+        result = await db.execute(
+            select(Conversation.agent_id)
+            .where(
+                Conversation.tenant_id == tenant_id,
+                Conversation.visitor_id == current.visitor_id,
+                Conversation.id != current.id,
+                Conversation.agent_id.is_not(None),
+                history_at >= cutoff,
+            )
+            .order_by(history_at.desc(), Conversation.id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def find_recent_call_center_agent(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        call_id: str,
+        cutoff: datetime,
+    ) -> int | None:
+        result = await db.execute(
+            select(CallRecord).where(
+                CallRecord.tenant_id == tenant_id,
+                CallRecord.call_id == call_id,
+            )
+        )
+        current = result.scalar_one_or_none()
+        if current is None:
+            return None
+
+        conditions = []
+        if current.user_id is not None:
+            conditions.append(CallRecord.user_id == current.user_id)
+        else:
+            from_number = (current.from_number or "").strip()
+            if not from_number:
+                return None
+            conditions.append(CallRecord.from_number == from_number)
+
+        history_at = func.coalesce(
+            CallRecord.ended_at,
+            CallRecord.answered_at,
+            CallRecord.started_at,
+            CallRecord.created_at,
+        )
+        result = await db.execute(
+            select(CallRecord.agent_id)
+            .where(
+                CallRecord.tenant_id == tenant_id,
+                CallRecord.call_id != current.call_id,
+                CallRecord.direction == "inbound",
+                CallRecord.agent_id.is_not(None),
+                CallRecord.answered_at.is_not(None),
+                history_at >= cutoff,
+                *conditions,
+            )
+            .order_by(history_at.desc(), CallRecord.id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
 class QueueRoundRobinRepository:
     @staticmethod
     async def get_state(
@@ -494,6 +580,40 @@ class QueueEventRepository:
         return event
 
 
+class ConversationQueueSummaryRepository:
+    @staticmethod
+    async def list_by_conversation(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+    ) -> list[ConversationQueueSummary]:
+        result = await db.execute(
+            select(ConversationQueueSummary).where(
+                ConversationQueueSummary.tenant_id == tenant_id,
+                ConversationQueueSummary.conversation_id == conversation_id,
+            )
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def replace_for_conversation(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+        rows: list[dict],
+    ) -> None:
+        """Rebuild all summary rows for a conversation (delete + insert). No commit."""
+        await db.execute(
+            delete(ConversationQueueSummary).where(
+                ConversationQueueSummary.tenant_id == tenant_id,
+                ConversationQueueSummary.conversation_id == conversation_id,
+            )
+        )
+        for row in rows:
+            db.add(ConversationQueueSummary(**row))
+        await db.flush()
+
+
 class QueueBusinessRepository:
     @staticmethod
     async def assign_conversation(
@@ -509,9 +629,10 @@ class QueueBusinessRepository:
         conversation.agent_id = agent_id
         conversation.status = "active"
         conversation.started_at = conversation.started_at or now
-        conversation.open_agent_handoff_state = (
-            "success" if conversation.open_agent_handoff_state else conversation.open_agent_handoff_state
-        )
+        if conversation.open_agent_handoff_state:
+            conversation.open_agent_handoff_state = "success"
+            conversation.bot_handoff_succeeded = True
+            conversation.bot_handoff_triggered = True
         await db.flush()
         return True
 

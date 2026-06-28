@@ -55,3 +55,5 @@ class VisitorTimeoutCloseState(Base, TimestampMixin):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     config_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    timeout_locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    timeout_locked_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)

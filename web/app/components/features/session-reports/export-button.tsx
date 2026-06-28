@@ -5,11 +5,11 @@ import { useEffect, useState } from 'react'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
 import { useSystemInfo } from '@/service/use-system'
-import { useSessionReportExport } from '@/service/use-session-reports'
+import { useSessionQueueReportExport, useSessionReportExport } from '@/service/use-session-reports'
 import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
 import { hasPermission } from '@/utils/permissions'
-import type { SessionReportExportParams } from '@/models/session-report'
+import type { QueueReportExportParams, SessionReportExportParams } from '@/models/session-report'
 
 type ToastState = {
   type: 'success' | 'error'
@@ -17,15 +17,17 @@ type ToastState = {
 }
 
 type Props = {
-  params: SessionReportExportParams
+  params: SessionReportExportParams | QueueReportExportParams
   disabled?: boolean
+  variant?: 'session' | 'queue'
 }
 
-export function SessionReportExportButton({ params, disabled }: Props) {
+export function SessionReportExportButton({ params, disabled, variant = 'session' }: Props) {
   const { locale } = useLocaleStore()
   const user = useAuthStore((state) => state.user)
   const { data: systemInfo } = useSystemInfo()
-  const exportMutation = useSessionReportExport()
+  const sessionExportMutation = useSessionReportExport()
+  const queueExportMutation = useSessionQueueReportExport()
   const [toast, setToast] = useState<ToastState | null>(null)
 
   useEffect(() => {
@@ -39,11 +41,15 @@ export function SessionReportExportButton({ params, disabled }: Props) {
 
   if (!reportsEnabled || !canExport) return null
 
-  const exporting = exportMutation.isPending
+  const exporting = variant === 'queue'
+    ? queueExportMutation.isPending
+    : sessionExportMutation.isPending
 
   const handleExport = async () => {
     try {
-      const { blob, filename } = await exportMutation.mutateAsync(params)
+      const { blob, filename } = variant === 'queue'
+        ? await queueExportMutation.mutateAsync(params as QueueReportExportParams)
+        : await sessionExportMutation.mutateAsync(params as SessionReportExportParams)
       triggerDownload(blob, filename)
       setToast({
         type: 'success',

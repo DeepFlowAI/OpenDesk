@@ -22,6 +22,7 @@ class FileMessageContent(BaseModel):
 class MessageCreate(BaseModel):
     content_type: Literal["text", "rich_text", "image", "file", "system", "internal_note"] = "text"
     content: str = Field(..., max_length=20000)
+    quoted_message_id: int | None = Field(default=None, gt=0)
 
 
 class MessageResponse(BaseModel):
@@ -35,8 +36,14 @@ class MessageResponse(BaseModel):
     sender_avatar: str | None = None
     content_type: str
     content: str
+    is_recalled: bool = False
+    recalled_at: datetime | None = None
+    recalled_by_type: str | None = None
+    recalled_by_id: int | None = None
+    recalled_by_name: str | None = None
     metadata: dict = Field(default_factory=dict)
     created_at: datetime
+    status: Literal["unread", "read"] | None = None
     event_type: str | None = None
     satisfaction_record_id: int | None = None
     config_version: int | None = None
@@ -56,8 +63,14 @@ class PublicMessageResponse(BaseModel):
     sender_avatar: str | None = None
     content_type: str
     content: str
+    is_recalled: bool = False
+    recalled_at: datetime | None = None
+    recalled_by_type: str | None = None
+    recalled_by_id: int | None = None
+    recalled_by_name: str | None = None
     metadata: dict = Field(default_factory=dict)
     created_at: datetime
+    status: Literal["unread", "read"] | None = None
     event_type: str | None = None
     satisfaction_record_id: int | None = None
     config_version: int | None = None
@@ -150,6 +163,11 @@ class WorkspaceMessageSearchResult(BaseModel):
     sender_avatar: str | None = None
     content_type: str
     content: str
+    is_recalled: bool = False
+    recalled_at: datetime | None = None
+    recalled_by_type: str | None = None
+    recalled_by_id: int | None = None
+    recalled_by_name: str | None = None
     created_at: datetime
     conversation: WorkspaceMessageSearchConversation
 

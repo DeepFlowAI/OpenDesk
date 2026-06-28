@@ -233,6 +233,32 @@ class TestQueueAPI:
         assert policy_resp.status_code == 422, policy_resp.text
 
     @pytest.mark.asyncio
+    async def test_policy_persists_returning_agent_config(self, client: AsyncClient):
+        headers = _auth_header()
+        _, group_id = await _create_agent_and_group(client)
+
+        policy_resp = await client.put(
+            "/api/v1/queue/policies",
+            json={
+                "channel": "online_chat",
+                "scope_type": "employee_group",
+                "scope_id": group_id,
+                "enabled": True,
+                "assignment_strategy": "round_robin",
+                "config": {
+                    "returning_agent_priority_enabled": True,
+                    "returning_agent_window_hours": 48,
+                },
+            },
+            headers=headers,
+        )
+
+        assert policy_resp.status_code == 200, policy_resp.text
+        data = policy_resp.json()
+        assert data["config"]["returning_agent_priority_enabled"] is True
+        assert data["config"]["returning_agent_window_hours"] == 48
+
+    @pytest.mark.asyncio
     async def test_dispatch_assigns_online_chat_agent(self, client: AsyncClient):
         headers = _auth_header()
         employee_id, group_id = await _create_agent_and_group(client)

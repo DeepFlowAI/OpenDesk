@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import {
   IconCheck,
   IconChevronDown,
@@ -8,6 +8,7 @@ import {
   IconLoader2,
   IconRefresh,
   IconSearch,
+  IconSend,
   IconUserCheck,
   IconUsers,
 } from '@tabler/icons-react'
@@ -30,6 +31,7 @@ import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { getWorkspaceHumanAgentLabel } from '@/lib/workspace-agent-display'
 import {
   useAssignableAgents,
+  useAssignAndSendQueueTaskToSelf,
   useAssignQueueTaskToAgent,
   useAssignQueueTaskToSelf,
   useQueueTask,
@@ -50,6 +52,7 @@ type QueueFilter = {
 type QueueTaskListSidebarProps = {
   items: QueueWorkspaceTask[]
   visibleQueues: QueueWorkspaceQueueBrief[]
+  itemsUpdatedAt: number
   selectedId: number | null
   loading: boolean
   queueFilter: QueueFilter
@@ -61,8 +64,13 @@ type QueueTaskListSidebarProps = {
 type QueueTaskPanelProps = {
   selectedId: number | null
   agentStatus: AgentStatus | null
-  onAssigned: (response: QueueAssignmentWorkspaceResponse) => void
+  onAssigned: (
+    response: QueueAssignmentWorkspaceResponse,
+    options?: { openConversation?: boolean; messageSent?: boolean },
+  ) => void
 }
+
+const QUICK_REPLY_MAX_LENGTH = 5000
 
 const STATUS_COLOR: Record<string, string> = {
   online: '#22C55E',
@@ -71,12 +79,44 @@ const STATUS_COLOR: Record<string, string> = {
 }
 
 function formatWait(seconds: number): string {
-  const total = Math.max(0, seconds)
+  const total = Math.max(0, Math.floor(seconds))
   const h = Math.floor(total / 3600)
   const m = Math.floor((total % 3600) / 60)
   const s = total % 60
   if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
+
+function getLiveWaitSeconds(baseSeconds: number, updatedAt: number, now: number | null): number {
+  const base = Number.isFinite(baseSeconds) ? Math.max(0, Math.floor(baseSeconds)) : 0
+  if (!now || updatedAt <= 0) return base
+  return base + Math.max(0, Math.floor((now - updatedAt) / 1000))
+}
+
+function useLiveNow(active: boolean, resetKey: number): number | null {
+  const [now, setNow] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (!active) {
+      setNow(null)
+      return
+    }
+
+    const update = () => {
+      if (document.visibilityState !== 'hidden') setNow(Date.now())
+    }
+
+    update()
+    const intervalId = window.setInterval(update, 1000)
+    document.addEventListener('visibilitychange', update)
+
+    return () => {
+      window.clearInterval(intervalId)
+      document.removeEventListener('visibilitychange', update)
+    }
+  }, [active, resetKey])
+
+  return now
 }
 
 function formatTime(value: string | null): string {
@@ -114,6 +154,7 @@ function queueLabel(queue: QueueWorkspaceQueueBrief): string {
 export function QueueTaskListSidebar({
   items,
   visibleQueues,
+  itemsUpdatedAt,
   selectedId,
   loading,
   queueFilter,
@@ -134,6 +175,7 @@ export function QueueTaskListSidebar({
   const totalQueueCount = visibleQueues.reduce((sum, queue) => sum + queue.waiting_count, 0)
   const selectedQueueLabel = selectedQueue ? queueLabel(selectedQueue) : t('ws.chat.queueAllVisible', locale)
   const selectedQueueCount = selectedQueue ? selectedQueue.waiting_count : totalQueueCount
+  const liveNow = useLiveNow(items.length > 0 && itemsUpdatedAt > 0, itemsUpdatedAt)
 
   useEffect(() => {
     if (!queueMenuOpen) return
@@ -228,6 +270,7 @@ export function QueueTaskListSidebar({
         ) : (
           items.map((item) => {
             const selected = selectedId === item.id
+            const waitSeconds = getLiveWaitSeconds(item.wait_seconds, itemsUpdatedAt, liveNow)
             return (
               <button
                 key={item.id}
@@ -257,7 +300,7 @@ export function QueueTaskListSidebar({
                   </div>
                   <div className="mt-1 flex items-center gap-1.5 text-[11px] text-[#999999]">
                     <IconClock size={12} stroke={1.7} />
-                    <span>{t('ws.chat.queueWaited', locale, { time: formatWait(item.wait_seconds) })}</span>
+                    <span>{t('ws.chat.queueWaited', locale, { time: formatWait(waitSeconds) })}</span>
                     {item.position_in_priority ? (
                       <span>#{item.position_in_priority}</span>
                     ) : null}
@@ -306,12 +349,27 @@ function QueueFilterMenuItem({
 
 export function QueueTaskPanel({ selectedId, agentStatus, onAssigned }: QueueTaskPanelProps) {
   const { locale } = useLocaleStore()
-  const { data, isLoading, refetch } = useQueueTask(selectedId)
+  const { data, isLoading, refetch, dataUpdatedAt } = useQueueTask(selectedId)
   const assignSelf = useAssignQueueTaskToSelf()
   const assignAgent = useAssignQueueTaskToAgent()
+  const assignAndSend = useAssignAndSendQueueTaskToSelf()
   const [toast, setToast] = useState<string | null>(null)
   const [assignOpen, setAssignOpen] = useState(false)
+  const [capacityConfirmOpen, setCapacityConfirmOpen] = useState(false)
+  const [pendingQuickReply, setPendingQuickReply] = useState('')
+  const [pendingQuickReplyTaskId, setPendingQuickReplyTaskId] = useState<number | null>(null)
+  const [quickReplyDrafts, setQuickReplyDrafts] = useState<Record<number, string>>({})
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const liveNow = useLiveNow(Boolean(data && dataUpdatedAt > 0), dataUpdatedAt)
+  const liveWaitSeconds = data ? getLiveWaitSeconds(data.wait_seconds, dataUpdatedAt, liveNow) : 0
+  const quickReplyDraft = selectedId ? quickReplyDrafts[selectedId] ?? '' : ''
+  const quickReplyLength = quickReplyDraft.length
+  const isOffline = agentStatus?.status === 'offline'
+  const capacityReached = Boolean(
+    agentStatus
+    && agentStatus.max_concurrent > 0
+    && agentStatus.current_count >= agentStatus.max_concurrent,
+  )
 
   useEffect(() => () => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
@@ -339,6 +397,66 @@ export function QueueTaskPanel({ selectedId, agentStatus, onAssigned }: QueueTas
     }
   }
 
+  const updateQuickReplyDraft = (taskId: number, value: string) => {
+    setQuickReplyDrafts((prev) => ({ ...prev, [taskId]: value }))
+  }
+
+  const submitQuickReply = async (taskId: number, content: string) => {
+    try {
+      const response = await assignAndSend.mutateAsync({ taskId, content })
+      if (response.message_sent) {
+        setQuickReplyDrafts((prev) => {
+          const next = { ...prev }
+          delete next[taskId]
+          return next
+        })
+      } else {
+        updateQuickReplyDraft(taskId, content)
+      }
+      onAssigned(response, { openConversation: true, messageSent: response.message_sent })
+    } catch {
+      showToast(t('ws.chat.queueQuickSendStateChanged', locale))
+      void refetch()
+    }
+  }
+
+  const handleQuickReplySend = () => {
+    if (!selectedId) return
+    if (isOffline) {
+      showToast(t('ws.chat.queueQuickReplyOffline', locale))
+      return
+    }
+    const content = quickReplyDraft.trim()
+    if (!content) {
+      showToast(t('ws.chat.queueQuickReplyEmpty', locale))
+      return
+    }
+    if (content.length > QUICK_REPLY_MAX_LENGTH) {
+      showToast(t('ws.chat.queueQuickReplyTooLong', locale))
+      return
+    }
+    const taskId = selectedId
+    if (capacityReached) {
+      setPendingQuickReply(content)
+      setPendingQuickReplyTaskId(taskId)
+      setCapacityConfirmOpen(true)
+      return
+    }
+    void submitQuickReply(taskId, content)
+  }
+
+  const handleQuickReplyKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return
+    event.preventDefault()
+    handleQuickReplySend()
+  }
+
+  const handleQuickReplyPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (event.clipboardData.files.length === 0) return
+    event.preventDefault()
+    showToast(t('ws.chat.queueQuickReplyPasteAttachment', locale))
+  }
+
   if (!selectedId) {
     return <QueueEmptyState text={t('ws.chat.queueSelectHint', locale)} />
   }
@@ -354,6 +472,10 @@ export function QueueTaskPanel({ selectedId, agentStatus, onAssigned }: QueueTas
   if (!data) {
     return <QueueEmptyState text={t('ws.chat.queueLoadFailed', locale)} />
   }
+
+  const showQuickReply = data.can_assign_self && data.conversation_id !== null
+  const quickReplyDisabled = assignAndSend.isPending || isOffline
+  const visitorName = data.visitor?.name || `${t('ws.chat.queueVisitor', locale)} #${data.conversation_id || data.id}`
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-white">
@@ -396,11 +518,13 @@ export function QueueTaskPanel({ selectedId, agentStatus, onAssigned }: QueueTas
         <div className="grid grid-cols-1 gap-3 text-xs md:grid-cols-3">
           <QueueMeta label={t('ws.chat.queueName', locale)} value={data.queue.name || '-'} />
           <QueueMeta label={t('ws.chat.queueEnqueuedAt', locale)} value={formatTime(data.enqueued_at)} />
-          <QueueMeta label={t('ws.chat.queueWaitTime', locale)} value={formatWait(data.wait_seconds)} />
+          <QueueMeta label={t('ws.chat.queueWaitTime', locale)} value={formatWait(liveWaitSeconds)} />
         </div>
-        <div className="mt-3 rounded-md bg-[#F5F5F5] px-3 py-2 text-xs text-[#737373]">
-          {t('ws.chat.queueReadOnlyHint', locale)}
-        </div>
+        {!showQuickReply && (
+          <div className="mt-3 rounded-md bg-[#F5F5F5] px-3 py-2 text-xs text-[#737373]">
+            {t('ws.chat.queueReadOnlyHint', locale)}
+          </div>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
@@ -417,10 +541,58 @@ export function QueueTaskPanel({ selectedId, agentStatus, onAssigned }: QueueTas
         )}
       </div>
 
+      {showQuickReply ? (
+        <div className="shrink-0 border-t border-[#E5E5E5] bg-[#FAFAFA] px-6 pb-4 pt-3">
+          <div className="mb-2 text-xs text-muted-foreground">
+            {isOffline ? t('ws.chat.queueQuickReplyOffline', locale) : t('ws.chat.queueQuickReplyHint', locale)}
+          </div>
+          <div className="relative flex flex-col gap-2 rounded-2xl border border-[#E5E5E5] bg-white pl-3.5 pr-3.5 pt-3 pb-2.5 transition-colors">
+            <textarea
+              value={quickReplyDraft}
+              onChange={(event) => selectedId && updateQuickReplyDraft(selectedId, event.target.value)}
+              onKeyDown={handleQuickReplyKeyDown}
+              onPaste={handleQuickReplyPaste}
+              placeholder={t('ws.chat.queueQuickReplyPlaceholder', locale)}
+              disabled={quickReplyDisabled}
+              rows={2}
+              className="max-h-[168px] min-h-[44px] w-full resize-none overflow-y-auto border-0 bg-transparent p-0 text-sm leading-[22px] text-[#1a1a1a] outline-none ring-0 transition-colors placeholder:text-[#BBBBBB] focus-visible:ring-0 disabled:cursor-not-allowed disabled:text-muted-foreground"
+            />
+            <div className="flex items-center justify-between">
+              <span className={cn(
+                'text-[11px]',
+                quickReplyLength > QUICK_REPLY_MAX_LENGTH ? 'text-destructive' : 'text-[#999999]',
+              )}>
+                {quickReplyLength} / {QUICK_REPLY_MAX_LENGTH}
+              </span>
+              <button
+                type="button"
+                onClick={handleQuickReplySend}
+                disabled={quickReplyDisabled}
+                title={t('ws.chat.queueQuickReplySendAria', locale)}
+                aria-label={t('ws.chat.queueQuickReplySendAria', locale)}
+                className="flex shrink-0 items-center gap-1.5 rounded-2xl bg-[#1a1a1a] px-4 py-1.5 text-[13px] font-medium leading-none text-white transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40"
+              >
+                {assignAndSend.isPending ? (
+                  <IconLoader2 size={15} className="animate-spin" />
+                ) : (
+                  <IconSend size={15} />
+                )}
+                {t('ws.chat.queueQuickReplySend', locale)}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="shrink-0 border-t border-border bg-background px-6 py-3 text-xs text-muted-foreground">
+          {t('ws.chat.queueReadOnlyHint', locale)}
+        </div>
+      )}
+
       <QueueAssignDialog
         open={assignOpen}
         taskId={selectedId}
         task={data}
+        waitSeconds={liveWaitSeconds}
         submitting={assignAgent.isPending}
         onClose={() => setAssignOpen(false)}
         onSubmit={async (agentId, reason) => {
@@ -436,6 +608,44 @@ export function QueueTaskPanel({ selectedId, agentStatus, onAssigned }: QueueTas
           }
         }}
       />
+
+      <Dialog open={capacityConfirmOpen} onOpenChange={(open) => { if (!assignAndSend.isPending) setCapacityConfirmOpen(open) }}>
+        <DialogContent className="sm:max-w-[440px]">
+          <DialogHeader>
+            <DialogTitle>{t('ws.chat.queueQuickReplyCapacityTitle', locale)}</DialogTitle>
+            <DialogDescription>
+              {t('ws.chat.queueQuickReplyCapacityDescription', locale)}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 rounded-md border border-border bg-muted px-3 py-2 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">{t('ws.chat.receptionLabel', locale)}</span>
+              <span className="font-medium text-foreground">
+                {(agentStatus?.current_count ?? 0)} / {(agentStatus?.max_concurrent ?? 0)}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-muted-foreground">{t('ws.chat.queueVisitor', locale)}</span>
+              <span className="min-w-0 truncate font-medium text-foreground">{visitorName}</span>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCapacityConfirmOpen(false)} disabled={assignAndSend.isPending}>
+              {t('ws.common.cancel', locale)}
+            </Button>
+            <Button
+              onClick={() => {
+                setCapacityConfirmOpen(false)
+                if (pendingQuickReplyTaskId) void submitQuickReply(pendingQuickReplyTaskId, pendingQuickReply)
+              }}
+              disabled={assignAndSend.isPending}
+            >
+              {assignAndSend.isPending && <IconLoader2 size={14} className="mr-1 animate-spin" />}
+              {t('ws.chat.queueQuickReplyCapacityConfirm', locale)}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
@@ -444,6 +654,7 @@ function QueueAssignDialog({
   open,
   taskId,
   task,
+  waitSeconds,
   submitting,
   onClose,
   onSubmit,
@@ -451,6 +662,7 @@ function QueueAssignDialog({
   open: boolean
   taskId: number
   task: QueueWorkspaceTask
+  waitSeconds: number
   submitting: boolean
   onClose: () => void
   onSubmit: (agentId: number, reason: string) => Promise<void>
@@ -494,7 +706,7 @@ function QueueAssignDialog({
         <DialogHeader>
           <DialogTitle>{t('ws.chat.queueAssignDialogTitle', locale)}</DialogTitle>
           <DialogDescription>
-            {task.visitor?.name || t('ws.chat.queueVisitor', locale)} · {task.queue.name || t('ws.chat.queueUnknown', locale)} · {formatWait(task.wait_seconds)}
+            {task.visitor?.name || t('ws.chat.queueVisitor', locale)} · {task.queue.name || t('ws.chat.queueUnknown', locale)} · {formatWait(waitSeconds)}
           </DialogDescription>
         </DialogHeader>
 

@@ -43,9 +43,15 @@ export type Conversation = {
   visitor_browser: string | null
   visitor_ip: string | null
   unread_count: number
+  is_pinned?: boolean
+  pinned_at?: string | null
+  is_timeout_locked?: boolean
+  timeout_locked_at?: string | null
+  timeout_locked_by_id?: number | null
   has_history_conversations?: boolean
-  viewer_relation?: 'own' | 'peer' | null
+  viewer_relation?: 'own' | 'peer' | 'collaborator' | null
   collaborated_by_current_user?: boolean
+  collaborators?: AgentBrief[]
   created_at: string | null
 }
 
@@ -75,7 +81,23 @@ export type VisitorWebStatusResponse = {
   checked_at: string
 }
 
-export type MessageStatus = 'sending' | 'delivered' | 'read'
+export type MessageStatus = 'sending' | 'delivered' | 'unread' | 'read'
+
+export type MessageQuote = {
+  schema_version: 1
+  message_id: number
+  sender_type: Message['sender_type']
+  sender_id: number | null
+  sender_name: string | null
+  content_type: Message['content_type']
+  summary?: string
+  file_name?: string
+  is_recalled?: boolean
+}
+
+export type MessageMetadata = Record<string, unknown> & {
+  quote?: MessageQuote
+}
 
 export type OpenAgentThinkingBlock = {
   id: string
@@ -115,7 +137,12 @@ export type Message = {
   sender_avatar: string | null
   content_type: 'text' | 'rich_text' | 'image' | 'file' | 'system' | 'welcome' | 'bot_welcome' | 'satisfaction_event' | 'internal_note'
   content: string
-  metadata?: Record<string, unknown>
+  is_recalled?: boolean
+  recalled_at?: string | null
+  recalled_by_type?: 'visitor' | 'agent' | 'bot' | 'system' | string | null
+  recalled_by_id?: number | null
+  recalled_by_name?: string | null
+  metadata?: MessageMetadata
   created_at: string
   status?: MessageStatus
   event_type?: 'invitation_sent' | 'feedback_submitted' | 'open_agent_handoff_event'
@@ -198,6 +225,11 @@ export type WorkspaceMessageSearchResult = {
   sender_avatar: string | null
   content_type: Message['content_type']
   content: string
+  is_recalled?: boolean
+  recalled_at?: string | null
+  recalled_by_type?: string | null
+  recalled_by_id?: number | null
+  recalled_by_name?: string | null
   created_at: string
   conversation: WorkspaceMessageSearchConversation
 }

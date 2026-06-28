@@ -52,6 +52,16 @@ export type PublicOfflineMessageSendResponse = {
   messages?: PublicMessage[]
 }
 
+export type VisitorEnvironmentPayload = {
+  system?: string | null
+  browser?: string | null
+}
+
+const visitorEnvironmentJson = (environment?: VisitorEnvironmentPayload | null) => ({
+  ...(environment?.system ? { system: environment.system } : {}),
+  ...(environment?.browser ? { browser: environment.browser } : {}),
+})
+
 export const visitorChatKeys = {
   channel: (key: string, visitorExternalId?: string | null, currentConversationPublicId?: string | null) =>
     ['public', 'channel', key, visitorExternalId ?? null, currentConversationPublicId ?? null] as const,
@@ -146,6 +156,7 @@ export const createOrContinueOfflineMessage = (params: {
   visitorSessionToken: string
   visitorName?: string | null
   metadata?: Record<string, unknown> | null
+  visitorEnvironment?: VisitorEnvironmentPayload | null
 }) =>
   publicClient
     .post('v1/public/offline-messages', {
@@ -153,6 +164,7 @@ export const createOrContinueOfflineMessage = (params: {
       json: {
         ...(params.visitorName ? { visitor_name: params.visitorName } : {}),
         ...(params.metadata ? { metadata: params.metadata } : {}),
+        ...visitorEnvironmentJson(params.visitorEnvironment),
       },
     })
     .json<PublicOfflineMessageResponse>()
@@ -194,6 +206,7 @@ export const createOfflineMessageWithMessage = (params: {
   visitorSessionToken: string
   contentType: 'text' | 'image' | 'file'
   content: string
+  visitorEnvironment?: VisitorEnvironmentPayload | null
 }) =>
   publicClient
     .post('v1/public/offline-messages/messages', {
@@ -201,6 +214,7 @@ export const createOfflineMessageWithMessage = (params: {
       json: {
         content_type: params.contentType,
         content: params.content,
+        ...visitorEnvironmentJson(params.visitorEnvironment),
       },
     })
     .json<PublicOfflineMessageSendResponse>()
@@ -210,6 +224,7 @@ export const sendOfflineMessage = (params: {
   visitorSessionToken: string
   contentType: 'text' | 'image' | 'file'
   content: string
+  visitorEnvironment?: VisitorEnvironmentPayload | null
 }) =>
   publicClient
     .post(`v1/public/offline-messages/${params.offlineMessagePublicId}/messages`, {
@@ -217,6 +232,7 @@ export const sendOfflineMessage = (params: {
       json: {
         content_type: params.contentType,
         content: params.content,
+        ...visitorEnvironmentJson(params.visitorEnvironment),
       },
     })
     .json<PublicOfflineMessageSendResponse>()
@@ -264,3 +280,14 @@ export const markConversationCustomerRead = (params: {
       headers: withVisitorToken(params.visitorSessionToken),
     })
     .json<{ ok: boolean }>()
+
+export const recallPublicMessage = (params: {
+  conversationPublicId: string
+  visitorSessionToken: string
+  messageId: number
+}) =>
+  publicClient
+    .post(`v1/public/conversations/${params.conversationPublicId}/messages/${params.messageId}/recall`, {
+      headers: withVisitorToken(params.visitorSessionToken),
+    })
+    .json<PublicMessage>()

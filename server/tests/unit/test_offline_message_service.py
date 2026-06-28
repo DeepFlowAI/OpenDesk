@@ -16,6 +16,7 @@ from app.services.offline_message_service import (
     OFFLINE_MESSAGE_PROMPT_EVENT,
     OfflineMessageRepository,
     OfflineMessageService,
+    VISITOR_ENVIRONMENT_METADATA_KEY,
 )
 from app.services.offline_message_realtime_service import OfflineMessageRealtimeService
 
@@ -28,6 +29,21 @@ def _principal() -> EffectivePrincipal:
         data_scopes={"offline_message": "group"},
         group_ids=[7],
     )
+
+
+def test_merge_visitor_environment_metadata_preserves_existing_metadata():
+    metadata = OfflineMessageService._merge_visitor_environment_metadata(
+        {"customer_id": "cus_1", VISITOR_ENVIRONMENT_METADATA_KEY: {"system": "Windows"}},
+        visitor_browser=" Chrome 126 ",
+        visitor_ip=" 203.0.113.42 ",
+    )
+
+    assert metadata["customer_id"] == "cus_1"
+    assert metadata[VISITOR_ENVIRONMENT_METADATA_KEY] == {
+        "system": "Windows",
+        "browser": "Chrome 126",
+        "ip": "203.0.113.42",
+    }
 
 
 @pytest.mark.asyncio
@@ -335,7 +351,7 @@ async def test_create_conversation_appends_created_event_after_offline_messages(
         tenant_id=1,
         status="pending",
         visitor=SimpleNamespace(name="Visitor"),
-        channel=SimpleNamespace(id=2),
+        channel=SimpleNamespace(id=2, channel_type="web"),
         target_group=SimpleNamespace(id=7),
         conversation=None,
         visitor_id=20,
@@ -348,7 +364,13 @@ async def test_create_conversation_appends_created_event_after_offline_messages(
         last_message_at=entry_visitor.created_at,
         last_message_preview="34324",
         message_count=2,
-        metadata_={},
+        metadata_={
+            VISITOR_ENVIRONMENT_METADATA_KEY: {
+                "system": "macOS 15.5",
+                "browser": "Chrome 126",
+                "ip": "203.0.113.42",
+            },
+        },
         created_at=datetime(2026, 6, 18, 22, 0),
         updated_at=datetime(2026, 6, 18, 22, 7),
         messages=[entry_prompt, entry_visitor],
@@ -362,6 +384,10 @@ async def test_create_conversation_appends_created_event_after_offline_messages(
     monkeypatch.setattr(OfflineMessageService, "_assert_view_access", AsyncMock())
     monkeypatch.setattr(OfflineMessageRepository, "get_by_id_for_update", AsyncMock(return_value=row))
     monkeypatch.setattr(OfflineMessageRepository, "get_by_id", AsyncMock(side_effect=refresh_row))
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.get_active_visitor_conversation",
+        AsyncMock(return_value=None),
+    )
     monkeypatch.setattr(
         "app.services.offline_message_service.ConversationRepository.generate_unique_public_id",
         AsyncMock(return_value="conv_test"),
@@ -408,7 +434,158 @@ async def test_create_conversation_appends_created_event_after_offline_messages(
     assert result["messages"][2]["event_type"] == OFFLINE_MESSAGE_CONVERSATION_CREATED_EVENT
     assert created_conversation.last_message_preview == OFFLINE_MESSAGE_CONVERSATION_CREATED_TEXT
     assert created_conversation.last_message_at == added_messages[-1].created_at
+    assert created_conversation.visitor_system == "macOS 15.5"
+    assert created_conversation.visitor_browser == "Chrome 126"
+    assert created_conversation.visitor_ip == "203.0.113.42"
     assert row.status == "converted"
+    db.commit.assert_awaited_once()
+    db.rollback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_reuses_existing_active_conversation(monkeypatch):
+    added_messages = []
+
+    def add_object(obj):
+        if isinstance(obj, Conversation):
+            raise AssertionError("should not create a second active conversation")
+        if isinstance(obj, Message):
+            obj.id = 2001 + len(added_messages)
+            added_messages.append(obj)
+
+    db = SimpleNamespace(
+        add=Mock(side_effect=add_object),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+    visitor = SimpleNamespace(
+        id=20,
+        public_id="usr_test",
+        external_id="visitor-1",
+        name="Visitor",
+        avatar_color="#60A5FA",
+    )
+    agent = SimpleNamespace(id=10, display_name=None, name="Agent", avatar=None)
+    existing = SimpleNamespace(
+        id=21,
+        public_id="conv_existing",
+        share_code="share001",
+        tenant_id=1,
+        visitor_id=visitor.id,
+        visitor=visitor,
+        agent_id=agent.id,
+        agent=agent,
+        channel_id=2,
+        channel=SimpleNamespace(id=2, name="Web", channel_type="web"),
+        group_id=7,
+        group=SimpleNamespace(id=7, name="Support"),
+        status="active",
+        started_at=datetime(2026, 6, 18, 21, 0),
+        ended_at=None,
+        ended_by=None,
+        last_message_at=datetime(2026, 6, 18, 21, 30),
+        last_message_preview="current conversation",
+        visitor_system=None,
+        visitor_browser=None,
+        visitor_ip=None,
+        unread_count=0,
+        created_at=datetime(2026, 6, 18, 21, 0),
+    )
+    entry = SimpleNamespace(
+        id=2,
+        sender_type="visitor",
+        sender_id=visitor.id,
+        content_type="text",
+        content="please help",
+        metadata_={},
+        created_at=datetime(2026, 6, 18, 22, 7),
+    )
+    row = SimpleNamespace(
+        id=12,
+        public_id="om_test",
+        tenant_id=1,
+        status="pending",
+        visitor=visitor,
+        channel=existing.channel,
+        target_group=existing.group,
+        conversation=None,
+        visitor_id=visitor.id,
+        visitor_external_id=visitor.external_id,
+        visitor_name=visitor.name,
+        channel_id=existing.channel_id,
+        target_group_id=existing.group_id,
+        handled_by_id=None,
+        handled_at=None,
+        last_message_at=entry.created_at,
+        last_message_preview=entry.content,
+        message_count=1,
+        metadata_={},
+        created_at=datetime(2026, 6, 18, 22, 0),
+        updated_at=datetime(2026, 6, 18, 22, 7),
+        messages=[entry],
+    )
+    principal = _principal()
+
+    async def refresh_row(_db, _offline_message_id):
+        row.conversation = existing
+        return row
+
+    get_active = AsyncMock(return_value=existing)
+    generate_public_id = AsyncMock(return_value="unused")
+    generate_share_code = AsyncMock(return_value="unused")
+    increment_count = AsyncMock()
+    monkeypatch.setattr(OfflineMessageService, "_assert_view_access", AsyncMock())
+    monkeypatch.setattr(OfflineMessageRepository, "get_by_id_for_update", AsyncMock(return_value=row))
+    monkeypatch.setattr(OfflineMessageRepository, "get_by_id", AsyncMock(side_effect=refresh_row))
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.get_active_visitor_conversation",
+        get_active,
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.generate_unique_public_id",
+        generate_public_id,
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.generate_unique_share_code",
+        generate_share_code,
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=existing),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.AgentStatusService.increment_count",
+        increment_count,
+    )
+    monkeypatch.setattr(OfflineMessageRealtimeService, "emit_updated", AsyncMock())
+    monkeypatch.setattr(
+        "app.services.offline_message_service.EmployeeRepository.get_by_id",
+        AsyncMock(return_value=agent),
+    )
+
+    result = await OfflineMessageService.create_conversation(db, object(), principal, row.id)
+
+    assert result["conversation"] is existing
+    assert result["reused_existing_conversation"] is True
+    assert [message.conversation_id for message in added_messages] == [existing.id, existing.id]
+    assert [message.content for message in added_messages] == [
+        "please help",
+        OFFLINE_MESSAGE_CONVERSATION_CREATED_TEXT,
+    ]
+    assert row.status == "converted"
+    assert row.conversation_id == existing.id
+    assert existing.last_message_preview == OFFLINE_MESSAGE_CONVERSATION_CREATED_TEXT
+    assert result["messages"][0]["metadata"]["offline_message_entry_id"] == entry.id
+    get_active.assert_awaited_once_with(
+        db,
+        tenant_id=row.tenant_id,
+        visitor_id=row.visitor_id,
+        channel_id=row.channel_id,
+    )
+    generate_public_id.assert_not_awaited()
+    generate_share_code.assert_not_awaited()
+    increment_count.assert_not_awaited()
     db.commit.assert_awaited_once()
     db.rollback.assert_not_awaited()
 

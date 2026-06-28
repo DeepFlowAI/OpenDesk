@@ -55,6 +55,8 @@ async def seed_reports_data():
         # Wipe any conversations + messages from prior test runs so counts
         # are deterministic. ON DELETE CASCADE on conversations handles messages.
         await db.execute(text("DELETE FROM conversations WHERE tenant_id = :tid"), {"tid": _TENANT_PK})
+        await db.execute(text("DELETE FROM queue_tasks WHERE tenant_id = :tid"), {"tid": _TENANT_PK})
+        await db.execute(text("DELETE FROM offline_messages WHERE tenant_id = :tid"), {"tid": _TENANT_PK})
         await db.commit()
 
         # Two agents
@@ -108,10 +110,98 @@ async def seed_reports_data():
         # Three messages per conversation: visitor / agent / agent
         rows = await db.execute(text("""
             SELECT id FROM conversations WHERE tenant_id=:tid AND agent_id IN (:a,:b)
-            ORDER BY id DESC LIMIT 3
+            ORDER BY started_at ASC LIMIT 3
         """), {"tid": _TENANT_PK, "a": _AGENT_A_ID, "b": _AGENT_B_ID})
         conv_ids = [r[0] for r in rows.all()]
         assert len(conv_ids) == 3
+
+        await db.execute(text("""
+            UPDATE conversations
+            SET open_agent_agent_id = 1001,
+                open_agent_conversation_external_id = 'oa-reports-success',
+                open_agent_handoff_state = 'success'
+            WHERE id = :cid
+        """), {"cid": conv_ids[0]})
+        await db.execute(text("""
+            UPDATE conversations
+            SET open_agent_agent_id = 1002,
+                open_agent_conversation_external_id = 'oa-reports-bot'
+            WHERE id = :cid
+        """), {"cid": conv_ids[1]})
+
+        # Materialized basic report fields (bot markers + ended-session duration).
+        # Reports now read these columns instead of re-deriving the OR / epoch
+        # expressions, so seed them with the same caliber as the backfill.
+        await db.execute(text("""
+            UPDATE conversations SET
+                had_bot_session = (
+                    open_agent_agent_id IS NOT NULL
+                    OR open_agent_conversation_id IS NOT NULL
+                    OR open_agent_conversation_external_id IS NOT NULL
+                ),
+                bot_handoff_succeeded = COALESCE(open_agent_handoff_state = 'success', false),
+                duration_seconds = CASE
+                    WHEN ended_at IS NOT NULL AND started_at IS NOT NULL
+                    THEN GREATEST(0, EXTRACT(epoch FROM ended_at - started_at))::int
+                END
+            WHERE tenant_id = :tid
+        """), {"tid": _TENANT_PK})
+
+        await db.execute(text("""
+            INSERT INTO queue_tasks (
+                tenant_id, channel, task_type, task_ref_id, task_ref_public_id,
+                queue_type, queue_id, priority, status, source_type,
+                enqueued_at, assigned_at
+            )
+            VALUES
+              (:tid, 'online_chat', 'conversation', :cid0, 'queue-ref-0',
+               'employee_group', 1, 5, 'assigned', 'test',
+               ((:anchor)::date + TIME '10:16')::timestamp AT TIME ZONE 'Asia/Shanghai',
+               ((:anchor)::date + TIME '10:18')::timestamp AT TIME ZONE 'Asia/Shanghai'),
+              (:tid, 'online_chat', 'conversation', :cid1, 'queue-ref-1',
+               'employee_group', 1, 5, 'assigned', 'test',
+               ((:anchor)::date + TIME '10:46')::timestamp AT TIME ZONE 'Asia/Shanghai',
+               ((:anchor)::date + TIME '10:47')::timestamp AT TIME ZONE 'Asia/Shanghai'),
+              (:tid, 'online_chat', 'open_agent_handoff', :cid1, 'queue-ref-2',
+               'employee_group', 1, 5, 'assigned', 'test',
+               ((:anchor)::date + TIME '10:48')::timestamp AT TIME ZONE 'Asia/Shanghai',
+               ((:anchor)::date + TIME '10:51')::timestamp AT TIME ZONE 'Asia/Shanghai')
+        """), {
+            "tid": _TENANT_PK,
+            "cid0": str(conv_ids[0]),
+            "cid1": str(conv_ids[1]),
+            "anchor": date.fromisoformat(_ANCHOR_DATE_STR),
+        })
+
+        # Materialized per-conversation queue duration (queue reports now read
+        # conversations.total_queue_duration_seconds instead of re-aggregating
+        # queue_tasks). cid0 waited 120s; cid1 waited 60s + 180s = 240s.
+        await db.execute(text("""
+            UPDATE conversations SET total_queue_duration_seconds = 120 WHERE id = :cid
+        """), {"cid": conv_ids[0]})
+        await db.execute(text("""
+            UPDATE conversations SET total_queue_duration_seconds = 240 WHERE id = :cid
+        """), {"cid": conv_ids[1]})
+
+        await db.execute(text("""
+            INSERT INTO offline_messages (
+                public_id, tenant_id, visitor_external_id, visitor_name, status,
+                handled_by_id, message_count, created_at
+            )
+            VALUES
+              ('om_reports_query_a', :tid, 'offline-a', 'Offline A', 'pending',
+               :a, 1, ((:anchor)::date + TIME '09:00')::timestamp AT TIME ZONE 'Asia/Shanghai'),
+              ('om_reports_query_b', :tid, 'offline-b', 'Offline B', 'converted',
+               :b, 2, ((:anchor)::date + TIME '15:00')::timestamp AT TIME ZONE 'Asia/Shanghai'),
+              ('om_reports_query_outside', :tid, 'offline-outside', 'Offline Outside', 'pending',
+               :a, 1, ((:anchor)::date - INTERVAL '1 day' + TIME '12:00')::timestamp AT TIME ZONE 'Asia/Shanghai')
+            ON CONFLICT (public_id) DO NOTHING
+        """), {
+            "tid": _TENANT_PK,
+            "a": _AGENT_A_ID,
+            "b": _AGENT_B_ID,
+            "anchor": date.fromisoformat(_ANCHOR_DATE_STR),
+        })
 
         for cid in conv_ids:
             await db.execute(text("""
@@ -122,6 +212,54 @@ async def seed_reports_data():
                   (:tid, :cid, 'agent',   'text', 'how can I help', NOW()),
                   (:tid, :cid, 'system',  'system', 'started', NOW())
             """), {"tid": _TENANT_PK, "cid": cid})
+        await db.commit()
+
+        # Materialized message counts (visitor / agent). Reports now read these
+        # columns instead of joining messages, so seed them with the same
+        # caliber as the backfill: count by sender_type, system excluded.
+        await db.execute(text("""
+            UPDATE conversations c SET
+                visitor_message_count = COALESCE(m.visitor_count, 0),
+                agent_message_count = COALESCE(m.agent_count, 0)
+            FROM (
+                SELECT conversation_id,
+                    COUNT(*) FILTER (WHERE sender_type = 'visitor') AS visitor_count,
+                    COUNT(*) FILTER (WHERE sender_type = 'agent') AS agent_count
+                FROM messages WHERE tenant_id = :tid
+                GROUP BY conversation_id
+            ) m
+            WHERE c.id = m.conversation_id AND c.tenant_id = :tid
+        """), {"tid": _TENANT_PK})
+        await db.commit()
+
+        # Reception segments: conv_ids[0] is a single conversation transferred
+        # from Agent A to Agent B (2 segments). The other conversations have no
+        # segments. Segments are attributed by conversation_started_at.
+        await db.execute(text("""
+            INSERT INTO conversation_reception_segments (
+                tenant_id, conversation_id, seq_no, agent_id, started_at, ended_at,
+                duration_seconds, entry_reason, end_reason, to_agent_id, from_agent_id,
+                visitor_message_count, agent_message_count, conversation_started_at
+            )
+            SELECT CAST(:tid AS integer), c.id, 1, CAST(:a AS integer),
+                   c.started_at, c.started_at + INTERVAL '5 min', 300,
+                   'first', 'transfer_out', CAST(:b AS integer), CAST(NULL AS integer),
+                   1, 1, c.started_at
+            FROM conversations c WHERE c.id = :cid
+            UNION ALL
+            SELECT CAST(:tid AS integer), c.id, 2, CAST(:b AS integer),
+                   c.started_at + INTERVAL '5 min', c.ended_at, 300,
+                   'transfer_in', 'session_closed', CAST(NULL AS integer), CAST(:a AS integer),
+                   0, 1, c.started_at
+            FROM conversations c WHERE c.id = :cid
+        """), {"tid": _TENANT_PK, "cid": conv_ids[0], "a": _AGENT_A_ID, "b": _AGENT_B_ID})
+        await db.execute(text("""
+            UPDATE conversations
+            SET reception_final_agent_id = :b,
+                reception_segment_count = 2,
+                reception_transfer_count = 1
+            WHERE id = :cid
+        """), {"cid": conv_ids[0], "b": _AGENT_B_ID})
         await db.commit()
 
     _SEEDED = True
@@ -150,6 +288,40 @@ class TestFetchOverview:
         assert res.message_count == 9
         # ~600s per session (10 min). Allow small float drift.
         assert 595 < res.avg_duration_seconds < 605
+
+    @pytest.mark.asyncio
+    async def test_overall_business_metrics(self):
+        rs, re, _, _ = _range_for_anchor()
+        async with AsyncSessionLocal() as db:
+            res = await queries.fetch_overview(
+                db,
+                _TENANT_PK,
+                rs,
+                re,
+                include_business_metrics=True,
+                include_offline_messages=True,
+            )
+        assert res.bot_session_count == 2
+        assert res.bot_handoff_count == 1
+        assert res.queued_session_count == 2
+        assert res.avg_queue_duration_seconds == 180
+        assert res.offline_message_count == 2
+        assert res.can_view_offline_messages is True
+
+    @pytest.mark.asyncio
+    async def test_offline_metrics_hidden_without_permission_flag(self):
+        rs, re, _, _ = _range_for_anchor()
+        async with AsyncSessionLocal() as db:
+            res = await queries.fetch_overview(
+                db,
+                _TENANT_PK,
+                rs,
+                re,
+                include_business_metrics=True,
+                include_offline_messages=False,
+            )
+        assert res.offline_message_count is None
+        assert res.can_view_offline_messages is False
 
     @pytest.mark.asyncio
     async def test_employee_a_overview(self):
@@ -196,6 +368,29 @@ class TestFetchTrend:
         # other hours are zero
         empty_hour = next(b for b in res if b.label == "00")
         assert empty_hour.metrics.session_count == 0
+
+    @pytest.mark.asyncio
+    async def test_hour_trend_includes_business_metrics(self):
+        rs, re, sd, ed = _range_for_anchor()
+        async with AsyncSessionLocal() as db:
+            res = await queries.fetch_trend(
+                db, _TENANT_PK, rs, re,
+                buckets_mod.TrendType.HOUR, TZ,
+                range_start_date=sd, range_end_date=ed,
+                include_business_metrics=True,
+                include_offline_messages=True,
+            )
+        hour_10 = next(b for b in res if b.label == "10")
+        assert hour_10.metrics.bot_session_count == 2
+        assert hour_10.metrics.bot_handoff_count == 1
+        assert hour_10.metrics.queued_session_count == 2
+        assert hour_10.metrics.avg_queue_duration_seconds == 180
+
+        hour_09 = next(b for b in res if b.label == "09")
+        hour_15 = next(b for b in res if b.label == "15")
+        assert hour_09.metrics.offline_message_count == 1
+        assert hour_15.metrics.offline_message_count == 1
+        assert hour_15.metrics.can_view_offline_messages is True
 
     @pytest.mark.asyncio
     async def test_half_hour_trend_groups_at_correct_half_hours(self):
@@ -268,3 +463,48 @@ class TestFetchEmployeesOverview:
                 db, _TENANT_PK, rs, re, employee_ids=[]
             )
         assert res == {}
+
+
+class TestReceptionMetrics:
+
+    @pytest.mark.asyncio
+    async def test_overall_reception_aggregates(self):
+        rs, re, _, _ = _range_for_anchor()
+        async with AsyncSessionLocal() as db:
+            metrics = await queries.fetch_overview(db, _TENANT_PK, rs, re)
+        # conv_ids[0] has 2 segments (A transfer_out -> B transfer_in).
+        assert metrics.reception_segment_count == 2
+        assert metrics.reception_participated_session_count == 1
+        assert metrics.reception_transfer_in_count == 1
+        assert metrics.reception_transfer_out_count == 1
+        # Only conv_ids[0] has a materialized final agent.
+        assert metrics.reception_final_session_count == 1
+
+    @pytest.mark.asyncio
+    async def test_per_employee_reception_split(self):
+        rs, re, _, _ = _range_for_anchor()
+        async with AsyncSessionLocal() as db:
+            res = await queries.fetch_employees_overview(db, _TENANT_PK, rs, re)
+        agent_a = res[_AGENT_A_ID]
+        agent_b = res[_AGENT_B_ID]
+        # Agent A: one segment, transferred out, not the final agent.
+        assert agent_a.reception_segment_count == 1
+        assert agent_a.reception_transfer_out_count == 1
+        assert agent_a.reception_transfer_in_count == 0
+        assert agent_a.reception_final_session_count == 0
+        # Agent B: one segment, transferred in, final agent of conv_ids[0].
+        assert agent_b.reception_segment_count == 1
+        assert agent_b.reception_transfer_in_count == 1
+        assert agent_b.reception_transfer_out_count == 0
+        assert agent_b.reception_final_session_count == 1
+
+    @pytest.mark.asyncio
+    async def test_reception_scoped_to_single_employee(self):
+        rs, re, _, _ = _range_for_anchor()
+        async with AsyncSessionLocal() as db:
+            metrics = await queries.fetch_overview(
+                db, _TENANT_PK, rs, re, employee_id=_AGENT_A_ID
+            )
+        assert metrics.reception_segment_count == 1
+        assert metrics.reception_transfer_out_count == 1
+        assert metrics.reception_final_session_count == 0

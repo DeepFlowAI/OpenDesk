@@ -1,21 +1,23 @@
 'use client'
 
-import { useState, useRef, useEffect, type ReactNode } from 'react'
-import { IconChevronDown, IconRefresh, IconSearch } from '@tabler/icons-react'
+import { useState, useRef, useEffect, useMemo, type ReactNode } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { IconChevronDown, IconLoader2, IconLock, IconPinned, IconRefresh, IconSearch } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { avatarBackgroundForName, singleAvatarLetter } from '@/lib/avatar-fallback'
 import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
-import { useUpdateAgentStatus } from '@/service/use-conversations'
+import { conversationKeys, setVisitorWebStatusQueryData, useUpdateAgentStatus, useVisitorWebStatus } from '@/service/use-conversations'
 import { hasPermission } from '@/utils/permissions'
 import { ReceptionStatsCapsule } from '@/app/components/features/chat/max-concurrent-popover'
 import { t } from '@/utils/i18n'
 import type { ConversationListScope } from '@/service/use-conversations'
 import type { DataScopeValue } from '@/utils/permissions'
-import type { Conversation, AgentStatus, AgentStats } from '@/models/conversation'
+import type { Conversation, AgentStatus, AgentStats, VisitorWebStatusResponse } from '@/models/conversation'
+import type { Socket } from 'socket.io-client'
 
 export type ConversationPanelTab = ConversationListScope | 'offline' | 'queue'
-export type MyConversationView = 'current' | 'history'
+export type MyConversationView = 'current' | 'collaborating' | 'history'
 
 type Props = {
   conversations: Conversation[]
@@ -33,15 +35,20 @@ type Props = {
   canOfflineTab: boolean
   canQueueTab: boolean
   peerConversationScope: DataScopeValue | null
+  myUnreadTotal?: number | null
   offlineTotal?: number | null
   queueTotal?: number | null
   loading: boolean
   onRefresh: () => void
+  onTogglePin?: (conversation: Conversation) => void
+  pinningConversationId?: number | null
   historyHasMore?: boolean
   historyLoadingMore?: boolean
   onHistoryLoadMore?: () => void
+  hasCollaboratingConversations?: boolean
   offlineList?: ReactNode
   queueList?: ReactNode
+  socket: Socket | null
 }
 
 const STATUS_OPTIONS = [
@@ -77,6 +84,76 @@ function conversationStartTimestamp(conv: Conversation): number {
   return Number.isNaN(timestamp) ? Number.MAX_SAFE_INTEGER : timestamp
 }
 
+function pinnedTimestamp(conv: Conversation): number {
+  const timestamp = new Date(conv.pinned_at || '').getTime()
+  return Number.isNaN(timestamp) ? 0 : timestamp
+}
+
+function sortPinnedConversations(conversations: Conversation[]): Conversation[] {
+  return conversations
+    .map((conversation, index) => ({ conversation, index }))
+    .sort((a, b) => {
+      const aPinned = Boolean(a.conversation.is_pinned)
+      const bPinned = Boolean(b.conversation.is_pinned)
+      if (aPinned !== bPinned) return aPinned ? -1 : 1
+      if (aPinned && bPinned) {
+        const diff = pinnedTimestamp(b.conversation) - pinnedTimestamp(a.conversation)
+        if (diff !== 0) return diff
+      }
+      return a.index - b.index
+    })
+    .map((item) => item.conversation)
+}
+
+function shouldShowVisitorWebStatus(conversation: Conversation): boolean {
+  return (
+    String(conversation.channel?.channel_type || '').toLowerCase() === 'web'
+    && Boolean(conversation.visitor?.external_id)
+  )
+}
+
+function VisitorConversationAvatar({
+  conversation,
+  showStatus,
+}: {
+  conversation: Conversation
+  showStatus: boolean
+}) {
+  const { locale } = useLocaleStore()
+  const visible = showStatus && shouldShowVisitorWebStatus(conversation)
+  const statusQuery = useVisitorWebStatus(conversation.id, {
+    enabled: visible,
+    refetchInterval: 10_000,
+  })
+  const status = statusQuery.isError ? 'unknown' : statusQuery.data?.status
+  const canDisplay = statusQuery.data?.can_display ?? true
+  const showDot = visible && canDisplay && (status === 'online' || status === 'offline')
+  const title = status === 'online'
+    ? t('ws.chat.visitorWebStatusOnline', locale)
+    : t('ws.chat.visitorWebStatusOffline', locale)
+
+  return (
+    <div className="relative h-10 w-10 shrink-0">
+      <div
+        className="flex h-10 w-10 items-center justify-center rounded-full text-base font-medium text-white"
+        style={{ backgroundColor: conversation.visitor?.avatar_color || '#4A8C5C' }}
+      >
+        {(conversation.visitor?.name || '访').charAt(0)}
+      </div>
+      {showDot && (
+        <span
+          aria-label={title}
+          title={title}
+          className={cn(
+            'absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-[#F5F5F5]',
+            status === 'online' ? 'bg-[#22C55E]' : 'bg-[#D4D4D4]',
+          )}
+        />
+      )}
+    </div>
+  )
+}
+
 export function ConversationListPanel({
   conversations,
   selectedId,
@@ -93,18 +170,24 @@ export function ConversationListPanel({
   canOfflineTab,
   canQueueTab,
   peerConversationScope,
+  myUnreadTotal,
   offlineTotal,
   queueTotal,
   loading,
   onRefresh,
+  onTogglePin,
+  pinningConversationId = null,
   historyHasMore,
   historyLoadingMore,
   onHistoryLoadMore,
+  hasCollaboratingConversations = false,
   offlineList,
   queueList,
+  socket,
 }: Props) {
   const { locale } = useLocaleStore()
   const { user } = useAuthStore()
+  const queryClient = useQueryClient()
   const [statusDropdownOpen, setStatusDropdownOpen] = useState(false)
   const [maxConcurrentOpen, setMaxConcurrentOpen] = useState(false)
   const [search, setSearch] = useState('')
@@ -116,6 +199,7 @@ export function ConversationListPanel({
   const searchTerm = search.trim().toLowerCase()
   const isMyTab = activeTab === 'my'
   const isHistoryView = isMyTab && myView === 'history'
+  const isCollaboratingView = isMyTab && myView === 'collaborating'
   const filteredConversations = searchTerm
     ? conversations.filter((conv) => {
       const values = [
@@ -130,16 +214,21 @@ export function ConversationListPanel({
       return values.some((value) => value?.toLowerCase().includes(searchTerm))
     })
     : conversations
-  const displayedConversations = scope === 'peers' && !isHistoryView
+  const baseDisplayedConversations = scope === 'peers' && !isHistoryView
     ? [...filteredConversations].sort(
       (a, b) => conversationStartTimestamp(a) - conversationStartTimestamp(b) || a.id - b.id,
     )
     : filteredConversations
+  const displayedConversations = isHistoryView
+    ? baseDisplayedConversations
+    : sortPinnedConversations(baseDisplayedConversations)
   const scopeLabel = peerConversationScope === 'all'
     ? t('ws.chat.scopeAll', locale)
     : t('ws.chat.scopeGroup', locale)
   const emptyText = isHistoryView
     ? t('ws.chat.noHistoryConversations', locale)
+    : isCollaboratingView
+    ? t('ws.chat.noCollaboratingConversations', locale)
     : scope === 'peers'
     ? t('ws.chat.noPeerConversations', locale)
     : t('ws.chat.noMyConversations', locale)
@@ -147,7 +236,12 @@ export function ConversationListPanel({
   const tabGridClass = tabCount >= 4 ? 'grid-cols-4' : tabCount === 3 ? 'grid-cols-3' : tabCount === 2 ? 'grid-cols-2' : 'grid-cols-1'
   const isOfflineTab = activeTab === 'offline'
   const isQueueTab = activeTab === 'queue'
+  const myUnreadCount = Math.max(0, myUnreadTotal ?? 0)
   const canEditMaxConcurrent = hasPermission(user, 'chat.workspace.max_concurrent.edit')
+  const visitorStatusConversationIds = useMemo(
+    () => conversations.filter(shouldShowVisitorWebStatus).map((conv) => conv.id),
+    [conversations],
+  )
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -163,6 +257,29 @@ export function ConversationListPanel({
     if (!statusDropdownOpen) return
     setMaxConcurrentOpen(false)
   }, [statusDropdownOpen])
+
+  useEffect(() => {
+    if (!socket) return
+
+    const handleStatusUpdated = (payload: VisitorWebStatusResponse) => {
+      setVisitorWebStatusQueryData(queryClient, payload)
+    }
+
+    const handleConnect = () => {
+      visitorStatusConversationIds.forEach((conversationId) => {
+        queryClient.invalidateQueries({
+          queryKey: conversationKeys.visitorWebStatus(conversationId),
+        })
+      })
+    }
+
+    socket.on('visitor_web_status_updated', handleStatusUpdated)
+    socket.on('connect', handleConnect)
+    return () => {
+      socket.off('visitor_web_status_updated', handleStatusUpdated)
+      socket.off('connect', handleConnect)
+    }
+  }, [queryClient, socket, visitorStatusConversationIds])
 
   return (
     <div className="flex w-[280px] shrink-0 flex-col border-r border-[#E5E5E5] bg-[#F5F5F5]">
@@ -245,11 +362,19 @@ export function ConversationListPanel({
               onTabChange('my')
             }}
             className={cn(
-              'h-8 rounded-md px-2 text-[13px] font-medium transition-colors',
+              'relative h-8 rounded-md px-2 text-[13px] font-medium transition-colors',
               activeTab === 'my' ? 'bg-white text-[#1a1a1a] shadow-sm' : 'text-[#737373] hover:text-[#1a1a1a]',
             )}
           >
             {t('ws.chat.tabMy', locale)}
+            {myUnreadCount > 0 ? (
+              <span
+                title={locale === 'zh' ? '未读消息' : 'Unread messages'}
+                className="absolute right-1 top-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-semibold leading-none text-white"
+              >
+                {myUnreadCount > 99 ? '99+' : myUnreadCount}
+              </span>
+            ) : null}
           </button>
           {canPeerTab ? (
             <button
@@ -321,6 +446,25 @@ export function ConversationListPanel({
               {t('ws.chat.myCurrent', locale)}
             </button>
             <span className="text-[#C7C7C7]">|</span>
+            {hasCollaboratingConversations && (
+              <>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={myView === 'collaborating'}
+                  onClick={() => onMyViewChange('collaborating')}
+                  className={cn(
+                    'px-1.5 py-1 transition-colors',
+                    myView === 'collaborating'
+                      ? 'font-semibold text-[#1a1a1a]'
+                      : 'text-[#737373] hover:text-[#1a1a1a]',
+                  )}
+                >
+                  {t('ws.chat.myCollaborating', locale)}
+                </button>
+                <span className="text-[#C7C7C7]">|</span>
+              </>
+            )}
             <button
               type="button"
               role="tab"
@@ -393,12 +537,26 @@ export function ConversationListPanel({
                 const selected = selectedId === conv.id
                 const ownerName = conv.agent?.display_name || conv.agent?.name
                 const peerAvatarName = ownerName || '?'
+                const isCollaboratorConversation = conv.viewer_relation === 'collaborator'
+                const pinLabel = conv.is_pinned
+                  ? t('ws.chat.unpinConversation', locale)
+                  : t('ws.chat.pinConversation', locale)
+                const timeoutLockLabel = t('ws.chat.timeoutLocked', locale)
+                const pinning = pinningConversationId === conv.id
                 return (
-                  <button
+                  <div
                     key={conv.id}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => onSelect(conv.id)}
+                    onKeyDown={(event) => {
+                      if (event.target !== event.currentTarget) return
+                      if (event.key !== 'Enter' && event.key !== ' ') return
+                      event.preventDefault()
+                      onSelect(conv.id)
+                    }}
                     className={cn(
-                      'mb-1 flex min-h-[72px] w-full items-center gap-3 rounded-[20px] px-4 py-2 text-left transition-colors',
+                      'group mb-1 flex min-h-[72px] w-full cursor-pointer items-center gap-3 rounded-[20px] px-4 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
                       selected
                         ? 'border border-[#E0E0E0] bg-[#FAFAFA]'
                         : 'border border-transparent hover:bg-white/60',
@@ -420,26 +578,60 @@ export function ConversationListPanel({
                         )}
                       </div>
                     ) : (
-                      <div
-                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-base font-medium text-white"
-                        style={{ backgroundColor: conv.visitor?.avatar_color || '#4A8C5C' }}
-                      >
-                        {(conv.visitor?.name || '访').charAt(0)}
-                      </div>
+                      <VisitorConversationAvatar
+                        conversation={conv}
+                        showStatus={scope === 'my' && !isHistoryView}
+                      />
                     )}
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
-                        <span
-                          className={cn(
-                            'truncate text-sm text-[#1a1a1a]',
-                            selected ? 'font-semibold' : 'font-medium',
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span
+                            className={cn(
+                              'truncate text-sm text-[#1a1a1a]',
+                              selected ? 'font-semibold' : 'font-medium',
+                            )}
+                          >
+                            {conv.visitor?.name || `#${conv.id}`}
+                          </span>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1">
+                          {conv.is_timeout_locked && !isHistoryView && (
+                            <span
+                              className="flex h-6 w-6 items-center justify-center rounded-md text-primary"
+                              aria-label={timeoutLockLabel}
+                              title={timeoutLockLabel}
+                            >
+                              <IconLock size={14} stroke={1.8} />
+                            </span>
                           )}
-                        >
-                          {conv.visitor?.name || `#${conv.id}`}
-                        </span>
-                        <span className="shrink-0 text-[12px] text-[#999999]">
-                          {isHistoryView ? formatHistoryTime(conv.ended_at) : formatTime(conv.last_message_at)}
-                        </span>
+                          {onTogglePin && !isHistoryView && (
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                onTogglePin(conv)
+                              }}
+                              disabled={pinning}
+                              className={cn(
+                                'flex h-6 w-6 items-center justify-center rounded-md text-[#999999] opacity-0 transition-colors hover:bg-[#E8E8E8] hover:text-[#1a1a1a] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 group-focus-within:opacity-100 disabled:cursor-not-allowed disabled:opacity-60',
+                                conv.is_pinned && 'text-primary opacity-100',
+                                pinning && 'opacity-100',
+                              )}
+                              aria-label={pinLabel}
+                              title={pinLabel}
+                            >
+                              {pinning ? (
+                                <IconLoader2 size={14} stroke={1.8} className="animate-spin" />
+                              ) : (
+                                <IconPinned size={14} stroke={1.8} />
+                              )}
+                            </button>
+                          )}
+                          <span className="shrink-0 text-[12px] text-[#999999]">
+                            {isHistoryView ? formatHistoryTime(conv.ended_at) : formatTime(conv.last_message_at)}
+                          </span>
+                        </div>
                       </div>
                       {isHistoryView ? (
                         <span className="mt-1 block truncate text-[13px] text-[#737373]">
@@ -448,23 +640,27 @@ export function ConversationListPanel({
                       ) : (
                         <div className="mt-1 flex items-center justify-between gap-2">
                           <div className="min-w-0">
-                            {scope === 'peers' && ownerName && (
+                            {(scope === 'peers' || isCollaboratorConversation) && ownerName && (
                               <div className="truncate text-[11px] text-[#999999]">
                                 {t('ws.chat.handledBy', locale, { name: ownerName })}
                               </div>
                             )}
-                            {scope !== 'peers' && (
+                            {scope !== 'peers' && !isCollaboratorConversation && (
                               <span className="block truncate text-[13px] text-[#737373]">
                                 {conv.last_message_preview || ''}
                               </span>
                             )}
                           </div>
-                          {scope === 'peers' && conv.collaborated_by_current_user && (
+                          {isCollaboratorConversation ? (
+                            <span className="shrink-0 rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
+                              {t('ws.chat.collaboratingBadge', locale)}
+                            </span>
+                          ) : scope === 'peers' && conv.collaborated_by_current_user && (
                             <span className="shrink-0 rounded-full bg-[#E8E8E8] px-1.5 py-0.5 text-[10px] font-medium text-[#737373]">
                               {t('ws.chat.collaborated', locale)}
                             </span>
                           )}
-                          {scope !== 'peers' && conv.unread_count > 0 && (
+                          {scope !== 'peers' && !isCollaboratorConversation && conv.unread_count > 0 && (
                             <span className="flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-medium text-white">
                               {conv.unread_count > 99 ? '99+' : conv.unread_count}
                             </span>
@@ -472,7 +668,7 @@ export function ConversationListPanel({
                         </div>
                       )}
                     </div>
-                  </button>
+                  </div>
                 )
               })}
               {isHistoryView && historyHasMore && (

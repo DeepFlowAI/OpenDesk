@@ -111,7 +111,15 @@ type CallCenterRuntimeValue = {
 
 const CallCenterRuntimeContext = createContext<CallCenterRuntimeValue | null>(null)
 
-export function CallCenterProvider({ children }: { children: ReactNode }) {
+type CallCenterProviderProps = {
+  children: ReactNode
+  recordsEnabled?: boolean
+}
+
+export function CallCenterProvider({
+  children,
+  recordsEnabled = true,
+}: CallCenterProviderProps) {
   const mic = useMicrophone({ autoRequestOnGranted: false })
   const { data: status, refetch: refetchStatus } = useMyAgentStatus()
   const setStatusMutation = useSetAgentStatus()
@@ -119,7 +127,15 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
   const leg = useWebRTCLeg()
   const ringtone = useRingtone()
   const { socket } = useSocketStore()
-  const { data: records, refetch: refetchRecords } = useCallRecords({ page: 1, per_page: 20 })
+  const { data: records, refetch: refetchRecords } = useCallRecords(
+    { page: 1, per_page: 20 },
+    { enabled: recordsEnabled },
+  )
+
+  const refetchCallRecords = useCallback(() => {
+    if (!recordsEnabled) return
+    void refetchRecords()
+  }, [recordsEnabled, refetchRecords])
 
   const [phase, setPhase] = useState<CallCenterPhase>('mic_check')
   const [incoming, setIncoming] = useState<IncomingCall | null>(null)
@@ -181,7 +197,7 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
       setSelectedRecordId(null)
       setPhase('incoming')
       ringtone.start()
-      void refetchRecords()
+      refetchCallRecords()
     }
 
     const onRemoteIce = (data: { call_id: string; candidate: RTCIceCandidateInit }) => {
@@ -194,7 +210,7 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
       leg.goOffline()
       setPhase('wrap_up')
       void refetchStatus()
-      void refetchRecords()
+      refetchCallRecords()
     }
 
     const onOutboundRinging = (data: { call_id: string }) => {
@@ -202,14 +218,14 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
         if (prev?.call_id !== data.call_id) return prev
         return { ...prev }
       })
-      void refetchRecords()
+      refetchCallRecords()
     }
 
     const onOutboundAnswered = (data: { call_id: string }) => {
       void data
       ringtone.stop()
       setPhase((curr) => (curr === 'outbound_ringing' ? 'on_call' : curr))
-      void refetchRecords()
+      refetchCallRecords()
     }
 
     const onOutboundHangup = (data: {
@@ -242,7 +258,7 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
         return curr
       })
       void refetchStatus()
-      void refetchRecords()
+      refetchCallRecords()
     }
 
     socket.on('cc.call_incoming', onIncoming)
@@ -259,7 +275,7 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
       socket.off('cc.outbound_answered', onOutboundAnswered)
       socket.off('cc.outbound_hangup', onOutboundHangup)
     }
-  }, [socket, leg, ringtone, refetchRecords, refetchStatus])
+  }, [socket, leg, ringtone, refetchCallRecords, refetchStatus])
 
   useEffect(() => {
     if (leg.state !== 'failed') return
@@ -336,10 +352,10 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
         setIncoming(null)
         setCallStart(null)
         setPhase('idle')
-        void refetchRecords()
+        refetchCallRecords()
       }
     }
-  }, [incoming, leg, refetchRecords, ringtone])
+  }, [incoming, leg, refetchCallRecords, ringtone])
 
   const completeWrapUp = useCallback(() => {
     setIncoming(null)
@@ -349,8 +365,8 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
       { status: 'ready' },
       { onSettled: () => void refetchStatus() },
     )
-    void refetchRecords()
-  }, [refetchRecords, refetchStatus, setStatusMutation])
+    refetchCallRecords()
+  }, [refetchCallRecords, refetchStatus, setStatusMutation])
 
   const handleDialStarted = useCallback(async ({ callId, destination, outboundNumber }: DialStartedInfo) => {
     setSelectedRecordId(null)
@@ -365,7 +381,7 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
     })
     setCallStart(Date.now())
     setPhase('outbound_ringing')
-    void refetchRecords()
+    refetchCallRecords()
     ringtone.start()
     if (mic.state !== 'granted') {
       await mic.request()
@@ -379,7 +395,7 @@ export function CallCenterProvider({ children }: { children: ReactNode }) {
       setCallStart(null)
       setPhase('idle')
     }
-  }, [leg, mic, refetchRecords, ringtone])
+  }, [leg, mic, refetchCallRecords, ringtone])
 
   const screenPopNumber = selectedRecord
     ? callRecordCustomerNumber(selectedRecord) || ''

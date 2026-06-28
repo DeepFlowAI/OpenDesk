@@ -3,7 +3,7 @@ Unified queue engine service.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -29,6 +29,7 @@ from app.repositories.queue_repository import (
     QueueEventRepository,
     QueuePolicyRepository,
     QueueRoundRobinRepository,
+    QueueReturningAgentRepository,
     QueueTaskRepository,
 )
 from app.schemas.queue import (
@@ -43,6 +44,11 @@ from app.schemas.queue import (
     QueuePullRequest,
     QueueStateResponse,
     QueueTaskActionRequest,
+    RETURNING_AGENT_DEFAULT_WINDOW_HOURS,
+    RETURNING_AGENT_MAX_WINDOW_HOURS,
+    RETURNING_AGENT_MIN_WINDOW_HOURS,
+    RETURNING_AGENT_PRIORITY_ENABLED_KEY,
+    RETURNING_AGENT_WINDOW_HOURS_KEY,
     normalize_queue_assignment_strategy,
 )
 from app.services.queue_resource_provider import QueueResourceProviderFactory
@@ -277,6 +283,7 @@ class QueueTaskService:
             reason=data.reason,
         )
         await QueueTaskService._record_event(db, task, "canceled", reason=data.reason)
+        await QueueTaskService._materialize_conversation_summary(db, task)
         await db.commit()
         await db.refresh(task)
         await QueueTaskService._emit_queue_change(task, "canceled")
@@ -302,6 +309,7 @@ class QueueTaskService:
             reason=data.reason,
         )
         await QueueTaskService._record_event(db, task, "timeout", reason=data.reason)
+        await QueueTaskService._materialize_conversation_summary(db, task)
         await db.commit()
         await db.refresh(task)
         await QueueTaskService._emit_queue_change(task, "timeout")
@@ -417,6 +425,7 @@ class QueueTaskService:
             before_load=reserve.before_load,
             after_load=reserve.after_load,
         )
+        await QueueTaskService._materialize_conversation_summary(db, task)
         await db.commit()
         await db.refresh(task)
         await QueueTaskService._emit_queue_change(task, "assigned")
@@ -471,6 +480,7 @@ class QueueTaskService:
             before_load=reserve.before_load,
             after_load=reserve.after_load,
         )
+        await QueueTaskService._materialize_conversation_summary(db, task)
         await db.commit()
         await db.refresh(task)
         await QueueTaskService._emit_queue_change(task, "assigned")
@@ -524,6 +534,13 @@ class QueueTaskService:
             last_agent_id=rr_state.last_agent_id if rr_state else None,
             config=(task.policy_snapshot or {}).get("config") or {},
         )
+        returning_candidate = await QueueTaskService._returning_agent_candidate(db, task, available)
+        returning_agent_id = returning_candidate.employee_id if returning_candidate else None
+        if returning_candidate is not None:
+            ordered = [
+                returning_candidate,
+                *[candidate for candidate in ordered if candidate.employee_id != returning_candidate.employee_id],
+            ]
         for candidate in ordered:
             reserve = await provider.try_reserve(db, r, tenant_id, candidate.employee_id, task)
             if not reserve.success:
@@ -545,15 +562,17 @@ class QueueTaskService:
                     assigned_by=QueueAssignmentType.AUTO.value,
                     now=_now(),
                 )
+                is_returning_agent = returning_agent_id == candidate.employee_id
                 await QueueTaskService._record_event(
                     db,
                     task,
-                    "auto_assigned",
+                    "returning_agent_assigned" if is_returning_agent else "auto_assigned",
                     agent_id=candidate.employee_id,
+                    reason="returning_agent_priority" if is_returning_agent else None,
                     before_load=reserve.before_load,
                     after_load=reserve.after_load,
                 )
-                if task.assignment_strategy == QueueAssignmentStrategy.ROUND_ROBIN.value:
+                if task.assignment_strategy == QueueAssignmentStrategy.ROUND_ROBIN.value and not is_returning_agent:
                     await QueueRoundRobinRepository.set_last_agent(
                         db,
                         tenant_id,
@@ -562,6 +581,7 @@ class QueueTaskService:
                         data.queue_id,
                         candidate.employee_id,
                     )
+                await QueueTaskService._materialize_conversation_summary(db, task)
                 await db.commit()
                 await db.refresh(task)
                 await QueueTaskService._emit_queue_change(task, "assigned")
@@ -581,13 +601,72 @@ class QueueTaskService:
         return QueueDispatchResponse(dispatched=False, task=task, status=task.status, reason="all_candidates_busy")
 
     @staticmethod
+    async def _returning_agent_candidate(
+        db: AsyncSession,
+        task: QueueTask,
+        available: list[QueueCandidate],
+    ) -> QueueCandidate | None:
+        if task.queue_type != QueueType.EMPLOYEE_GROUP.value or len(available) <= 1:
+            return None
+        enabled, window_hours = QueueTaskService._returning_agent_config(task.policy_snapshot or {})
+        if not enabled:
+            return None
+
+        cutoff = _now() - timedelta(hours=window_hours)
+        agent_id: int | None = None
+        if task.channel == QueueChannel.ONLINE_CHAT.value:
+            if task.task_type not in [QueueTaskType.CONVERSATION.value, QueueTaskType.OPEN_AGENT_HANDOFF.value]:
+                return None
+            try:
+                conversation_id = int(task.task_ref_id)
+            except (TypeError, ValueError):
+                return None
+            agent_id = await QueueReturningAgentRepository.find_recent_online_chat_agent(
+                db,
+                task.tenant_id,
+                conversation_id=conversation_id,
+                cutoff=cutoff,
+            )
+        elif task.channel == QueueChannel.CALL_CENTER.value:
+            context = task.source_context or {}
+            call_id = str(context.get("call_id") or task.task_ref_id or "").strip()
+            if not call_id:
+                return None
+            agent_id = await QueueReturningAgentRepository.find_recent_call_center_agent(
+                db,
+                task.tenant_id,
+                call_id=call_id,
+                cutoff=cutoff,
+            )
+
+        if agent_id is None:
+            return None
+        candidate_by_id = {candidate.employee_id: candidate for candidate in available}
+        return candidate_by_id.get(agent_id)
+
+    @staticmethod
+    def _returning_agent_config(policy_snapshot: dict[str, Any]) -> tuple[bool, int]:
+        config = policy_snapshot.get("config") if isinstance(policy_snapshot, dict) else None
+        if not isinstance(config, dict) or config.get(RETURNING_AGENT_PRIORITY_ENABLED_KEY) is not True:
+            return False, RETURNING_AGENT_DEFAULT_WINDOW_HOURS
+        raw_hours = config.get(RETURNING_AGENT_WINDOW_HOURS_KEY, RETURNING_AGENT_DEFAULT_WINDOW_HOURS)
+        try:
+            hours = int(raw_hours)
+        except (TypeError, ValueError):
+            return False, RETURNING_AGENT_DEFAULT_WINDOW_HOURS
+        if hours < RETURNING_AGENT_MIN_WINDOW_HOURS or hours > RETURNING_AGENT_MAX_WINDOW_HOURS:
+            return False, RETURNING_AGENT_DEFAULT_WINDOW_HOURS
+        return True, hours
+
+    @staticmethod
     async def _assign_business_object(db: AsyncSession, tenant_id: int, task: QueueTask, employee_id: int) -> None:
         if task.task_type in [QueueTaskType.CONVERSATION.value, QueueTaskType.OPEN_AGENT_HANDOFF.value]:
             try:
                 conversation_id = int(task.task_ref_id)
             except ValueError:
                 return
-            await QueueBusinessRepository.assign_conversation(db, tenant_id, conversation_id, employee_id, _now())
+            assigned_at = _now()
+            await QueueBusinessRepository.assign_conversation(db, tenant_id, conversation_id, employee_id, assigned_at)
             from app.services.conversation_service import ConversationService
 
             await ConversationService.create_agent_assigned_system_message(
@@ -605,9 +684,72 @@ class QueueTaskService:
             from app.repositories.conversation_repository import ConversationRepository
 
             conversation = await ConversationRepository.get_by_id(db, conversation_id)
-            await VisitorTimeoutCloseService.initialize_for_conversation(db, conversation, commit=False)
+            await QueueTaskService._record_reception_assignment(
+                db, tenant_id, conversation, task, employee_id, assigned_at
+            )
+            await VisitorTimeoutCloseService.initialize_for_conversation(
+                db,
+                conversation,
+                anchor_at=assigned_at,
+                commit=False,
+            )
         elif task.task_type == QueueTaskType.CALL.value:
             await QueueBusinessRepository.assign_call(db, tenant_id, task.task_ref_id, employee_id)
+
+    @staticmethod
+    async def _materialize_conversation_summary(db: AsyncSession, task: QueueTask) -> None:
+        """Refresh redundant queue summary for the conversation behind an online-chat task."""
+        if task.channel != QueueChannel.ONLINE_CHAT.value:
+            return
+        if task.task_type not in [QueueTaskType.CONVERSATION.value, QueueTaskType.OPEN_AGENT_HANDOFF.value]:
+            return
+        try:
+            conversation_id = int(task.task_ref_id)
+        except (TypeError, ValueError):
+            return
+        from app.services.queue_materialization_service import QueueMaterializationService
+
+        await QueueMaterializationService.materialize_conversation(db, task.tenant_id, conversation_id)
+
+    @staticmethod
+    async def _record_reception_assignment(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation,
+        task: QueueTask,
+        employee_id: int,
+        assigned_at: datetime,
+    ) -> None:
+        """Log a structured reception event when the queue assigns a conversation.
+
+        The reason distinguishes a bot-to-human handoff, the first human takeover
+        and a later re-entry (a re-queued conversation assigned again) so the
+        post-end segment generation can derive the entry reason.
+        """
+        if conversation is None:
+            return
+        from app.enums import ReceptionEventReason, ReceptionEventType
+        from app.repositories.reception_event_repository import ReceptionEventRepository
+        from app.services.reception_event_service import ReceptionEventService
+
+        if task.task_type == QueueTaskType.OPEN_AGENT_HANDOFF.value:
+            reason = ReceptionEventReason.BOT_HANDOFF.value
+        elif await ReceptionEventRepository.has_events(db, conversation.id):
+            reason = ReceptionEventReason.REASSIGN.value
+        else:
+            reason = ReceptionEventReason.FIRST_HUMAN.value
+
+        await ReceptionEventService.record(
+            db,
+            tenant_id=tenant_id,
+            conversation_id=conversation.id,
+            event_type=ReceptionEventType.ASSIGNED.value,
+            occurred_at=assigned_at,
+            agent_id=employee_id,
+            group_id=conversation.group_id,
+            to_agent_id=employee_id,
+            reason=reason,
+        )
 
     @staticmethod
     async def _record_event(

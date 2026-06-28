@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { MessagePrimitive, ThreadPrimitive, type MessageState } from '@assistant-ui/react'
 import { useQueryClient } from '@tanstack/react-query'
 import {
@@ -8,7 +8,17 @@ import {
   type AgentMessageMeta,
 } from './agent-chat-runtime'
 import { AgentComposer, type ComposerInsertRequest } from './agent-composer'
-import { IconArrowsExchange2, IconTicket, IconX, IconLoader2, IconMessagePlus } from '@tabler/icons-react'
+import {
+  IconArrowsExchange2,
+  IconLock,
+  IconLockOpen,
+  IconTicket,
+  IconX,
+  IconLoader2,
+  IconMessagePlus,
+  IconPinned,
+  IconUserPlus,
+} from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/context/auth-store'
 import { useChatStore } from '@/context/chat-store'
@@ -16,9 +26,19 @@ import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { EndConversationModal } from '@/app/components/features/chat/end-conversation-modal'
 import { TransferConversationModal } from '@/app/components/features/chat/transfer-conversation-modal'
+import { InviteCollaboratorModal } from '@/app/components/features/chat/invite-collaborator-modal'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
+import { MessageQuoteBlock } from '@/app/components/features/chat/message-quote'
+import { OpenAgentFeedbackStatus } from '@/app/components/features/chat/open-agent-feedback'
 import { RichTextMessageContent } from '@/app/components/features/chat/rich-text-message-content'
-import { conversationKeys, useVisitorWebStatus } from '@/service/use-conversations'
+import {
+  OpenAgentTextBlockView,
+  OpenAgentTraceBlocks,
+  getOpenAgentTextBlocks,
+  getOpenAgentThinkingBlocks,
+  getVisibleOpenAgentToolBlocks,
+} from '@/app/components/features/chat/open-agent-trace-blocks'
+import { conversationKeys, setVisitorWebStatusQueryData, useVisitorWebStatus } from '@/service/use-conversations'
 import { get } from '@/service/base'
 import { AssistantMarkdownText, MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
@@ -30,6 +50,11 @@ import {
   sanitizeWorkspaceAgentEventContent,
   resolveWorkspaceSystemEventContent,
 } from '@/lib/workspace-agent-display'
+import { isConversationHistoryContentMessage } from '@/lib/conversation-history-message'
+import {
+  canQuoteMessage,
+  messageQuoteFromMetadata,
+} from '@/lib/message-quote'
 import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 import type {
   Conversation,
@@ -61,6 +86,80 @@ function formatHistoryTime(dateStr: string | null, locale: string): string {
     hour12: false,
   })
   return `${date} ${time}`
+}
+
+function readStatusLabel(status: string | undefined, locale: Locale): string | null {
+  if (status === 'unread') return locale === 'zh' ? '未读' : 'Unread'
+  if (status === 'read') return locale === 'zh' ? '已读' : 'Read'
+  return null
+}
+
+function isReadStatusContentType(contentType: string | undefined): boolean {
+  return contentType === 'text'
+    || contentType === 'rich_text'
+    || contentType === 'image'
+    || contentType === 'file'
+}
+
+const MESSAGE_RECALL_WINDOW_MS = 2 * 60 * 1000
+
+function isRecallableContentType(contentType: string | undefined): boolean {
+  return contentType === 'text'
+    || contentType === 'rich_text'
+    || contentType === 'image'
+    || contentType === 'file'
+}
+
+function isMessageWithinRecallWindow(createdAt: Date | undefined): boolean {
+  if (!createdAt) return false
+  return Date.now() - createdAt.getTime() <= MESSAGE_RECALL_WINDOW_MS
+}
+
+function recalledMessageText(input: {
+  locale: string
+  isOwn?: boolean
+  senderType?: string
+  senderName?: string | null
+}): string {
+  const { locale, isOwn, senderType, senderName } = input
+  if (isOwn) return t('ws.chat.recall.youRecalled', locale as Locale)
+  if (senderType === 'visitor') return t('ws.chat.recall.visitorRecalled', locale as Locale)
+  if (senderName) return t('ws.chat.recall.namedRecalled', locale as Locale, { name: senderName })
+  return t('ws.chat.recall.otherRecalled', locale as Locale)
+}
+
+function RecalledMessageNotice({
+  text,
+  time,
+  alignEnd,
+  editLabel,
+  onEdit,
+}: {
+  text: string
+  time?: string
+  alignEnd?: boolean
+  editLabel?: string
+  onEdit?: () => void
+}) {
+  return (
+    <div className={cn('flex min-w-0 flex-col', alignEnd ? 'items-end' : 'items-start')}>
+      <div className="max-w-full rounded-[18px] border border-dashed border-[#D8D8D8] bg-[#F5F5F5] px-3.5 py-2 text-sm leading-normal text-[#737373]">
+        <span>{text}</span>
+        {onEdit && editLabel && (
+          <button
+            type="button"
+            className="ml-2 text-primary underline-offset-2 hover:underline"
+            onClick={onEdit}
+          >
+            {editLabel}
+          </button>
+        )}
+      </div>
+      {time && (
+        <span className="mt-1 text-[11px] text-[#999999]">{time}</span>
+      )}
+    </div>
+  )
 }
 
 function SystemAgentAvatar({
@@ -146,11 +245,48 @@ function AgentSideWelcomeBubble({
 const internalNoteBubbleClass = 'border border-[#F4C35E] bg-[#FFE6A6]'
 const EMPTY_MESSAGES: Message[] = []
 
+function scrollToWorkspaceMessage(messageId: number, locale: Locale): void {
+  const node = document.querySelector<HTMLElement>(`[data-workspace-message-id="${messageId}"]`)
+  if (!node) {
+    window.alert(t('ws.chat.quote.locateFailed', locale))
+    return
+  }
+  node.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  node.classList.add('bg-warning/15')
+  window.setTimeout(() => node.classList.remove('bg-warning/15'), 2000)
+}
+
+function isCollaborativeConversation(conversation: Conversation): boolean {
+  return (
+    conversation.viewer_relation === 'collaborator'
+    || conversation.collaborated_by_current_user === true
+    || Boolean(conversation.collaborators?.length)
+  )
+}
+
 // ─── Agent-side message bubble ───────────────────────────────────
 
-function AgentMessageBubble({ message }: { message: MessageState }) {
-  const { conversation, imageMessages, locale: cfgLocale } = useAgentChatConfig()
+function AgentMessageBubble({
+  message,
+  socket,
+  onComposerInsertRequest,
+}: {
+  message: MessageState
+  socket: Socket | null
+  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id'>) => void
+}) {
+  const {
+    conversation,
+    imageMessages,
+    locale: cfgLocale,
+    readStatusEnabled,
+    isClosed,
+    canSendPublicReply,
+    onQuoteMessage,
+  } = useAgentChatConfig()
   const meta = message.metadata?.custom as AgentMessageMeta | undefined
+  const [messageMenu, setMessageMenu] = useState<{ x: number; y: number } | null>(null)
+  const conversationMessages = useChatStore((state) => state.messages.get(conversation.id) || EMPTY_MESSAGES)
   const isAgent = meta?.senderType === 'agent'
   const isBot = meta?.senderType === 'bot'
   const isInternalNote = meta?.contentType === 'internal_note'
@@ -168,6 +304,176 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
   const attachmentContentType =
     meta?.contentType === 'image' ? 'image' : meta?.contentType === 'file' ? 'file' : null
   const isRichText = meta?.contentType === 'rich_text'
+  const textBlocks = isBot ? getOpenAgentTextBlocks(meta?.metadata) : []
+  const thinkingBlocks = isBot ? getOpenAgentThinkingBlocks(meta?.metadata) : []
+  const visibleToolBlocks = isBot ? getVisibleOpenAgentToolBlocks(meta?.metadata) : []
+  const hasOpenAgentTrace =
+    isBot && (textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0)
+  const hasMessageText = content.trim().length > 0
+  const showSenderName = Boolean(
+    meta?.senderName && (isBot || (isAgent && isCollaborativeConversation(conversation))),
+  )
+  const readStatusText = readStatusEnabled
+    && isAgent
+    && meta?.isOwn
+    && isReadStatusContentType(meta?.contentType)
+    ? readStatusLabel(meta?.messageStatus, cfgLocale)
+    : null
+  const isRecalled = Boolean(meta?.isRecalled || meta?.metadata?.is_recalled)
+  const canRecallMessage =
+    Boolean(socket)
+    && !isRecalled
+    && !isClosed
+    && canSendPublicReply
+    && meta?.isOwn
+    && isRecallableContentType(meta?.contentType)
+    && String(conversation.channel?.channel_type || '').toLowerCase() === 'web'
+    && isMessageWithinRecallWindow(message.createdAt)
+  const originalMessage = useMemo<Message>(() => ({
+    id: Number(message.id) || 0,
+    conversation_id: meta?.conversationId ?? conversation.id,
+    sender_type: (meta?.senderType || 'system') as Message['sender_type'],
+    sender_id: meta?.senderId ?? null,
+    sender_name: meta?.senderName ?? null,
+    sender_avatar: meta?.senderAvatar ?? null,
+    content_type: (meta?.contentType || 'text') as Message['content_type'],
+    content,
+    is_recalled: isRecalled,
+    recalled_at: meta?.recalledAt ?? null,
+    recalled_by_type: meta?.recalledByType ?? null,
+    recalled_by_name: meta?.recalledByName ?? null,
+    metadata: meta?.metadata,
+    created_at: message.createdAt?.toISOString() || new Date().toISOString(),
+  }), [
+    content,
+    conversation.id,
+    isRecalled,
+    message.createdAt,
+    message.id,
+    meta?.contentType,
+    meta?.conversationId,
+    meta?.metadata,
+    meta?.recalledAt,
+    meta?.recalledByName,
+    meta?.recalledByType,
+    meta?.senderAvatar,
+    meta?.senderId,
+    meta?.senderName,
+    meta?.senderType,
+  ])
+  const canQuoteCurrentMessage =
+    Boolean(socket)
+    && canQuoteMessage(originalMessage, {
+      canSend: canSendPublicReply,
+      closed: isClosed,
+      webChannel: String(conversation.channel?.channel_type || '').toLowerCase() === 'web',
+    })
+  const quote = messageQuoteFromMetadata(meta?.metadata)
+  const quotedOriginal = quote
+    ? conversationMessages.find((item) => item.id === quote.message_id) ?? null
+    : null
+  const reeditQuotedMessage =
+    quotedOriginal && canQuoteMessage(quotedOriginal, {
+      canSend: canSendPublicReply,
+      closed: isClosed,
+      webChannel: String(conversation.channel?.channel_type || '').toLowerCase() === 'web',
+    })
+      ? quotedOriginal
+      : null
+  const handleQuoteClick = quote
+    ? () => scrollToWorkspaceMessage(quote.message_id, cfgLocale)
+    : undefined
+  const quoteAttachmentContext = {
+    conversationId: meta?.conversationId ?? conversation.id,
+  }
+  const quoteBlock = quote ? (
+    <MessageQuoteBlock
+      quote={quote}
+      locale={cfgLocale}
+      original={quotedOriginal}
+      onClick={handleQuoteClick}
+      attachmentContext={quoteAttachmentContext}
+      className="max-w-full rounded-lg"
+    />
+  ) : null
+  const embeddedQuoteBlock = quote ? (
+    <MessageQuoteBlock
+      quote={quote}
+      locale={cfgLocale}
+      original={quotedOriginal}
+      onClick={handleQuoteClick}
+      variant="embedded"
+      attachmentContext={quoteAttachmentContext}
+      className="mb-2"
+    />
+  ) : null
+  const bubbleClassName = cn(
+    'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all text-[#1a1a1a]',
+    isInternalNote
+      ? internalNoteBubbleClass
+      : isAssistantSide ? 'bg-[#DBEAFE]' : 'border border-[#E0E0E0] bg-[#F0F0F0]',
+  )
+  const recallEditContent = typeof meta?.metadata?.recall_edit_content === 'string'
+    ? meta.metadata.recall_edit_content
+    : ''
+  const canEditRecalled =
+    isRecalled
+    && meta?.isOwn
+    && canSendPublicReply
+    && !isClosed
+    && (meta?.contentType === 'text' || meta?.contentType === 'rich_text')
+    && recallEditContent.length > 0
+
+  useEffect(() => {
+    if (!messageMenu) return
+    const close = () => setMessageMenu(null)
+    window.addEventListener('click', close)
+    window.addEventListener('scroll', close, true)
+    window.addEventListener('keydown', close)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('scroll', close, true)
+      window.removeEventListener('keydown', close)
+    }
+  }, [messageMenu])
+
+  const handleContextMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!canRecallMessage && !canQuoteCurrentMessage) return
+    event.preventDefault()
+    setMessageMenu({ x: event.clientX, y: event.clientY })
+  }, [canQuoteCurrentMessage, canRecallMessage])
+
+  const handleQuote = useCallback(() => {
+    setMessageMenu(null)
+    if (!canQuoteCurrentMessage) return
+    onQuoteMessage(originalMessage)
+  }, [canQuoteCurrentMessage, onQuoteMessage, originalMessage])
+
+  const handleRecall = useCallback(() => {
+    setMessageMenu(null)
+    if (!socket || !canRecallMessage) return
+    socket.emit(
+      'recall_message',
+      {
+        conversation_id: conversation.id,
+        message_id: Number(message.id),
+      },
+      (response?: { ok?: boolean; message?: string }) => {
+        if (response?.ok === false) {
+          window.alert(response.message || t('ws.chat.recall.failed', cfgLocale))
+        }
+      },
+    )
+  }, [canRecallMessage, cfgLocale, conversation.id, message.id, socket])
+
+  const handleEditRecalled = useCallback(() => {
+    if (!canEditRecalled || !onComposerInsertRequest) return
+    onComposerInsertRequest({
+      text: recallEditContent,
+      contentType: meta?.contentType === 'rich_text' ? 'rich_text' : 'text',
+      quotedMessage: reeditQuotedMessage,
+    })
+  }, [canEditRecalled, meta?.contentType, onComposerInsertRequest, recallEditContent, reeditQuotedMessage])
 
   if (meta?.contentType && isWelcomeLikeContentType(meta.contentType)) {
     return (
@@ -215,10 +521,73 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
     )
   }
 
+  if (isBot && !attachmentContentType && !hasOpenAgentTrace && !hasMessageText) return null
+
+  if (isRecalled) {
+    return (
+      <div className={cn('mb-4 flex gap-2.5', isAssistantSide ? 'flex-row-reverse' : 'flex-row')}>
+        {isAssistantSide ? (
+          <AgentAvatar
+            avatar={meta?.senderAvatar}
+            name={meta?.senderName}
+            isBot={isBot}
+          />
+        ) : (
+          <div
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-medium text-white"
+            style={{ backgroundColor: visitorAvatarBg }}
+          >
+            {visitorAvatarChar}
+          </div>
+        )}
+        <RecalledMessageNotice
+          text={recalledMessageText({
+            locale: cfgLocale,
+            isOwn: meta?.isOwn,
+            senderType: meta?.senderType,
+            senderName: meta?.senderName,
+          })}
+          time={message.createdAt ? formatMessageTime(message.createdAt.toISOString()) : ''}
+          alignEnd={isAssistantSide}
+          editLabel={canEditRecalled ? t('ws.chat.recall.editAgain', cfgLocale) : undefined}
+          onEdit={canEditRecalled ? handleEditRecalled : undefined}
+        />
+      </div>
+    )
+  }
 
   // 2.1 pen: visitor left (#F0F0F0 + border), agent (own) right (#DBEAFE)
   return (
-    <div className={cn('mb-4 flex gap-2.5', isAssistantSide ? 'flex-row-reverse' : 'flex-row')}>
+    <div
+      className={cn('mb-4 flex gap-2.5', isAssistantSide ? 'flex-row-reverse' : 'flex-row')}
+      onContextMenu={handleContextMenu}
+    >
+      {messageMenu && (
+        <div
+          className="fixed z-50 min-w-28 rounded-md border border-border bg-background p-1 text-sm shadow-lg"
+          style={{ left: messageMenu.x, top: messageMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          {canQuoteCurrentMessage && (
+            <button
+              type="button"
+              className="flex w-full items-center rounded px-3 py-1.5 text-left text-foreground hover:bg-muted"
+              onClick={handleQuote}
+            >
+              {t('ws.chat.quote.action', cfgLocale)}
+            </button>
+          )}
+          {canRecallMessage && (
+            <button
+              type="button"
+              className="flex w-full items-center rounded px-3 py-1.5 text-left text-foreground hover:bg-muted"
+              onClick={handleRecall}
+            >
+              {t('ws.chat.recall.action', cfgLocale)}
+            </button>
+          )}
+        </div>
+      )}
       {isAssistantSide ? (
         <AgentAvatar
           avatar={meta?.senderAvatar}
@@ -234,36 +603,61 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
         </div>
       )}
       <div className={cn('flex min-w-0 max-w-[70%] flex-col', isAssistantSide ? 'items-end' : 'items-start')}>
-        {isBot && meta?.senderName && (
-          <span className="mb-1 text-[11px] text-[#737373]">{meta.senderName}</span>
+        {showSenderName && meta?.senderName && (
+          <span className="mb-1 max-w-full truncate text-right text-[11px] text-[#737373]" title={meta.senderName}>
+            {meta.senderName}
+          </span>
         )}
         {attachmentContentType ? (
-          <MessageAttachment
-            conversationId={meta?.conversationId ?? conversation.id}
-            contentType={attachmentContentType}
-            content={content}
-            imageGallery={attachmentContentType === 'image' ? imageMessages : undefined}
-            currentImageId={attachmentContentType === 'image' ? message.id : undefined}
-          />
+          <>
+            {quoteBlock}
+            <MessageAttachment
+              conversationId={meta?.conversationId ?? conversation.id}
+              contentType={attachmentContentType}
+              content={content}
+              imageGallery={attachmentContentType === 'image' ? imageMessages : undefined}
+              currentImageId={attachmentContentType === 'image' ? message.id : undefined}
+            />
+          </>
         ) : isRichText ? (
-          <RichTextMessageContent
-            html={content}
-            conversationId={meta?.conversationId ?? conversation.id}
-            className={cn(
-              'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all text-[#1a1a1a]',
-              isAssistantSide ? 'bg-[#DBEAFE]' : 'border border-[#E0E0E0] bg-[#F0F0F0]',
+          quote ? (
+            <div className={bubbleClassName}>
+              {embeddedQuoteBlock}
+              <RichTextMessageContent
+                html={content}
+                conversationId={meta?.conversationId ?? conversation.id}
+                className="max-w-full text-sm leading-normal break-words break-all text-[#1a1a1a]"
+              />
+            </div>
+          ) : (
+            <RichTextMessageContent
+              html={content}
+              conversationId={meta?.conversationId ?? conversation.id}
+              className={bubbleClassName}
+            />
+          )
+        ) : hasOpenAgentTrace ? (
+          <div className="w-full min-w-0 space-y-2">
+            {quoteBlock}
+            <OpenAgentTraceBlocks
+              textBlocks={textBlocks}
+              thinkingBlocks={thinkingBlocks}
+              toolBlocks={visibleToolBlocks}
+              locale={cfgLocale}
+            />
+            {textBlocks.length === 0 && (
+              <OpenAgentTextBlockView content={content} />
             )}
-          />
+          </div>
         ) : (
           <div
             className={cn(
-              'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all whitespace-pre-wrap text-[#1a1a1a]',
-              isInternalNote
-                ? internalNoteBubbleClass
-                : isAssistantSide ? 'bg-[#DBEAFE]' : 'border border-[#E0E0E0] bg-[#F0F0F0]',
+              bubbleClassName,
+              'whitespace-pre-wrap',
               isBot && [markdownTextRootClass, richTextListStyleClass],
             )}
           >
+            {embeddedQuoteBlock}
             {isBot ? (
               <MessagePrimitive.Parts>
                 {({ part }) => (
@@ -275,9 +669,21 @@ function AgentMessageBubble({ message }: { message: MessageState }) {
             ) : content}
           </div>
         )}
-        <span className={cn('mt-1 text-[11px] text-[#999999]', isAssistantSide && 'text-right')}>
-          {message.createdAt ? formatMessageTime(message.createdAt.toISOString()) : ''}
-        </span>
+        {(message.createdAt || readStatusText) && (
+          <div className={cn('mt-1 flex items-center gap-1 text-[11px] text-[#999999]', isAssistantSide && 'flex-row-reverse text-right')}>
+            {message.createdAt && <span>{formatMessageTime(message.createdAt.toISOString())}</span>}
+            {readStatusText && <span>{readStatusText}</span>}
+          </div>
+        )}
+        {isBot && (
+          <OpenAgentFeedbackStatus
+            messageId={Number(message.id)}
+            senderType={meta?.senderType ?? ''}
+            metadata={meta?.metadata}
+            locale={cfgLocale}
+            align="end"
+          />
+        )}
       </div>
     </div>
   )
@@ -323,12 +729,18 @@ function AgentHistoryMessageBubble({
   visitorAvatarBg,
   visitorAvatarChar,
   imageMessages,
+  allMessages,
+  readStatusEnabled,
+  currentUserId,
 }: {
   message: Message
   locale: string
   visitorAvatarBg: string
   visitorAvatarChar: string
   imageMessages: { id: string; content: string }[]
+  allMessages: Message[]
+  readStatusEnabled: boolean
+  currentUserId?: number | null
 }) {
   const isAgent = message.sender_type === 'agent' || message.sender_type === 'bot'
   const isBot = message.sender_type === 'bot'
@@ -337,6 +749,87 @@ function AgentHistoryMessageBubble({
   const attachmentContentType =
     message.content_type === 'image' ? 'image' : message.content_type === 'file' ? 'file' : null
   const isRichText = message.content_type === 'rich_text'
+  const textBlocks = isBot ? getOpenAgentTextBlocks(message.metadata) : []
+  const thinkingBlocks = isBot ? getOpenAgentThinkingBlocks(message.metadata) : []
+  const visibleToolBlocks = isBot ? getVisibleOpenAgentToolBlocks(message.metadata) : []
+  const hasOpenAgentTrace =
+    isBot && (textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0)
+  const hasMessageText = message.content.trim().length > 0
+  const readStatusText = readStatusEnabled
+    && message.sender_type === 'agent'
+    && message.sender_id === currentUserId
+    && isReadStatusContentType(message.content_type)
+    ? readStatusLabel(message.status, locale as Locale)
+    : null
+  const quote = messageQuoteFromMetadata(message.metadata)
+  const quotedOriginal = quote
+    ? allMessages.find((item) => item.id === quote.message_id) ?? null
+    : null
+  const handleQuoteClick = quote
+    ? () => scrollToWorkspaceMessage(quote.message_id, locale as Locale)
+    : undefined
+  const quoteAttachmentContext = {
+    conversationId: message.conversation_id,
+  }
+  const quoteBlock = quote ? (
+    <MessageQuoteBlock
+      quote={quote}
+      locale={locale as Locale}
+      original={quotedOriginal}
+      onClick={handleQuoteClick}
+      attachmentContext={quoteAttachmentContext}
+      className="max-w-full rounded-lg"
+    />
+  ) : null
+  const embeddedQuoteBlock = quote ? (
+    <MessageQuoteBlock
+      quote={quote}
+      locale={locale as Locale}
+      original={quotedOriginal}
+      onClick={handleQuoteClick}
+      variant="embedded"
+      attachmentContext={quoteAttachmentContext}
+      className="mb-2"
+    />
+  ) : null
+  const historyBubbleClassName = cn(
+    'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all text-[#1a1a1a]',
+    isInternalNote
+      ? internalNoteBubbleClass
+      : isAgent ? 'bg-[#E8E8E8]' : 'border border-[#E0E0E0] bg-white',
+  )
+
+  if (message.is_recalled) {
+    return (
+      <div className={cn('mb-4 flex gap-2.5 opacity-90', isAgent ? 'flex-row-reverse' : 'flex-row')}>
+        {isAgent ? (
+          <AgentAvatar
+            avatar={message.sender_avatar}
+            name={message.sender_name}
+            isBot={isBot}
+            muted
+          />
+        ) : (
+          <div
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-medium text-white"
+            style={{ backgroundColor: visitorAvatarBg }}
+          >
+            {visitorAvatarChar}
+          </div>
+        )}
+        <RecalledMessageNotice
+          text={recalledMessageText({
+            locale,
+            isOwn: message.sender_type === 'agent' && message.sender_id === currentUserId,
+            senderType: message.sender_type,
+            senderName: message.sender_name,
+          })}
+          time={formatMessageTime(message.created_at)}
+          alignEnd={isAgent}
+        />
+      </div>
+    )
+  }
 
   if (isWelcomeLikeContentType(message.content_type)) {
     return (
@@ -386,6 +879,8 @@ function AgentHistoryMessageBubble({
     )
   }
 
+  if (isBot && !attachmentContentType && !hasOpenAgentTrace && !hasMessageText) return null
+
   return (
     <div className={cn('mb-4 flex gap-2.5 opacity-90', isAgent ? 'flex-row-reverse' : 'flex-row')}>
       {isAgent ? (
@@ -408,38 +903,71 @@ function AgentHistoryMessageBubble({
           <span className="mb-1 text-[11px] text-[#737373]">{message.sender_name}</span>
         )}
         {attachmentContentType ? (
-          <MessageAttachment
-            conversationId={message.conversation_id}
-            contentType={attachmentContentType}
-            content={message.content}
-            imageGallery={attachmentContentType === 'image' ? imageMessages : undefined}
-            currentImageId={attachmentContentType === 'image' ? String(message.id) : undefined}
-          />
+          <>
+            {quoteBlock}
+            <MessageAttachment
+              conversationId={message.conversation_id}
+              contentType={attachmentContentType}
+              content={message.content}
+              imageGallery={attachmentContentType === 'image' ? imageMessages : undefined}
+              currentImageId={attachmentContentType === 'image' ? String(message.id) : undefined}
+            />
+          </>
         ) : isRichText ? (
-          <RichTextMessageContent
-            html={message.content}
-            conversationId={message.conversation_id}
-            className={cn(
-              'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all text-[#1a1a1a]',
-              isAgent ? 'bg-[#E8E8E8]' : 'border border-[#E0E0E0] bg-white',
+          quote ? (
+            <div className={historyBubbleClassName}>
+              {embeddedQuoteBlock}
+              <RichTextMessageContent
+                html={message.content}
+                conversationId={message.conversation_id}
+                className="max-w-full text-sm leading-normal break-words break-all text-[#1a1a1a]"
+              />
+            </div>
+          ) : (
+            <RichTextMessageContent
+              html={message.content}
+              conversationId={message.conversation_id}
+              className={historyBubbleClassName}
+            />
+          )
+        ) : hasOpenAgentTrace ? (
+          <div className="w-full min-w-0 space-y-2">
+            {quoteBlock}
+            <OpenAgentTraceBlocks
+              textBlocks={textBlocks}
+              thinkingBlocks={thinkingBlocks}
+              toolBlocks={visibleToolBlocks}
+              locale={locale}
+            />
+            {textBlocks.length === 0 && (
+              <OpenAgentTextBlockView content={message.content} />
             )}
-          />
+          </div>
         ) : (
           <div
             className={cn(
-              'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all whitespace-pre-wrap text-[#1a1a1a]',
-              isInternalNote
-                ? internalNoteBubbleClass
-                : isAgent ? 'bg-[#E8E8E8]' : 'border border-[#E0E0E0] bg-white',
+              historyBubbleClassName,
+              'whitespace-pre-wrap',
               isBot && [markdownTextRootClass, richTextListStyleClass],
             )}
           >
+            {embeddedQuoteBlock}
             {isBot ? <MarkdownText>{message.content}</MarkdownText> : message.content}
           </div>
         )}
-        <span className={cn('mt-1 text-[11px] text-[#999999]', isAgent && 'text-right')}>
-          {formatMessageTime(message.created_at)}
-        </span>
+        <div className={cn('mt-1 flex items-center gap-1 text-[11px] text-[#999999]', isAgent && 'flex-row-reverse text-right')}>
+          <span>{formatMessageTime(message.created_at)}</span>
+          {readStatusText && <span>{readStatusText}</span>}
+        </div>
+        {isBot && (
+          <OpenAgentFeedbackStatus
+            messageId={message.id}
+            senderType={message.sender_type}
+            metadata={message.metadata}
+            locale={locale}
+            align="end"
+          />
+        )}
       </div>
     </div>
   )
@@ -451,19 +979,27 @@ function HistoryConversationBlock({
   visitorAvatarBg,
   visitorAvatarChar,
   highlightedMessageId,
+  readStatusEnabled,
+  currentUserId,
 }: {
   conversation: WorkspaceConversationHistoryItem
   locale: string
   visitorAvatarBg: string
   visitorAvatarChar: string
   highlightedMessageId: number | null
+  readStatusEnabled: boolean
+  currentUserId?: number | null
 }) {
+  const visibleMessages = useMemo(
+    () => conversation.messages.filter(isConversationHistoryContentMessage),
+    [conversation.messages],
+  )
   const imageMessages = useMemo(
     () =>
-      conversation.messages
-        .filter((msg) => msg.content_type === 'image')
+      visibleMessages
+        .filter((msg) => msg.content_type === 'image' && !msg.is_recalled)
         .map((msg) => ({ id: String(msg.id), content: msg.content })),
-    [conversation.messages],
+    [visibleMessages],
   )
   const time = formatHistoryTime(
     conversation.started_at || conversation.created_at || conversation.last_message_at,
@@ -485,7 +1021,7 @@ function HistoryConversationBlock({
           {locale === 'zh' ? '仅显示最近 200 条消息' : 'Showing latest 200 messages'}
         </div>
       )}
-      {conversation.messages.map((message) => (
+      {visibleMessages.map((message) => (
         <div
           key={message.id}
           data-workspace-message-id={message.id}
@@ -500,6 +1036,9 @@ function HistoryConversationBlock({
             visitorAvatarBg={visitorAvatarBg}
             visitorAvatarChar={visitorAvatarChar}
             imageMessages={imageMessages}
+            allMessages={visibleMessages}
+            readStatusEnabled={readStatusEnabled}
+            currentUserId={currentUserId}
           />
         </div>
       ))}
@@ -537,17 +1076,17 @@ function VisitorWebStatusBadge({
   const { locale } = useLocaleStore()
   const queryClient = useQueryClient()
   const visible = conversation.status !== 'closed' && shouldShowVisitorWebStatus(conversation)
-  const statusQuery = useVisitorWebStatus(conversation.id, { enabled: visible })
+  const statusQuery = useVisitorWebStatus(conversation.id, {
+    enabled: visible,
+    refetchInterval: 5_000,
+  })
 
   useEffect(() => {
     if (!socket || !visible) return
 
     const handleStatusUpdated = (payload: VisitorWebStatusResponse) => {
       if (payload.conversation_id !== conversation.id) return
-      queryClient.setQueryData(
-        conversationKeys.visitorWebStatus(conversation.id),
-        payload,
-      )
+      setVisitorWebStatusQueryData(queryClient, payload)
     }
 
     const handleConnect = () => {
@@ -615,6 +1154,7 @@ function VisitorWebStatusBadge({
 type AgentThreadProps = {
   socket: Socket | null
   composerInsertRequest?: ComposerInsertRequest | null
+  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id'>) => void
   composerInputHeight?: number
   onComposerInputHeightCommit?: (height: number) => void
   messageSearchOpen?: boolean
@@ -629,6 +1169,7 @@ type AgentThreadProps = {
 export function AgentThread({
   socket,
   composerInsertRequest,
+  onComposerInsertRequest,
   composerInputHeight,
   onComposerInputHeightCommit,
   messageSearchOpen,
@@ -654,19 +1195,29 @@ export function AgentThread({
     onEndConversation,
     onCreateTicket,
     canCreateTicket,
+    canPinConversation,
+    pinningConversation,
+    onTogglePinConversation,
+    canLockConversationTimeout,
+    lockingConversationTimeout,
+    onToggleConversationTimeoutLock,
     canTransfer,
     canEndConversation,
+    canInviteCollaborator,
     canStartNewConversation,
     startNewConversationDisabledReason,
     startingNewConversation,
     onStartNewConversation,
     onTransferred,
+    onCollaborationInvitationSent,
+    readStatusEnabled,
   } = useAgentChatConfig()
   const { locale } = useLocaleStore()
   const currentUserId = useAuthStore((state) => state.user?.id)
   const currentMessages = useChatStore((state) => state.messages.get(conversation.id) || EMPTY_MESSAGES)
   const [showEndModal, setShowEndModal] = useState(false)
   const [showTransferModal, setShowTransferModal] = useState(false)
+  const [showInviteModal, setShowInviteModal] = useState(false)
   const [highlightedMessageId, setHighlightedMessageId] = useState<number | null>(null)
   const viewportRef = useRef<HTMLDivElement | null>(null)
   const pendingScrollDeltaRef = useRef<number | null>(null)
@@ -681,16 +1232,30 @@ export function AgentThread({
   const latestMessage = currentMessages[currentMessages.length - 1]
   const latestMessageId = latestMessage?.id ?? null
   const isPeerConversation = conversation.viewer_relation === 'peer'
+  const isCollaboratorConversation = conversation.viewer_relation === 'collaborator'
   const ownerName = conversation.agent?.display_name || conversation.agent?.name
+  const collaboratorNames = (conversation.collaborators ?? [])
+    .map((agent) => agent.display_name || agent.name)
+    .filter(Boolean)
+  const visibleHistoryConversations = useMemo(
+    () => historyConversations.filter((item) => item.messages.some(isConversationHistoryContentMessage)),
+    [historyConversations],
+  )
   const oldestHistoryId = historyConversations[0]?.id
   const showHistoryEntry = historyAvailable && !historyLoaded
-  const showCurrentDivider = historyLoaded && historyConversations.length > 0
+  const showCurrentDivider = historyLoaded && visibleHistoryConversations.length > 0
   const showHistoryDone =
-    historyLoaded && historyConversations.length > 0 && (!historyHasMore || historyLimitReached)
+    historyLoaded && visibleHistoryConversations.length > 0 && (!historyHasMore || historyLimitReached)
   const historyEndTime = formatHistoryTime(
     conversation.ended_at || conversation.last_message_at || conversation.created_at,
     locale,
   )
+  const pinLabel = conversation.is_pinned
+    ? t('ws.chat.unpinConversation', locale)
+    : t('ws.chat.pinConversation', locale)
+  const timeoutLockLabel = conversation.is_timeout_locked
+    ? t('ws.chat.unlockConversationTimeout', locale)
+    : t('ws.chat.lockConversationTimeout', locale)
 
   const loadHistoryWithAnchor = useCallback(
     async (beforeId?: number) => {
@@ -830,18 +1395,83 @@ export function AgentThread({
             </span>
           )}
           <VisitorWebStatusBadge conversation={conversation} socket={socket} />
+          {conversation.is_timeout_locked && (
+            <span className="shrink-0 rounded border border-[#D6D6D6] bg-[#F0F0F0] px-2 py-0.5 text-[12px] font-medium text-[#555555]">
+              {t('ws.chat.timeoutLocked', locale)}
+            </span>
+          )}
           {isPeerConversation && (
             <span className="shrink-0 rounded border border-[#E5E5E5] bg-[#F5F5F5] px-2 py-0.5 text-[12px] font-medium text-[#737373]">
               {t('ws.chat.peerConversation', locale)}
             </span>
           )}
-          {isPeerConversation && ownerName && (
+          {isCollaboratorConversation && (
+            <span className="shrink-0 rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[12px] font-medium text-emerald-700">
+              {t('ws.chat.collaboratingBadge', locale)}
+            </span>
+          )}
+          {(isPeerConversation || isCollaboratorConversation) && ownerName && (
             <span className="max-w-40 truncate text-[12px] text-[#737373]" title={ownerName}>
               {t('ws.chat.ownerLabel', locale, { name: ownerName })}
             </span>
           )}
+          {collaboratorNames.length > 0 && (
+            <span
+              className="max-w-48 truncate text-[12px] text-[#737373]"
+              title={collaboratorNames.join(', ')}
+            >
+              {t('ws.chat.collaboratorsLabel', locale, {
+                names: collaboratorNames.slice(0, 2).join(', '),
+              })}
+              {collaboratorNames.length > 2 ? ` +${collaboratorNames.length - 2}` : ''}
+            </span>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {canPinConversation && (
+            <button
+              onClick={onTogglePinConversation}
+              disabled={pinningConversation}
+              className={cn(
+                'flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                conversation.is_pinned
+                  ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                  : 'bg-[#E8E8E8] text-[#666666] hover:bg-[#DDDDDD]',
+              )}
+              title={pinLabel}
+              aria-label={pinLabel}
+              type="button"
+            >
+              {pinningConversation ? (
+                <IconLoader2 size={16} stroke={1.5} className="animate-spin" />
+              ) : (
+                <IconPinned size={16} stroke={1.5} />
+              )}
+            </button>
+          )}
+          {canLockConversationTimeout && (
+            <button
+              onClick={onToggleConversationTimeoutLock}
+              disabled={lockingConversationTimeout}
+              className={cn(
+                'flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-60',
+                conversation.is_timeout_locked
+                  ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                  : 'bg-[#E8E8E8] text-[#666666] hover:bg-[#DDDDDD]',
+              )}
+              title={timeoutLockLabel}
+              aria-label={timeoutLockLabel}
+              type="button"
+            >
+              {lockingConversationTimeout ? (
+                <IconLoader2 size={16} stroke={1.5} className="animate-spin" />
+              ) : conversation.is_timeout_locked ? (
+                <IconLockOpen size={16} stroke={1.5} />
+              ) : (
+                <IconLock size={16} stroke={1.5} />
+              )}
+            </button>
+          )}
           {isClosed && (
             <button
               onClick={onStartNewConversation}
@@ -867,6 +1497,17 @@ export function AgentThread({
             >
               <IconTicket size={16} stroke={1.5} />
               {t('ws.chat.createTicket', locale)}
+            </button>
+          )}
+          {!isClosed && canInviteCollaborator && conversation.agent && (
+            <button
+              onClick={() => setShowInviteModal(true)}
+              className="flex h-8 items-center gap-1.5 rounded-md bg-[#E8E8E8] px-2.5 text-[12px] font-medium text-[#666666] transition-colors hover:bg-[#DDDDDD]"
+              title={t('ws.chat.collabInviteAction', locale)}
+              type="button"
+            >
+              <IconUserPlus size={16} stroke={1.5} />
+              {t('ws.chat.collabInviteAction', locale)}
             </button>
           )}
           {!isClosed && canTransfer && conversation.agent && (
@@ -933,7 +1574,7 @@ export function AgentThread({
           />
         )}
 
-        {historyConversations.map((historyConversation) => (
+        {visibleHistoryConversations.map((historyConversation) => (
           <HistoryConversationBlock
             key={historyConversation.id}
             conversation={historyConversation}
@@ -941,6 +1582,8 @@ export function AgentThread({
             visitorAvatarBg={visitorAvatarBg}
             visitorAvatarChar={visitorAvatarChar}
             highlightedMessageId={highlightedMessageId}
+            readStatusEnabled={readStatusEnabled}
+            currentUserId={currentUserId}
           />
         ))}
 
@@ -975,7 +1618,11 @@ export function AgentThread({
                 highlightedMessageId === Number(message.id) && 'bg-warning/15',
               )}
             >
-              <AgentMessageBubble message={message} />
+              <AgentMessageBubble
+                message={message}
+                socket={socket}
+                onComposerInsertRequest={onComposerInsertRequest}
+              />
             </div>
           )}
         </ThreadPrimitive.Messages>
@@ -1034,6 +1681,18 @@ export function AgentThread({
           onTransferred={(toName) => {
             setShowTransferModal(false)
             onTransferred(toName)
+          }}
+        />
+      )}
+
+      {canInviteCollaborator && (
+        <InviteCollaboratorModal
+          conversation={conversation}
+          open={showInviteModal}
+          onClose={() => setShowInviteModal(false)}
+          onInvited={(name) => {
+            setShowInviteModal(false)
+            onCollaborationInvitationSent(name)
           }}
         />
       )}

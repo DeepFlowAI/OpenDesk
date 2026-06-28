@@ -2,12 +2,13 @@
 
 import { useCallback, useMemo, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { useSessionReportsOverview } from '@/service/use-session-reports'
+import { useOverallSummary } from '@/service/use-session-reports-overall'
 import { DateToolbar } from '@/app/components/features/session-reports/date-toolbar'
-import { SessionReportExportButton } from '@/app/components/features/session-reports/export-button'
-import { OverviewCards } from '@/app/components/features/session-reports/overview-cards'
 import { ReportTabs } from '@/app/components/features/session-reports/report-tabs'
-import { TrendChartCard } from '@/app/components/features/session-reports/trend-chart'
+import { OverallOverview } from '@/app/components/features/session-reports/overall/overall-overview'
+import { OverallTrend } from '@/app/components/features/session-reports/overall/overall-trend'
+import { OverallExportButton } from '@/app/components/features/session-reports/overall/overall-export-button'
+import { orderedGroups } from '@/app/components/features/session-reports/overall/group-utils'
 import type { TrendType } from '@/models/session-report'
 
 function todayIsoDate(): string {
@@ -43,17 +44,13 @@ export default function SessionReportsOverallPage() {
     [router, searchParams]
   )
 
-  const { data: overview, refetch: refetchOverview, isFetching } = useSessionReportsOverview({
-    start,
-    end,
-  })
+  const { data: summary, refetch: refetchSummary, isFetching, isLoading } = useOverallSummary({ start, end })
+
+  const groups = useMemo(() => orderedGroups(summary?.metrics ?? []), [summary])
 
   const handleRefresh = useCallback(() => {
-    refetchOverview()
-    // Trend hook re-fetches via its own queryKey when refetch is triggered through
-    // a global refetcher; for simplicity here we rely on React Query's window-focus
-    // refetch. A keyed refetch from a parent ref is a future improvement.
-  }, [refetchOverview])
+    refetchSummary()
+  }, [refetchSummary])
 
   const carriedSearch = useMemo(() => searchParams.toString(), [searchParams])
 
@@ -64,11 +61,11 @@ export default function SessionReportsOverallPage() {
         <DateToolbar
           start={start}
           end={end}
-          asOf={overview?.as_of ?? null}
+          asOf={summary?.as_of ?? null}
           loading={isFetching}
           exportAction={
-            <SessionReportExportButton
-              params={{ scope: 'overall', start, end, trend }}
+            <OverallExportButton
+              params={{ start, end, trend }}
               disabled={!dateRangeValid || isFetching || trendLoading}
             />
           }
@@ -76,11 +73,17 @@ export default function SessionReportsOverallPage() {
           onRefresh={handleRefresh}
           onValidityChange={setDateRangeValid}
         />
-        <OverviewCards start={start} end={end} />
-        <TrendChartCard
+        <OverallOverview
+          metrics={summary?.metrics ?? []}
+          distributions={summary?.distributions ?? []}
+          loading={isLoading}
+        />
+        <OverallTrend
           start={start}
           end={end}
           trend={trend}
+          groups={groups}
+          distributions={summary?.distributions ?? []}
           onTrendChange={(t) => updateParams({ trend: t })}
           onLoadingChange={setTrendLoading}
         />

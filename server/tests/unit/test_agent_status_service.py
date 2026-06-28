@@ -39,6 +39,41 @@ async def test_mark_connected_preserves_manual_offline_status(fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_set_status_offline_preserves_current_count(fake_redis):
+    await AgentStatusService.set_count(fake_redis, tenant_id=7, user_id=42, count=2)
+
+    await AgentStatusService.set_status(
+        fake_redis,
+        tenant_id=7,
+        user_id=42,
+        status=AgentOnlineStatus.OFFLINE.value,
+    )
+
+    status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
+    assert status["status"] == AgentOnlineStatus.OFFLINE.value
+    assert status["current_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_set_status_refreshes_current_count_when_provided(fake_redis, monkeypatch):
+    notify = AsyncMock()
+    monkeypatch.setattr(AgentStatusService, "_notify_stats_changed", notify)
+
+    await AgentStatusService.set_status(
+        fake_redis,
+        tenant_id=7,
+        user_id=42,
+        status=AgentOnlineStatus.ONLINE.value,
+        current_count=3,
+    )
+
+    status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
+    assert status["status"] == AgentOnlineStatus.ONLINE.value
+    assert status["current_count"] == 3
+    notify.assert_awaited_once_with(fake_redis, 7, 42)
+
+
+@pytest.mark.asyncio
 async def test_mark_connected_preserves_existing_status_without_desired_status(fake_redis):
     await fake_redis.hset("agent:status:7:42", mapping={"status": AgentOnlineStatus.OFFLINE.value})
 
@@ -113,7 +148,6 @@ async def test_finalized_disconnect_resets_desired_status_to_offline(fake_redis,
             await fake_redis.hdel(key_arg, connection_sid_field, pending_offline_field)
             await fake_redis.hset(key_arg, "status", offline_status)
             await fake_redis.hset(key_arg, desired_status_field, offline_status)
-            await fake_redis.hset(key_arg, "current_count", 0)
             return 1
         return 0
 
@@ -129,7 +163,7 @@ async def test_finalized_disconnect_resets_desired_status_to_offline(fake_redis,
     status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
     assert status["status"] == AgentOnlineStatus.OFFLINE.value
     assert await fake_redis.hget(key, "desired_status") == AgentOnlineStatus.OFFLINE.value
-    assert status["current_count"] == 0
+    assert status["current_count"] == 3
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import type {
   SessionRecordDetail,
   SessionRecordMessageListResponse,
   SessionRecordFilters,
+  ReceptionTrajectory,
 } from '@/models/session-record'
 
 const NS = 'session-records'
@@ -15,6 +16,7 @@ export const sessionRecordKeys = {
   list: (filters: SessionRecordFilters) => [...sessionRecordKeys.lists(), filters] as const,
   detail: (id: number) => [...sessionRecordKeys.all, 'detail', id] as const,
   messages: (id: number, afterId?: number) => [...sessionRecordKeys.all, 'messages', id, afterId] as const,
+  receptionTrajectory: (id: number) => [...sessionRecordKeys.all, 'reception-trajectory', id] as const,
 }
 
 export const useSessionRecords = (filters: SessionRecordFilters) =>
@@ -30,6 +32,7 @@ export const useSessionRecords = (filters: SessionRecordFilters) =>
       if (filters.agent_id) params.agent_id = filters.agent_id
       if (filters.visitor_id) params.visitor_id = filters.visitor_id
       if (filters.session_type) params.session_type = filters.session_type
+      if (filters.has_queue !== undefined) params.has_queue = filters.has_queue ? 'true' : 'false'
       if (filters.keyword) params.keyword = filters.keyword
       if (filters.satisfaction_status) params.satisfaction_status = filters.satisfaction_status
       if (filters.satisfaction_resolved) params.satisfaction_resolved = filters.satisfaction_resolved
@@ -55,5 +58,12 @@ export const useSessionRecordMessages = (id: number, afterId?: number) =>
       get<SessionRecordMessageListResponse>(`v1/session-records/${id}/messages`, {
         searchParams: afterId ? { after_id: afterId, limit: 20 } : { limit: 20 },
       }),
+    enabled: id > 0,
+  })
+
+export const useReceptionTrajectory = (id: number) =>
+  useQuery({
+    queryKey: sessionRecordKeys.receptionTrajectory(id),
+    queryFn: () => get<ReceptionTrajectory>(`v1/session-records/${id}/reception-segments`),
     enabled: id > 0,
   })

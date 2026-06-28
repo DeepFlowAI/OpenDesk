@@ -19,6 +19,7 @@ from app.schemas.knowledge import (
     KnowledgeDocumentListResponse,
     KnowledgeDocumentResponse,
     KnowledgeDocumentUpdate,
+    KnowledgeRecommendationResponse,
 )
 from app.schemas.knowledge_import import (
     KnowledgeImportExecuteRequest,
@@ -27,6 +28,7 @@ from app.schemas.knowledge_import import (
 )
 from app.schemas.permission import EffectivePrincipal
 from app.services.knowledge_import_service import KnowledgeImportService
+from app.services.knowledge_recommendation_service import KnowledgeRecommendationService
 from app.services.knowledge_service import KnowledgeService
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge"])
@@ -192,6 +194,47 @@ async def delete_knowledge_directory(
     """Delete an empty knowledge directory."""
     await KnowledgeService.delete_directory(db, principal.tenant_id, directory_id)
     return {"message": "Deleted successfully"}
+
+
+@router.get(
+    "/recommendations",
+    response_model=KnowledgeRecommendationResponse,
+    dependencies=[Depends(require_permission("knowledge.workspace.view"))],
+)
+async def list_knowledge_recommendations(
+    conversation_id: int | None = None,
+    limit: int | None = Query(default=None, ge=1, le=20),
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """List recommended knowledge documents for a conversation."""
+    return await KnowledgeRecommendationService.list_recommendations(
+        db,
+        principal.tenant_id,
+        conversation_id=conversation_id,
+        limit=limit,
+    )
+
+
+@router.post(
+    "/recommendations/retry",
+    response_model=KnowledgeRecommendationResponse,
+    dependencies=[Depends(require_permission("knowledge.workspace.view"))],
+)
+async def retry_knowledge_recommendations(
+    conversation_id: int | None = None,
+    limit: int | None = Query(default=None, ge=1, le=20),
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry failed recommended knowledge generation for a conversation."""
+    return await KnowledgeRecommendationService.list_recommendations(
+        db,
+        principal.tenant_id,
+        conversation_id=conversation_id,
+        limit=limit,
+        retry_failed=True,
+    )
 
 
 @router.get(

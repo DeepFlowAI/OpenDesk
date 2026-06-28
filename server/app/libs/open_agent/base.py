@@ -38,6 +38,15 @@ class OpenAgentAgentListResult:
 class OpenAgentAgentDetail(OpenAgentAgentSummary):
     welcome_message: dict[str, Any] | None = None
     faq: dict[str, Any] | None = None
+    ai_disclaimer: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class OpenAgentFeedbackResult:
+    step_id: int
+    rating: str
+    comment: str | None = None
+    updated_at: str | None = None
 
 
 class BaseOpenAgentClient(ABC):
@@ -90,4 +99,17 @@ class BaseOpenAgentClient(ABC):
         payload: dict[str, Any],
     ) -> AsyncIterator[bytes]:
         """Stream an OpenAgent external tool result response as raw SSE bytes."""
+        ...
+
+    @abstractmethod
+    async def submit_feedback(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: int,
+        conversation_id: int,
+        step_id: int,
+        payload: dict[str, Any],
+    ) -> OpenAgentFeedbackResult:
+        """Submit feedback for an OpenAgent assistant reply step."""
         ...

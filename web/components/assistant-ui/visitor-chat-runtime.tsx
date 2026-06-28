@@ -29,9 +29,11 @@ import type { ChannelConfig } from '@/models/channel'
 import type { EmojiTargetConfig } from '@/models/emoji-setting'
 import {
   createOfflineMessageWithMessage,
+  recallPublicMessage,
   sendOfflineMessage,
   type ChannelPublicConfig,
   type PublicMessage,
+  type VisitorEnvironmentPayload,
 } from '@/service/use-visitor-chat'
 import {
   sendVisitorOfflineMessageFile,
@@ -42,6 +44,7 @@ import type { SatisfactionSurveyRecord } from '@/models/satisfaction-survey'
 import type { Socket } from 'socket.io-client'
 import {
   streamOpenAgentConversation,
+  submitOpenAgentFeedback,
   isHumanHandoffEventPayload,
   type HumanHandoffEventPayload,
   type OpenAgentLlmStepPayload,
@@ -52,6 +55,7 @@ import {
 } from '@/service/use-open-agent-conversation'
 import { createStreamMetrics, telemetry } from '@/service/telemetry'
 import { isVisitorQueueEnteredMessage } from '@/lib/visitor-queue-notice'
+import type { OpenAgentFeedbackSubmitInput } from '@/app/components/features/chat/open-agent-feedback'
 import {
   getAssistantAvatarSrc,
   shouldShowAssistantAvatar,
@@ -61,6 +65,7 @@ import {
   isHandoffQueueFullPayload,
   type HandoffRouteUnavailablePayload,
 } from '@/lib/handoff-route-unavailable'
+import { quoteFromMessage } from '@/lib/message-quote'
 
 // ─── Config context ──────────────────────────────────────────────
 
@@ -81,6 +86,7 @@ export type VisitorChatConfigValue = {
   startConversationError: string | null
   currentQueueCount: number | null
   visitorSessionToken: string
+  visitorEnvironment: VisitorEnvironmentPayload
   hasMore: boolean
   loadingMore: boolean
   historyAvailable: boolean
@@ -120,6 +126,11 @@ export type VisitorChatConfigValue = {
   onAssistSendMessage: (text: string) => Promise<boolean>
   onRequestHumanHandoff: (payload?: HumanHandoffEventPayload | null) => Promise<boolean>
   onDismissHumanHandoff: () => void
+  onRecallMessage: (message: Message) => Promise<boolean>
+  quotedMessage: Message | null
+  onQuoteMessage: (message: Message) => void
+  onClearQuote: () => void
+  onSubmitOpenAgentFeedback: (input: OpenAgentFeedbackSubmitInput) => Promise<void>
   onSatisfactionInitiate: () => Promise<SatisfactionSurveyRecord | null>
   onSatisfactionSubmitted: () => void
   onFileSend: (file: File) => Promise<void>
@@ -142,6 +153,11 @@ export type VisitorMessageMeta = {
   senderId: number | null
   contentType: string
   conversationPublicId: string
+  isRecalled?: boolean
+  recalledAt?: string | null
+  recalledByType?: string | null
+  recalledById?: number | null
+  recalledByName?: string | null
   metadata?: Record<string, unknown>
   eventType?: string
   handoffPayload?: unknown
@@ -213,7 +229,11 @@ export function getOpenAgentToolBlocks(metadata?: Record<string, unknown>): Open
   return value.flatMap((item): OpenAgentToolBlock[] => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return []
     const record = item as Record<string, unknown>
-    const toolCallId = getStringValue(record.toolCallId) || getStringValue(record.tool_call_id)
+    const toolCallId = (
+      getStringValue(record.toolCallId)
+      || getStringValue(record.tool_call_id)
+      || getStringValue(record.call_id)
+    )
     const toolName = getStringValue(record.toolName) || getStringValue(record.tool_name)
     const id = getStringValue(record.id) || (toolCallId ? `tool_${toolCallId}` : '')
     if (!id || !toolCallId) return []
@@ -252,7 +272,7 @@ export function getOpenAgentTextBlocks(metadata?: Record<string, unknown>): Open
 }
 
 function getToolCallId(data: OpenAgentToolCallPayload | OpenAgentToolResultPayload, fallback: string): string {
-  return getStringValue(data.tool_call_id) || getStringValue(data.id) || fallback
+  return getStringValue(data.tool_call_id) || getStringValue(data.call_id) || getStringValue(data.id) || fallback
 }
 
 function buildToolBrief(data: OpenAgentToolCallPayload, toolName: string): string {
@@ -435,7 +455,7 @@ function mapPublicMessage(message: PublicMessage): Message {
 function mapDeliveredPublicMessage(message: PublicMessage): Message {
   const mapped = mapPublicMessage(message)
   return message.sender_type === 'visitor'
-    ? { ...mapped, status: 'delivered' }
+    ? { ...mapped, status: mapped.status ?? 'delivered' }
     : mapped
 }
 
@@ -627,6 +647,11 @@ type ProviderProps = Omit<
   | 'onAssistSendMessage'
   | 'onRequestHumanHandoff'
   | 'onDismissHumanHandoff'
+  | 'onRecallMessage'
+  | 'quotedMessage'
+  | 'onQuoteMessage'
+  | 'onClearQuote'
+  | 'onSubmitOpenAgentFeedback'
 > & {
   socket: Socket | null
   onConversationStatusChange: (status: string | null) => void
@@ -639,6 +664,7 @@ type ProviderProps = Omit<
 
 type RunOpenAgentTurnOptions = {
   text: string
+  quotedMessageId?: number
   requestId?: string
   clientMessageId?: string
   lastEventId?: string | null
@@ -748,8 +774,10 @@ export function VisitorChatRuntimeProvider({
     offlineMode,
     offlineMessagePublicId,
     visitorSessionToken,
+    visitorEnvironment,
   } = chatConfig
   const [botRunning, setBotRunning] = useState(false)
+  const [quotedMessage, setQuotedMessage] = useState<Message | null>(null)
   const abortRef = useRef<OpenAgentStreamController | null>(null)
   const pendingTurnRef = useRef<PendingOpenAgentTurn | null>(null)
   const detachedRequestIdsRef = useRef<Set<string>>(new Set())
@@ -760,7 +788,7 @@ export function VisitorChatRuntimeProvider({
       const prev = idx > 0 ? messages[idx - 1] : null
       const next = idx < messages.length - 1 ? messages[idx + 1] : null
       const showAvatar = msg.sender_type === 'agent' || msg.sender_type === 'bot'
-        ? shouldShowAssistantAvatar(msg.sender_type, chatConfig.config)
+        ? shouldShowAssistantAvatar(msg, chatConfig.config)
         : shouldShowAvatar(msg, next)
       const senderAvatar = getAssistantAvatarSrc(msg, chatConfig.config) ?? msg.sender_avatar
 
@@ -771,6 +799,11 @@ export function VisitorChatRuntimeProvider({
         senderId: msg.sender_id,
         contentType: msg.content_type,
         conversationPublicId: msg.conversation_public_id || conversationPublicId || offlineMessagePublicId || '',
+        isRecalled: msg.is_recalled,
+        recalledAt: msg.recalled_at,
+        recalledByType: msg.recalled_by_type,
+        recalledById: msg.recalled_by_id,
+        recalledByName: msg.recalled_by_name,
         metadata: msg.metadata,
         eventType: getMetadataString(msg, 'event_type') || undefined,
         handoffPayload: msg.metadata?.handoff_payload,
@@ -811,6 +844,7 @@ export function VisitorChatRuntimeProvider({
     },
     [
       messages,
+      chatConfig.config.agent_default_avatar_url,
       chatConfig.config.open_agent_avatar_url,
       chatConfig.config.use_agent_avatar,
       conversationPublicId,
@@ -837,6 +871,19 @@ export function VisitorChatRuntimeProvider({
   const handleHandoffRouteFailed = useVisitorChatStore((s) => s.handleHandoffRouteFailed)
   const handoffRouting = useVisitorChatStore((s) => s.handoffRouting)
   const visitorExternalId = useVisitorChatStore((s) => s.visitorId)
+
+  useEffect(() => {
+    setQuotedMessage(null)
+  }, [conversationPublicId, offlineMode])
+
+  const onQuoteMessage = useCallback((message: Message) => {
+    if (offlineMode) return
+    setQuotedMessage(message)
+  }, [offlineMode])
+
+  const onClearQuote = useCallback(() => {
+    setQuotedMessage(null)
+  }, [])
 
   const applyQueueConversationState = useCallback((input: {
     status?: string | null
@@ -999,6 +1046,61 @@ export function VisitorChatRuntimeProvider({
     ],
   )
 
+  const onSubmitOpenAgentFeedback = useCallback(
+    async (input: OpenAgentFeedbackSubmitInput) => {
+      if (!conversationPublicId) throw new Error('Conversation is required')
+      const result = await submitOpenAgentFeedback({
+        conversationPublicId,
+        visitorSessionToken,
+        messageId: input.messageId,
+        stepId: input.stepId,
+        rating: input.rating,
+        comment: input.comment,
+      })
+      updateMessageMetadata(input.messageId, () => result.message.metadata || {})
+    },
+    [conversationPublicId, visitorSessionToken, updateMessageMetadata],
+  )
+
+  const onRecallMessage = useCallback(
+    async (message: Message) => {
+      if (!conversationPublicId || !visitorSessionToken) return false
+      if (socket?.connected) {
+        return await new Promise<boolean>((resolve) => {
+          socket.emit(
+            'recall_message',
+            {
+              conversation_public_id: conversationPublicId,
+              message_id: message.id,
+            },
+            (response?: { ok?: boolean; message?: string }) => {
+              if (response?.ok === false) {
+                window.alert(response.message || (chatConfig.locale === 'zh' ? '撤回失败，请稍后重试' : 'Recall failed. Try again later'))
+                resolve(false)
+                return
+              }
+              resolve(true)
+            },
+          )
+        })
+      }
+
+      try {
+        const recalled = await recallPublicMessage({
+          conversationPublicId,
+          visitorSessionToken,
+          messageId: message.id,
+        })
+        useVisitorChatStore.getState().updateMessage(recalled as Message)
+        return true
+      } catch {
+        window.alert(chatConfig.locale === 'zh' ? '撤回失败，请稍后重试' : 'Recall failed. Try again later')
+        return false
+      }
+    },
+    [chatConfig.locale, conversationPublicId, socket, visitorSessionToken],
+  )
+
   const onFileSend = useCallback(
     async (file: File) => {
       if (chatConfig.botMode) return
@@ -1016,6 +1118,7 @@ export function VisitorChatRuntimeProvider({
           const res = await sendVisitorOfflineMessageFile({
             visitorSessionToken,
             file,
+            visitorEnvironment,
           })
           const returnedMessages = res.messages?.length
             ? res.messages
@@ -1064,6 +1167,7 @@ export function VisitorChatRuntimeProvider({
             visitorSessionToken,
             contentType,
             content,
+            visitorEnvironment,
           })
           if (res.ok && res.message) {
             confirmOptimistic(tempId, mapPublicMessage(res.message))
@@ -1099,21 +1203,27 @@ export function VisitorChatRuntimeProvider({
           size: uploaded.size,
           mime_type: uploaded.mime_type,
         })
-        const tempId = addOptimistic(conversationPublicId, content, contentType)
+        const quoteMetadata = quotedMessage ? { quote: quoteFromMessage(quotedMessage, chatConfig.locale) } : undefined
+        const tempId = addOptimistic(conversationPublicId, content, contentType, quoteMetadata)
 
         socket.emit('send_message', {
           conversation_public_id: conversationPublicId,
           content,
           content_type: contentType,
-        }, (res: { ok?: boolean; message?: Message }) => {
+          ...(quotedMessage ? { quoted_message_id: quotedMessage.id } : {}),
+        }, (res: { ok?: boolean; message?: Message | string; error?: string }) => {
           if (res?.ok && res.message) {
-            confirmOptimistic(tempId, res.message)
+            confirmOptimistic(tempId, res.message as Message)
+            if (quotedMessage) setQuotedMessage(null)
             trackEvent('file_send_succeeded', {
               props: { target: 'conversation' },
               metrics: { duration_ms: Date.now() - startedAt },
             })
             return
           }
+          removeMessage(tempId)
+          const errorMessage = typeof res?.message === 'string' ? res.message : res?.error
+          if (errorMessage) window.alert(errorMessage)
           trackEvent('file_send_failed', {
             level: 'warn',
             props: { target: 'conversation', stage: 'socket_ack' },
@@ -1132,22 +1242,27 @@ export function VisitorChatRuntimeProvider({
     [
       socket,
       chatConfig.botMode,
+      chatConfig.locale,
       conversationPublicId,
       offlineMode,
       offlineMessagePublicId,
       visitorExternalId,
       visitorSessionToken,
+      visitorEnvironment,
       onOfflineMessageCreated,
       addOptimistic,
       confirmOptimistic,
       addMessage,
+      removeMessage,
       trackEvent,
+      quotedMessage,
     ],
   )
 
   const runOpenAgentTurn = useCallback(
     async ({
       text,
+      quotedMessageId,
       requestId = generateRequestId(),
       clientMessageId = generateClientMessageId(),
       lastEventId = null,
@@ -1168,7 +1283,8 @@ export function VisitorChatRuntimeProvider({
       })
 
       if (addVisitorOptimistic) {
-        const tempId = addOptimistic(conversationPublicId, text, 'text')
+        const quoteMetadata = quotedMessage ? { quote: quoteFromMessage(quotedMessage, chatConfig.locale) } : undefined
+        const tempId = addOptimistic(conversationPublicId, text, 'text', quoteMetadata)
         markOptimisticDelivered(tempId)
       }
 
@@ -1345,6 +1461,7 @@ export function VisitorChatRuntimeProvider({
         conversationPublicId,
         visitorSessionToken,
         message: text,
+        quotedMessageId,
         requestId,
         clientMessageId,
         lastEventId,
@@ -1695,6 +1812,7 @@ export function VisitorChatRuntimeProvider({
       applyHandoffUnavailableState,
       applyQueueConversationState,
       trackEvent,
+      quotedMessage,
     ],
   )
 
@@ -1717,11 +1835,13 @@ export function VisitorChatRuntimeProvider({
                 visitorSessionToken,
                 contentType: 'text',
                 content: trimmed,
+                visitorEnvironment,
               })
             : await createOfflineMessageWithMessage({
                 visitorSessionToken,
                 contentType: 'text',
                 content: trimmed,
+                visitorEnvironment,
               })
           if (res.ok && res.message) {
             if (res.offline_message_public_id) {
@@ -1768,8 +1888,10 @@ export function VisitorChatRuntimeProvider({
         if (botRunning) return false
         await runOpenAgentTurn({
           text: trimmed,
+          quotedMessageId: quotedMessage?.id,
           addVisitorOptimistic: true,
         })
+        if (quotedMessage) setQuotedMessage(null)
         return true
       }
 
@@ -1779,16 +1901,19 @@ export function VisitorChatRuntimeProvider({
         props: { target: 'conversation', content_type: 'text' },
         metrics: { content_length: trimmed.length },
       })
-      const tempId = addOptimistic(conversationPublicId, trimmed, 'text')
+      const quoteMetadata = quotedMessage ? { quote: quoteFromMessage(quotedMessage, chatConfig.locale) } : undefined
+      const tempId = addOptimistic(conversationPublicId, trimmed, 'text', quoteMetadata)
 
       return await new Promise<boolean>((resolve) => {
         socket.emit('send_message', {
           conversation_public_id: conversationPublicId,
           content: trimmed,
           content_type: 'text',
-        }, (res: { ok?: boolean; message?: Message }) => {
+          ...(quotedMessage ? { quoted_message_id: quotedMessage.id } : {}),
+        }, (res: { ok?: boolean; message?: Message | string; error?: string }) => {
           if (res?.ok && res.message) {
-            confirmOptimistic(tempId, res.message)
+            confirmOptimistic(tempId, res.message as Message)
+            if (quotedMessage) setQuotedMessage(null)
             trackEvent('message_send_succeeded', {
               props: { target: 'conversation' },
               metrics: { duration_ms: Date.now() - startedAt },
@@ -1801,6 +1926,9 @@ export function VisitorChatRuntimeProvider({
             props: { target: 'conversation', reason: 'socket_ack' },
             metrics: { duration_ms: Date.now() - startedAt },
           })
+          const errorMessage = typeof res?.message === 'string' ? res.message : res?.error
+          if (errorMessage) window.alert(errorMessage)
+          removeMessage(tempId)
           resolve(false)
         })
       })
@@ -1811,6 +1939,7 @@ export function VisitorChatRuntimeProvider({
       offlineMode,
       offlineMessagePublicId,
       visitorSessionToken,
+      visitorEnvironment,
       onOfflineMessageCreated,
       chatConfig.botMode,
       botRunning,
@@ -1820,6 +1949,8 @@ export function VisitorChatRuntimeProvider({
       addMessage,
       removeMessage,
       trackEvent,
+      quotedMessage,
+      chatConfig.locale,
     ],
   )
 
@@ -1933,6 +2064,11 @@ export function VisitorChatRuntimeProvider({
         onFileSend,
         onAssistSendMessage: sendTextMessage,
         onRequestHumanHandoff: requestHumanHandoff,
+        onRecallMessage,
+        quotedMessage,
+        onQuoteMessage,
+        onClearQuote,
+        onSubmitOpenAgentFeedback,
         onDismissHumanHandoff: () => {
           useVisitorChatStore.getState().dismissPendingHumanHandoff()
           onConversationStatusChange('bot')

@@ -558,18 +558,28 @@ function FieldInput({
   const editorTypeConfig = useMemo(() => {
     const base = { ...((fieldDef?.type_config ?? {}) as Record<string, unknown>) }
 
-    if (fieldType === FieldType.EMPLOYEE_SELECT) {
+    if (
+      editorField.source === 'system' &&
+      editorField.domain === 'ticket' &&
+      editorField.key === 'assignee' &&
+      fieldType === FieldType.EMPLOYEE_SELECT
+    ) {
       const groupValue = formValues.assignee_group ?? formValues.assignee_group_id
       if (typeof groupValue === 'number') base.group_id = groupValue
     }
 
-    if (fieldType === FieldType.GROUP_SELECT) {
+    if (
+      editorField.source === 'system' &&
+      editorField.domain === 'ticket' &&
+      editorField.key === 'assignee_group' &&
+      fieldType === FieldType.GROUP_SELECT
+    ) {
       const assigneeValue = formValues.assignee ?? formValues.agent_id
       if (typeof assigneeValue === 'number') base.member_id = assigneeValue
     }
 
     return base
-  }, [fieldDef, fieldType, formValues.assignee_group, formValues.assignee_group_id, formValues.assignee, formValues.agent_id])
+  }, [fieldDef, fieldType, editorField, formValues.assignee_group, formValues.assignee_group_id, formValues.assignee, formValues.agent_id])
 
   const placeholder = fieldPlaceholder(editorField, isZh)
 

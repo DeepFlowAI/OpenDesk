@@ -106,6 +106,18 @@ async def test_peer_list_returns_collaboration_marker(monkeypatch):
         "app.services.conversation_service.ConversationRepository.get_visitor_history",
         AsyncMock(return_value=[]),
     )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationPinRepository.get_by_conversation_ids",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationCollaborationRepository.get_active_collaborator_agents_by_conversation_ids",
+        AsyncMock(return_value={conversation.id: []}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.VisitorTimeoutCloseStateRepository.get_by_conversation_ids",
+        AsyncMock(return_value={}),
+    )
 
     result = await ConversationService.get_agent_conversations(
         AsyncMock(),
@@ -128,6 +140,10 @@ async def test_peer_public_message_requires_send_permission(monkeypatch):
     monkeypatch.setattr(
         "app.services.conversation_service.ConversationRepository.get_by_id",
         AsyncMock(return_value=_conversation()),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationCollaborationRepository.is_active_collaborator",
+        AsyncMock(return_value=False),
     )
 
     with pytest.raises(ForbiddenError):
@@ -152,6 +168,10 @@ async def test_internal_note_requires_internal_permission(monkeypatch):
     monkeypatch.setattr(
         "app.services.conversation_service.ConversationRepository.get_by_id",
         AsyncMock(return_value=_conversation()),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationCollaborationRepository.is_active_collaborator",
+        AsyncMock(return_value=False),
     )
 
     with pytest.raises(ForbiddenError):

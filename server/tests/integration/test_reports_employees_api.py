@@ -202,3 +202,47 @@ class TestEmployeesListAPI:
             params={"start": _ANCHOR_DATE_STR, "end": _ANCHOR_DATE_STR},
         )
         assert resp.status_code == 401
+
+
+class TestEmployeeDetailAPI:
+
+    @pytest.mark.asyncio
+    async def test_detail_returns_employee_and_metrics(self, client: AsyncClient):
+        resp = await client.get(
+            f"/api/v1/reports/sessions/employees/{_AGENT_A_ID}",
+            params={"start": _ANCHOR_DATE_STR, "end": _ANCHOR_DATE_STR},
+            headers=_auth(),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["employee"]["id"] == _AGENT_A_ID
+        assert data["employee"]["name"] == "Alpha User"
+        assert data["metrics"]["session_count"] == 3
+        assert "reception_segment_count" in data["metrics"]
+        assert "bot_session_count" not in data["metrics"]
+        assert "as_of" in data
+
+    @pytest.mark.asyncio
+    async def test_detail_unknown_employee_returns_404(self, client: AsyncClient):
+        resp = await client.get(
+            "/api/v1/reports/sessions/employees/999999999",
+            params={"start": _ANCHOR_DATE_STR, "end": _ANCHOR_DATE_STR},
+            headers=_auth(),
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_trend_returns_basic_metrics_only(self, client: AsyncClient):
+        resp = await client.get(
+            f"/api/v1/reports/sessions/employees/{_AGENT_A_ID}/trend",
+            params={"start": _ANCHOR_DATE_STR, "end": _ANCHOR_DATE_STR, "trend": "hour"},
+            headers=_auth(),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["trend"] == "hour"
+        assert len(data["buckets"]) == 24
+        hour_10 = next(bucket for bucket in data["buckets"] if bucket["label"] == "10")
+        assert hour_10["metrics"]["session_count"] == 1
+        assert "bot_session_count" not in hour_10["metrics"]
+        assert "reception_segment_count" not in hour_10["metrics"]

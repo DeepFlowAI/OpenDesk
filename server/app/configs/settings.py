@@ -47,6 +47,7 @@ class Settings(BaseSettings):
 
     # OpenAgent integration
     OPEN_AGENT_PROVIDER: str = Field(default="http")
+    VOICE_SPEED_PROVIDER: str = Field(default="http")
 
     # Realtime Transport
     REALTIME_PROVIDER: str = Field(default="socketio")
@@ -74,6 +75,10 @@ class Settings(BaseSettings):
     VISITOR_TIMEOUT_CLOSE_WORKER_ENABLED: bool = Field(default=True)
     VISITOR_TIMEOUT_CLOSE_SCAN_INTERVAL_SECONDS: int = Field(default=60, ge=5)
     VISITOR_TIMEOUT_CLOSE_SCAN_BATCH_SIZE: int = Field(default=100, ge=1, le=500)
+    OPEN_AGENT_BOT_TIMEOUT_WORKER_ENABLED: bool = Field(default=True)
+    OPEN_AGENT_BOT_TIMEOUT_SECONDS: int = Field(default=3600, ge=60)
+    OPEN_AGENT_BOT_TIMEOUT_SCAN_INTERVAL_SECONDS: int = Field(default=60, ge=5)
+    OPEN_AGENT_BOT_TIMEOUT_SCAN_BATCH_SIZE: int = Field(default=100, ge=1, le=500)
 
     SMTP_HOST: str = Field(default="")
     SMTP_PORT: int = Field(default=465)
@@ -100,6 +105,18 @@ class Settings(BaseSettings):
     # extensions registered via the ``app.extensions`` loader. The default
     # single-tenant build does not read this value.
     TENANT_API_KEY: str = Field(default="change-me-tenant-api-key")
+
+    # Knowledge recommendation embeddings
+    KNOWLEDGE_EMBEDDING_PROVIDER: str = Field(default="aliyun")
+    KNOWLEDGE_EMBEDDING_MODEL: str = Field(default="text-embedding-v4")
+    KNOWLEDGE_EMBEDDING_DIMENSION: int = Field(default=1024, ge=1)
+    KNOWLEDGE_EMBEDDING_TIMEOUT_SECONDS: float = Field(default=30.0, ge=1.0)
+    KNOWLEDGE_EMBEDDING_TEXT_MAX_CHARS: int = Field(default=6000, ge=500)
+    KNOWLEDGE_RECOMMENDATION_LIMIT: int = Field(default=20, ge=1, le=20)
+    ALIYUN_DASHSCOPE_API_KEY: str = Field(default="")
+    ALIYUN_DASHSCOPE_EMBEDDING_URL: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
+    )
 
     # Storage / OSS
     STORAGE_PROVIDER: str = Field(default="aliyun_oss")
@@ -183,6 +200,10 @@ class Settings(BaseSettings):
         if raw == "*" or not raw:
             return ["*"]
         return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+    @property
+    def knowledge_embedding_version(self) -> str:
+        return f"{self.KNOWLEDGE_EMBEDDING_MODEL}:{self.KNOWLEDGE_EMBEDDING_DIMENSION}"
 
 
 settings = Settings()

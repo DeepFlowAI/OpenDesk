@@ -20,9 +20,16 @@ from app.schemas.channel import (
     DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL,
     DEFAULT_QUEUE_FULL_MESSAGE,
     DEFAULT_QUEUE_MESSAGE,
+    DEFAULT_RESTRICTED_SERVICE_MESSAGE,
+    DEFAULT_RESTRICTED_SERVICE_TITLE,
 )
-from app.schemas.open_agent_settings import OpenAgentAgentListResponse, OpenAgentAgentSummary
-from app.schemas.open_agent_settings import OpenAgentWelcomeMessage
+from app.schemas.open_agent_settings import (
+    OpenAgentAIDisclaimer,
+    OpenAgentAgentListResponse,
+    OpenAgentAgentSummary,
+    OpenAgentVisitorRuntimeConfig,
+    OpenAgentWelcomeMessage,
+)
 from app.schemas.visitor_session import VisitorSessionRequest
 from app.services.channel_service import ChannelService
 from app.services.conversation_service import ConversationService
@@ -51,11 +58,13 @@ def test_channel_config_uses_default_offline_message():
     assert config.service_hours_id is None
     assert config.outside_service_hours_strategy == "offline_message"
     assert config.leave_message_prompt == DEFAULT_LEAVE_MESSAGE_PROMPT
+    assert config.restricted_service_message == DEFAULT_RESTRICTED_SERVICE_MESSAGE
     assert config.queue_message == DEFAULT_QUEUE_MESSAGE
     assert config.queue_full_message == DEFAULT_QUEUE_FULL_MESSAGE
     assert config.queue_full_show_leave_message_button is True
     assert config.queue_full_leave_message_button_label == DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL
     assert config.use_agent_avatar is False
+    assert config.agent_default_avatar_url is None
     assert config.send_button_bg_color is None
     assert config.open_agent_enabled is False
     assert config.open_agent_bot_strategy == "always"
@@ -71,6 +80,23 @@ def test_channel_config_uses_default_offline_message():
     assert config.assist_panel_title is None
     assert config.assist_panel_react_code is None
     assert config.assist_panel_config == {}
+
+
+def test_generate_copy_name_uses_next_available_suffix():
+    result = ChannelService._generate_copy_name(
+        "测试",
+        ["测试", "测试副本1", "测试副本2"],
+    )
+
+    assert result == "测试副本3"
+
+
+def test_generate_copy_name_truncates_long_source_name():
+    source_name = "测" * 64
+    result = ChannelService._generate_copy_name(source_name, [])
+
+    assert result.endswith("副本1")
+    assert len(result) == 64
 
 
 def test_channel_config_rejects_empty_offline_title():
@@ -89,6 +115,24 @@ def test_channel_config_rejects_empty_queue_messages():
 
     with pytest.raises(PydanticValidationError):
         ChannelConfig(queue_full_message="<p>&nbsp;</p>")
+
+
+def test_channel_config_rejects_empty_restricted_service_message():
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(restricted_service_message="<p>&nbsp;</p>")
+
+
+def test_availability_payload_includes_restricted_copy():
+    payload = ChannelService._availability_payload(
+        ChannelConfig(restricted_service_message="暂时无法提供在线咨询"),
+        can_start_conversation=False,
+        reason="restricted",
+        checked_at=datetime.now(timezone.utc),
+    )
+
+    assert payload["reason"] == "restricted"
+    assert payload["restricted_service_title"] == DEFAULT_RESTRICTED_SERVICE_TITLE
+    assert payload["restricted_service_message"] == "暂时无法提供在线咨询"
 
 
 def test_channel_config_validates_queue_full_leave_message_button_label():
@@ -165,6 +209,19 @@ def test_channel_config_rejects_invalid_handoff_threshold():
 def test_channel_config_rejects_long_open_agent_avatar_url():
     with pytest.raises(PydanticValidationError):
         ChannelConfig(open_agent_avatar_url=f"https://example.com/{'x' * 500}")
+
+
+def test_channel_config_normalizes_agent_default_avatar_url():
+    config = ChannelConfig(agent_default_avatar_url="  https://cdn.example.com/agent.png  ")
+    assert config.agent_default_avatar_url == "https://cdn.example.com/agent.png"
+
+    blank_config = ChannelConfig(agent_default_avatar_url="  ")
+    assert blank_config.agent_default_avatar_url is None
+
+
+def test_channel_config_rejects_long_agent_default_avatar_url():
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(agent_default_avatar_url=f"https://example.com/{'x' * 500}")
 
 
 def test_channel_config_requires_assist_panel_code_when_enabled():
@@ -349,6 +406,10 @@ async def test_public_config_returns_open_agent_welcome_message(monkeypatch):
         "enabled": True,
         "blocks": [{"type": "markdown", "content": "Hello from bot"}],
     })
+    ai_disclaimer = OpenAgentAIDisclaimer(
+        enabled=True,
+        content="本内容由AI生成，仅供参考",
+    )
     availability = {
         "can_start_conversation": True,
         "reason": "available",
@@ -368,8 +429,16 @@ async def test_public_config_returns_open_agent_welcome_message(monkeypatch):
         AsyncMock(return_value=availability),
     )
     monkeypatch.setattr(
-        "app.services.channel_service.OpenAgentSettingsService.get_agent_welcome_message",
-        AsyncMock(return_value=welcome_message),
+        "app.services.channel_service.OpenAgentSettingsService.get_agent_visitor_runtime_config",
+        AsyncMock(return_value=OpenAgentVisitorRuntimeConfig(
+            welcome_message=welcome_message,
+            ai_disclaimer=ai_disclaimer,
+        )),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_announcement_rule_service."
+        "ConversationAnnouncementRuleService.match_public_announcement",
+        AsyncMock(return_value=None),
     )
 
     result = await ChannelService.get_public_config_with_availability_by_key(
@@ -380,6 +449,7 @@ async def test_public_config_returns_open_agent_welcome_message(monkeypatch):
 
     assert result["welcome_message"] is None
     assert result["open_agent_welcome_message"] == welcome_message
+    assert result["open_agent_ai_disclaimer"] == ai_disclaimer
 
 
 @pytest.mark.asyncio

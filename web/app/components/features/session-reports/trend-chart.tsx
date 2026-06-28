@@ -3,12 +3,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useLocaleStore } from '@/context/locale-store'
 import { useSessionReportsTrend } from '@/service/use-session-reports'
-import type { MetricKey, TrendBucket, TrendType } from '@/models/session-report'
+import type { MetricKey, TrendBucket, TrendResponse, TrendType } from '@/models/session-report'
 import { formatDuration } from '@/utils/format-duration'
 import { formatTrendXLabel, shouldShowTrendXLabel } from '@/utils/trend-chart-x-axis'
 import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
-import { metricLabelKey, METRIC_KEYS, isDurationMetric, trendTypeLabelKey, TREND_TYPES } from './types'
+import { isDurationMetric, metricLabelKey, trendTypeLabelKey, TREND_TYPES, visibleMetricKeys } from './types'
 import { TrendTable } from './trend-table'
 
 type Props = {
@@ -18,11 +18,22 @@ type Props = {
   onTrendChange: (trend: TrendType) => void
   employeeId?: number
   onLoadingChange?: (loading: boolean) => void
+  data?: TrendResponse
+  loading?: boolean
+  fetch?: boolean
 }
 
 function metricValue(bucket: TrendBucket, metric: MetricKey): number {
-  if (isDurationMetric(metric)) return bucket.metrics.avg_duration_seconds ?? 0
-  return (bucket.metrics as any)[metric] ?? 0
+  switch (metric) {
+    case 'avg_duration_seconds':
+      return bucket.metrics.avg_duration_seconds ?? 0
+    case 'avg_queue_duration_seconds':
+      return bucket.metrics.avg_queue_duration_seconds ?? 0
+    case 'offline_message_count':
+      return bucket.metrics.offline_message_count ?? 0
+    default:
+      return bucket.metrics[metric]
+  }
 }
 
 function niceMax(rawMax: number): number {
@@ -37,22 +48,48 @@ function niceMax(rawMax: number): number {
   return nice * pow
 }
 
-export function TrendChartCard({ start, end, trend, onTrendChange, employeeId, onLoadingChange }: Props) {
+export function TrendChartCard({
+  start,
+  end,
+  trend,
+  onTrendChange,
+  employeeId,
+  onLoadingChange,
+  data: externalData,
+  loading,
+  fetch = true,
+}: Props) {
   const { locale } = useLocaleStore()
   const [metric, setMetric] = useState<MetricKey>('session_count')
-  const { data, isLoading, isFetching } = useSessionReportsTrend({
+  const trendQuery = useSessionReportsTrend({
     start,
     end,
     trend,
     employee_id: employeeId,
+    enabled: fetch && externalData === undefined,
   })
+  const data = externalData ?? trendQuery.data
+  const isLoading = loading ?? trendQuery.isLoading
+  const isFetching = loading ?? trendQuery.isFetching
+  const includeBusinessMetrics = employeeId === undefined
+  const canViewOfflineMessages = data?.buckets[0]?.metrics.can_view_offline_messages ?? true
+  const metricKeys = useMemo(() => visibleMetricKeys({
+    includeBusinessMetrics,
+    canViewOfflineMessages,
+  }), [canViewOfflineMessages, includeBusinessMetrics])
 
   useEffect(() => {
     onLoadingChange?.(isFetching)
   }, [isFetching, onLoadingChange])
 
+  useEffect(() => {
+    if (!metricKeys.includes(metric)) {
+      setMetric('session_count')
+    }
+  }, [metric, metricKeys])
+
   const buckets = data?.buckets ?? []
-  const isEmpty = !isLoading && buckets.every((b) => b.metrics.session_count === 0 && b.metrics.message_count === 0)
+  const isEmpty = !isLoading && buckets.every((b) => metricValue(b, metric) === 0)
 
   const maxValue = useMemo(() => {
     const max = Math.max(0, ...buckets.map((b) => metricValue(b, metric)))
@@ -159,8 +196,8 @@ export function TrendChartCard({ start, end, trend, onTrendChange, employeeId, o
       )}
 
       {/* Metric tabs */}
-      <div className="mt-4 flex justify-center gap-1 border-t border-border pt-4">
-        {METRIC_KEYS.map((key) => {
+      <div className="mt-4 flex flex-wrap justify-center gap-1 border-t border-border pt-4">
+        {metricKeys.map((key) => {
           const active = key === metric
           return (
             <button
@@ -185,7 +222,7 @@ export function TrendChartCard({ start, end, trend, onTrendChange, employeeId, o
         <div className="mb-3 text-sm font-semibold text-foreground">
           {t('ws.records.sessionReports.trend.detail', locale)}
         </div>
-        <TrendTable buckets={buckets} />
+        <TrendTable buckets={buckets} showBusinessMetrics={includeBusinessMetrics} />
       </div>
     </div>
   )

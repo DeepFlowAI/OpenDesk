@@ -3,33 +3,10 @@ Queue history summary service for session and call records.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.libs.queue_metrics import SUCCESS_ASSIGNMENT_EVENT_TYPES, wait_seconds as _wait_seconds
 from app.repositories.queue_history_repository import QueueHistoryRepository
-
-
-SUCCESS_ASSIGNMENT_EVENT_TYPES = {"auto_assigned", "pull_assigned", "admin_assigned"}
-
-
-def _to_aware(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
-
-
-def _terminal_time(task) -> datetime | None:
-    return task.assigned_at or task.canceled_at or task.timeout_at
-
-
-def _wait_seconds(task) -> int:
-    if not task.enqueued_at:
-        return 0
-    end = _terminal_time(task)
-    if end is None:
-        return 0
-    return max(0, int((_to_aware(end) - _to_aware(task.enqueued_at)).total_seconds()))
 
 
 class QueueHistoryService:

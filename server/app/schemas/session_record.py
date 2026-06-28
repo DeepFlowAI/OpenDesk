@@ -37,6 +37,11 @@ class SessionRecordChannel(BaseModel):
     channel_type: str
 
 
+class ReceptionParticipant(BaseModel):
+    agent_id: int
+    name: str | None = None
+
+
 class SessionRecordResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -52,10 +57,33 @@ class SessionRecordResponse(BaseModel):
     started_at: datetime | None = None
     ended_at: datetime | None = None
     ended_by: str | None = None
+    duration_seconds: int | None = None
+    visitor_system: str | None = None
+    visitor_browser: str | None = None
+    visitor_ip: str | None = None
     created_at: datetime | None = None
+    message_count: int = 0
+    visitor_message_count: int = 0
+    agent_message_count: int = 0
+    bot_phase_message_count: int = 0
+    human_phase_message_count: int = 0
+    human_phase_visitor_message_count: int = 0
+    human_phase_agent_message_count: int = 0
     satisfaction: SatisfactionSummaryResponse | None = None
     last_assigned_queue: QueueRecordBrief | None = None
     queue_duration_seconds: int | None = None
+    first_human_response_seconds: int | None = None
+    agent_response_count: int | None = None
+    agent_avg_response_seconds: int | None = None
+    has_queue: bool = False
+    queue_entered_at: datetime | None = None
+    queue_assigned_at: datetime | None = None
+    queue_result: str | None = None
+    reception_segment_count: int = 0
+    reception_transfer_count: int = 0
+    reception_final_agent_id: int | None = None
+    reception_participants: list[ReceptionParticipant] = Field(default_factory=list)
+    reception_generation_status: str | None = None
 
 
 class SessionRecordListResponse(BaseModel):
@@ -93,3 +121,29 @@ class SessionRecordMessageResponse(BaseModel):
 class SessionRecordMessageListResponse(BaseModel):
     items: list[SessionRecordMessageResponse]
     has_more: bool
+
+
+class SessionRecordSegmentResponse(BaseModel):
+    seq_no: int
+    agent_id: int | None = None
+    agent_name: str | None = None
+    group_id: int | None = None
+    group_name: str | None = None
+    started_at: datetime
+    ended_at: datetime | None = None
+    duration_seconds: int | None = None
+    entry_reason: str
+    end_reason: str | None = None
+    from_agent_id: int | None = None
+    to_agent_id: int | None = None
+    visitor_message_count: int = 0
+    agent_message_count: int = 0
+    first_response_seconds: int | None = None
+    avg_response_seconds: int | None = None
+
+
+class ReceptionTrajectoryResponse(BaseModel):
+    conversation_id: int
+    conversation_status: str
+    generation_status: str | None = None
+    segments: list[SessionRecordSegmentResponse] = Field(default_factory=list)

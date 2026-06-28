@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import { QueryProvider } from '@/context/query-client'
 import { Toaster } from '@/components/ui/sonner'
 import { UpdateNotice } from '@/components/update-notice'
+import { ChunkErrorReloader } from '@/components/chunk-error-reloader'
 import { AuthSessionKeeper } from '@/app/components/features/auth-session-keeper'
 import '@/styles/globals.css'
 import '@/styles/_variables.scss'
@@ -25,6 +26,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="zh-CN" className={cn("font-sans", geist.variable)} suppressHydrationWarning>
       <body suppressHydrationWarning>
         <QueryProvider>
+          <ChunkErrorReloader />
           <AuthSessionKeeper />
           {children}
           <UpdateNotice />

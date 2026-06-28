@@ -1,12 +1,15 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { IconLoader2, IconSearch, IconX } from '@tabler/icons-react'
+import { IconInfoCircle, IconLoader2, IconSearch, IconX } from '@tabler/icons-react'
 import { useWorkspaceConversationHistory } from '@/service/use-conversations'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
+import { isConversationHistoryContentMessage } from '@/lib/conversation-history-message'
 import { richTextPreview } from '@/lib/rich-text-message'
+import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
+import { SessionDetailDrawer } from '@/app/components/features/session-records/session-detail-drawer'
 import type { Conversation, Message, WorkspaceConversationHistoryItem } from '@/models/conversation'
 
 type Props = {
@@ -74,6 +77,7 @@ function highlightText(text: string, keyword: string) {
 }
 
 function senderLabel(message: Message, locale: 'zh' | 'en'): string {
+  if (isWelcomeLikeContentType(message.content_type)) return locale === 'zh' ? '欢迎语' : 'Welcome'
   if (message.sender_name) return message.sender_name
   if (message.sender_type === 'visitor') return locale === 'zh' ? '访客' : 'Visitor'
   if (message.sender_type === 'agent') return locale === 'zh' ? '客服' : 'Agent'
@@ -84,7 +88,9 @@ function senderLabel(message: Message, locale: 'zh' | 'en'): string {
 function renderMessageContent(message: Message, keyword: string, locale: 'zh' | 'en') {
   if (message.content_type === 'image') return t('ws.chat.image', locale)
   if (message.content_type === 'file') return locale === 'zh' ? '[文件]' : '[File]'
-  if (message.content_type === 'rich_text') return highlightText(richTextPreview(message.content, locale), keyword)
+  if (message.content_type === 'rich_text' || isWelcomeLikeContentType(message.content_type)) {
+    return highlightText(richTextPreview(message.content, locale), keyword)
+  }
   if (message.content_type === 'satisfaction_event') return message.content
   return highlightText(message.content, keyword)
 }
@@ -103,30 +109,49 @@ function ConversationBlock({
   conversation,
   keyword,
   locale,
+  onOpenDetail,
 }: {
   conversation: WorkspaceConversationHistoryItem
   keyword: string
   locale: 'zh' | 'en'
+  onOpenDetail: (recordId: number) => void
 }) {
+  const visibleMessages = useMemo(
+    () => conversation.messages.filter(isConversationHistoryContentMessage),
+    [conversation.messages],
+  )
+  const detailLabel = locale === 'zh' ? '查看会话详情' : 'View conversation details'
+
   return (
     <section className="border-b border-border/70 px-4 py-3">
       <div className="mb-2 flex items-center justify-between gap-3">
         <div className="min-w-0 truncate text-[11px] font-medium text-muted-foreground">
           {conversationTitle(conversation, locale)}
         </div>
-        {conversation.messages_truncated && (
-          <span className="shrink-0 text-[11px] text-muted-foreground">
-            {locale === 'zh' ? '仅显示最近 200 条' : 'Latest 200 only'}
-          </span>
-        )}
+        <div className="flex shrink-0 items-center gap-1.5">
+          {conversation.messages_truncated && (
+            <span className="text-[11px] text-muted-foreground">
+              {locale === 'zh' ? '仅显示最近 200 条' : 'Latest 200 only'}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => onOpenDetail(conversation.id)}
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            aria-label={detailLabel}
+            title={detailLabel}
+          >
+            <IconInfoCircle size={16} stroke={1.7} />
+          </button>
+        </div>
       </div>
       <div className="space-y-1.5">
-        {conversation.messages.length === 0 ? (
+        {visibleMessages.length === 0 ? (
           <p className="text-xs text-muted-foreground">
             {locale === 'zh' ? '该会话暂无消息' : 'No messages in this conversation'}
           </p>
         ) : (
-          conversation.messages.map((message) => {
+          visibleMessages.map((message) => {
             const internal = message.content_type === 'internal_note'
             return (
               <div key={message.id} className="flex gap-2 text-[12px] leading-5">
@@ -172,6 +197,7 @@ export function MessageSearchPanel({
   const autoScrolledKeyRef = useRef<string | null>(null)
   const [query, setQuery] = useState('')
   const [lengthError, setLengthError] = useState(false)
+  const [selectedRecordId, setSelectedRecordId] = useState<number | null>(null)
   const debouncedQuery = useDebouncedValue(query)
   const historyQuery = useWorkspaceConversationHistory(conversation?.id ?? 0, debouncedQuery, {
     enabled: Boolean(conversation?.id),
@@ -180,9 +206,13 @@ export function MessageSearchPanel({
     () => [...(historyQuery.data?.pages.flatMap((page) => page.items) ?? [])].reverse(),
     [historyQuery.data?.pages],
   )
+  const visibleConversations = useMemo(
+    () => conversations.filter((item) => item.messages.some(isConversationHistoryContentMessage)),
+    [conversations],
+  )
   const visitorName = conversation?.visitor?.name || conversation?.visitor?.external_id || conversation?.share_code || '-'
   const hasKeyword = debouncedQuery.trim().length > 0
-  const loadedCount = conversations.length
+  const loadedCount = visibleConversations.length
 
   useEffect(() => {
     inputRef.current?.focus()
@@ -191,6 +221,7 @@ export function MessageSearchPanel({
   useEffect(() => {
     setQuery('')
     setLengthError(false)
+    setSelectedRecordId(null)
     autoScrolledKeyRef.current = null
   }, [conversation?.id])
 
@@ -204,7 +235,7 @@ export function MessageSearchPanel({
     if (!viewport || historyQuery.isLoading || autoScrolledKeyRef.current === key) return
     viewport.scrollTop = viewport.scrollHeight
     autoScrolledKeyRef.current = key
-  }, [conversation?.id, conversations.length, debouncedQuery, historyQuery.isLoading])
+  }, [conversation?.id, visibleConversations.length, debouncedQuery, historyQuery.isLoading])
 
   const handleChange = (value: string) => {
     if (value.length > MAX_SEARCH_LENGTH) {
@@ -312,7 +343,7 @@ export function MessageSearchPanel({
               {t('ws.chat.retry', locale)}
             </button>
           </div>
-        ) : conversations.length === 0 ? (
+        ) : visibleConversations.length === 0 && !historyQuery.hasNextPage ? (
           <div className="px-4 py-8 text-center">
             <p className="text-sm text-muted-foreground">
               {hasKeyword
@@ -335,17 +366,25 @@ export function MessageSearchPanel({
                 </button>
               </div>
             )}
-            {conversations.map((item) => (
+            {visibleConversations.map((item) => (
               <ConversationBlock
                 key={item.id}
                 conversation={item}
                 keyword={debouncedQuery}
                 locale={locale}
+                onOpenDetail={setSelectedRecordId}
               />
             ))}
           </div>
         )}
       </div>
+
+      {selectedRecordId != null && (
+        <SessionDetailDrawer
+          recordId={selectedRecordId}
+          onClose={() => setSelectedRecordId(null)}
+        />
+      )}
     </div>
   )
 }

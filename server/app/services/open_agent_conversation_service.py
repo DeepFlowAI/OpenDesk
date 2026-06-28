@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 import json
+import logging
 import re
 import uuid
 from typing import Any
@@ -13,20 +14,39 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError, ValidationError
+from app.db.session import AsyncSessionLocal
 from app.enums import ConversationStatus, MessageContentType, MessageSenderType
 from app.libs.open_agent import create_open_agent_client
 from app.libs.open_agent.base import BaseOpenAgentClient, OpenAgentClientError
 from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.message_repository import MessageRepository
 from app.schemas.channel import ChannelConfig
-from app.schemas.open_agent_conversation import OpenAgentChatRequest
+from app.schemas.open_agent_conversation import OpenAgentChatRequest, OpenAgentFeedbackRequest
 from app.services.conversation_service import ConversationService
 from app.services.open_agent_settings_service import OpenAgentSettingsService
+
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAgentConversationService:
     _ROUND_EVENT_ID_RE = re.compile(r"^r\d+-e\d+$")
     _MAX_TOOL_METADATA_VALUE_LENGTH = 2000
+    _FEEDBACK_STEP_ID_KEYS = (
+        "feedback_step_id",
+        "assistant_step_id",
+        "agent_reply_step_id",
+        "assistant_reply_step_id",
+        "answer_step_id",
+        "message_step_id",
+    )
+    _FEEDBACK_STEP_ID_CONTAINERS = (
+        "feedback",
+        "reply",
+        "message",
+        "assistant_message",
+        "agent_message",
+    )
     _HUMAN_HANDOFF_TOOL_NAME = "human_handoff"
     _DEFAULT_HANDOFF_BRIEF = "这个问题需要人工客服进一步处理。"
     _HANDOFF_EVENT_CONFIRM_REQUESTED = "confirm_requested"
@@ -45,6 +65,106 @@ class OpenAgentConversationService:
         "agent_group_id": 128,
         "business_type": 128,
     }
+
+    @staticmethod
+    async def _load_stream_chat_context(
+        db: AsyncSession,
+        conversation_public_id: str,
+        visitor_context: dict,
+        body: OpenAgentChatRequest,
+    ) -> tuple[Any, ChannelConfig, str, str, str, str, str | None, dict[str, Any]]:
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        if conversation.status not in {
+            ConversationStatus.BOT.value,
+            ConversationStatus.HANDOFF_PENDING.value,
+        }:
+            raise BusinessError("Conversation is not in bot mode")
+        if not conversation.channel:
+            raise ValidationError("Channel is required")
+
+        config = ChannelConfig.model_validate(conversation.channel.config or {})
+        if not config.open_agent_enabled or not config.open_agent_agent_id:
+            raise ValidationError("OpenAgent bot is not enabled")
+
+        credentials = await OpenAgentSettingsService.get_credentials(db, conversation.tenant_id)
+        if not credentials or not credentials[1]:
+            raise ValidationError("OpenAgent settings are required")
+        base_url, api_key = credentials
+
+        client_message_id = body.client_message_id or uuid.uuid4().hex
+        existing_message = await MessageRepository.get_by_client_message_id(
+            db,
+            conversation.tenant_id,
+            conversation.id,
+            client_message_id,
+        )
+        if existing_message is None and (not body.resume or body.client_message_id):
+            visitor = conversation.visitor
+            await ConversationService.send_message(
+                db,
+                conversation_id=conversation.id,
+                sender_type=MessageSenderType.VISITOR.value,
+                sender_id=visitor.id if visitor else None,
+                content_type=MessageContentType.TEXT.value,
+                content=body.message,
+                tenant_id=conversation.tenant_id,
+                metadata={
+                    "client_message_id": client_message_id,
+                    "open_agent": True,
+                },
+                quoted_message_id=body.quoted_message_id,
+            )
+
+        request_id = body.request_id or uuid.uuid4().hex
+        resume_last_event_id = body.last_event_id or (
+            conversation.open_agent_last_event_id if body.resume else None
+        )
+        payload = {
+            "message": body.message,
+            "conversation_id": conversation.open_agent_conversation_id,
+            "conversation_external_id": conversation.open_agent_conversation_external_id
+            or OpenAgentConversationService._external_conversation_id(conversation.public_id),
+            "request_id": request_id,
+            "client_message_id": client_message_id,
+            "resume": body.resume,
+            "last_event_id": resume_last_event_id,
+            "customer_context": {
+                "external_user_id": visitor_context["visitor_external_id"],
+                "display_name": visitor_context.get("visitor_name") or (conversation.visitor.name if conversation.visitor else None),
+                "source": "api",
+                "metadata": {
+                    "opendesk_conversation_id": conversation.public_id,
+                    "opendesk_channel_id": conversation.channel_id,
+                    **(visitor_context.get("metadata") or {}),
+                },
+            },
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+        open_agent_state = {
+            "open_agent_agent_id": config.open_agent_agent_id,
+            "open_agent_agent_name": config.open_agent_agent_name or conversation.open_agent_agent_name or "智能助手",
+            "open_agent_last_request_id": request_id,
+        }
+        if not body.resume:
+            open_agent_state["open_agent_last_event_id"] = None
+        conversation = await ConversationRepository.update_open_agent_state(db, conversation, open_agent_state)
+
+        return (
+            conversation,
+            config,
+            base_url,
+            api_key,
+            request_id,
+            client_message_id,
+            resume_last_event_id,
+            payload,
+        )
 
     @staticmethod
     def _is_round_event_id(event_id: str | None) -> bool:
@@ -135,6 +255,58 @@ class OpenAgentConversationService:
     @staticmethod
     def _tool_int(value: Any) -> int | None:
         return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @staticmethod
+    def _tool_block_log_summary(blocks: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for block in blocks[:5]:
+            tool_call_id = OpenAgentConversationService._tool_string(block.get("toolCallId")) or "-"
+            tool_name = OpenAgentConversationService._tool_string(block.get("toolName")) or "-"
+            brief_len = len(OpenAgentConversationService._tool_string(block.get("brief")))
+            parts.append(
+                f"{tool_call_id}:{tool_name}:handoff={block.get('usedForHandoff') is True}:"
+                f"exec={block.get('isExecuting') is True}:brief_len={brief_len}",
+            )
+        if len(blocks) > 5:
+            parts.append(f"+{len(blocks) - 5}")
+        return ",".join(parts) if parts else "-"
+
+    @staticmethod
+    def _tool_event_name_for_log(
+        data: dict[str, Any],
+        pending_tool_calls: dict[str, dict[str, Any]] | None = None,
+    ) -> str:
+        return (
+            OpenAgentConversationService._resolve_event_tool_name(data, pending_tool_calls)
+            or "-"
+        )
+
+    @staticmethod
+    def _feedback_step_int(value: Any) -> int | None:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            parsed = int(value.strip())
+            return parsed if parsed > 0 else None
+        return None
+
+    @staticmethod
+    def _extract_feedback_step_id(data: dict[str, Any] | None) -> int | None:
+        if not isinstance(data, dict):
+            return None
+        for key in OpenAgentConversationService._FEEDBACK_STEP_ID_KEYS:
+            step_id = OpenAgentConversationService._feedback_step_int(data.get(key))
+            if step_id is not None:
+                return step_id
+        for container_key in OpenAgentConversationService._FEEDBACK_STEP_ID_CONTAINERS:
+            nested = data.get(container_key)
+            if not isinstance(nested, dict):
+                continue
+            for key in OpenAgentConversationService._FEEDBACK_STEP_ID_KEYS:
+                step_id = OpenAgentConversationService._feedback_step_int(nested.get(key))
+                if step_id is not None:
+                    return step_id
+        return None
 
     @staticmethod
     def _normalize_human_handoff_tool_name(tool_name: str | None) -> str:
@@ -325,6 +497,7 @@ class OpenAgentConversationService:
     def _extract_tool_call_id(data: dict[str, Any]) -> str:
         return (
             OpenAgentConversationService._tool_string(data.get("tool_call_id"))
+            or OpenAgentConversationService._tool_string(data.get("call_id"))
             or OpenAgentConversationService._tool_string(data.get("id"))
         )
 
@@ -332,18 +505,45 @@ class OpenAgentConversationService:
     def _extract_handoff_payload_tool_call_id(payload: Any) -> str | None:
         if not isinstance(payload, dict):
             return None
-        value = payload.get("tool_call_id")
-        return value.strip() if isinstance(value, str) and value.strip() else None
+        for key in ("tool_call_id", "call_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
 
     @staticmethod
-    def _mark_handoff_tool_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _extract_tool_block_call_id(block: dict[str, Any]) -> str:
+        return (
+            OpenAgentConversationService._tool_string(block.get("toolCallId"))
+            or OpenAgentConversationService._tool_string(block.get("tool_call_id"))
+            or OpenAgentConversationService._tool_string(block.get("call_id"))
+        )
+
+    @staticmethod
+    def _is_handoff_tool_block(
+        block: dict[str, Any],
+        handoff_tool_call_ids: set[str] | None = None,
+    ) -> bool:
+        tool_call_id = OpenAgentConversationService._extract_tool_block_call_id(block)
+        if tool_call_id and handoff_tool_call_ids and tool_call_id in handoff_tool_call_ids:
+            return True
+        return OpenAgentConversationService._is_human_handoff_tool_name(
+            OpenAgentConversationService._tool_string(block.get("toolName")),
+        )
+
+    @staticmethod
+    def _mark_handoff_tool_blocks(
+        blocks: list[dict[str, Any]],
+        handoff_tool_call_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         return [
             {
                 **block,
                 "usedForHandoff": True,
             }
-            if OpenAgentConversationService._is_human_handoff_tool_name(
-                OpenAgentConversationService._tool_string(block.get("toolName")),
+            if OpenAgentConversationService._is_handoff_tool_block(
+                block,
+                handoff_tool_call_ids,
             )
             else block
             for block in blocks
@@ -356,10 +556,8 @@ class OpenAgentConversationService:
             OpenAgentConversationService._tool_string(data.get("tool_name"))
             or OpenAgentConversationService._tool_string(data.get("name"))
         )
-        tool_call_id = (
-            OpenAgentConversationService._tool_string(data.get("tool_call_id"))
-            or OpenAgentConversationService._tool_string(data.get("id"))
-            or (f"step_{step_id}" if step_id is not None else f"tool_{timeline_index}")
+        tool_call_id = OpenAgentConversationService._extract_tool_call_id(data) or (
+            f"step_{step_id}" if step_id is not None else f"tool_{timeline_index}"
         )
         brief = OpenAgentConversationService._tool_string(data.get("brief"))
         if not brief:
@@ -407,11 +605,7 @@ class OpenAgentConversationService:
         data: dict[str, Any],
         timeline_index: int,
     ) -> list[dict[str, Any]]:
-        tool_call_id = (
-            OpenAgentConversationService._tool_string(data.get("tool_call_id"))
-            or OpenAgentConversationService._tool_string(data.get("id"))
-            or f"tool_{timeline_index}"
-        )
+        tool_call_id = OpenAgentConversationService._extract_tool_call_id(data) or f"tool_{timeline_index}"
         existing_index = next(
             (idx for idx, item in enumerate(blocks) if item.get("toolCallId") == tool_call_id),
             None,
@@ -661,6 +855,18 @@ class OpenAgentConversationService:
                 conversation,
                 {"open_agent_handoff_payload": payload},
             )
+            logger.info(
+                "open_agent_handoff_event_updated tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s handoff_source=%s handoff_event_type=%s "
+                "tool_call_id=%s previous_state=%s",
+                conversation.tenant_id,
+                conversation.id,
+                conversation.public_id,
+                handoff_source,
+                resolved_event_type,
+                normalized_tool_call_id or "-",
+                current_state,
+            )
             return {
                 "event": "open_desk_handoff_updated",
                 "payload": payload,
@@ -710,6 +916,19 @@ class OpenAgentConversationService:
         conversation = await ConversationRepository.get_by_id(db, conversation.id)
         saved = ConversationService._public_message_payload(msg, conversation)
         saved["handoff_event_type"] = resolved_event_type
+        logger.info(
+            "open_agent_handoff_event_saved tenant_id=%s conversation_id=%s "
+            "conversation_public_id=%s message_id=%s handoff_source=%s "
+            "handoff_event_type=%s tool_call_id=%s previous_state=%s",
+            conversation.tenant_id,
+            conversation.id,
+            conversation.public_id,
+            msg.id,
+            handoff_source,
+            resolved_event_type,
+            normalized_tool_call_id or "-",
+            current_state or "-",
+        )
         return saved
 
     @staticmethod
@@ -757,7 +976,7 @@ class OpenAgentConversationService:
         handoff_behavior: str | None = None,
     ) -> dict | None:
         related_tool_call_step_id = OpenAgentConversationService._tool_int(data.get("related_tool_call_step_id"))
-        tool_call_id = OpenAgentConversationService._tool_string(data.get("tool_call_id"))
+        tool_call_id = OpenAgentConversationService._extract_tool_call_id(data)
         if not tool_call_id and related_tool_call_step_id is not None:
             tool_call_id = f"step_{related_tool_call_step_id}"
 
@@ -888,18 +1107,22 @@ class OpenAgentConversationService:
         return payload
 
     @staticmethod
-    def _non_handoff_tool_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _non_handoff_tool_blocks(
+        blocks: list[dict[str, Any]],
+        handoff_tool_call_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         return [
             block
             for block in blocks
-            if not OpenAgentConversationService._is_human_handoff_tool_name(
-                OpenAgentConversationService._tool_string(block.get("toolName")),
+            if not OpenAgentConversationService._is_handoff_tool_block(
+                block,
+                handoff_tool_call_ids,
             )
         ]
 
     @staticmethod
     async def _submit_handoff_tool_result_for_conversation(
-        db: AsyncSession,
+        db: AsyncSession | None,
         conversation,
         visitor_context: dict,
         config: ChannelConfig,
@@ -914,6 +1137,15 @@ class OpenAgentConversationService:
         try:
             open_agent_conversation_id = int(conversation.open_agent_conversation_id)
         except (TypeError, ValueError):
+            logger.warning(
+                "open_agent_handoff_tool_result_skipped tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s tool_call_id=%s status=%s reason=missing_open_agent_conversation_id",
+                getattr(conversation, "tenant_id", "-"),
+                getattr(conversation, "id", "-"),
+                getattr(conversation, "public_id", "-"),
+                tool_call_id,
+                status,
+            )
             return [
                 OpenAgentConversationService._sse_event(
                     "error",
@@ -926,6 +1158,16 @@ class OpenAgentConversationService:
             tool_call_id,
             status,
             message,
+        )
+        logger.info(
+            "open_agent_handoff_tool_result_submit_start tenant_id=%s conversation_id=%s "
+            "conversation_public_id=%s open_agent_conversation_id=%s tool_call_id=%s status=%s",
+            conversation.tenant_id,
+            conversation.id,
+            conversation.public_id,
+            open_agent_conversation_id,
+            tool_call_id,
+            status,
         )
         buffer = ""
         accumulated_content = ""
@@ -970,24 +1212,65 @@ class OpenAgentConversationService:
 
                     thinking_delta = OpenAgentConversationService._extract_thinking_delta(event, data)
                     if event == "human_handoff_event" and data:
-                        saved = await OpenAgentConversationService._handle_human_handoff_event(
-                            db,
-                            conversation,
-                            data,
-                            processed_handoff_tool_call_ids,
-                            handoff_behavior=config.open_agent_handoff_behavior,
+                        event_tool_call_id = (
+                            OpenAgentConversationService._extract_tool_call_id(data)
+                            or "-"
                         )
-                        conversation = await ConversationRepository.get_by_id(db, conversation.id)
-                        if saved:
-                            events.extend(
-                                await OpenAgentConversationService._collect_handoff_saved_events(
-                                    db,
-                                    None,
-                                    conversation,
-                                    visitor_context,
-                                    saved,
-                                ),
+                        if db is None:
+                            async with AsyncSessionLocal() as event_db:
+                                fresh = await ConversationRepository.get_by_id(event_db, conversation.id)
+                                if fresh is None:
+                                    saved = None
+                                else:
+                                    saved = await OpenAgentConversationService._handle_human_handoff_event(
+                                        event_db,
+                                        fresh,
+                                        data,
+                                        processed_handoff_tool_call_ids,
+                                        handoff_behavior=config.open_agent_handoff_behavior,
+                                    )
+                                    conversation = (
+                                        await ConversationRepository.get_by_id(event_db, conversation.id)
+                                        or fresh
+                                    )
+                                    if saved:
+                                        events.extend(
+                                            await OpenAgentConversationService._collect_handoff_saved_events(
+                                                event_db,
+                                                None,
+                                                conversation,
+                                                visitor_context,
+                                                saved,
+                                            ),
+                                        )
+                        else:
+                            saved = await OpenAgentConversationService._handle_human_handoff_event(
+                                db,
+                                conversation,
+                                data,
+                                processed_handoff_tool_call_ids,
+                                handoff_behavior=config.open_agent_handoff_behavior,
                             )
+                            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                            if saved:
+                                events.extend(
+                                    await OpenAgentConversationService._collect_handoff_saved_events(
+                                        db,
+                                        None,
+                                        conversation,
+                                        visitor_context,
+                                        saved,
+                                    ),
+                                )
+                        logger.info(
+                            "open_agent_handoff_tool_result_event tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s event=human_handoff_event tool_call_id=%s saved=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            event_tool_call_id,
+                            bool(saved),
+                        )
                     elif event == "llm_step_created" and data:
                         current_llm_step_id = OpenAgentConversationService._tool_int(data.get("step_id"))
                         thinking_blocks = OpenAgentConversationService._apply_thinking_step_id(
@@ -1016,6 +1299,17 @@ class OpenAgentConversationService:
                             data,
                             trace_timeline_index,
                         )
+                        logger.info(
+                            "open_agent_handoff_tool_result_event tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s event=tool_call tool_call_id=%s tool_name=%s "
+                            "tool_blocks=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            OpenAgentConversationService._extract_tool_call_id(data) or "-",
+                            OpenAgentConversationService._tool_event_name_for_log(data),
+                            OpenAgentConversationService._tool_block_log_summary(tool_blocks),
+                        )
                     elif event == "tool_result" and data:
                         text_blocks = OpenAgentConversationService._finish_text_blocks(text_blocks)
                         trace_timeline_index += 1
@@ -1023,6 +1317,17 @@ class OpenAgentConversationService:
                             tool_blocks,
                             data,
                             trace_timeline_index,
+                        )
+                        logger.info(
+                            "open_agent_handoff_tool_result_event tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s event=tool_result tool_call_id=%s tool_name=%s "
+                            "tool_blocks=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            OpenAgentConversationService._extract_tool_call_id(data) or "-",
+                            OpenAgentConversationService._tool_event_name_for_log(data),
+                            OpenAgentConversationService._tool_block_log_summary(tool_blocks),
                         )
                     elif event == "assistant_reset":
                         accumulated_content = ""
@@ -1045,8 +1350,33 @@ class OpenAgentConversationService:
                             thinking_blocks,
                             current_llm_step_id,
                         )
+                        handoff_tool_call_ids = {
+                            *processed_handoff_tool_call_ids,
+                            *({tool_call_id} if tool_call_id else set()),
+                        }
                         finished_tool_blocks = OpenAgentConversationService._finish_tool_blocks(
-                            OpenAgentConversationService._non_handoff_tool_blocks(tool_blocks),
+                            OpenAgentConversationService._non_handoff_tool_blocks(
+                                tool_blocks,
+                                handoff_tool_call_ids,
+                            ),
+                        )
+                        logger.info(
+                            "open_agent_handoff_tool_result_done tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s tool_call_id=%s status=%s final_content_len=%s "
+                            "text_blocks=%s thinking_blocks=%s raw_tool_blocks=%s saved_tool_blocks=%s "
+                            "raw_tool_summary=%s saved_tool_summary=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            tool_call_id,
+                            status,
+                            len(final_content),
+                            len(finished_text_blocks),
+                            len(finished_thinking_blocks),
+                            len(tool_blocks),
+                            len(finished_tool_blocks),
+                            OpenAgentConversationService._tool_block_log_summary(tool_blocks),
+                            OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
                         )
                         if final_content.strip() or finished_text_blocks or finished_thinking_blocks or finished_tool_blocks:
                             metadata = {
@@ -1056,6 +1386,9 @@ class OpenAgentConversationService:
                                 "open_agent_agent_id": config.open_agent_agent_id,
                                 "open_agent_agent_name": config.open_agent_agent_name or conversation.open_agent_agent_name,
                             }
+                            feedback_step_id = OpenAgentConversationService._extract_feedback_step_id(data)
+                            if feedback_step_id is not None:
+                                metadata["open_agent_feedback_step_id"] = feedback_step_id
                             if finished_text_blocks:
                                 metadata["open_agent_text_blocks"] = finished_text_blocks
                             if finished_thinking_blocks:
@@ -1066,20 +1399,83 @@ class OpenAgentConversationService:
                                 OpenAgentConversationService._text_blocks_content(finished_text_blocks)
                                 or final_content
                             )
-                            saved = await OpenAgentConversationService._save_bot_message(
-                                db,
-                                conversation,
-                                saved_content,
-                                metadata,
-                            )
-                            final_saved = True
-                            conversation = await ConversationRepository.get_by_id(db, conversation.id)
-                            events.append(
-                                OpenAgentConversationService._sse_event("open_desk_message_saved", saved),
-                            )
-                        await ConversationRepository.update_open_agent_state(db, conversation, {
-                            "open_agent_last_event_id": last_event_id,
-                        })
+                            if db is None:
+                                async with AsyncSessionLocal() as message_db:
+                                    fresh = await ConversationRepository.get_by_id(message_db, conversation.id)
+                                    if fresh is not None:
+                                        metadata["open_agent_agent_name"] = (
+                                            config.open_agent_agent_name or fresh.open_agent_agent_name
+                                        )
+                                        saved = await OpenAgentConversationService._save_bot_message(
+                                            message_db,
+                                            fresh,
+                                            saved_content,
+                                            metadata,
+                                        )
+                                        final_saved = True
+                                        conversation = (
+                                            await ConversationRepository.get_by_id(message_db, conversation.id)
+                                            or fresh
+                                        )
+                                        logger.info(
+                                            "open_agent_handoff_tool_result_bot_message_saved tenant_id=%s "
+                                            "conversation_id=%s conversation_public_id=%s message_id=%s "
+                                            "tool_call_id=%s status=%s saved_tool_blocks=%s saved_tool_summary=%s",
+                                            conversation.tenant_id,
+                                            conversation.id,
+                                            conversation.public_id,
+                                            saved.get("id"),
+                                            tool_call_id,
+                                            status,
+                                            len(finished_tool_blocks),
+                                            OpenAgentConversationService._tool_block_log_summary(
+                                                finished_tool_blocks,
+                                            ),
+                                        )
+                                        events.append(
+                                            OpenAgentConversationService._sse_event(
+                                                "open_desk_message_saved",
+                                                saved,
+                                            ),
+                                        )
+                            else:
+                                saved = await OpenAgentConversationService._save_bot_message(
+                                    db,
+                                    conversation,
+                                    saved_content,
+                                    metadata,
+                                )
+                                final_saved = True
+                                conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                                logger.info(
+                                    "open_agent_handoff_tool_result_bot_message_saved tenant_id=%s "
+                                    "conversation_id=%s conversation_public_id=%s message_id=%s "
+                                    "tool_call_id=%s status=%s saved_tool_blocks=%s saved_tool_summary=%s",
+                                    conversation.tenant_id,
+                                    conversation.id,
+                                    conversation.public_id,
+                                    saved.get("id"),
+                                    tool_call_id,
+                                    status,
+                                    len(finished_tool_blocks),
+                                    OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+                                )
+                                events.append(
+                                    OpenAgentConversationService._sse_event("open_desk_message_saved", saved),
+                                )
+                        if db is None:
+                            async with AsyncSessionLocal() as state_db:
+                                fresh = await ConversationRepository.get_by_id(state_db, conversation.id)
+                                if fresh is not None:
+                                    conversation = await ConversationRepository.update_open_agent_state(
+                                        state_db,
+                                        fresh,
+                                        {"open_agent_last_event_id": last_event_id},
+                                    )
+                        else:
+                            await ConversationRepository.update_open_agent_state(db, conversation, {
+                                "open_agent_last_event_id": last_event_id,
+                            })
         except OpenAgentClientError as exc:
             events.append(OpenAgentConversationService._sse_event("error", {"message": str(exc)}))
             return events
@@ -1090,8 +1486,33 @@ class OpenAgentConversationService:
                 thinking_blocks,
                 current_llm_step_id,
             )
+            handoff_tool_call_ids = {
+                *processed_handoff_tool_call_ids,
+                *({tool_call_id} if tool_call_id else set()),
+            }
             finished_tool_blocks = OpenAgentConversationService._finish_tool_blocks(
-                OpenAgentConversationService._non_handoff_tool_blocks(tool_blocks),
+                OpenAgentConversationService._non_handoff_tool_blocks(
+                    tool_blocks,
+                    handoff_tool_call_ids,
+                ),
+            )
+            logger.info(
+                "open_agent_handoff_tool_result_finalize tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s tool_call_id=%s status=%s accumulated_content_len=%s "
+                "text_blocks=%s thinking_blocks=%s raw_tool_blocks=%s saved_tool_blocks=%s "
+                "raw_tool_summary=%s saved_tool_summary=%s",
+                conversation.tenant_id,
+                conversation.id,
+                conversation.public_id,
+                tool_call_id,
+                status,
+                len(accumulated_content),
+                len(finished_text_blocks),
+                len(finished_thinking_blocks),
+                len(tool_blocks),
+                len(finished_tool_blocks),
+                OpenAgentConversationService._tool_block_log_summary(tool_blocks),
+                OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
             )
             if accumulated_content.strip() or finished_text_blocks or finished_thinking_blocks or finished_tool_blocks:
                 metadata = {
@@ -1107,27 +1528,69 @@ class OpenAgentConversationService:
                     metadata["open_agent_thinking_blocks"] = finished_thinking_blocks
                 if finished_tool_blocks:
                     metadata["open_agent_tool_blocks"] = finished_tool_blocks
-                saved = await OpenAgentConversationService._save_bot_message(
-                    db,
-                    conversation,
-                    OpenAgentConversationService._text_blocks_content(finished_text_blocks) or accumulated_content,
-                    metadata,
+                saved_content = (
+                    OpenAgentConversationService._text_blocks_content(finished_text_blocks)
+                    or accumulated_content
                 )
-                events.append(OpenAgentConversationService._sse_event("open_desk_message_saved", saved))
+                if db is None:
+                    async with AsyncSessionLocal() as message_db:
+                        fresh = await ConversationRepository.get_by_id(message_db, conversation.id)
+                        if fresh is not None:
+                            metadata["open_agent_agent_name"] = (
+                                config.open_agent_agent_name or fresh.open_agent_agent_name
+                            )
+                            saved = await OpenAgentConversationService._save_bot_message(
+                                message_db,
+                                fresh,
+                                saved_content,
+                                metadata,
+                            )
+                            logger.info(
+                                "open_agent_handoff_tool_result_bot_message_saved tenant_id=%s "
+                                "conversation_id=%s conversation_public_id=%s message_id=%s "
+                                "tool_call_id=%s status=%s saved_tool_blocks=%s saved_tool_summary=%s",
+                                fresh.tenant_id,
+                                fresh.id,
+                                fresh.public_id,
+                                saved.get("id"),
+                                tool_call_id,
+                                status,
+                                len(finished_tool_blocks),
+                                OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+                            )
+                            events.append(
+                                OpenAgentConversationService._sse_event("open_desk_message_saved", saved)
+                            )
+                else:
+                    saved = await OpenAgentConversationService._save_bot_message(
+                        db,
+                        conversation,
+                        saved_content,
+                        metadata,
+                    )
+                    logger.info(
+                        "open_agent_handoff_tool_result_bot_message_saved tenant_id=%s "
+                        "conversation_id=%s conversation_public_id=%s message_id=%s "
+                        "tool_call_id=%s status=%s saved_tool_blocks=%s saved_tool_summary=%s",
+                        conversation.tenant_id,
+                        conversation.id,
+                        conversation.public_id,
+                        saved.get("id"),
+                        tool_call_id,
+                        status,
+                        len(finished_tool_blocks),
+                        OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+                    )
+                    events.append(OpenAgentConversationService._sse_event("open_desk_message_saved", saved))
 
         return events
 
     @staticmethod
-    async def submit_handoff_tool_result_for_session(
+    async def _load_handoff_tool_result_context(
         db: AsyncSession,
         conversation_public_id: str,
         visitor_context: dict,
-        *,
-        tool_call_id: str,
-        status: str,
-        message: str | None = None,
-        open_agent_client: BaseOpenAgentClient | None = None,
-    ) -> list[bytes]:
+    ) -> tuple[Any, ChannelConfig, str, str]:
         conversation = await ConversationService.get_conversation_for_visitor_session(
             db,
             conversation_public_id=conversation_public_id,
@@ -1146,6 +1609,26 @@ class OpenAgentConversationService:
         if not credentials or not credentials[1]:
             raise ValidationError("OpenAgent settings are required")
         base_url, api_key = credentials
+        return conversation, config, base_url, api_key
+
+    @staticmethod
+    async def submit_handoff_tool_result_for_session(
+        db: AsyncSession,
+        conversation_public_id: str,
+        visitor_context: dict,
+        *,
+        tool_call_id: str,
+        status: str,
+        message: str | None = None,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> list[bytes]:
+        conversation, config, base_url, api_key = (
+            await OpenAgentConversationService._load_handoff_tool_result_context(
+                db,
+                conversation_public_id,
+                visitor_context,
+            )
+        )
         client = open_agent_client or create_open_agent_client()
         return await OpenAgentConversationService._submit_handoff_tool_result_for_conversation(
             db,
@@ -1159,6 +1642,125 @@ class OpenAgentConversationService:
             status=status,
             message=message,
         )
+
+    @staticmethod
+    async def submit_handoff_tool_result_for_session_managed(
+        conversation_public_id: str,
+        visitor_context: dict,
+        *,
+        tool_call_id: str,
+        status: str,
+        message: str | None = None,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> list[bytes]:
+        async with AsyncSessionLocal() as db:
+            conversation, config, base_url, api_key = (
+                await OpenAgentConversationService._load_handoff_tool_result_context(
+                    db,
+                    conversation_public_id,
+                    visitor_context,
+                )
+            )
+
+        client = open_agent_client or create_open_agent_client()
+        return await OpenAgentConversationService._submit_handoff_tool_result_for_conversation(
+            None,
+            conversation,
+            visitor_context,
+            config,
+            base_url,
+            api_key,
+            client,
+            tool_call_id=tool_call_id,
+            status=status,
+            message=message,
+        )
+
+    @staticmethod
+    async def submit_feedback_for_session(
+        db: AsyncSession,
+        conversation_public_id: str,
+        visitor_context: dict,
+        body: OpenAgentFeedbackRequest,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> dict:
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        if not conversation.channel:
+            raise ValidationError("Channel is required")
+
+        config = ChannelConfig.model_validate(conversation.channel.config or {})
+        if not config.open_agent_enabled or not config.open_agent_agent_id:
+            raise ValidationError("OpenAgent bot is not enabled")
+        if not config.open_agent_feedback_enabled:
+            raise ValidationError("OpenAgent feedback is not enabled")
+
+        message = await MessageRepository.get_by_id_for_conversation(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            message_id=body.message_id,
+        )
+        if not message:
+            raise ValidationError("Feedback message is not available")
+        if message.sender_type != MessageSenderType.BOT.value:
+            raise ValidationError("Only bot messages can receive OpenAgent feedback")
+
+        metadata = dict(getattr(message, "metadata_", None) or {})
+        feedback_step_id = OpenAgentConversationService._feedback_step_int(
+            metadata.get("open_agent_feedback_step_id"),
+        )
+        if feedback_step_id is None or feedback_step_id != body.step_id:
+            raise ValidationError("OpenAgent feedback step does not match the message")
+        if not conversation.open_agent_conversation_id:
+            raise ValidationError("OpenAgent conversation is not available for feedback")
+
+        credentials = await OpenAgentSettingsService.get_credentials(db, conversation.tenant_id)
+        if not credentials or not credentials[1]:
+            raise ValidationError("OpenAgent settings are required")
+        base_url, api_key = credentials
+
+        comment = body.comment if body.rating == "dislike" else None
+        client = open_agent_client or create_open_agent_client()
+        try:
+            result = await client.submit_feedback(
+                base_url,
+                api_key,
+                int(config.open_agent_agent_id),
+                int(conversation.open_agent_conversation_id),
+                body.step_id,
+                {
+                    "rating": body.rating,
+                    "comment": comment,
+                },
+            )
+        except OpenAgentClientError as exc:
+            raise ValidationError(str(exc)) from exc
+
+        rating = result.rating if result.rating in {"like", "dislike"} else body.rating
+        updated_at = result.updated_at or datetime.now(timezone.utc).isoformat()
+        normalized_comment = result.comment if rating == "dislike" else None
+        feedback = {
+            "schema_version": 1,
+            "step_id": body.step_id,
+            "rating": rating,
+            "comment": normalized_comment,
+            "updated_at": updated_at,
+        }
+        metadata["open_agent_feedback"] = feedback
+        updated_message = await MessageRepository.update_metadata(db, message, metadata)
+        return {
+            "message": ConversationService._public_message_payload(updated_message, conversation),
+            "step_id": body.step_id,
+            "rating": rating,
+            "comment": normalized_comment,
+            "updated_at": updated_at,
+        }
 
     @staticmethod
     def _handoff_unavailable_status_fields(result: dict) -> dict:
@@ -1228,18 +1830,15 @@ class OpenAgentConversationService:
         )
 
     @staticmethod
-    async def _handle_required_handoff_action(
+    async def _handle_required_handoff_action_route(
         db: AsyncSession,
         redis,
         conversation,
         visitor_context: dict,
         config: ChannelConfig,
-        base_url: str,
-        api_key: str,
-        client: BaseOpenAgentClient,
         action: dict[str, Any],
         pending_tool_calls: dict[str, dict[str, Any]],
-    ) -> tuple[Any, list[bytes], bool]:
+    ) -> tuple[Any, list[bytes], bool, dict[str, Any] | None]:
         tool_call_id = OpenAgentConversationService._extract_tool_call_id(action)
         payload = OpenAgentConversationService._build_required_action_handoff_payload(
             action,
@@ -1267,10 +1866,10 @@ class OpenAgentConversationService:
         handoff_triggered = bool(saved and saved.get("event") != "open_desk_handoff_updated")
 
         if config.open_agent_handoff_behavior != "auto":
-            return conversation, events, handoff_triggered
+            return conversation, events, handoff_triggered, None
 
         if not saved:
-            return conversation, events, handoff_triggered
+            return conversation, events, handoff_triggered, None
 
         route_result = await ConversationService.request_human_handoff_for_session(
             db,
@@ -1284,21 +1883,57 @@ class OpenAgentConversationService:
         events.extend(OpenAgentConversationService._handoff_route_result_events(route_result))
         routed_conversation = route_result.get("conversation") or conversation
         status, message = OpenAgentConversationService._handoff_tool_result_from_route_result(route_result)
+        tool_result_request = {
+            "conversation": routed_conversation,
+            "conversation_id": routed_conversation.id,
+            "tool_call_id": tool_call_id,
+            "status": status,
+            "message": message,
+        }
+        return routed_conversation, events, handoff_triggered, tool_result_request
+
+    @staticmethod
+    async def _handle_required_handoff_action(
+        db: AsyncSession,
+        redis,
+        conversation,
+        visitor_context: dict,
+        config: ChannelConfig,
+        base_url: str,
+        api_key: str,
+        client: BaseOpenAgentClient,
+        action: dict[str, Any],
+        pending_tool_calls: dict[str, dict[str, Any]],
+    ) -> tuple[Any, list[bytes], bool]:
+        conversation, events, handoff_triggered, tool_result_request = (
+            await OpenAgentConversationService._handle_required_handoff_action_route(
+                db,
+                redis,
+                conversation,
+                visitor_context,
+                config,
+                action,
+                pending_tool_calls,
+            )
+        )
+        if tool_result_request is None:
+            return conversation, events, handoff_triggered
+
         events.extend(
             await OpenAgentConversationService._submit_handoff_tool_result_for_conversation(
                 db,
-                routed_conversation,
+                tool_result_request["conversation"],
                 visitor_context,
                 config,
                 base_url,
                 api_key,
                 client,
-                tool_call_id=tool_call_id,
-                status=status,
-                message=message,
+                tool_call_id=tool_result_request["tool_call_id"],
+                status=tool_result_request["status"],
+                message=tool_result_request["message"],
             ),
         )
-        conversation = await ConversationRepository.get_by_id(db, routed_conversation.id)
+        conversation = await ConversationRepository.get_by_id(db, tool_result_request["conversation_id"])
         return conversation, events, handoff_triggered
 
     @staticmethod
@@ -1355,6 +1990,7 @@ class OpenAgentConversationService:
                     "client_message_id": client_message_id,
                     "open_agent": True,
                 },
+                quoted_message_id=body.quoted_message_id,
             )
 
         request_id = body.request_id or uuid.uuid4().hex
@@ -1390,6 +2026,18 @@ class OpenAgentConversationService:
         if not body.resume:
             open_agent_state["open_agent_last_event_id"] = None
         await ConversationRepository.update_open_agent_state(db, conversation, open_agent_state)
+        logger.info(
+            "open_agent_stream_started tenant_id=%s conversation_id=%s conversation_public_id=%s "
+            "request_id=%s client_message_id=%s resume=%s status=%s open_agent_conversation_id=%s",
+            conversation.tenant_id,
+            conversation.id,
+            conversation.public_id,
+            request_id,
+            client_message_id,
+            body.resume,
+            conversation.status,
+            conversation.open_agent_conversation_id or "-",
+        )
 
         client = open_agent_client or create_open_agent_client()
         accumulated_content = ""
@@ -1452,6 +2100,21 @@ class OpenAgentConversationService:
                             if action
                             else ""
                         )
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=requires_action action_present=%s tool_call_id=%s "
+                            "already_processed=%s pending_tool_count=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            bool(action),
+                            action_tool_call_id or "-",
+                            action_tool_call_id in processed_required_handoff_tool_call_ids,
+                            len(pending_tool_calls),
+                        )
                         if action and action_tool_call_id not in processed_required_handoff_tool_call_ids:
                             processed_required_handoff_tool_call_ids.add(action_tool_call_id)
                             conversation, action_events, action_triggered = (
@@ -1471,7 +2134,24 @@ class OpenAgentConversationService:
                             if action_triggered:
                                 handoff_triggered_this_round = True
                             local_events.extend(action_events)
+                            logger.info(
+                                "open_agent_handoff_action_processed tenant_id=%s conversation_id=%s "
+                                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                                "tool_call_id=%s handoff_triggered=%s emitted_events=%s",
+                                conversation.tenant_id,
+                                conversation.id,
+                                conversation.public_id,
+                                request_id,
+                                client_message_id,
+                                action_tool_call_id or "-",
+                                action_triggered,
+                                len(action_events),
+                            )
                     elif event == "human_handoff_event" and data:
+                        event_tool_call_id = (
+                            OpenAgentConversationService._extract_tool_call_id(data)
+                            or "-"
+                        )
                         saved = await OpenAgentConversationService._handle_human_handoff_event(
                             db,
                             conversation,
@@ -1480,6 +2160,19 @@ class OpenAgentConversationService:
                             handoff_behavior=config.open_agent_handoff_behavior,
                         )
                         conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=human_handoff_event tool_call_id=%s saved=%s saved_event=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            event_tool_call_id,
+                            bool(saved),
+                            saved.get("event") if saved else "-",
+                        )
                         if saved:
                             if saved.get("event") != "open_desk_handoff_updated":
                                 handoff_triggered_this_round = True
@@ -1523,6 +2216,21 @@ class OpenAgentConversationService:
                             data,
                             trace_timeline_index,
                         )
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=tool_call tool_call_id=%s tool_name=%s timeline_index=%s "
+                            "tool_blocks=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            tool_call_id or "-",
+                            OpenAgentConversationService._tool_event_name_for_log(data),
+                            trace_timeline_index,
+                            OpenAgentConversationService._tool_block_log_summary(tool_blocks),
+                        )
                     elif event == "tool_result" and data:
                         text_blocks = OpenAgentConversationService._finish_text_blocks(text_blocks)
                         trace_timeline_index += 1
@@ -1531,10 +2239,30 @@ class OpenAgentConversationService:
                             data,
                             trace_timeline_index,
                         )
-                        if OpenAgentConversationService._is_human_handoff_tool_event(
+                        is_handoff_tool_result = OpenAgentConversationService._is_human_handoff_tool_event(
                             data,
                             pending_tool_calls,
-                        ):
+                        )
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=tool_result tool_call_id=%s tool_name=%s is_handoff=%s "
+                            "timeline_index=%s tool_blocks=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            OpenAgentConversationService._extract_tool_call_id(data) or "-",
+                            OpenAgentConversationService._tool_event_name_for_log(
+                                data,
+                                pending_tool_calls,
+                            ),
+                            is_handoff_tool_result,
+                            trace_timeline_index,
+                            OpenAgentConversationService._tool_block_log_summary(tool_blocks),
+                        )
+                        if is_handoff_tool_result:
                             saved = await OpenAgentConversationService._handle_human_handoff_tool_result(
                                 db,
                                 conversation,
@@ -1544,6 +2272,19 @@ class OpenAgentConversationService:
                                 handoff_behavior=config.open_agent_handoff_behavior,
                             )
                             conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                            logger.info(
+                                "open_agent_handoff_tool_result_processed tenant_id=%s "
+                                "conversation_id=%s conversation_public_id=%s request_id=%s "
+                                "client_message_id=%s tool_call_id=%s saved=%s saved_event=%s",
+                                conversation.tenant_id,
+                                conversation.id,
+                                conversation.public_id,
+                                request_id,
+                                client_message_id,
+                                OpenAgentConversationService._extract_tool_call_id(data) or "-",
+                                bool(saved),
+                                saved.get("event") if saved else "-",
+                            )
                             if saved:
                                 if saved.get("event") != "open_desk_handoff_updated":
                                     handoff_triggered_this_round = True
@@ -1567,6 +2308,16 @@ class OpenAgentConversationService:
                         processed_handoff_tool_call_ids = set()
                         processed_required_handoff_tool_call_ids = set()
                         handoff_triggered_this_round = False
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=assistant_reset",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                        )
                     elif event == "done":
                         action = OpenAgentConversationService._extract_required_tool_result_action(data)
                         action_tool_call_id = (
@@ -1593,6 +2344,19 @@ class OpenAgentConversationService:
                             if action_triggered:
                                 handoff_triggered_this_round = True
                             local_events.extend(action_events)
+                            logger.info(
+                                "open_agent_handoff_action_processed tenant_id=%s conversation_id=%s "
+                                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                                "tool_call_id=%s handoff_triggered=%s emitted_events=%s source=done",
+                                conversation.tenant_id,
+                                conversation.id,
+                                conversation.public_id,
+                                request_id,
+                                client_message_id,
+                                action_tool_call_id or "-",
+                                action_triggered,
+                                len(action_events),
+                            )
                         final_content = OpenAgentConversationService._extract_final_content(data, accumulated_content)
                         text_blocks, trace_timeline_index = (
                             OpenAgentConversationService._append_final_text_if_needed(
@@ -1606,15 +2370,43 @@ class OpenAgentConversationService:
                             thinking_blocks,
                             current_llm_step_id,
                         )
-                        finished_tool_blocks = OpenAgentConversationService._finish_tool_blocks(tool_blocks)
+                        raw_finished_tool_blocks = OpenAgentConversationService._finish_tool_blocks(tool_blocks)
+                        finished_tool_blocks = raw_finished_tool_blocks
+                        handoff_tool_call_ids = (
+                            processed_handoff_tool_call_ids
+                            | processed_required_handoff_tool_call_ids
+                        )
                         if processed_required_handoff_tool_call_ids:
                             finished_tool_blocks = OpenAgentConversationService._non_handoff_tool_blocks(
                                 finished_tool_blocks,
+                                processed_required_handoff_tool_call_ids,
                             )
                         if handoff_triggered_this_round:
                             finished_tool_blocks = OpenAgentConversationService._mark_handoff_tool_blocks(
                                 finished_tool_blocks,
+                                handoff_tool_call_ids,
                             )
+                        logger.info(
+                            "open_agent_stream_done tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "final_content_len=%s text_blocks=%s thinking_blocks=%s "
+                            "raw_tool_blocks=%s saved_tool_blocks=%s required_handoff_count=%s "
+                            "handoff_triggered=%s raw_tool_summary=%s saved_tool_summary=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            len(final_content),
+                            len(finished_text_blocks),
+                            len(finished_thinking_blocks),
+                            len(raw_finished_tool_blocks),
+                            len(finished_tool_blocks),
+                            len(processed_required_handoff_tool_call_ids),
+                            handoff_triggered_this_round,
+                            OpenAgentConversationService._tool_block_log_summary(raw_finished_tool_blocks),
+                            OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+                        )
                         if (
                             final_content.strip()
                             or finished_text_blocks
@@ -1629,6 +2421,9 @@ class OpenAgentConversationService:
                                 "open_agent_agent_id": config.open_agent_agent_id,
                                 "open_agent_agent_name": config.open_agent_agent_name or conversation.open_agent_agent_name,
                             }
+                            feedback_step_id = OpenAgentConversationService._extract_feedback_step_id(data)
+                            if feedback_step_id is not None:
+                                metadata["open_agent_feedback_step_id"] = feedback_step_id
                             if handoff_triggered_this_round:
                                 metadata["bot_message_used_for_handoff"] = True
                             if finished_text_blocks:
@@ -1649,6 +2444,21 @@ class OpenAgentConversationService:
                             )
                             final_saved = True
                             conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                            logger.info(
+                                "open_agent_bot_message_saved tenant_id=%s conversation_id=%s "
+                                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                                "message_id=%s bot_message_used_for_handoff=%s saved_tool_blocks=%s "
+                                "saved_tool_summary=%s",
+                                conversation.tenant_id,
+                                conversation.id,
+                                conversation.public_id,
+                                request_id,
+                                client_message_id,
+                                saved.get("id"),
+                                handoff_triggered_this_round,
+                                len(finished_tool_blocks),
+                                OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+                            )
                             local_events.append(
                                 OpenAgentConversationService._sse_event("open_desk_message_saved", saved)
                             )
@@ -1668,15 +2478,43 @@ class OpenAgentConversationService:
                 thinking_blocks,
                 current_llm_step_id,
             )
-            finished_tool_blocks = OpenAgentConversationService._finish_tool_blocks(tool_blocks)
+            raw_finished_tool_blocks = OpenAgentConversationService._finish_tool_blocks(tool_blocks)
+            finished_tool_blocks = raw_finished_tool_blocks
+            handoff_tool_call_ids = (
+                processed_handoff_tool_call_ids
+                | processed_required_handoff_tool_call_ids
+            )
             if processed_required_handoff_tool_call_ids:
                 finished_tool_blocks = OpenAgentConversationService._non_handoff_tool_blocks(
                     finished_tool_blocks,
+                    processed_required_handoff_tool_call_ids,
                 )
             if handoff_triggered_this_round:
                 finished_tool_blocks = OpenAgentConversationService._mark_handoff_tool_blocks(
                     finished_tool_blocks,
+                    handoff_tool_call_ids,
                 )
+            logger.info(
+                "open_agent_stream_finalize tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                "accumulated_content_len=%s text_blocks=%s thinking_blocks=%s "
+                "raw_tool_blocks=%s saved_tool_blocks=%s required_handoff_count=%s "
+                "handoff_triggered=%s raw_tool_summary=%s saved_tool_summary=%s",
+                conversation.tenant_id,
+                conversation.id,
+                conversation.public_id,
+                request_id,
+                client_message_id,
+                len(accumulated_content),
+                len(finished_text_blocks),
+                len(finished_thinking_blocks),
+                len(raw_finished_tool_blocks),
+                len(finished_tool_blocks),
+                len(processed_required_handoff_tool_call_ids),
+                handoff_triggered_this_round,
+                OpenAgentConversationService._tool_block_log_summary(raw_finished_tool_blocks),
+                OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+            )
         if (
             not final_saved
             and (
@@ -1711,4 +2549,641 @@ class OpenAgentConversationService:
                 saved_content,
                 metadata,
             )
+            logger.info(
+                "open_agent_bot_message_saved tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                "message_id=%s bot_message_used_for_handoff=%s saved_tool_blocks=%s "
+                "saved_tool_summary=%s source=finalize",
+                conversation.tenant_id,
+                conversation.id,
+                conversation.public_id,
+                request_id,
+                client_message_id,
+                saved.get("id"),
+                handoff_triggered_this_round,
+                len(finished_tool_blocks),
+                OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+            )
             yield OpenAgentConversationService._sse_event("open_desk_message_saved", saved)
+
+    @staticmethod
+    async def stream_chat_for_session_managed(
+        conversation_public_id: str,
+        visitor_context: dict,
+        body: OpenAgentChatRequest,
+        open_agent_client: BaseOpenAgentClient | None = None,
+        redis=None,
+    ) -> AsyncIterator[bytes]:
+        async with AsyncSessionLocal() as db:
+            (
+                conversation,
+                config,
+                base_url,
+                api_key,
+                request_id,
+                client_message_id,
+                resume_last_event_id,
+                payload,
+            ) = await OpenAgentConversationService._load_stream_chat_context(
+                db,
+                conversation_public_id,
+                visitor_context,
+                body,
+            )
+
+        logger.info(
+            "open_agent_stream_started tenant_id=%s conversation_id=%s conversation_public_id=%s "
+            "request_id=%s client_message_id=%s resume=%s status=%s open_agent_conversation_id=%s",
+            conversation.tenant_id,
+            conversation.id,
+            conversation.public_id,
+            request_id,
+            client_message_id,
+            body.resume,
+            conversation.status,
+            conversation.open_agent_conversation_id or "-",
+        )
+
+        client = open_agent_client or create_open_agent_client()
+        accumulated_content = ""
+        last_event_id = resume_last_event_id
+        final_saved = False
+        buffer = ""
+        text_blocks: list[dict[str, Any]] = []
+        thinking_blocks: list[dict[str, Any]] = []
+        tool_blocks: list[dict[str, Any]] = []
+        trace_timeline_index = 0
+        current_llm_step_id: int | None = None
+        pending_tool_calls: dict[str, dict[str, Any]] = {}
+        processed_handoff_tool_call_ids: set[str] = set()
+        processed_required_handoff_tool_call_ids: set[str] = set()
+        handoff_triggered_this_round = False
+
+        async def submit_deferred_handoff_tool_result(
+            tool_result_request: dict[str, Any] | None,
+        ) -> list[bytes]:
+            if tool_result_request is None:
+                return []
+            return await OpenAgentConversationService._submit_handoff_tool_result_for_conversation(
+                None,
+                tool_result_request["conversation"],
+                visitor_context,
+                config,
+                base_url,
+                api_key,
+                client,
+                tool_call_id=tool_result_request["tool_call_id"],
+                status=tool_result_request["status"],
+                message=tool_result_request["message"],
+            )
+
+        try:
+            async for chunk in client.stream_chat(base_url, api_key, config.open_agent_agent_id, payload):
+                local_events: list[bytes] = []
+                buffer += chunk.decode("utf-8", errors="replace")
+                while "\n\n" in buffer:
+                    frame, buffer = buffer.split("\n\n", 1)
+                    event, data, event_id = OpenAgentConversationService._parse_sse_frame(frame)
+                    if OpenAgentConversationService._is_round_event_id(event_id):
+                        last_event_id = event_id
+                    delta = OpenAgentConversationService._extract_delta(event, data)
+                    if delta:
+                        accumulated_content += delta
+                        thinking_blocks = OpenAgentConversationService._finish_thinking_blocks(
+                            thinking_blocks,
+                            current_llm_step_id,
+                        )
+                        if not text_blocks or text_blocks[-1].get("isStreaming") is not True:
+                            trace_timeline_index += 1
+                        text_blocks = OpenAgentConversationService._append_text_block(
+                            text_blocks,
+                            delta,
+                            trace_timeline_index,
+                        )
+                    thinking_delta = OpenAgentConversationService._extract_thinking_delta(event, data)
+
+                    if event == "conversation_created" and data:
+                        oa_conversation = data.get("conversation_id") or data.get("id")
+                        external_id = data.get("external_id") or data.get("conversation_external_id")
+                        update_data: dict[str, Any] = {"open_agent_last_event_id": last_event_id}
+                        try:
+                            if oa_conversation is not None:
+                                update_data["open_agent_conversation_id"] = int(oa_conversation)
+                        except (TypeError, ValueError):
+                            pass
+                        if isinstance(external_id, str):
+                            update_data["open_agent_conversation_external_id"] = external_id[:128]
+                        async with AsyncSessionLocal() as db:
+                            fresh = await ConversationRepository.get_by_id(db, conversation.id)
+                            if fresh is not None:
+                                conversation = await ConversationRepository.update_open_agent_state(
+                                    db,
+                                    fresh,
+                                    update_data,
+                                )
+                    elif event == "requires_action" and data:
+                        action = OpenAgentConversationService._extract_required_tool_result_action(data)
+                        action_tool_call_id = (
+                            OpenAgentConversationService._extract_tool_call_id(action)
+                            if action
+                            else ""
+                        )
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=requires_action action_present=%s tool_call_id=%s "
+                            "already_processed=%s pending_tool_count=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            bool(action),
+                            action_tool_call_id or "-",
+                            action_tool_call_id in processed_required_handoff_tool_call_ids,
+                            len(pending_tool_calls),
+                        )
+                        if action and action_tool_call_id not in processed_required_handoff_tool_call_ids:
+                            processed_required_handoff_tool_call_ids.add(action_tool_call_id)
+                            tool_result_request: dict[str, Any] | None = None
+                            async with AsyncSessionLocal() as db:
+                                fresh = await ConversationRepository.get_by_id(db, conversation.id)
+                                if fresh is not None:
+                                    conversation, action_events, action_triggered, tool_result_request = (
+                                        await OpenAgentConversationService._handle_required_handoff_action_route(
+                                            db,
+                                            redis,
+                                            fresh,
+                                            visitor_context,
+                                            config,
+                                            action,
+                                            pending_tool_calls,
+                                        )
+                                    )
+                                else:
+                                    action_events = []
+                                    action_triggered = False
+                            action_events.extend(
+                                await submit_deferred_handoff_tool_result(tool_result_request)
+                            )
+                            if action_triggered:
+                                handoff_triggered_this_round = True
+                            local_events.extend(action_events)
+                            logger.info(
+                                "open_agent_handoff_action_processed tenant_id=%s conversation_id=%s "
+                                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                                "tool_call_id=%s handoff_triggered=%s emitted_events=%s",
+                                conversation.tenant_id,
+                                conversation.id,
+                                conversation.public_id,
+                                request_id,
+                                client_message_id,
+                                action_tool_call_id or "-",
+                                action_triggered,
+                                len(action_events),
+                            )
+                    elif event == "human_handoff_event" and data:
+                        event_tool_call_id = (
+                            OpenAgentConversationService._extract_tool_call_id(data)
+                            or "-"
+                        )
+                        async with AsyncSessionLocal() as db:
+                            fresh = await ConversationRepository.get_by_id(db, conversation.id)
+                            if fresh is not None:
+                                saved = await OpenAgentConversationService._handle_human_handoff_event(
+                                    db,
+                                    fresh,
+                                    data,
+                                    processed_handoff_tool_call_ids,
+                                    handoff_behavior=config.open_agent_handoff_behavior,
+                                )
+                                conversation = await ConversationRepository.get_by_id(db, conversation.id) or fresh
+                                if saved:
+                                    if saved.get("event") != "open_desk_handoff_updated":
+                                        handoff_triggered_this_round = True
+                                    local_events.extend(
+                                        await OpenAgentConversationService._collect_handoff_saved_events(
+                                            db,
+                                            redis,
+                                            conversation,
+                                            visitor_context,
+                                            saved,
+                                        ),
+                                    )
+                            else:
+                                saved = None
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=human_handoff_event tool_call_id=%s saved=%s saved_event=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            event_tool_call_id,
+                            bool(saved),
+                            saved.get("event") if saved else "-",
+                        )
+                    elif event == "llm_step_created" and data:
+                        current_llm_step_id = OpenAgentConversationService._tool_int(data.get("step_id"))
+                        thinking_blocks = OpenAgentConversationService._apply_thinking_step_id(
+                            thinking_blocks,
+                            current_llm_step_id,
+                        )
+                    elif thinking_delta:
+                        text_blocks = OpenAgentConversationService._finish_text_blocks(text_blocks)
+                        if not thinking_blocks or thinking_blocks[-1].get("isStreaming") is not True:
+                            trace_timeline_index += 1
+                        thinking_blocks = OpenAgentConversationService._append_thinking_block(
+                            thinking_blocks,
+                            thinking_delta,
+                            trace_timeline_index,
+                            current_llm_step_id,
+                        )
+                    elif event == "tool_call" and data:
+                        text_blocks = OpenAgentConversationService._finish_text_blocks(text_blocks)
+                        thinking_blocks = OpenAgentConversationService._finish_thinking_blocks(
+                            thinking_blocks,
+                            current_llm_step_id,
+                        )
+                        trace_timeline_index += 1
+                        tool_call_id = OpenAgentConversationService._extract_tool_call_id(data)
+                        if tool_call_id:
+                            pending_tool_calls[tool_call_id] = data
+                        tool_blocks = OpenAgentConversationService._merge_tool_call(
+                            tool_blocks,
+                            data,
+                            trace_timeline_index,
+                        )
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=tool_call tool_call_id=%s tool_name=%s timeline_index=%s "
+                            "tool_blocks=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            tool_call_id or "-",
+                            OpenAgentConversationService._tool_event_name_for_log(data),
+                            trace_timeline_index,
+                            OpenAgentConversationService._tool_block_log_summary(tool_blocks),
+                        )
+                    elif event == "tool_result" and data:
+                        text_blocks = OpenAgentConversationService._finish_text_blocks(text_blocks)
+                        trace_timeline_index += 1
+                        tool_blocks = OpenAgentConversationService._merge_tool_result(
+                            tool_blocks,
+                            data,
+                            trace_timeline_index,
+                        )
+                        is_handoff_tool_result = OpenAgentConversationService._is_human_handoff_tool_event(
+                            data,
+                            pending_tool_calls,
+                        )
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=tool_result tool_call_id=%s tool_name=%s is_handoff=%s "
+                            "timeline_index=%s tool_blocks=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            OpenAgentConversationService._extract_tool_call_id(data) or "-",
+                            OpenAgentConversationService._tool_event_name_for_log(
+                                data,
+                                pending_tool_calls,
+                            ),
+                            is_handoff_tool_result,
+                            trace_timeline_index,
+                            OpenAgentConversationService._tool_block_log_summary(tool_blocks),
+                        )
+                        if is_handoff_tool_result:
+                            async with AsyncSessionLocal() as db:
+                                fresh = await ConversationRepository.get_by_id(db, conversation.id)
+                                if fresh is not None:
+                                    saved = await OpenAgentConversationService._handle_human_handoff_tool_result(
+                                        db,
+                                        fresh,
+                                        data,
+                                        pending_tool_calls,
+                                        processed_handoff_tool_call_ids,
+                                        handoff_behavior=config.open_agent_handoff_behavior,
+                                    )
+                                    conversation = await ConversationRepository.get_by_id(db, conversation.id) or fresh
+                                    if saved:
+                                        if saved.get("event") != "open_desk_handoff_updated":
+                                            handoff_triggered_this_round = True
+                                        local_events.extend(
+                                            await OpenAgentConversationService._collect_handoff_saved_events(
+                                                db,
+                                                redis,
+                                                conversation,
+                                                visitor_context,
+                                                saved,
+                                            ),
+                                        )
+                                else:
+                                    saved = None
+                            logger.info(
+                                "open_agent_handoff_tool_result_processed tenant_id=%s "
+                                "conversation_id=%s conversation_public_id=%s request_id=%s "
+                                "client_message_id=%s tool_call_id=%s saved=%s saved_event=%s",
+                                conversation.tenant_id,
+                                conversation.id,
+                                conversation.public_id,
+                                request_id,
+                                client_message_id,
+                                OpenAgentConversationService._extract_tool_call_id(data) or "-",
+                                bool(saved),
+                                saved.get("event") if saved else "-",
+                            )
+                    elif event == "assistant_reset":
+                        accumulated_content = ""
+                        text_blocks = []
+                        thinking_blocks = []
+                        tool_blocks = []
+                        trace_timeline_index = 0
+                        current_llm_step_id = None
+                        pending_tool_calls = {}
+                        processed_handoff_tool_call_ids = set()
+                        processed_required_handoff_tool_call_ids = set()
+                        handoff_triggered_this_round = False
+                        logger.info(
+                            "open_agent_tool_trace tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "event=assistant_reset",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                        )
+                    elif event == "done":
+                        action = OpenAgentConversationService._extract_required_tool_result_action(data)
+                        action_tool_call_id = (
+                            OpenAgentConversationService._extract_tool_call_id(action)
+                            if action
+                            else ""
+                        )
+                        if action and action_tool_call_id not in processed_required_handoff_tool_call_ids:
+                            processed_required_handoff_tool_call_ids.add(action_tool_call_id)
+                            tool_result_request: dict[str, Any] | None = None
+                            async with AsyncSessionLocal() as db:
+                                fresh = await ConversationRepository.get_by_id(db, conversation.id)
+                                if fresh is not None:
+                                    conversation, action_events, action_triggered, tool_result_request = (
+                                        await OpenAgentConversationService._handle_required_handoff_action_route(
+                                            db,
+                                            redis,
+                                            fresh,
+                                            visitor_context,
+                                            config,
+                                            action,
+                                            pending_tool_calls,
+                                        )
+                                    )
+                                else:
+                                    action_events = []
+                                    action_triggered = False
+                            action_events.extend(
+                                await submit_deferred_handoff_tool_result(tool_result_request)
+                            )
+                            if action_triggered:
+                                handoff_triggered_this_round = True
+                            local_events.extend(action_events)
+                            logger.info(
+                                "open_agent_handoff_action_processed tenant_id=%s conversation_id=%s "
+                                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                                "tool_call_id=%s handoff_triggered=%s emitted_events=%s source=done",
+                                conversation.tenant_id,
+                                conversation.id,
+                                conversation.public_id,
+                                request_id,
+                                client_message_id,
+                                action_tool_call_id or "-",
+                                action_triggered,
+                                len(action_events),
+                            )
+                        final_content = OpenAgentConversationService._extract_final_content(data, accumulated_content)
+                        text_blocks, trace_timeline_index = (
+                            OpenAgentConversationService._append_final_text_if_needed(
+                                text_blocks,
+                                final_content,
+                                trace_timeline_index,
+                            )
+                        )
+                        finished_text_blocks = OpenAgentConversationService._finish_text_blocks(text_blocks)
+                        finished_thinking_blocks = OpenAgentConversationService._finish_thinking_blocks(
+                            thinking_blocks,
+                            current_llm_step_id,
+                        )
+                        raw_finished_tool_blocks = OpenAgentConversationService._finish_tool_blocks(tool_blocks)
+                        finished_tool_blocks = raw_finished_tool_blocks
+                        handoff_tool_call_ids = (
+                            processed_handoff_tool_call_ids
+                            | processed_required_handoff_tool_call_ids
+                        )
+                        if processed_required_handoff_tool_call_ids:
+                            finished_tool_blocks = OpenAgentConversationService._non_handoff_tool_blocks(
+                                finished_tool_blocks,
+                                processed_required_handoff_tool_call_ids,
+                            )
+                        if handoff_triggered_this_round:
+                            finished_tool_blocks = OpenAgentConversationService._mark_handoff_tool_blocks(
+                                finished_tool_blocks,
+                                handoff_tool_call_ids,
+                            )
+                        logger.info(
+                            "open_agent_stream_done tenant_id=%s conversation_id=%s "
+                            "conversation_public_id=%s request_id=%s client_message_id=%s "
+                            "final_content_len=%s text_blocks=%s thinking_blocks=%s "
+                            "raw_tool_blocks=%s saved_tool_blocks=%s required_handoff_count=%s "
+                            "handoff_triggered=%s raw_tool_summary=%s saved_tool_summary=%s",
+                            conversation.tenant_id,
+                            conversation.id,
+                            conversation.public_id,
+                            request_id,
+                            client_message_id,
+                            len(final_content),
+                            len(finished_text_blocks),
+                            len(finished_thinking_blocks),
+                            len(raw_finished_tool_blocks),
+                            len(finished_tool_blocks),
+                            len(processed_required_handoff_tool_call_ids),
+                            handoff_triggered_this_round,
+                            OpenAgentConversationService._tool_block_log_summary(raw_finished_tool_blocks),
+                            OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+                        )
+                        async with AsyncSessionLocal() as db:
+                            fresh = await ConversationRepository.get_by_id(db, conversation.id)
+                            if (
+                                fresh is not None
+                                and (
+                                    final_content.strip()
+                                    or finished_text_blocks
+                                    or finished_thinking_blocks
+                                    or finished_tool_blocks
+                                )
+                            ):
+                                metadata = {
+                                    "open_agent_request_id": request_id,
+                                    "client_message_id": client_message_id,
+                                    "open_agent_conversation_id": fresh.open_agent_conversation_id,
+                                    "open_agent_last_event_id": last_event_id,
+                                    "open_agent_agent_id": config.open_agent_agent_id,
+                                    "open_agent_agent_name": config.open_agent_agent_name or fresh.open_agent_agent_name,
+                                }
+                                feedback_step_id = OpenAgentConversationService._extract_feedback_step_id(data)
+                                if feedback_step_id is not None:
+                                    metadata["open_agent_feedback_step_id"] = feedback_step_id
+                                if handoff_triggered_this_round:
+                                    metadata["bot_message_used_for_handoff"] = True
+                                if finished_text_blocks:
+                                    metadata["open_agent_text_blocks"] = finished_text_blocks
+                                if finished_thinking_blocks:
+                                    metadata["open_agent_thinking_blocks"] = finished_thinking_blocks
+                                if finished_tool_blocks:
+                                    metadata["open_agent_tool_blocks"] = finished_tool_blocks
+                                saved_content = (
+                                    OpenAgentConversationService._text_blocks_content(finished_text_blocks)
+                                    or final_content
+                                )
+                                saved = await OpenAgentConversationService._save_bot_message(
+                                    db,
+                                    fresh,
+                                    saved_content,
+                                    metadata,
+                                )
+                                final_saved = True
+                                conversation = await ConversationRepository.get_by_id(db, conversation.id) or fresh
+                                logger.info(
+                                    "open_agent_bot_message_saved tenant_id=%s conversation_id=%s "
+                                    "conversation_public_id=%s request_id=%s client_message_id=%s "
+                                    "message_id=%s bot_message_used_for_handoff=%s saved_tool_blocks=%s "
+                                    "saved_tool_summary=%s",
+                                    conversation.tenant_id,
+                                    conversation.id,
+                                    conversation.public_id,
+                                    request_id,
+                                    client_message_id,
+                                    saved.get("id"),
+                                    handoff_triggered_this_round,
+                                    len(finished_tool_blocks),
+                                    OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+                                )
+                                local_events.append(
+                                    OpenAgentConversationService._sse_event("open_desk_message_saved", saved)
+                                )
+                            if fresh is not None:
+                                conversation = await ConversationRepository.update_open_agent_state(db, fresh, {
+                                    "open_agent_last_event_id": last_event_id,
+                                })
+                yield chunk
+                for local_event in local_events:
+                    yield local_event
+        except OpenAgentClientError as exc:
+            yield OpenAgentConversationService._sse_event("error", {"message": str(exc)})
+            return
+
+        if not final_saved:
+            finished_text_blocks = OpenAgentConversationService._finish_text_blocks(text_blocks)
+            finished_thinking_blocks = OpenAgentConversationService._finish_thinking_blocks(
+                thinking_blocks,
+                current_llm_step_id,
+            )
+            raw_finished_tool_blocks = OpenAgentConversationService._finish_tool_blocks(tool_blocks)
+            finished_tool_blocks = raw_finished_tool_blocks
+            handoff_tool_call_ids = (
+                processed_handoff_tool_call_ids
+                | processed_required_handoff_tool_call_ids
+            )
+            if processed_required_handoff_tool_call_ids:
+                finished_tool_blocks = OpenAgentConversationService._non_handoff_tool_blocks(
+                    finished_tool_blocks,
+                    processed_required_handoff_tool_call_ids,
+                )
+            if handoff_triggered_this_round:
+                finished_tool_blocks = OpenAgentConversationService._mark_handoff_tool_blocks(
+                    finished_tool_blocks,
+                    handoff_tool_call_ids,
+                )
+            logger.info(
+                "open_agent_stream_finalize tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                "accumulated_content_len=%s text_blocks=%s thinking_blocks=%s "
+                "raw_tool_blocks=%s saved_tool_blocks=%s required_handoff_count=%s "
+                "handoff_triggered=%s raw_tool_summary=%s saved_tool_summary=%s",
+                conversation.tenant_id,
+                conversation.id,
+                conversation.public_id,
+                request_id,
+                client_message_id,
+                len(accumulated_content),
+                len(finished_text_blocks),
+                len(finished_thinking_blocks),
+                len(raw_finished_tool_blocks),
+                len(finished_tool_blocks),
+                len(processed_required_handoff_tool_call_ids),
+                handoff_triggered_this_round,
+                OpenAgentConversationService._tool_block_log_summary(raw_finished_tool_blocks),
+                OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+            )
+        if (
+            not final_saved
+            and (
+                accumulated_content.strip()
+                or finished_text_blocks
+                or finished_thinking_blocks
+                or finished_tool_blocks
+            )
+        ):
+            async with AsyncSessionLocal() as db:
+                fresh = await ConversationRepository.get_by_id(db, conversation.id)
+                if fresh is None:
+                    return
+                metadata = {
+                    "open_agent_request_id": request_id,
+                    "client_message_id": client_message_id,
+                    "open_agent_last_event_id": last_event_id,
+                    "open_agent_agent_id": config.open_agent_agent_id,
+                    "open_agent_agent_name": config.open_agent_agent_name or fresh.open_agent_agent_name,
+                }
+                if handoff_triggered_this_round:
+                    metadata["bot_message_used_for_handoff"] = True
+                if finished_text_blocks:
+                    metadata["open_agent_text_blocks"] = finished_text_blocks
+                if finished_thinking_blocks:
+                    metadata["open_agent_thinking_blocks"] = finished_thinking_blocks
+                if finished_tool_blocks:
+                    metadata["open_agent_tool_blocks"] = finished_tool_blocks
+                saved_content = (
+                    OpenAgentConversationService._text_blocks_content(finished_text_blocks)
+                    or accumulated_content
+                )
+                saved = await OpenAgentConversationService._save_bot_message(
+                    db,
+                    fresh,
+                    saved_content,
+                    metadata,
+                )
+                logger.info(
+                    "open_agent_bot_message_saved tenant_id=%s conversation_id=%s "
+                    "conversation_public_id=%s request_id=%s client_message_id=%s "
+                    "message_id=%s bot_message_used_for_handoff=%s saved_tool_blocks=%s "
+                    "saved_tool_summary=%s source=finalize",
+                    conversation.tenant_id,
+                    conversation.id,
+                    conversation.public_id,
+                    request_id,
+                    client_message_id,
+                    saved.get("id"),
+                    handoff_triggered_this_round,
+                    len(finished_tool_blocks),
+                    OpenAgentConversationService._tool_block_log_summary(finished_tool_blocks),
+                )
+                yield OpenAgentConversationService._sse_event("open_desk_message_saved", saved)

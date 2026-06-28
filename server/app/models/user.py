@@ -18,6 +18,8 @@ class User(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
         UniqueConstraint("tenant_id", "external_id", name="uq_users_tenant_external"),
         UniqueConstraint("public_id", name="uq_users_public_id"),
         Index("ix_users_tenant_id", "tenant_id"),
+        Index("ix_users_agent", "agent_id"),
+        Index("ix_users_assignee_group", "assignee_group_id"),
     )
 
     # ── Core identity ──
@@ -36,10 +38,13 @@ class User(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
     address: Mapped[str | None] = mapped_column(String(256), nullable=True)
     remark: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     web_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    blacklist: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # ── Associations & meta ──
     avatar_color: Mapped[str | None] = mapped_column(String(16), nullable=True)
     channel_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("channels.id", ondelete="SET NULL"), nullable=True)
+    agent_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
+    assignee_group_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employee_groups.id", ondelete="SET NULL"), nullable=True)
     organization_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True
     )

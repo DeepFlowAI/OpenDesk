@@ -6,7 +6,6 @@ import { DateToolbar } from '@/app/components/features/session-reports/date-tool
 import { SessionReportExportButton } from '@/app/components/features/session-reports/export-button'
 import { EmployeesTable } from '@/app/components/features/session-reports/employees-table'
 import { ReportTabs } from '@/app/components/features/session-reports/report-tabs'
-import { useSessionReportsEmployees } from '@/service/use-session-reports'
 import type { EmployeeSortField, SortOrder } from '@/models/session-report'
 
 function todayIsoDate(): string {
@@ -26,12 +25,15 @@ export default function SessionReportsEmployeesPage() {
     sort: EmployeeSortField
     order: SortOrder
     loading: boolean
+    asOf: string | null
   }>({
     q: '',
     sort: 'session_count',
     order: 'desc',
     loading: false,
+    asOf: null,
   })
+  const [refreshToken, setRefreshToken] = useState(0)
 
   const today = todayIsoDate()
   const start = searchParams.get('start') || today
@@ -47,9 +49,6 @@ export default function SessionReportsEmployeesPage() {
     [router, searchParams]
   )
 
-  // Use the list query just to surface as_of in the toolbar.
-  const { data, refetch, isFetching } = useSessionReportsEmployees({ start, end })
-
   const carriedSearch = useMemo(() => searchParams.toString(), [searchParams])
 
   return (
@@ -59,8 +58,8 @@ export default function SessionReportsEmployeesPage() {
         <DateToolbar
           start={start}
           end={end}
-          asOf={data?.as_of ?? null}
-          loading={isFetching}
+          asOf={exportState.asOf}
+          loading={exportState.loading}
           exportAction={
             <SessionReportExportButton
               params={{
@@ -71,17 +70,18 @@ export default function SessionReportsEmployeesPage() {
                 sort: exportState.sort,
                 order: exportState.order,
               }}
-              disabled={!dateRangeValid || isFetching || exportState.loading}
+              disabled={!dateRangeValid || exportState.loading}
             />
           }
           onChange={(r) => updateParams(r)}
-          onRefresh={() => refetch()}
+          onRefresh={() => setRefreshToken((v) => v + 1)}
           onValidityChange={setDateRangeValid}
         />
         <EmployeesTable
           start={start}
           end={end}
           carriedSearch={carriedSearch}
+          refreshToken={refreshToken}
           onExportStateChange={setExportState}
         />
       </div>

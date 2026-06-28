@@ -12,12 +12,14 @@ import {
   IconTicket,
 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/context/auth-store'
 import { useUserChanges } from '@/service/use-users'
 import { useSessionRecords } from '@/service/use-session-records'
 import { useUserRelatedTickets } from '@/service/use-tickets'
 import { useCallRecords } from '@/service/use-call-center'
 import { useEmployee } from '@/service/use-employees'
 import { useEmployeeGroup } from '@/service/use-employee-groups'
+import { hasPermission } from '@/utils/permissions'
 import type { UnifiedField } from '@/models/field-definition'
 import type { EntityChange } from '@/models/entity-change'
 import type { SessionRecord } from '@/models/session-record'
@@ -58,11 +60,16 @@ export function UserRelatedTimeline({
   const [timelineTab, setTimelineTab] = useState<TimelineTab>('all')
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null)
   const [selectedCallId, setSelectedCallId] = useState<number | null>(null)
+  const currentUser = useAuthStore((state) => state.user)
+  const canViewCallRecords = hasPermission(currentUser, 'call.record.view')
 
   const changesQuery = useUserChanges(userId, { page: 1, per_page: 50 }, timelineTab === 'all')
   const sessionsQuery = useSessionRecords({ visitor_id: userId, page: 1, per_page: 50 })
   const ticketsQuery = useUserRelatedTickets(userId)
-  const callsQuery = useCallRecords({ user_id: userId, page: 1, per_page: 50 })
+  const callsQuery = useCallRecords(
+    { user_id: userId, page: 1, per_page: 50 },
+    { enabled: canViewCallRecords },
+  )
 
   const relatedEvents = useMemo<TimelineEvent[]>(() => {
     const tickets = (ticketsQuery.data?.items ?? []).map<TimelineEvent>((ticket) => ({
@@ -77,15 +84,17 @@ export function UserRelatedTimeline({
       time: session.started_at ?? session.created_at,
       session,
     }))
-    const calls = (callsQuery.data?.items ?? []).map<TimelineEvent>((call) => ({
-      type: 'call',
-      key: `call-${call.id}`,
-      time: call.started_at,
-      call,
-    }))
+    const calls = canViewCallRecords
+      ? (callsQuery.data?.items ?? []).map<TimelineEvent>((call) => ({
+          type: 'call',
+          key: `call-${call.id}`,
+          time: call.started_at,
+          call,
+        }))
+      : []
 
     return sortTimelineEvents([...tickets, ...sessions, ...calls])
-  }, [callsQuery.data?.items, sessionsQuery.data?.items, ticketsQuery.data?.items])
+  }, [callsQuery.data?.items, canViewCallRecords, sessionsQuery.data?.items, ticketsQuery.data?.items])
 
   const allEvents = useMemo<TimelineEvent[]>(() => {
     const changes = (changesQuery.data?.items ?? []).map<TimelineEvent>((change) => ({
@@ -102,18 +111,21 @@ export function UserRelatedTimeline({
   const isLoading =
     sessionsQuery.isLoading ||
     ticketsQuery.isLoading ||
-    callsQuery.isLoading ||
+    (canViewCallRecords && callsQuery.isLoading) ||
     (timelineTab === 'all' && changesQuery.isLoading)
   const isError =
     sessionsQuery.isError ||
     ticketsQuery.isError ||
-    callsQuery.isError ||
+    (canViewCallRecords && callsQuery.isError) ||
     (timelineTab === 'all' && changesQuery.isError)
+  const emptyRelatedText = canViewCallRecords
+    ? isZh ? '暂无会话、工单与通话记录' : 'No sessions, tickets, or calls yet'
+    : isZh ? '暂无会话与工单记录' : 'No sessions or tickets yet'
 
   const retry = () => {
     void sessionsQuery.refetch()
     void ticketsQuery.refetch()
-    void callsQuery.refetch()
+    if (canViewCallRecords) void callsQuery.refetch()
     if (timelineTab === 'all') void changesQuery.refetch()
   }
 
@@ -152,7 +164,7 @@ export function UserRelatedTimeline({
             icon={timelineTab === 'related' ? <IconTicket size={32} strokeWidth={1.5} /> : undefined}
             text={
               timelineTab === 'related'
-                ? isZh ? '暂无会话、工单与通话记录' : 'No sessions, tickets, or calls yet'
+                ? emptyRelatedText
                 : isZh ? '暂无动态' : 'No activity yet'
             }
           />
@@ -186,7 +198,7 @@ export function UserRelatedTimeline({
           onClose={() => setSelectedSessionId(null)}
         />
       ) : null}
-      {selectedCallId != null ? (
+      {canViewCallRecords && selectedCallId != null ? (
         <CallRecordDetailDrawer
           recordId={selectedCallId}
           onClose={() => setSelectedCallId(null)}

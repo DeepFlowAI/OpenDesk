@@ -9,7 +9,7 @@ import { OverviewCards } from '@/app/components/features/session-reports/overvie
 import { ReportTabs } from '@/app/components/features/session-reports/report-tabs'
 import { TrendChartCard } from '@/app/components/features/session-reports/trend-chart'
 import { useLocaleStore } from '@/context/locale-store'
-import { useSessionReportsEmployees, useSessionReportsOverview } from '@/service/use-session-reports'
+import { useSessionReportEmployeeDetail, useSessionReportEmployeeTrend } from '@/service/use-session-reports'
 import { t } from '@/utils/i18n'
 import type { TrendType } from '@/models/session-report'
 
@@ -30,19 +30,13 @@ export default function EmployeeDetailPage() {
   const searchParams = useSearchParams()
   const { locale } = useLocaleStore()
   const [dateRangeValid, setDateRangeValid] = useState(true)
-  const [trendLoading, setTrendLoading] = useState(false)
 
   const today = todayIsoDate()
   const start = searchParams.get('start') || today
   const end = searchParams.get('end') || today
   const trendParam = searchParams.get('trend')
   const trend: TrendType = (VALID_TRENDS.includes(trendParam as TrendType) ? trendParam : 'hour') as TrendType
-
-  // Look up the employee from the list query — saves an extra round-trip and
-  // matches the data we already cache. Falls back to a brief stub if the
-  // employee isn't found (out-of-range page, deleted, etc.).
-  const { data: employeesData } = useSessionReportsEmployees({ start, end, per_page: 100 })
-  const employee = employeesData?.items.find((row) => row.employee.id === employeeId)?.employee
+  const validEmployeeId = Number.isFinite(employeeId)
 
   const updateParams = useCallback(
     (next: { start?: string; end?: string; trend?: TrendType }) => {
@@ -55,17 +49,46 @@ export default function EmployeeDetailPage() {
     [router, searchParams, employeeId]
   )
 
-  const { data: overview, refetch, isFetching } = useSessionReportsOverview({
-    start, end, employee_id: employeeId,
+  const detailQuery = useSessionReportEmployeeDetail({
+    start,
+    end,
+    employee_id: employeeId,
+    enabled: validEmployeeId && dateRangeValid,
   })
+  const trendQuery = useSessionReportEmployeeTrend({
+    start,
+    end,
+    trend,
+    employee_id: employeeId,
+    enabled: validEmployeeId && dateRangeValid && !!detailQuery.data,
+  })
+  const detail = detailQuery.data
+  const employee = detail?.employee
 
   const carriedSearch = useMemo(() => searchParams.toString(), [searchParams])
+  const loading = detailQuery.isFetching || trendQuery.isFetching
+  const inaccessible = !validEmployeeId || detailQuery.isError
 
-  if (!Number.isFinite(employeeId)) {
+  const handleRefresh = () => {
+    if (!validEmployeeId) return
+    detailQuery.refetch()
+    if (detailQuery.data) trendQuery.refetch()
+  }
+
+  if (inaccessible) {
     return (
       <div className="flex h-full flex-col overflow-auto">
         <div className="flex flex-col gap-5 p-6">
           <ReportTabs active="employees" search={carriedSearch} />
+          <DateToolbar
+            start={start}
+            end={end}
+            asOf={null}
+            loading={loading}
+            onChange={(r) => updateParams(r)}
+            onRefresh={handleRefresh}
+            onValidityChange={setDateRangeValid}
+          />
           <div className="text-sm text-muted-foreground">
             {t('ws.records.sessionReports.employees.notFound', locale)}
           </div>
@@ -81,16 +104,16 @@ export default function EmployeeDetailPage() {
         <DateToolbar
           start={start}
           end={end}
-          asOf={overview?.as_of ?? null}
-          loading={isFetching}
+          asOf={detail?.as_of ?? null}
+          loading={loading}
           exportAction={
             <SessionReportExportButton
               params={{ scope: 'employee', start, end, trend, employee_id: employeeId }}
-              disabled={!dateRangeValid || isFetching || trendLoading || !employee}
+              disabled={!dateRangeValid || loading || !employee}
             />
           }
           onChange={(r) => updateParams(r)}
-          onRefresh={() => refetch()}
+          onRefresh={handleRefresh}
           onValidityChange={setDateRangeValid}
         />
         {employee ? (
@@ -100,14 +123,23 @@ export default function EmployeeDetailPage() {
             {t('ws.records.sessionReports.common.loading', locale)}
           </div>
         )}
-        <OverviewCards start={start} end={end} employeeId={employeeId} />
+        <OverviewCards
+          start={start}
+          end={end}
+          employeeId={employeeId}
+          data={detail?.metrics}
+          loading={detailQuery.isLoading}
+          fetch={false}
+        />
         <TrendChartCard
           start={start}
           end={end}
           trend={trend}
           onTrendChange={(t) => updateParams({ trend: t })}
           employeeId={employeeId}
-          onLoadingChange={setTrendLoading}
+          data={trendQuery.data}
+          loading={trendQuery.isLoading}
+          fetch={false}
         />
       </div>
     </div>

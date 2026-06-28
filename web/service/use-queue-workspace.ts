@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { get, post } from './base'
 import type {
+  QueueAssignAndSendResponse,
   QueueAssignableAgentListResponse,
   QueueAssignmentWorkspaceResponse,
   QueueWorkspaceCountResponse,
@@ -95,6 +96,22 @@ export const useAssignQueueTaskToSelf = () => {
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: queueWorkspaceKeys.lists() })
+      qc.invalidateQueries({ queryKey: conversationKeys.lists() })
+      qc.invalidateQueries({ queryKey: agentKeys.stats })
+    },
+  })
+}
+
+export const useAssignAndSendQueueTaskToSelf = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, content }: { taskId: number; content: string }) =>
+      post<QueueAssignAndSendResponse>(`v1/workspace/queue/tasks/${taskId}/assign-self/send`, {
+        json: { content },
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queueWorkspaceKeys.lists() })
+      qc.invalidateQueries({ queryKey: queueWorkspaceKeys.counts() })
       qc.invalidateQueries({ queryKey: conversationKeys.lists() })
       qc.invalidateQueries({ queryKey: agentKeys.stats })
     },

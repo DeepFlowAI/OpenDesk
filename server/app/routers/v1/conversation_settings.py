@@ -14,6 +14,19 @@ from app.schemas.conversation_user_statistics import (
     ConversationUserStatFieldSettingsPayload,
     ConversationUserStatFieldSettingsResponse,
 )
+from app.schemas.conversation_read_status import (
+    ConversationReadStatusPayload,
+    ConversationReadStatusResponse,
+    ConversationReadStatusTargetResponse,
+)
+from app.schemas.conversation_announcement_rule import (
+    ConversationAnnouncementRuleCreate,
+    ConversationAnnouncementRuleEnabledPatch,
+    ConversationAnnouncementRuleListResponse,
+    ConversationAnnouncementRuleReorder,
+    ConversationAnnouncementRuleResponse,
+    ConversationAnnouncementRuleUpdate,
+)
 from app.schemas.visitor_timeout_close import (
     VisitorTimeoutClosePayload,
     VisitorTimeoutCloseResponse,
@@ -35,6 +48,8 @@ from app.schemas.satisfaction_survey_config import (
 )
 from app.services.satisfaction_survey_config_service import SatisfactionSurveyConfigService
 from app.services.emoji_setting_service import EmojiSettingService
+from app.services.conversation_announcement_rule_service import ConversationAnnouncementRuleService
+from app.services.conversation_read_status_service import ConversationReadStatusService
 from app.services.conversation_user_stat_service import ConversationUserStatService
 from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 from app.services.welcome_message_rule_service import WelcomeMessageRuleService
@@ -43,6 +58,8 @@ router = APIRouter(prefix="/conversation-settings", tags=["ConversationSettings"
 EMOJI_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 USER_STAT_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 VISITOR_TIMEOUT_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
+ANNOUNCEMENT_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
+READ_STATUS_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 
 
 @router.get(
@@ -110,6 +127,46 @@ async def save_user_stat_field_settings(
 ):
     """Save workspace user statistic display settings."""
     return await ConversationUserStatService.save_settings(db, current_user["tenant_id"], current_user, body)
+
+
+@router.get(
+    "/read-status",
+    response_model=ConversationReadStatusResponse,
+    dependencies=[Depends(require_all_permissions(READ_STATUS_ADMIN_PERMISSIONS))],
+)
+async def get_read_status_settings(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get read-status display settings."""
+    return await ConversationReadStatusService.get_current(db, current_user["tenant_id"])
+
+
+@router.put(
+    "/read-status",
+    response_model=ConversationReadStatusResponse,
+    dependencies=[Depends(require_all_permissions(READ_STATUS_ADMIN_PERMISSIONS))],
+)
+async def save_read_status_settings(
+    body: ConversationReadStatusPayload,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save read-status display settings."""
+    return await ConversationReadStatusService.save(db, current_user["tenant_id"], current_user, body)
+
+
+@router.get(
+    "/read-status/agent",
+    response_model=ConversationReadStatusTargetResponse,
+    dependencies=[Depends(require_permission("chat.workspace.use"))],
+)
+async def get_agent_read_status_settings(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get agent workspace read-status display settings."""
+    return await ConversationReadStatusService.get_target(db, current_user["tenant_id"], "agent_workspace")
 
 
 @router.get(
@@ -270,4 +327,108 @@ async def delete_welcome_message_rule(
 ):
     """Delete a welcome message rule."""
     await WelcomeMessageRuleService.delete(db, rule_id, current_user["tenant_id"])
+    return {"message": "Deleted successfully"}
+
+
+@router.put(
+    "/announcements/reorder",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(require_all_permissions(ANNOUNCEMENT_ADMIN_PERMISSIONS))],
+)
+async def reorder_conversation_announcements(
+    body: ConversationAnnouncementRuleReorder,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reorder announcement rules by drag-and-drop."""
+    await ConversationAnnouncementRuleService.reorder(db, current_user["tenant_id"], body.ordered_ids)
+    return {"message": "Reordered successfully"}
+
+
+@router.get(
+    "/announcements",
+    response_model=ConversationAnnouncementRuleListResponse,
+    dependencies=[Depends(require_all_permissions(ANNOUNCEMENT_ADMIN_PERMISSIONS))],
+)
+async def list_conversation_announcements(
+    page: int = 1,
+    per_page: int = 50,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List announcement rules ordered by priority."""
+    return await ConversationAnnouncementRuleService.get_paginated(db, current_user["tenant_id"], page, per_page)
+
+
+@router.post(
+    "/announcements",
+    response_model=ConversationAnnouncementRuleResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_all_permissions(ANNOUNCEMENT_ADMIN_PERMISSIONS))],
+)
+async def create_conversation_announcement(
+    body: ConversationAnnouncementRuleCreate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new announcement rule."""
+    return await ConversationAnnouncementRuleService.create(db, current_user["tenant_id"], body)
+
+
+@router.get(
+    "/announcements/{rule_id}",
+    response_model=ConversationAnnouncementRuleResponse,
+    dependencies=[Depends(require_all_permissions(ANNOUNCEMENT_ADMIN_PERMISSIONS))],
+)
+async def get_conversation_announcement(
+    rule_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get an announcement rule by ID."""
+    return await ConversationAnnouncementRuleService.get_by_id(db, rule_id, current_user["tenant_id"])
+
+
+@router.put(
+    "/announcements/{rule_id}",
+    response_model=ConversationAnnouncementRuleResponse,
+    dependencies=[Depends(require_all_permissions(ANNOUNCEMENT_ADMIN_PERMISSIONS))],
+)
+async def update_conversation_announcement(
+    rule_id: int,
+    body: ConversationAnnouncementRuleUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update an announcement rule."""
+    return await ConversationAnnouncementRuleService.update(db, rule_id, current_user["tenant_id"], body)
+
+
+@router.patch(
+    "/announcements/{rule_id}",
+    response_model=ConversationAnnouncementRuleResponse,
+    dependencies=[Depends(require_all_permissions(ANNOUNCEMENT_ADMIN_PERMISSIONS))],
+)
+async def patch_conversation_announcement_enabled(
+    rule_id: int,
+    body: ConversationAnnouncementRuleEnabledPatch,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Toggle announcement rule enabled/disabled."""
+    return await ConversationAnnouncementRuleService.patch_enabled(db, rule_id, current_user["tenant_id"], body.enabled)
+
+
+@router.delete(
+    "/announcements/{rule_id}",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(require_all_permissions(ANNOUNCEMENT_ADMIN_PERMISSIONS))],
+)
+async def delete_conversation_announcement(
+    rule_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an announcement rule."""
+    await ConversationAnnouncementRuleService.delete(db, rule_id, current_user["tenant_id"])
     return {"message": "Deleted successfully"}

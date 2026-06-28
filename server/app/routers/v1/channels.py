@@ -47,6 +47,17 @@ async def get_channel(
     return await ChannelService.get_by_id(db, channel_id, tenant_id)
 
 
+@router.post("/{channel_id}/copy", response_model=ChannelResponse, status_code=status.HTTP_201_CREATED)
+async def copy_channel(
+    channel_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Copy a channel configuration into a new channel."""
+    tenant_id = current_user["tenant_id"]
+    return await ChannelService.copy(db, channel_id, tenant_id)
+
+
 @router.put("/{channel_id}", response_model=ChannelResponse)
 async def update_channel(
     channel_id: int,

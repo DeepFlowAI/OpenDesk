@@ -40,6 +40,7 @@ export type OpenAgentToolCallPayload = Record<string, unknown> & {
   name?: string
   brief?: string
   tool_call_id?: string
+  call_id?: string
   id?: string
   arguments?: unknown
   args?: unknown
@@ -47,6 +48,7 @@ export type OpenAgentToolCallPayload = Record<string, unknown> & {
 
 export type OpenAgentToolResultPayload = Record<string, unknown> & {
   tool_call_id?: string
+  call_id?: string
   id?: string
   result?: unknown
   tool_name?: string
@@ -95,6 +97,7 @@ type StreamOpenAgentConversationParams = {
   conversationPublicId: string
   visitorSessionToken: string
   message: string
+  quotedMessageId?: number
   clientMessageId?: string
   requestId?: string
   lastEventId?: string | null
@@ -102,6 +105,23 @@ type StreamOpenAgentConversationParams = {
   signal?: AbortSignal
   retry?: RetryOptions
   handlers?: OpenAgentSseHandlers
+}
+
+export type SubmitOpenAgentFeedbackParams = {
+  conversationPublicId: string
+  visitorSessionToken: string
+  messageId: number
+  stepId: number
+  rating: 'like' | 'dislike'
+  comment?: string | null
+}
+
+export type SubmitOpenAgentFeedbackResponse = {
+  message: Message
+  step_id: number
+  rating: 'like' | 'dislike'
+  comment?: string | null
+  updated_at?: string | null
 }
 
 export type OpenAgentStreamSnapshot = {
@@ -116,6 +136,46 @@ export type OpenAgentStreamController = AbortController & {
   clientMessageId: string
   getSnapshot: () => OpenAgentStreamSnapshot
   detach: () => OpenAgentStreamSnapshot
+}
+
+export async function submitOpenAgentFeedback({
+  conversationPublicId,
+  visitorSessionToken,
+  messageId,
+  stepId,
+  rating,
+  comment,
+}: SubmitOpenAgentFeedbackParams): Promise<SubmitOpenAgentFeedbackResponse> {
+  const response = await fetch(
+    `${API_BASE}/v1/public/conversations/${conversationPublicId}/open-agent/feedback`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${visitorSessionToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message_id: messageId,
+        step_id: stepId,
+        rating,
+        comment: rating === 'dislike' ? comment ?? null : null,
+      }),
+    },
+  )
+
+  if (!response.ok) {
+    let message = 'OpenAgent feedback failed'
+    try {
+      const payload = await response.json() as { detail?: unknown; message?: unknown }
+      if (typeof payload.detail === 'string') message = payload.detail
+      else if (typeof payload.message === 'string') message = payload.message
+    } catch {
+      // Keep the generic error when the server response is not JSON.
+    }
+    throw new Error(message)
+  }
+
+  return await response.json() as SubmitOpenAgentFeedbackResponse
 }
 
 type RetryState = {
@@ -632,6 +692,7 @@ export function streamOpenAgentConversation({
   conversationPublicId,
   visitorSessionToken,
   message,
+  quotedMessageId,
   clientMessageId,
   requestId,
   lastEventId,
@@ -667,6 +728,7 @@ export function streamOpenAgentConversation({
   const buildInit = (): RequestInit => {
     const body: Record<string, unknown> = {
       message,
+      ...(quotedMessageId ? { quoted_message_id: quotedMessageId } : {}),
       request_id: state.requestId,
       client_message_id: state.clientMessageId,
       resume: state.resume || state.isRetry,

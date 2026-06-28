@@ -7,7 +7,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.schemas.open_agent_settings import OpenAgentWelcomeMessage
+from app.schemas.open_agent_settings import OpenAgentAIDisclaimer, OpenAgentWelcomeMessage
+from app.schemas.conversation_announcement_rule import ConversationAnnouncementPublic
+from app.schemas.conversation_read_status import ConversationReadStatusPublicResponse
 from app.schemas.welcome_message_rule import WelcomeMessagePublic
 
 
@@ -15,6 +17,8 @@ DEFAULT_OFFLINE_TITLE = "当前客服不在线"
 DEFAULT_OFFLINE_MESSAGE = "您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。"
 DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY = "offline_message"
 DEFAULT_LEAVE_MESSAGE_PROMPT = "请留下您的问题和联系方式，我们上线后会尽快联系您。"
+DEFAULT_RESTRICTED_SERVICE_TITLE = "当前暂时无法提供在线咨询"
+DEFAULT_RESTRICTED_SERVICE_MESSAGE = "抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。"
 DEFAULT_QUEUE_MESSAGE = (
     "您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。"
     "客服接入后会立即回复您。"
@@ -111,6 +115,7 @@ class ChannelConfig(BaseModel):
     agent_bubble_border_color: str | None = None
     agent_bubble_radius: list[float] = [10, 10, 10, 10]
     use_agent_avatar: bool = False
+    agent_default_avatar_url: str | None = None
     user_bubble_bg_color: str | None = None
     user_bubble_text_color: str | None = None
     user_bubble_border_color: str | None = None
@@ -125,6 +130,7 @@ class ChannelConfig(BaseModel):
     offline_title: str = DEFAULT_OFFLINE_TITLE
     offline_message: str = DEFAULT_OFFLINE_MESSAGE
     leave_message_prompt: str = DEFAULT_LEAVE_MESSAGE_PROMPT
+    restricted_service_message: str = DEFAULT_RESTRICTED_SERVICE_MESSAGE
     queue_message: str = DEFAULT_QUEUE_MESSAGE
     queue_full_message: str = DEFAULT_QUEUE_FULL_MESSAGE
     queue_full_show_leave_message_button: bool = True
@@ -140,6 +146,7 @@ class ChannelConfig(BaseModel):
     open_agent_handoff_label: str = DEFAULT_OPEN_AGENT_HANDOFF_LABEL
     open_agent_handoff_after_messages: int = DEFAULT_OPEN_AGENT_HANDOFF_AFTER_MESSAGES
     open_agent_handoff_behavior: str = DEFAULT_OPEN_AGENT_HANDOFF_BEHAVIOR
+    open_agent_feedback_enabled: bool = False
     open_agent_custom_buttons_enabled: bool = False
     open_agent_custom_buttons: list[ChannelCustomButton] = Field(default_factory=list)
     human_custom_buttons_enabled: bool = False
@@ -172,9 +179,15 @@ class ChannelConfig(BaseModel):
             raise ValueError("Outside service hours strategy is invalid")
         return v
 
-    @field_validator("open_agent_agent_name", "open_agent_avatar_url", "open_agent_input_placeholder", mode="before")
+    @field_validator(
+        "agent_default_avatar_url",
+        "open_agent_agent_name",
+        "open_agent_avatar_url",
+        "open_agent_input_placeholder",
+        mode="before",
+    )
     @classmethod
-    def normalize_optional_open_agent_text(cls, v: str | None) -> str | None:
+    def normalize_optional_config_text(cls, v: str | None) -> str | None:
         if v is None:
             return None
         value = v.strip()
@@ -187,11 +200,11 @@ class ChannelConfig(BaseModel):
             raise ValueError("OpenAgent agent name must be at most 128 characters")
         return v
 
-    @field_validator("open_agent_avatar_url")
+    @field_validator("agent_default_avatar_url", "open_agent_avatar_url")
     @classmethod
-    def validate_open_agent_avatar_url(cls, v: str | None) -> str | None:
+    def validate_avatar_url(cls, v: str | None) -> str | None:
         if v and len(v) > 512:
-            raise ValueError("OpenAgent avatar URL must be at most 512 characters")
+            raise ValueError("Avatar URL must be at most 512 characters")
         return v
 
     @field_validator("open_agent_input_placeholder")
@@ -348,6 +361,22 @@ class ChannelConfig(BaseModel):
             raise ValueError("Leave message prompt must be at most 5000 characters")
         return v
 
+    @field_validator("restricted_service_message", mode="before")
+    @classmethod
+    def normalize_restricted_service_message(cls, v: str | None) -> str:
+        if v is None:
+            return DEFAULT_RESTRICTED_SERVICE_MESSAGE
+        return v
+
+    @field_validator("restricted_service_message")
+    @classmethod
+    def validate_restricted_service_message(cls, v: str) -> str:
+        if not strip_rich_text(v):
+            raise ValueError("Restricted service message is required")
+        if len(v) > 5000:
+            raise ValueError("Restricted service message must be at most 5000 characters")
+        return v
+
     @field_validator("queue_message", mode="before")
     @classmethod
     def normalize_queue_message(cls, v: str | None) -> str:
@@ -405,6 +434,8 @@ class ChannelAvailability(BaseModel):
     offline_message: str
     outside_service_hours_strategy: str = DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY
     leave_message_prompt: str = DEFAULT_LEAVE_MESSAGE_PROMPT
+    restricted_service_title: str = DEFAULT_RESTRICTED_SERVICE_TITLE
+    restricted_service_message: str = DEFAULT_RESTRICTED_SERVICE_MESSAGE
     queue_message: str = DEFAULT_QUEUE_MESSAGE
     queue_full_message: str = DEFAULT_QUEUE_FULL_MESSAGE
     queue_full_show_leave_message_button: bool = True
@@ -474,5 +505,8 @@ class ChannelPublicResponse(BaseModel):
     config: ChannelConfig = ChannelConfig()
     availability: ChannelAvailability | None = None
     has_conversation_history: bool = False
+    announcement: ConversationAnnouncementPublic | None = None
     welcome_message: WelcomeMessagePublic | None = None
     open_agent_welcome_message: OpenAgentWelcomeMessage | None = None
+    open_agent_ai_disclaimer: OpenAgentAIDisclaimer | None = None
+    read_status: ConversationReadStatusPublicResponse = Field(default_factory=ConversationReadStatusPublicResponse)

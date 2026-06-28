@@ -9,6 +9,7 @@ import { FieldValueDisplay } from '@/app/components/features/field-system/field-
 import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
+import { getLinkedSelectTypeConfig } from '@/lib/field-linked-select-config'
 import { cn } from '@/lib/utils'
 import { hasPermission } from '@/utils/permissions'
 import type { CallRecordUserBrief } from '@/models/call-center'
@@ -28,14 +29,32 @@ type Props = {
   fallbackNumber: string
 }
 
-const SYSTEM_KEY_ALIAS: Record<string, keyof User> = { nickname: 'name' }
-const EDITABLE_SYSTEM_KEYS = new Set(['name', 'email', 'phone', 'gender', 'level', 'address', 'remark', 'web_id', 'organization_id'])
+const SYSTEM_KEY_ALIAS: Record<string, keyof User> = {
+  nickname: 'name',
+  assignee: 'agent_id',
+  assignee_group: 'assignee_group_id',
+}
+const EDITABLE_SYSTEM_KEYS = new Set([
+  'name',
+  'email',
+  'phone',
+  'gender',
+  'level',
+  'address',
+  'remark',
+  'web_id',
+  'organization_id',
+  'agent_id',
+  'assignee_group_id',
+])
 const READONLY_FIELD_KEYS = new Set(['id', 'public_id', 'external_id', 'created_at', 'updated_at', 'channel_id'])
 const INSTANT_SAVE_FIELD_TYPES = new Set<FieldType>([
   FieldType.SINGLE_SELECT,
   FieldType.SINGLE_SELECT_TREE,
   FieldType.FILE,
   FieldType.ORGANIZATION_SELECT,
+  FieldType.EMPLOYEE_SELECT,
+  FieldType.GROUP_SELECT,
 ])
 
 export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
@@ -245,11 +264,14 @@ function EditableUserFields({
         const identity = getFieldIdentity(field)
         const editing = editingKey === identity
         const editable = canEdit && isFieldEditable(field)
+        const resolveFieldValue = (targetField: UnifiedField) =>
+          editingKey === getFieldIdentity(targetField) ? draftValue : getFieldRawValue(user, targetField)
         return (
           <EditableInfoRow
             key={identity}
             field={field}
             value={editing ? draftValue : getFieldRawValue(user, field)}
+            typeConfig={getLinkedSelectTypeConfig(field, fields, resolveFieldValue)}
             editing={editing}
             editable={editable}
             saving={editing && isSaving}
@@ -270,6 +292,7 @@ function EditableUserFields({
 function EditableInfoRow({
   field,
   value,
+  typeConfig,
   editing,
   editable,
   saving,
@@ -283,6 +306,7 @@ function EditableInfoRow({
 }: {
   field: UnifiedField
   value: unknown
+  typeConfig: Record<string, unknown>
   editing: boolean
   editable: boolean
   saving: boolean
@@ -325,6 +349,7 @@ function EditableInfoRow({
             <UnifiedFieldValueEditor
               field={field}
               value={value}
+              typeConfig={typeConfig}
               onChange={(nextValue) => {
                 onChange(nextValue)
                 if (shouldSaveOnChange) void onSaveValue(nextValue)

@@ -8,6 +8,7 @@ import { useAuthStore } from '@/context/auth-store'
 import { useChatStore } from '@/context/chat-store'
 import { useMessages, conversationKeys, fetchConversationHistory } from '@/service/use-conversations'
 import { useAgentEmojiSettings } from '@/service/use-emoji-settings'
+import { useAgentReadStatusSettings } from '@/service/use-conversation-read-status'
 import { useConversationSatisfaction, useSendSatisfactionInvitation } from '@/service/use-satisfaction-survey'
 import { AgentChatRuntimeProvider } from '@/components/assistant-ui/agent-chat-runtime'
 import { AgentThread } from '@/components/assistant-ui/agent-thread'
@@ -38,6 +39,7 @@ type Props = {
   startingNewConversation?: boolean
   onTransferred?: (toName: string) => void
   composerInsertRequest?: ComposerInsertRequest | null
+  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id'>) => void
   composerInputHeight?: number
   onComposerInputHeightCommit?: (height: number) => void
   messageSearchOpen?: boolean
@@ -47,6 +49,12 @@ type Props = {
     messageId: number
     requestId: number
   } | null
+  markReadOnOpen?: boolean
+  onCollaborationInvitationSent?: (name: string) => void
+  pinningConversation?: boolean
+  onTogglePinConversation?: (conversation: Conversation) => void | Promise<void>
+  lockingConversationTimeout?: boolean
+  onToggleConversationTimeoutLock?: (conversation: Conversation) => void | Promise<void>
 }
 
 export function MessagePanel({
@@ -59,11 +67,18 @@ export function MessagePanel({
   startingNewConversation,
   onTransferred,
   composerInsertRequest,
+  onComposerInsertRequest,
   composerInputHeight,
   onComposerInputHeightCommit,
   messageSearchOpen,
   onOpenMessageSearch,
   messageSearchTarget,
+  markReadOnOpen = true,
+  onCollaborationInvitationSent,
+  pinningConversation = false,
+  onTogglePinConversation,
+  lockingConversationTimeout = false,
+  onToggleConversationTimeoutLock,
 }: Props) {
   const { locale } = useLocaleStore()
   const currentUser = useAuthStore((state) => state.user)
@@ -85,18 +100,29 @@ export function MessagePanel({
   const isTyping = visitorTyping.get(convId) || false
   const typingContent = visitorTypingContent.get(convId) || ''
   const isClosed = conversation?.status === 'closed'
+  const isCollaboratorConversation = conversation?.viewer_relation === 'collaborator'
   const isPeerConversation = Boolean(
     conversation
     && (
       conversation.viewer_relation === 'peer'
       || (
-        conversation.agent?.id != null
+        conversation.viewer_relation == null
+        && !isCollaboratorConversation
+        && conversation.agent?.id != null
         && currentUser?.id != null
         && conversation.agent.id !== currentUser.id
       )
     ),
   )
   const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
+  const canPinConversation = Boolean(!isClosed && onTogglePinConversation)
+  const canLockConversationTimeout = Boolean(
+    conversation
+    && conversation.status === 'active'
+    && conversation.agent?.id === currentUser?.id
+    && hasPermission(currentUser, 'chat.conversation.lock')
+    && onToggleConversationTimeoutLock,
+  )
   const canTransferPeerConversation =
     hasPermission(currentUser, 'chat.conversation.transfer')
     || (
@@ -109,15 +135,27 @@ export function MessagePanel({
   const canTransfer = Boolean(
     conversation?.agent
     && !isClosed
+    && !isCollaboratorConversation
     && canTransferCurrentConversation,
   )
   const canSendPublicReply =
-    !isClosed && (!isPeerConversation || hasPermission(currentUser, 'chat.conversation.peer_message.send'))
+    !isClosed
+    && (
+      isCollaboratorConversation
+        ? hasPermission(currentUser, 'chat.conversation.collaboration.message.send')
+        : !isPeerConversation || hasPermission(currentUser, 'chat.conversation.peer_message.send')
+    )
   const canCreateInternalNote =
     !isClosed
-    && isPeerConversation
+    && (isPeerConversation || isCollaboratorConversation)
     && hasPermission(currentUser, 'chat.conversation.internal_note.create')
-  const canEndConversation = !isClosed && !isPeerConversation
+  const canEndConversation = !isClosed && !isPeerConversation && !isCollaboratorConversation
+  const canInviteCollaborator = Boolean(
+    conversation?.agent
+    && !isClosed
+    && !isCollaboratorConversation
+    && hasPermission(currentUser, 'chat.conversation.collaboration.invite')
+  )
   const startNewDisabledReason = !isClosed
     ? null
     : agentStatus?.status !== 'online'
@@ -127,7 +165,7 @@ export function MessagePanel({
         : null
   const canStartNewConversation = Boolean(isClosed && !startNewDisabledReason)
   const composerReadOnlyReason = !isClosed && !canSendPublicReply && !canCreateInternalNote
-    ? t('ws.chat.peerReadOnly', locale)
+    ? t(isCollaboratorConversation ? 'ws.chat.collabReadOnly' : 'ws.chat.peerReadOnly', locale)
     : null
 
   // Force refetch when switching conversations
@@ -149,6 +187,7 @@ export function MessagePanel({
   const { data: msgData } = useMessages(convId)
   const { data: satisfactionState, isLoading: satisfactionLoading } = useConversationSatisfaction(convId)
   const { data: emojiConfig } = useAgentEmojiSettings(hasPermission(currentUser, 'chat.workspace.use'))
+  const { data: readStatusConfig } = useAgentReadStatusSettings(hasPermission(currentUser, 'chat.workspace.use'))
   const sendSatisfaction = useSendSatisfactionInvitation(convId)
 
   const handleSendSatisfaction = useCallback(async () => {
@@ -180,10 +219,11 @@ export function MessagePanel({
   // the server-side reset cannot revive the unread badge.
   useEffect(() => {
     if (!socket || !convId || !connected) return
-    if (isPeerConversation) return
+    if (!markReadOnOpen) return
+    if (isPeerConversation || isCollaboratorConversation) return
     socket.emit('mark_read', { conversation_id: convId })
     markConversationRead(convId)
-  }, [socket, convId, connected, markConversationRead, isPeerConversation])
+  }, [socket, convId, connected, markConversationRead, markReadOnOpen, isPeerConversation, isCollaboratorConversation])
 
   // Load more messages
   const handleLoadMore = useCallback(async () => {
@@ -302,8 +342,19 @@ export function MessagePanel({
         }}
         onCreateTicket={() => onCreateTicket?.(convId)}
         canCreateTicket={canCreateTicket}
+        canPinConversation={canPinConversation}
+        pinningConversation={pinningConversation}
+        onTogglePinConversation={() => {
+          if (conversation) void onTogglePinConversation?.(conversation)
+        }}
+        canLockConversationTimeout={canLockConversationTimeout}
+        lockingConversationTimeout={lockingConversationTimeout}
+        onToggleConversationTimeoutLock={() => {
+          if (conversation) void onToggleConversationTimeoutLock?.(conversation)
+        }}
         canTransfer={canTransfer}
         canEndConversation={canEndConversation}
+        canInviteCollaborator={canInviteCollaborator}
         canSendPublicReply={canSendPublicReply}
         canCreateInternalNote={canCreateInternalNote}
         composerReadOnlyReason={composerReadOnlyReason}
@@ -314,16 +365,19 @@ export function MessagePanel({
           if (convId) void onStartNewConversation?.(convId)
         }}
         onTransferred={(toName) => onTransferred?.(toName)}
+        onCollaborationInvitationSent={(name) => onCollaborationInvitationSent?.(name)}
         satisfactionState={satisfactionState ?? null}
         satisfactionLoading={satisfactionLoading}
         satisfactionSending={sendSatisfaction.isPending}
         onSendSatisfaction={handleSendSatisfaction}
         emojiConfig={emojiConfig ?? null}
+        readStatusEnabled={readStatusConfig?.enabled ?? true}
       >
         <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-[#FAFAFA]">
           <AgentThread
             socket={socket}
             composerInsertRequest={composerInsertRequest}
+            onComposerInsertRequest={onComposerInsertRequest}
             composerInputHeight={composerInputHeight}
             onComposerInputHeightCommit={onComposerInputHeightCommit}
             messageSearchOpen={messageSearchOpen}

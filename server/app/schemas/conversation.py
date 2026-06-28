@@ -4,7 +4,7 @@ Conversation Pydantic schemas
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class VisitorBrief(BaseModel):
@@ -62,9 +62,15 @@ class ConversationResponse(BaseModel):
     visitor_browser: str | None = None
     visitor_ip: str | None = None
     unread_count: int = 0
+    is_pinned: bool = False
+    pinned_at: datetime | None = None
+    is_timeout_locked: bool = False
+    timeout_locked_at: datetime | None = None
+    timeout_locked_by_id: int | None = None
     has_history_conversations: bool = False
-    viewer_relation: Literal["own", "peer"] | None = None
+    viewer_relation: Literal["own", "peer", "collaborator"] | None = None
     collaborated_by_current_user: bool = False
+    collaborators: list[AgentBrief] = Field(default_factory=list)
     created_at: datetime | None = None
 
 

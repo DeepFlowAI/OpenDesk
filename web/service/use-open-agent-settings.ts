@@ -5,7 +5,11 @@ import type {
   OpenAgentSettings,
   TestOpenAgentConnectionPayload,
   TestOpenAgentConnectionResponse,
+  TestVoiceSpeedConnectionPayload,
+  TestVoiceSpeedConnectionResponse,
   UpdateOpenAgentSettingsPayload,
+  UpdateVoiceSpeedSettingsPayload,
+  VoiceSpeedSettings,
 } from '@/models/open-agent-settings'
 
 const NS = 'open-agent-settings'
@@ -14,6 +18,7 @@ export const openAgentSettingsKeys = {
   all: [NS] as const,
   detail: () => [...openAgentSettingsKeys.all, 'detail'] as const,
   agents: () => [...openAgentSettingsKeys.all, 'agents'] as const,
+  voiceSpeed: () => [...openAgentSettingsKeys.all, 'voice-speed'] as const,
 }
 
 export const useOpenAgentSettings = () =>
@@ -37,6 +42,29 @@ export const useTestOpenAgentConnection = () =>
   useMutation({
     mutationFn: (data: TestOpenAgentConnectionPayload) =>
       post<TestOpenAgentConnectionResponse>('v1/open-agent-settings/test', { json: data }),
+  })
+
+export const useVoiceSpeedSettings = () =>
+  useQuery({
+    queryKey: openAgentSettingsKeys.voiceSpeed(),
+    queryFn: () => get<VoiceSpeedSettings>('v1/open-agent-settings/voice-speed'),
+  })
+
+export const useUpdateVoiceSpeedSettings = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: UpdateVoiceSpeedSettingsPayload) =>
+      put<VoiceSpeedSettings>('v1/open-agent-settings/voice-speed', { json: data }),
+    onSuccess: (data) => {
+      qc.setQueryData(openAgentSettingsKeys.voiceSpeed(), data)
+    },
+  })
+}
+
+export const useTestVoiceSpeedConnection = () =>
+  useMutation({
+    mutationFn: (data: TestVoiceSpeedConnectionPayload) =>
+      post<TestVoiceSpeedConnectionResponse>('v1/open-agent-settings/voice-speed/test', { json: data }),
   })
 
 export const useOpenAgentAgents = (enabled = true) =>

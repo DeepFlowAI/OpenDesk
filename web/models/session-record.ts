@@ -39,6 +39,46 @@ export type BotHandoffStatus =
   | 'failed'
   | 'dismissed'
 
+export type QueueResult =
+  | 'assigned'
+  | 'canceled'
+  | 'timeout'
+  | 'waiting'
+  | 'failed'
+
+export type ReceptionParticipant = {
+  agent_id: number
+  name: string | null
+}
+
+export type ReceptionGenerationStatus = 'generated' | 'failed' | null
+
+export type ReceptionSegment = {
+  seq_no: number
+  agent_id: number | null
+  agent_name: string | null
+  group_id: number | null
+  group_name: string | null
+  started_at: string
+  ended_at: string | null
+  duration_seconds: number | null
+  entry_reason: string
+  end_reason: string | null
+  from_agent_id: number | null
+  to_agent_id: number | null
+  visitor_message_count: number
+  agent_message_count: number
+  first_response_seconds: number | null
+  avg_response_seconds: number | null
+}
+
+export type ReceptionTrajectory = {
+  conversation_id: number
+  conversation_status: SessionRecord['status']
+  generation_status: ReceptionGenerationStatus
+  segments: ReceptionSegment[]
+}
+
 export type SessionRecord = {
   id: number
   public_id: string
@@ -52,10 +92,33 @@ export type SessionRecord = {
   started_at: string | null
   ended_at: string | null
   ended_by: string | null
+  duration_seconds: number | null
+  visitor_system: string | null
+  visitor_browser: string | null
+  visitor_ip: string | null
   created_at: string | null
+  message_count: number
+  visitor_message_count: number
+  agent_message_count: number
+  bot_phase_message_count: number
+  human_phase_message_count: number
+  human_phase_visitor_message_count: number
+  human_phase_agent_message_count: number
   satisfaction: SatisfactionSummary | null
   last_assigned_queue: QueueRecordBrief | null
   queue_duration_seconds: number | null
+  first_human_response_seconds: number | null
+  agent_response_count: number | null
+  agent_avg_response_seconds: number | null
+  has_queue: boolean
+  queue_entered_at: string | null
+  queue_assigned_at: string | null
+  queue_result: QueueResult | null
+  reception_segment_count: number
+  reception_transfer_count: number
+  reception_final_agent_id: number | null
+  reception_participants: ReceptionParticipant[]
+  reception_generation_status: ReceptionGenerationStatus
 }
 
 export type SessionRecordListResponse = {
@@ -100,6 +163,7 @@ export type SessionRecordFilters = {
   agent_id?: number
   visitor_id?: number
   session_type?: SessionRecordType
+  has_queue?: boolean
   keyword?: string
   satisfaction_status?: string
   satisfaction_resolved?: string

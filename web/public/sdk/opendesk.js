@@ -534,6 +534,8 @@
       if (this.options.locale && this.options.locale !== 'auto') {
         url.searchParams.set('locale', this.options.locale)
       }
+    } else if (this.options.contextToken) {
+      url.searchParams.set('contextToken', this.options.contextToken)
     }
     return url.toString()
   }

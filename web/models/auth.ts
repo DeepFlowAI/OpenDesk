@@ -17,6 +17,7 @@ export type LoginPayload = {
 export type UserInfo = {
   id: number
   username: string
+  name: string
   display_name: string | null
   avatar: string | null
   roles: string[]

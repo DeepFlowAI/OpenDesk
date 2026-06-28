@@ -1,10 +1,13 @@
 """
 Knowledge base repository.
 """
+import re
 from datetime import datetime, timezone
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.models.knowledge import KnowledgeDirectory, KnowledgeDocument
 
@@ -111,6 +114,63 @@ class KnowledgeDirectoryRepository:
 
 class KnowledgeDocumentRepository:
     @staticmethod
+    def _keyword_terms(search: str | None) -> list[str]:
+        if not search:
+            return []
+        return [part.casefold() for part in re.split(r"\s+", search.strip()) if part]
+
+    @staticmethod
+    def _content_for_search_sql() -> ColumnElement:
+        return func.concat_ws(" ", KnowledgeDocument.title, KnowledgeDocument.content_plain)
+
+    @staticmethod
+    def _content_for_search(document: KnowledgeDocument) -> str:
+        return " ".join(part for part in [document.title, document.content_plain] if part)
+
+    @staticmethod
+    def _compute_keyword_score(search: str | None, content_for_search: str) -> int:
+        terms = KnowledgeDocumentRepository._keyword_terms(search)
+        if not terms:
+            return 0
+        content = content_for_search.casefold()
+        return sum(content.count(term) for term in terms)
+
+    @staticmethod
+    def _updated_at_sort_value(document: KnowledgeDocument) -> float:
+        updated_at = getattr(document, "updated_at", None)
+        if not isinstance(updated_at, datetime):
+            return float("-inf")
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        return updated_at.timestamp()
+
+    @staticmethod
+    def _sort_by_keyword_score(
+        documents: list[KnowledgeDocument],
+        search: str | None,
+    ) -> list[KnowledgeDocument]:
+        return sorted(
+            documents,
+            key=lambda document: (
+                KnowledgeDocumentRepository._compute_keyword_score(
+                    search,
+                    KnowledgeDocumentRepository._content_for_search(document),
+                ),
+                KnowledgeDocumentRepository._updated_at_sort_value(document),
+                int(document.id or 0),
+            ),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _apply_search_filter(query: Select, search: str | None) -> Select:
+        terms = KnowledgeDocumentRepository._keyword_terms(search)
+        if not terms:
+            return query
+        content_for_search = KnowledgeDocumentRepository._content_for_search_sql()
+        return query.where(or_(*(content_for_search.ilike(f"%{term}%") for term in terms)))
+
+    @staticmethod
     async def get_by_id(db: AsyncSession, document_id: int) -> KnowledgeDocument | None:
         return await db.get(KnowledgeDocument, document_id)
 
@@ -209,14 +269,7 @@ class KnowledgeDocumentRepository:
             if not directory_ids:
                 return [], 0
             query = query.where(KnowledgeDocument.directory_id.in_(directory_ids))
-        if search:
-            like_pattern = f"%{search.strip()}%"
-            query = query.where(
-                or_(
-                    KnowledgeDocument.title.ilike(like_pattern),
-                    KnowledgeDocument.content_plain.ilike(like_pattern),
-                )
-            )
+        query = KnowledgeDocumentRepository._apply_search_filter(query, search)
         if status:
             query = query.where(KnowledgeDocument.status == status)
         if display_status:
@@ -252,6 +305,11 @@ class KnowledgeDocumentRepository:
 
         total = int((await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one())
         offset = (page - 1) * per_page
+        if KnowledgeDocumentRepository._keyword_terms(search):
+            result = await db.execute(query)
+            items = KnowledgeDocumentRepository._sort_by_keyword_score(list(result.scalars().all()), search)
+            return items[offset : offset + per_page], total
+
         result = await db.execute(
             query.order_by(KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc())
             .offset(offset)
@@ -273,16 +331,12 @@ class KnowledgeDocumentRepository:
             if not directory_ids:
                 return []
             query = query.where(KnowledgeDocument.directory_id.in_(directory_ids))
-        if search:
-            like_pattern = f"%{search.strip()}%"
-            query = query.where(
-                or_(
-                    KnowledgeDocument.title.ilike(like_pattern),
-                    KnowledgeDocument.content_plain.ilike(like_pattern),
-                )
-            )
+        query = KnowledgeDocumentRepository._apply_search_filter(query, search)
         if not include_drafts:
             query = query.where(KnowledgeDocument.status == "published")
+        if KnowledgeDocumentRepository._keyword_terms(search):
+            result = await db.execute(query)
+            return KnowledgeDocumentRepository._sort_by_keyword_score(list(result.scalars().all()), search)
         result = await db.execute(query.order_by(KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()))
         return list(result.scalars().all())
 

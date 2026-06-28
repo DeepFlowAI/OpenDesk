@@ -20,10 +20,17 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { cn } from '@/lib/utils'
-import type { UnifiedField } from '@/models/field-definition'
 
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetFooter } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
+
+/** Minimal field shape the drawer needs. Compatible with UnifiedField and any
+ * static column definition that exposes an id/key/display name. */
+export type ColumnsDrawerField = {
+  id: number | null
+  key: string | null
+  name: string
+}
 
 /** Same shape as admin ColumnConfigItem (user / ticket / org views). */
 export type WorkspaceColumnConfigItem = {
@@ -93,7 +100,7 @@ function SortableVisibleColumnRow({
 
 export type WorkspaceColumnsDrawerProps = {
   locale: string
-  fields: UnifiedField[]
+  fields: ColumnsDrawerField[]
   baselineConfig: WorkspaceColumnConfigItem[] | null
   currentOverride: WorkspaceColumnConfigItem[] | null
   onApply: (cols: WorkspaceColumnConfigItem[]) => void

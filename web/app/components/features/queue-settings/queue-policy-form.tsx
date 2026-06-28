@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { Locale } from '@/context/locale-store'
@@ -24,11 +25,14 @@ export type QueuePolicyDraft = {
   assignment_strategy: QueueAssignmentStrategy
   max_waiting_count: string
   max_wait_seconds: string
+  returning_agent_priority_enabled: boolean
+  returning_agent_window_hours: string
 }
 
 export type QueuePolicyFieldErrors = {
   max_waiting_count?: string
   max_wait_seconds?: string
+  returning_agent_window_hours?: string
 }
 
 export function channelLabel(channel: QueueChannel, locale: Locale): string {
@@ -37,6 +41,10 @@ export function channelLabel(channel: QueueChannel, locale: Locale): string {
 
 export function strategyLabel(strategy: QueueAssignmentStrategy, locale: Locale): string {
   return t(`queue.strategy.${strategy}`, locale)
+}
+
+export function returningAgentLabel(channel: QueueChannel, locale: Locale): string {
+  return t(`queue.field.returningAgent.${channel}`, locale)
 }
 
 export function formatQueueLimit(value: number | null | undefined, locale: Locale): string {
@@ -67,6 +75,12 @@ export function createQueuePolicyDraft(
       DEFAULT_QUEUE_ASSIGNMENT_STRATEGY,
     max_waiting_count: policy?.max_waiting_count != null ? String(policy.max_waiting_count) : '',
     max_wait_seconds: policy?.max_wait_seconds != null ? String(policy.max_wait_seconds) : '',
+    returning_agent_priority_enabled:
+      (policy?.config ?? fallback?.config)?.returning_agent_priority_enabled === true,
+    returning_agent_window_hours:
+      (policy?.config ?? fallback?.config)?.returning_agent_window_hours != null
+        ? String((policy?.config ?? fallback?.config)?.returning_agent_window_hours)
+        : '24',
   }
 }
 
@@ -90,6 +104,16 @@ export function validateQueuePolicyDraft(draft: QueuePolicyDraft, locale: Locale
   } else if (maxWait != null && maxWait > 86400) {
     errors.max_wait_seconds = t('queue.validation.maxWaitRange', locale)
   }
+  const returningWindow = parseOptionalPositiveInt(draft.returning_agent_window_hours)
+  if (draft.returning_agent_priority_enabled && returningWindow == null) {
+    errors.returning_agent_window_hours = t('queue.validation.returningAgentRequired', locale)
+  } else if (
+    draft.returning_agent_priority_enabled &&
+    returningWindow != null &&
+    (!Number.isInteger(returningWindow) || returningWindow < 1 || returningWindow > 720)
+  ) {
+    errors.returning_agent_window_hours = t('queue.validation.returningAgentRange', locale)
+  }
   return errors
 }
 
@@ -99,6 +123,7 @@ export function buildQueuePolicyPayload({
   scopeId,
   enabled,
   includeStrategy,
+  includeReturningAgent = true,
   draft,
 }: {
   channel: QueueChannel
@@ -106,8 +131,10 @@ export function buildQueuePolicyPayload({
   scopeId?: number | null
   enabled: boolean
   includeStrategy: boolean
+  includeReturningAgent?: boolean
   draft: QueuePolicyDraft
 }): QueuePolicyUpsertPayload {
+  const returningWindow = parseOptionalPositiveInt(draft.returning_agent_window_hours) ?? 24
   return {
     channel,
     scope_type: scopeType,
@@ -116,7 +143,12 @@ export function buildQueuePolicyPayload({
     assignment_strategy: includeStrategy ? draft.assignment_strategy : null,
     max_waiting_count: parseOptionalPositiveInt(draft.max_waiting_count),
     max_wait_seconds: parseOptionalPositiveInt(draft.max_wait_seconds),
-    config: {},
+    config: includeReturningAgent
+      ? {
+          returning_agent_priority_enabled: draft.returning_agent_priority_enabled,
+          returning_agent_window_hours: returningWindow,
+        }
+      : {},
   }
 }
 
@@ -125,7 +157,9 @@ function draftEqualsPolicy(draft: QueuePolicyDraft, policy: QueuePolicy | undefi
   return (
     draft.assignment_strategy === baseline.assignment_strategy &&
     draft.max_waiting_count === baseline.max_waiting_count &&
-    draft.max_wait_seconds === baseline.max_wait_seconds
+    draft.max_wait_seconds === baseline.max_wait_seconds &&
+    draft.returning_agent_priority_enabled === baseline.returning_agent_priority_enabled &&
+    draft.returning_agent_window_hours === baseline.returning_agent_window_hours
   )
 }
 
@@ -181,6 +215,40 @@ export function QueuePolicyForm({ channel, title, policy, saving = false, onSave
             <option key={strategy} value={strategy}>{strategyLabel(strategy, locale)}</option>
           ))}
         </select>
+      </div>
+      <div className="flex max-w-[360px] flex-col gap-3">
+        <div className="flex items-center justify-between gap-4">
+          <Label>{returningAgentLabel(channel, locale)}</Label>
+          <Switch
+            checked={draft.returning_agent_priority_enabled}
+            onCheckedChange={(checked) => {
+              setDraft((prev) => ({ ...prev, returning_agent_priority_enabled: checked }))
+              setErrors((prev) => ({ ...prev, returning_agent_window_hours: undefined }))
+            }}
+          />
+        </div>
+        {draft.returning_agent_priority_enabled && (
+          <div className="flex flex-col gap-2">
+            <Label>{t('queue.field.returningAgentWindow', locale)}</Label>
+            <div className="flex items-center gap-2">
+              <Input
+                value={draft.returning_agent_window_hours}
+                onChange={(e) => {
+                  setDraft((prev) => ({ ...prev, returning_agent_window_hours: e.target.value }))
+                  setErrors((prev) => ({ ...prev, returning_agent_window_hours: undefined }))
+                }}
+                inputMode="numeric"
+                placeholder={t('queue.placeholder.returningAgentWindow', locale)}
+                aria-invalid={!!errors.returning_agent_window_hours}
+                className="h-10 max-w-[220px]"
+              />
+              <span className="text-sm text-muted-foreground">{t('queue.unit.hours', locale)}</span>
+            </div>
+            {errors.returning_agent_window_hours && (
+              <span className="text-xs text-destructive">{errors.returning_agent_window_hours}</span>
+            )}
+          </div>
+        )}
       </div>
       <div className="flex max-w-[220px] flex-col gap-2">
         <Label>{t('queue.field.maxWaiting', locale)}</Label>

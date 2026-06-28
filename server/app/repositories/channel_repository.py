@@ -26,6 +26,13 @@ class ChannelRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def get_names_by_tenant(db: AsyncSession, tenant_id: int) -> list[str]:
+        result = await db.execute(
+            select(Channel.name).where(Channel.tenant_id == tenant_id)
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
     async def get_by_id(db: AsyncSession, channel_id: int) -> Channel | None:
         return await db.get(Channel, channel_id)
 

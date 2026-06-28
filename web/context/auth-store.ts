@@ -9,7 +9,7 @@ type AuthState = {
   token: string | null
   setAuth: (user: User, token: string) => void
   setUser: (user: User) => void
-  updateUser: (partial: Partial<Pick<User, 'display_name' | 'avatar' | 'preferences'>>) => void
+  updateUser: (partial: Partial<Pick<User, 'name' | 'display_name' | 'avatar' | 'preferences'>>) => void
   clearAuth: () => void
 }
 

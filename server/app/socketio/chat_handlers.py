@@ -341,7 +341,25 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             return {"error": "Invalid status"}
 
         r = redis_client.client
-        await AgentStatusService.set_status(r, tenant_id, user_id, status)
+        async with AsyncSessionLocal() as db:
+            from app.repositories.conversation_repository import ConversationRepository
+            from app.repositories.employee_repository import EmployeeRepository
+
+            user = await EmployeeRepository.get_by_id(db, user_id)
+            max_c = user.max_concurrent if user else 10
+            active_count = await ConversationRepository.count_active_by_agent(
+                db,
+                tenant_id,
+                user_id,
+            )
+
+        await AgentStatusService.set_status(
+            r,
+            tenant_id,
+            user_id,
+            status,
+            current_count=active_count,
+        )
 
         # Becoming online is a capacity-gain event: pull any queued work the
         # agent is now eligible for, mirroring the connect-time backfill.
@@ -355,11 +373,6 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                 )
 
         # Fetch updated status to return
-        async with AsyncSessionLocal() as db:
-            from app.repositories.employee_repository import EmployeeRepository
-            user = await EmployeeRepository.get_by_id(db, user_id)
-            max_c = user.max_concurrent if user else 10
-
         status_data = await AgentStatusService.get_status(r, tenant_id, user_id, max_c)
         return {"ok": True, "status": status_data}
 
@@ -542,6 +555,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         conversation_id = data.get("conversation_id")
         content = data.get("content", "")
         content_type = data.get("content_type", "text")
+        quoted_message_id = data.get("quoted_message_id")
 
         if not conversation_id or not content:
             return {"error": "conversation_id and content required"}
@@ -550,6 +564,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             user_id = int(user_id)
             tenant_id = int(tenant_id)
             conversation_id = int(conversation_id)
+            quoted_message_id = int(quoted_message_id) if quoted_message_id is not None else None
         except (TypeError, ValueError):
             logger.warning(
                 "workspace_message_send_invalid message_flow_id=%s sid=%s tenant_id=%s user_id=%s "
@@ -590,13 +605,20 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                     content=content,
                     tenant_id=tenant_id,
                     principal=principal,
+                    quoted_message_id=quoted_message_id,
                 )
 
                 # Fetch agent info for the message payload
+                from app.repositories.conversation_collaboration_repository import ConversationCollaborationRepository
                 from app.repositories.employee_repository import EmployeeRepository
                 from app.repositories.conversation_repository import ConversationRepository
                 user = await EmployeeRepository.get_by_id(db, user_id)
                 conv = await ConversationRepository.get_by_id(db, conversation_id)
+                collaborator_agent_ids = await ConversationCollaborationRepository.get_active_collaborator_agent_ids(
+                    db,
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                )
         except BusinessError as exc:
             logger.warning(
                 "workspace_message_save_rejected message_flow_id=%s tenant_id=%s user_id=%s "
@@ -609,7 +631,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                 exc.code,
                 exc.message,
             )
-            raise
+            return {"ok": False, "error": exc.code, "message": exc.message}
         except Exception:
             logger.exception(
                 "workspace_message_save_failed message_flow_id=%s tenant_id=%s user_id=%s "
@@ -648,6 +670,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             "content": msg.content,
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
             **ConversationService._message_event_overlay(msg),
+            **ConversationService._message_read_status_overlay(msg, visitor_facing=False),
         }
 
         # Broadcast through the same message stream used for visitor messages so
@@ -655,6 +678,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         recipient_agent_ids = {int(user_id)}
         if conv and conv.agent_id:
             recipient_agent_ids.add(int(conv.agent_id))
+        recipient_agent_ids.update(collaborator_agent_ids)
         emit_log_context = {
             "message_flow_id": message_flow_id,
             "tenant_id": tenant_id,
@@ -712,6 +736,12 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                 **msg_payload,
                 "sender_name": ConversationService.visitor_agent_display_name(user) if user else "Agent",
             }
+            # The Web SDK keys messages by conversation_public_id and only marks
+            # agent messages read when this id matches the open conversation, so
+            # the realtime payload must carry it (the numeric id alone is not
+            # enough for the visitor side to send a read receipt).
+            if conv:
+                visitor_msg_payload["conversation_public_id"] = conv.public_id
             await _emit_workspace_message_event(
                 rt,
                 "new_message",
@@ -740,6 +770,144 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             is_internal_note,
         )
         return {"ok": True, "message": msg_payload}
+
+    @rt.on("recall_message", namespace=NAMESPACE)  # type: ignore
+    async def on_recall_message(sid: str, data: dict):
+        message_flow_id = uuid.uuid4().hex
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        user_id = session.get("user_id")
+        tenant_id = session.get("tenant_id")
+        conversation_id = data.get("conversation_id")
+        message_id = data.get("message_id")
+
+        try:
+            user_id = int(user_id)
+            tenant_id = int(tenant_id)
+            conversation_id = int(conversation_id)
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Invalid message_id"}
+
+        try:
+            async with AsyncSessionLocal() as db:
+                principal = await PermissionService.get_current_principal(
+                    db,
+                    {"user_id": user_id, "tenant_id": tenant_id},
+                )
+                msg, conv, conversation_update = await ConversationService.recall_agent_message(
+                    db,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    tenant_id=tenant_id,
+                    principal=principal,
+                )
+                from app.repositories.conversation_collaboration_repository import ConversationCollaborationRepository
+                from app.repositories.employee_repository import EmployeeRepository
+
+                sender = await EmployeeRepository.get_by_id(db, user_id)
+                collaborator_agent_ids = await ConversationCollaborationRepository.get_active_collaborator_agent_ids(
+                    db,
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                )
+        except BusinessError as exc:
+            logger.warning(
+                "workspace_message_recall_rejected message_flow_id=%s tenant_id=%s user_id=%s "
+                "conversation_id=%s message_id=%s error_code=%s message=%s",
+                message_flow_id,
+                tenant_id,
+                user_id,
+                conversation_id,
+                message_id,
+                exc.code,
+                exc.message,
+            )
+            return {"ok": False, "error": exc.code, "message": exc.message}
+        except Exception:
+            logger.exception(
+                "workspace_message_recall_failed message_flow_id=%s tenant_id=%s user_id=%s "
+                "conversation_id=%s message_id=%s",
+                message_flow_id,
+                tenant_id,
+                user_id,
+                conversation_id,
+                message_id,
+            )
+            raise
+
+        recipient_agent_ids = {int(user_id)}
+        if conv and conv.agent_id:
+            recipient_agent_ids.add(int(conv.agent_id))
+        recipient_agent_ids.update(collaborator_agent_ids)
+        emit_log_context = {
+            "message_flow_id": message_flow_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "message_id": msg.id,
+        }
+        response_payload = ConversationService._message_response_payload(
+            msg,
+            conversation_id=conversation_id,
+            sender_name=sender.display_name or sender.name if sender else None,
+            sender_avatar=sender.avatar if sender else None,
+            viewer_agent_id=int(user_id),
+        )
+        for recipient_agent_id in recipient_agent_ids:
+            agent_payload = ConversationService._message_response_payload(
+                msg,
+                conversation_id=conversation_id,
+                sender_name=sender.display_name or sender.name if sender else None,
+                sender_avatar=sender.avatar if sender else None,
+                viewer_agent_id=recipient_agent_id,
+            )
+            if recipient_agent_id == int(user_id):
+                response_payload = agent_payload
+            agent_room = f"agent:{tenant_id}:{recipient_agent_id}"
+            await _emit_workspace_message_event(
+                rt,
+                "message_recalled",
+                jsonable_encoder(agent_payload),
+                room=agent_room,
+                namespace=NAMESPACE,
+                log_context=emit_log_context,
+            )
+            if conversation_update:
+                await _emit_workspace_message_event(
+                    rt,
+                    "conversation_updated",
+                    jsonable_encoder({
+                        **conversation_update,
+                        "unread_count": conv.unread_count if conv else None,
+                    }),
+                    room=agent_room,
+                    namespace=NAMESPACE,
+                    log_context=emit_log_context,
+                )
+
+        visitor_payload = ConversationService._message_response_payload(
+            msg,
+            conversation_public_id=conv.public_id,
+            sender_name=ConversationService.visitor_agent_display_name(sender) if sender else None,
+            sender_avatar=sender.avatar if sender else None,
+            visitor_facing=True,
+        )
+        await _emit_workspace_message_event(
+            rt,
+            "message_recalled",
+            jsonable_encoder(visitor_payload),
+            room=f"conv:{conversation_id}",
+            namespace="/visitor",
+            log_context=emit_log_context,
+        )
+        await ConversationRealtimeService.emit_conversation_list_updated(
+            tenant_id,
+            action="message",
+            conversation_id=conversation_id,
+            rt=rt,
+            message_flow_id=message_flow_id,
+        )
+        return {"ok": True, "message": jsonable_encoder(response_payload)}
 
     @rt.on("send_satisfaction_invitation", namespace=NAMESPACE)  # type: ignore
     async def on_send_satisfaction_invitation(sid: str, data: dict):
@@ -771,7 +939,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         conversation_id = data.get("conversation_id")
         if conversation_id:
             conv_room = f"conv:{conversation_id}"
-            await rt.emit("agent_typing", {"conversation_id": conversation_id}, room=conv_room, namespace="/visitor")
+            payload = {"conversation_id": conversation_id}
+            if data.get("stop"):
+                payload["stop"] = True
+            await rt.emit("agent_typing", payload, room=conv_room, namespace="/visitor")
 
     @rt.on("end_conversation", namespace=NAMESPACE)  # type: ignore
     async def on_end_conversation(sid: str, data: dict):
@@ -826,13 +997,15 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                 conv = await ConversationService.get_by_id(db, conversation_id)
                 if conv.agent_id != int(user_id):
                     return {"ok": True}
-                await ConversationService.mark_read(db, conversation_id)
+                read_message_ids = await ConversationService.mark_read(db, conversation_id)
 
             conv_room = f"conv:{conversation_id}"
             agent_room = f"agent:{tenant_id}:{user_id}"
             await rt.emit("messages_read", {
+                "reader": "agent",
                 "conversation_id": conversation_id,
                 "conversation_public_id": conv.public_id,
+                "message_ids": read_message_ids,
             }, room=conv_room, namespace="/visitor")
             await rt.emit("conversation_updated", {
                 "conversation_id": conversation_id,

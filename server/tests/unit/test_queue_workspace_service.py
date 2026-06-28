@@ -6,7 +6,12 @@ import pytest
 
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.schemas.permission import EffectivePrincipal
-from app.schemas.queue_workspace import QueueAssignRequest, QueueAssignSelfRequest
+from app.schemas.queue_workspace import (
+    QueueAssignAndSendRequest,
+    QueueAssignRequest,
+    QueueAssignSelfRequest,
+    QueueAssignmentWorkspaceResponse,
+)
 from app.services.agent_status_service import AgentStatusService
 from app.services.queue_workspace_service import (
     DataScopeService,
@@ -77,6 +82,51 @@ def _queue_task(task_id: int, conversation_id: int, *, priority: int = 5, status
         status=status,
         source_type="visitor_waiting",
         enqueued_at=datetime(2026, 6, 16, 10, 0),
+    )
+
+
+def _assignment_response(
+    *,
+    principal: EffectivePrincipal,
+    task_id: int = 11,
+    conversation_id: int = 100,
+) -> QueueAssignmentWorkspaceResponse:
+    task = _queue_task(task_id, conversation_id, status="assigned")
+    conversation = _conversation(conversation_id)
+    return QueueAssignmentWorkspaceResponse(
+        task={
+            "id": task.id,
+            "source": "queue_task",
+            "queue_task_id": task.id,
+            "conversation_id": conversation.id,
+            "conversation_public_id": conversation.public_id,
+            "visitor": conversation.visitor,
+            "channel": conversation.channel,
+            "group": conversation.group,
+            "queue": {
+                "queue_type": task.queue_type,
+                "queue_id": task.queue_id,
+                "name": "售后组",
+                "waiting_count": 0,
+            },
+            "priority": task.priority,
+            "status": task.status,
+            "source_type": task.source_type,
+            "last_message_preview": conversation.last_message_preview,
+            "last_message_at": conversation.last_message_at,
+            "enqueued_at": task.enqueued_at,
+            "wait_seconds": 0,
+            "position_overall": None,
+            "position_in_priority": None,
+        },
+        conversation_id=conversation.id,
+        assigned_agent={
+            "id": principal.user_id,
+            "display_name": "Alice",
+            "name": "alice",
+            "avatar": None,
+        },
+        assigned_to_current_user=True,
     )
 
 
@@ -260,6 +310,129 @@ async def test_assign_self_uses_unified_queue_assignment(monkeypatch):
     assert result.assigned_to_current_user is True
     assert result.conversation_id == assigned_conversation.id
     assert result.assigned_agent.name == "alice"
+
+
+@pytest.mark.asyncio
+async def test_assign_self_and_send_assigns_then_sends_text(monkeypatch):
+    principal = _principal(permissions=["chat.queue.assign_self"])
+    assignment = _assignment_response(principal=principal)
+    assigned_conversation = _conversation(100)
+    assigned_conversation.agent = SimpleNamespace(
+        id=principal.user_id,
+        display_name="Alice",
+        name="alice",
+        avatar=None,
+    )
+    assigned_conversation.agent_id = principal.user_id
+    message = SimpleNamespace(
+        id=901,
+        conversation_id=assigned_conversation.id,
+        sender_type="agent",
+        sender_id=principal.user_id,
+        content_type="text",
+        content="您好，我来处理",
+        metadata_=None,
+        created_at=datetime(2026, 6, 16, 10, 5),
+    )
+    assign_to_agent = AsyncMock(return_value=assignment)
+    send_message = AsyncMock(return_value=message)
+    emit_message = AsyncMock()
+    monkeypatch.setattr(QueueWorkspaceService, "_assign_to_agent", assign_to_agent)
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=assigned_conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationService.send_message",
+        send_message,
+    )
+    monkeypatch.setattr(QueueWorkspaceService, "_emit_sent_message_events", emit_message)
+    db = object()
+    redis = object()
+
+    result = await QueueWorkspaceService.assign_self_and_send(
+        db,
+        redis,
+        principal,
+        11,
+        QueueAssignAndSendRequest(content="  您好，我来处理  "),
+    )
+
+    assign_to_agent.assert_awaited_once_with(
+        db,
+        redis,
+        principal,
+        11,
+        principal.user_id,
+    )
+    send_message.assert_awaited_once()
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["conversation_id"] == assigned_conversation.id
+    assert kwargs["sender_type"] == "agent"
+    assert kwargs["sender_id"] == principal.user_id
+    assert kwargs["content_type"] == "text"
+    assert kwargs["content"] == "您好，我来处理"
+    assert kwargs["principal"] is principal
+    emit_message.assert_awaited_once_with(assigned_conversation, message, principal.user_id)
+    assert result.message_sent is True
+    assert result.message.content == "您好，我来处理"
+    assert result.message.sender_name == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_assign_self_and_send_requires_assign_self_permission(monkeypatch):
+    principal = _principal(permissions=[])
+    monkeypatch.setattr(
+        QueueWorkspaceService,
+        "_assign_to_agent",
+        AsyncMock(side_effect=AssertionError("assignment should not be attempted")),
+    )
+
+    with pytest.raises(ForbiddenError):
+        await QueueWorkspaceService.assign_self_and_send(
+            object(),
+            object(),
+            principal,
+            11,
+            QueueAssignAndSendRequest(content="hello"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_assign_self_and_send_keeps_assignment_when_message_fails(monkeypatch):
+    principal = _principal(permissions=["chat.queue.assign_self"])
+    assignment = _assignment_response(principal=principal)
+    assigned_conversation = _conversation(100)
+    assigned_conversation.agent_id = principal.user_id
+    assign_to_agent = AsyncMock(return_value=assignment)
+    send_message = AsyncMock(side_effect=ForbiddenError("Permission denied"))
+    emit_message = AsyncMock()
+    monkeypatch.setattr(QueueWorkspaceService, "_assign_to_agent", assign_to_agent)
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=assigned_conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationService.send_message",
+        send_message,
+    )
+    monkeypatch.setattr(QueueWorkspaceService, "_emit_sent_message_events", emit_message)
+
+    result = await QueueWorkspaceService.assign_self_and_send(
+        object(),
+        object(),
+        principal,
+        11,
+        QueueAssignAndSendRequest(content="hello"),
+    )
+
+    assign_to_agent.assert_awaited_once()
+    send_message.assert_awaited_once()
+    emit_message.assert_not_awaited()
+    assert result.assigned_to_current_user is True
+    assert result.conversation_id == assigned_conversation.id
+    assert result.message is None
+    assert result.message_sent is False
 
 
 @pytest.mark.asyncio

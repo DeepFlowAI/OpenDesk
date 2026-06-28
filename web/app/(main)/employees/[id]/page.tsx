@@ -45,7 +45,7 @@ export default function EditEmployeePage() {
           await Promise.all(queuePolicyPayloads.map((queuePayload) => upsertQueuePolicyMutation.mutateAsync(queuePayload)))
         }
         if (user?.id === employeeId) {
-          updateUser({ avatar: updated.avatar ?? null })
+          updateUser({ name: updated.name, avatar: updated.avatar ?? null })
         }
         setToast({ type: 'success', text: t('emp.saveSuccess', locale) })
         setTimeout(() => setToast(null), 3000)

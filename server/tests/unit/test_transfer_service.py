@@ -350,6 +350,7 @@ class _TransferPatches:
             patch.object(ts.AgentStatusService, "increment_count", new=self.status_inc),
             patch.object(ts.AgentStatusService, "decrement_count", new=self.status_dec),
             patch.object(ts, "get_realtime_transport", new=self.get_rt),
+            patch.object(ts.ReceptionEventService, "record", new=AsyncMock(return_value=None)),
         ]
         for p in self._patches:
             p.start()

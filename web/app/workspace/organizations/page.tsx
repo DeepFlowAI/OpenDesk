@@ -40,8 +40,10 @@ import { OrgImportModal } from './org-import-modal'
 import { GroupBar } from '@/components/workspace/group-bar'
 import { WorkspaceListExport } from '@/app/components/features/workspace-list-export'
 import {
+  FieldValueDisplay,
   formatActorFieldValue,
   formatFileFieldValue,
+  isEntitySelectFieldType,
 } from '@/app/components/features/field-system/field-value-display'
 import { formatDatetimeForDisplay } from '@/lib/datetime-display'
 import { hasPermission } from '@/utils/permissions'
@@ -588,7 +590,7 @@ export default function WorkspaceOrganizationsPage() {
             className={cn(
               'flex h-9 items-center gap-1.5 rounded-lg border px-3 text-sm transition-colors',
               hasColumnOverride
-                ? 'border-ring bg-info/10 text-primary'
+                ? 'border-border bg-muted text-foreground hover:bg-muted/80'
                 : 'border-border text-foreground/80 hover:bg-accent',
             )}
           >
@@ -697,13 +699,22 @@ export default function WorkspaceOrganizationsPage() {
                   >
                     {displayColumns.map((col, idx) => {
                       const val = getCellValue(org, col, fieldLookup, locale)
+                      const raw = getRawCellValue(org, col)
                       return (
                         <td
                           key={col.field_key ?? col.field_id ?? `cell-${idx}`}
                           className="max-w-[280px] overflow-hidden px-6 py-3 text-sm text-foreground/80"
                           style={{ minWidth: getColumnMinWidth(col.field_type, col.field_key) }}
                         >
-                          <span className="block truncate">{val}</span>
+                          {isEntitySelectFieldType(col.field_type) && raw != null && raw !== '' ? (
+                            <FieldValueDisplay
+                              fieldType={col.field_type}
+                              value={raw}
+                              className="block truncate"
+                            />
+                          ) : (
+                            <span className="block truncate">{val}</span>
+                          )}
                         </td>
                       )
                     })}
@@ -891,7 +902,7 @@ function getCellValue(
   if (field_key === '__user_count') return String(org.user_count ?? 0)
 
   if (field_key && ORG_SYSTEM_KEYS.has(field_key)) {
-    const raw = (org as Record<string, unknown>)[field_key]
+    const raw = getRawCellValue(org, col)
     if (raw == null) return ''
     if (field_key === 'created_by' || field_key === 'updated_by') return formatActorFieldValue(raw)
     if (DATETIME_KEYS.has(field_key)) return new Date(raw as string).toLocaleString()
@@ -905,11 +916,7 @@ function getCellValue(
     const customKey = field_key && !ORG_SYSTEM_KEYS.has(field_key) ? field_key : null
     const legacyIdKey = field_id != null ? String(field_id) : null
     const lookupKey = customKey ?? legacyIdKey ?? ''
-    const val = customKey && org.custom_fields[customKey] != null
-      ? org.custom_fields[customKey]
-      : legacyIdKey
-        ? org.custom_fields[legacyIdKey]
-        : null
+    const val = getRawCellValue(org, col)
     if (val == null) return ''
     if (field_type === 'file') {
       return formatFileFieldValue(val, locale === 'zh')
@@ -925,6 +932,27 @@ function getCellValue(
   }
 
   return ''
+}
+
+function getRawCellValue(
+  org: Organization,
+  col: { field_key: string | null; field_id: number | null },
+): unknown {
+  const { field_key, field_id } = col
+  if (field_key === '__user_count') return org.user_count ?? 0
+  if (field_key && ORG_SYSTEM_KEYS.has(field_key)) {
+    return (org as Record<string, unknown>)[field_key]
+  }
+
+  const customKey = field_key && !ORG_SYSTEM_KEYS.has(field_key) ? field_key : null
+  const legacyIdKey = field_id != null ? String(field_id) : null
+  if (customKey && org.custom_fields?.[customKey] != null) {
+    return org.custom_fields[customKey]
+  }
+  if (legacyIdKey) {
+    return org.custom_fields?.[legacyIdKey]
+  }
+  return null
 }
 
 function getColumnMinWidth(fieldType: string, fieldKey: string | null): number {

@@ -53,6 +53,17 @@ export const useDeleteChannel = () => {
   })
 }
 
+export const useCopyChannel = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => post<Channel>(`v1/channels/${id}/copy`),
+    onSuccess: (channel) => {
+      qc.invalidateQueries({ queryKey: channelKeys.detail(channel.id) })
+      qc.invalidateQueries({ queryKey: channelKeys.lists() })
+    },
+  })
+}
+
 export const useRotateChannelKey = () => {
   const qc = useQueryClient()
   return useMutation({

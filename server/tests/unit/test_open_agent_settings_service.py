@@ -14,16 +14,24 @@ from app.libs.open_agent.base import (
     OpenAgentAgentSummary,
     OpenAgentConnectionResult,
 )
+from app.libs.voice_speed.base import VoiceSpeedConnectionResult
 from app.repositories.open_agent_settings_repository import OpenAgentSettingsRepository
-from app.schemas.open_agent_settings import OpenAgentConnectionTestRequest, OpenAgentSettingsUpdate
+from app.schemas.open_agent_settings import (
+    OpenAgentConnectionTestRequest,
+    OpenAgentSettingsUpdate,
+    VoiceSpeedConnectionTestRequest,
+    VoiceSpeedSettingsUpdate,
+)
 from app.services.open_agent_settings_service import OpenAgentSettingsService
 
 
 @dataclass
 class FakeOpenAgentSettings:
     tenant_id: int
-    base_url: str
-    api_key_ciphertext: str
+    base_url: str | None
+    api_key_ciphertext: str | None
+    voice_speed_base_url: str | None = None
+    voice_speed_api_key_ciphertext: str | None = None
     updated_at: datetime | None = None
 
 
@@ -33,6 +41,10 @@ class FakeOpenAgentClient:
         self.calls: list[tuple[str, str]] = []
         self.agent_calls: list[tuple[str, str, str, int, int]] = []
         self.agent_detail_calls: list[tuple[str, str, int]] = []
+        self.ai_disclaimer = {
+            "enabled": True,
+            "content": "本内容由AI生成，仅供参考",
+        }
 
     async def test_connection(self, base_url: str, api_key: str) -> OpenAgentConnectionResult:
         self.calls.append((base_url, api_key))
@@ -87,13 +99,47 @@ class FakeOpenAgentClient:
                     }
                 ],
             },
+            ai_disclaimer=self.ai_disclaimer,
         )
+
+
+class FakeVoiceSpeedClient:
+    def __init__(self, ok: bool = True):
+        self.ok = ok
+        self.calls: list[tuple[str, str]] = []
+
+    async def test_connection(self, base_url: str, api_key: str) -> VoiceSpeedConnectionResult:
+        self.calls.append((base_url, api_key))
+        return VoiceSpeedConnectionResult(self.ok, "VoiceSpeed 连接成功" if self.ok else "Denied")
 
 
 @pytest.mark.asyncio
 async def test_update_settings_requires_api_key_on_first_binding(monkeypatch):
     async def fake_get(_db, _tenant_id):
         return None
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    with pytest.raises(ValidationError):
+        await OpenAgentSettingsService.update_settings(
+            object(),
+            1,
+            OpenAgentSettingsUpdate(base_url="https://newagent.example.com"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_settings_requires_api_key_when_only_voice_speed_exists(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url=None,
+        api_key_ciphertext=None,
+        voice_speed_base_url="https://voicespeed.example.com",
+        voice_speed_api_key_ciphertext=encrypt_secret("vsk-existing"),
+    )
+
+    async def fake_get(_db, _tenant_id):
+        return existing
 
     monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
 
@@ -281,3 +327,169 @@ async def test_get_agent_welcome_message_uses_agent_detail(monkeypatch):
     assert response.faq.title == "常见问题"
     assert response.faq.categories[0].questions[0].text == "怎么重置密码？"
     assert client.agent_detail_calls == [("https://new.example.com/api/v1", "sk-saved", 10)]
+
+
+@pytest.mark.asyncio
+async def test_get_agent_visitor_runtime_config_returns_ai_disclaimer(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url="https://new.example.com/api/v1",
+        api_key_ciphertext=encrypt_secret("sk-saved"),
+    )
+    client = FakeOpenAgentClient()
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    response = await OpenAgentSettingsService.get_agent_visitor_runtime_config(
+        object(),
+        1,
+        10,
+        open_agent_client=client,
+    )
+
+    assert response.ai_disclaimer is not None
+    assert response.ai_disclaimer.enabled is True
+    assert response.ai_disclaimer.content == "本内容由AI生成，仅供参考"
+
+
+@pytest.mark.asyncio
+async def test_get_agent_visitor_runtime_config_filters_empty_ai_disclaimer(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url="https://new.example.com/api/v1",
+        api_key_ciphertext=encrypt_secret("sk-saved"),
+    )
+    client = FakeOpenAgentClient()
+    client.ai_disclaimer = {"enabled": True, "content": " "}
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    response = await OpenAgentSettingsService.get_agent_visitor_runtime_config(
+        object(),
+        1,
+        10,
+        open_agent_client=client,
+    )
+
+    assert response.ai_disclaimer is None
+
+
+@pytest.mark.asyncio
+async def test_update_voice_speed_settings_creates_encrypted_secret(monkeypatch):
+    created: dict = {}
+
+    async def fake_get(_db, _tenant_id):
+        return None
+
+    async def fake_create(_db, data):
+        created.update(data)
+        return FakeOpenAgentSettings(
+            tenant_id=data["tenant_id"],
+            base_url=None,
+            api_key_ciphertext=None,
+            voice_speed_base_url=data["voice_speed_base_url"],
+            voice_speed_api_key_ciphertext=data["voice_speed_api_key_ciphertext"],
+        )
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+    monkeypatch.setattr(OpenAgentSettingsRepository, "create", fake_create)
+
+    response = await OpenAgentSettingsService.update_voice_speed_settings(
+        object(),
+        1,
+        VoiceSpeedSettingsUpdate(
+            base_url=" https://voicespeed.example.com/ ",
+            api_key=" vsk-test ",
+        ),
+    )
+
+    assert response.base_url == "https://voicespeed.example.com"
+    assert response.has_api_key is True
+    assert created["voice_speed_api_key_ciphertext"] != "vsk-test"
+    assert decrypt_secret(created["voice_speed_api_key_ciphertext"]) == "vsk-test"
+    assert "base_url" not in created
+    assert "api_key_ciphertext" not in created
+
+
+@pytest.mark.asyncio
+async def test_update_voice_speed_settings_keeps_existing_secret_when_blank(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url="https://newagent.example.com",
+        api_key_ciphertext=encrypt_secret("sk-existing"),
+        voice_speed_base_url="https://old-voicespeed.example.com",
+        voice_speed_api_key_ciphertext=encrypt_secret("vsk-existing"),
+    )
+    updates: dict = {}
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    async def fake_update(_db, item, data):
+        updates.update(data)
+        item.voice_speed_base_url = data["voice_speed_base_url"]
+        if "voice_speed_api_key_ciphertext" in data:
+            item.voice_speed_api_key_ciphertext = data["voice_speed_api_key_ciphertext"]
+        return item
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+    monkeypatch.setattr(OpenAgentSettingsRepository, "update", fake_update)
+
+    response = await OpenAgentSettingsService.update_voice_speed_settings(
+        object(),
+        1,
+        VoiceSpeedSettingsUpdate(base_url="https://voicespeed.example.com", api_key=""),
+    )
+
+    assert response.base_url == "https://voicespeed.example.com"
+    assert "voice_speed_api_key_ciphertext" not in updates
+    assert decrypt_secret(existing.voice_speed_api_key_ciphertext) == "vsk-existing"
+    assert decrypt_secret(existing.api_key_ciphertext) == "sk-existing"
+
+
+@pytest.mark.asyncio
+async def test_voice_speed_connection_uses_saved_secret_when_api_key_blank(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url=None,
+        api_key_ciphertext=None,
+        voice_speed_base_url="https://voicespeed.example.com",
+        voice_speed_api_key_ciphertext=encrypt_secret("vsk-saved"),
+    )
+    client = FakeVoiceSpeedClient()
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    response = await OpenAgentSettingsService.test_voice_speed_connection(
+        object(),
+        1,
+        VoiceSpeedConnectionTestRequest(base_url="https://voicespeed.example.com", api_key=None),
+        voice_speed_client=client,
+    )
+
+    assert response.ok is True
+    assert client.calls == [("https://voicespeed.example.com", "vsk-saved")]
+
+
+@pytest.mark.asyncio
+async def test_update_voice_speed_settings_requires_api_key_on_first_binding(monkeypatch):
+    async def fake_get(_db, _tenant_id):
+        return None
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    with pytest.raises(ValidationError):
+        await OpenAgentSettingsService.update_voice_speed_settings(
+            object(),
+            1,
+            VoiceSpeedSettingsUpdate(base_url="https://voicespeed.example.com"),
+        )

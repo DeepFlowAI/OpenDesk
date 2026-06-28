@@ -13,6 +13,7 @@ from app.schemas.base import PaginatedResponse, TimestampSchema
 KnowledgeDocumentStatus = Literal["draft", "published"]
 KnowledgeDocumentDisplayStatus = Literal["draft", "published", "expired"]
 KnowledgeValidityType = Literal["permanent", "scheduled"]
+KnowledgeRecommendationStatus = Literal["no_conversation", "updating", "no_vector", "ready", "failed"]
 
 
 class ActorRef(BaseModel):
@@ -147,6 +148,14 @@ class KnowledgeDocumentResponse(TimestampSchema):
 
 class KnowledgeDocumentListResponse(PaginatedResponse):
     items: list[KnowledgeDocumentResponse]
+
+
+class KnowledgeRecommendationResponse(BaseModel):
+    status: KnowledgeRecommendationStatus
+    items: list[KnowledgeDocumentResponse] = Field(default_factory=list)
+    limit: int = 5
+    vector_updated_at: datetime | None = None
+    message: str | None = None
 
 
 KnowledgeDirectoryNode.model_rebuild()

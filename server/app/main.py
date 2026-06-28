@@ -54,6 +54,33 @@ async def _visitor_timeout_close_worker() -> None:
         await asyncio.sleep(interval)
 
 
+async def _open_agent_bot_timeout_worker() -> None:
+    from app.services.open_agent_bot_timeout_service import OpenAgentBotTimeoutService
+
+    logger = logging.getLogger(__name__)
+    interval = settings.OPEN_AGENT_BOT_TIMEOUT_SCAN_INTERVAL_SECONDS
+    batch_size = settings.OPEN_AGENT_BOT_TIMEOUT_SCAN_BATCH_SIZE
+    while True:
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await OpenAgentBotTimeoutService.process_expired_conversations(
+                    db,
+                    limit=batch_size,
+                )
+            if result["closed"]:
+                logger.info(
+                    "open_agent_bot_timeout_scan checked=%s closed=%s skipped=%s",
+                    result["checked"],
+                    result["closed"],
+                    result["skipped"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("OpenAgent bot timeout scan failed")
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     assert_safe_production_config()
@@ -70,6 +97,12 @@ async def lifespan(app: FastAPI):
         visitor_timeout_task = asyncio.create_task(
             _visitor_timeout_close_worker(),
             name="visitor-timeout-close-worker",
+        )
+    bot_timeout_task = None
+    if settings.OPEN_AGENT_BOT_TIMEOUT_WORKER_ENABLED:
+        bot_timeout_task = asyncio.create_task(
+            _open_agent_bot_timeout_worker(),
+            name="open-agent-bot-timeout-worker",
         )
 
     # Optional: call-center orchestrator. Off by default in OSS to avoid
@@ -92,6 +125,10 @@ async def lifespan(app: FastAPI):
         visitor_timeout_task.cancel()
         with suppress(asyncio.CancelledError):
             await visitor_timeout_task
+    if bot_timeout_task is not None:
+        bot_timeout_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await bot_timeout_task
 
     # Shutdown call center
     if orchestrator is not None:

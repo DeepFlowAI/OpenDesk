@@ -36,9 +36,10 @@ async def seed_data():
 
         hashed = hash_password("Test1234")
         await db.execute(text("""
-            INSERT INTO employees (tenant_id, username, email, password_hash, display_name, roles, is_active)
-            VALUES (:tid, 'testuser', 'test@example.com', :pw, 'Test User', '["admin"]'::jsonb, true)
-            ON CONFLICT ON CONSTRAINT uq_employees_tenant_username DO NOTHING
+            INSERT INTO employees (tenant_id, username, email, password_hash, display_name, name, roles, is_active)
+            VALUES (:tid, 'testuser', 'test@example.com', :pw, 'Test User', 'Test User Name', '["admin"]'::jsonb, true)
+            ON CONFLICT ON CONSTRAINT uq_employees_tenant_username
+            DO UPDATE SET name = EXCLUDED.name
         """), {"tid": tenant_pk, "pw": hashed})
 
         await db.execute(text("""
@@ -65,6 +66,7 @@ class TestAuthAPI:
         assert "access_token" in data
         assert data["token_type"] == "bearer"
         assert data["user"]["username"] == "testuser"
+        assert data["user"]["name"] == "Test User Name"
         assert data["user"]["roles"] == ["admin"]
 
     @pytest.mark.asyncio
@@ -215,6 +217,7 @@ class TestAuthAPI:
         assert resp.status_code == 200
         user = resp.json()
         assert user["username"] == "auth_me_refresh_user"
+        assert user["name"] == "Auth Me Refresh"
         assert user["role_ids"] == [role_id]
         assert user["permissions"] == ["call.workspace.use"]
 

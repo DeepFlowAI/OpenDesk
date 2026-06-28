@@ -7,10 +7,12 @@ import json
 
 import pytest
 
+from app.core.exceptions import ValidationError
 from app.enums import ConversationStatus
+from app.libs.open_agent.base import OpenAgentFeedbackResult
 from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.message_repository import MessageRepository
-from app.schemas.open_agent_conversation import OpenAgentChatRequest
+from app.schemas.open_agent_conversation import OpenAgentChatRequest, OpenAgentFeedbackRequest
 from app.services.conversation_service import ConversationService
 from app.services.open_agent_conversation_service import OpenAgentConversationService
 from app.services.open_agent_settings_service import OpenAgentSettingsService
@@ -164,12 +166,12 @@ class FakeDuplicateHandoffClient:
 class FakeToolResultHandoffWithoutToolNameClient:
     async def stream_chat(self, _base_url, _api_key, _agent_id, _payload):
         tool_call = {
-            "tool_call_id": "call_handoff",
-            "tool_name": "human_handoff",
+            "call_id": "call_handoff",
+            "name": "human_handoff",
             "arguments": {"brief": "需要人工协助", "reason": "billing issue"},
         }
         tool_result = {
-            "tool_call_id": "call_handoff",
+            "call_id": "call_handoff",
             "result": {"brief": "需要人工协助", "reason": "billing issue"},
         }
         yield f"event: tool_call\ndata: {json.dumps(tool_call, ensure_ascii=False)}\n\n".encode()
@@ -213,6 +215,60 @@ class FakeRequiredActionHandoffClient:
         self.tool_result_payloads.append(payload)
         for chunk in self.tool_result_chunks:
             yield chunk
+
+
+class FakeFeedbackOpenAgentClient:
+    def __init__(self):
+        self.agent_ids: list[int] = []
+        self.conversation_ids: list[int] = []
+        self.step_ids: list[int] = []
+        self.payloads: list[dict] = []
+
+    async def submit_feedback(self, _base_url, _api_key, agent_id, conversation_id, step_id, payload):
+        self.agent_ids.append(agent_id)
+        self.conversation_ids.append(conversation_id)
+        self.step_ids.append(step_id)
+        self.payloads.append(payload)
+        return OpenAgentFeedbackResult(
+            step_id=step_id,
+            rating=payload["rating"],
+            comment=payload.get("comment"),
+            updated_at="2026-06-23T00:00:00+00:00",
+        )
+
+
+class FakeAsyncSessionContext:
+    async def __aenter__(self):
+        return object()
+
+    async def __aexit__(self, *_exc_info):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def patch_managed_stream_session(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.open_agent_conversation_service.AsyncSessionLocal",
+        lambda: FakeAsyncSessionContext(),
+    )
+
+
+async def stream_chat_for_session_under_test(
+    _db,
+    conversation_public_id: str,
+    visitor_context: dict,
+    body: OpenAgentChatRequest,
+    open_agent_client=None,
+    redis=None,
+):
+    async for chunk in OpenAgentConversationService.stream_chat_for_session_managed(
+        conversation_public_id,
+        visitor_context,
+        body,
+        open_agent_client=open_agent_client,
+        redis=redis,
+    ):
+        yield chunk
 
 
 def patch_required_action_stream_dependencies(monkeypatch, conversation, created_messages: list[dict]):
@@ -333,7 +389,7 @@ async def test_stream_chat_saves_final_bot_message(monkeypatch):
         b"event: done\ndata: {\"final_content\":\"Hello\"}\n\n",
     ])
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -350,6 +406,440 @@ async def test_stream_chat_saves_final_bot_message(monkeypatch):
     assert created_messages[-1]["sender_type"] == "bot"
     assert created_messages[-1]["content"] == "Hello"
     assert created_messages[-1]["metadata_"]["client_message_id"] == "cm_1"
+
+
+@pytest.mark.asyncio
+async def test_managed_stream_chat_closes_db_session_while_waiting_for_open_agent(monkeypatch):
+    conversation = FakeConversation()
+    created_messages: list[dict] = []
+
+    class SessionTracker:
+        active = False
+        opens = 0
+        closes = 0
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            assert SessionTracker.active is False
+            SessionTracker.active = True
+            SessionTracker.opens += 1
+            return object()
+
+        async def __aexit__(self, *_exc_info):
+            SessionTracker.active = False
+            SessionTracker.closes += 1
+
+    class SessionAwareOpenAgentClient:
+        def __init__(self):
+            self.payloads: list[dict] = []
+            self.active_states: list[bool] = []
+
+        async def stream_chat(self, _base_url, _api_key, _agent_id, payload):
+            self.payloads.append(payload)
+            self.active_states.append(SessionTracker.active)
+            yield b"event: content_delta\ndata: {\"content\":\"Hello\"}\n\n"
+            self.active_states.append(SessionTracker.active)
+            yield b"event: done\ndata: {\"final_content\":\"Hello\"}\n\n"
+            self.active_states.append(SessionTracker.active)
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_get_credentials(*_args, **_kwargs):
+        return "https://openagent.example.com", "sk-test"
+
+    async def fake_get_by_client_message_id(*_args, **_kwargs):
+        return None
+
+    async def fake_send_message(*_args, **_kwargs):
+        return None
+
+    async def fake_update_open_agent_state(_db, conv, data):
+        for key, value in data.items():
+            setattr(conv, key, value)
+        return conv
+
+    async def fake_create(_db, data):
+        created_messages.append(data)
+        return FakeMessage(id=len(created_messages) + 10, **data)
+
+    async def fake_noop(*_args, **_kwargs):
+        return None
+
+    async def fake_get_by_id(*_args, **_kwargs):
+        return conversation
+
+    monkeypatch.setattr(
+        "app.services.open_agent_conversation_service.AsyncSessionLocal",
+        lambda: FakeSessionContext(),
+    )
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+    monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
+    monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
+    monkeypatch.setattr(ConversationService, "send_message", fake_send_message)
+    monkeypatch.setattr(ConversationRepository, "update_open_agent_state", fake_update_open_agent_state)
+    monkeypatch.setattr(MessageRepository, "create", fake_create)
+    monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
+    monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
+
+    client = SessionAwareOpenAgentClient()
+    stream = OpenAgentConversationService.stream_chat_for_session_managed(
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        OpenAgentChatRequest(message="hi", client_message_id="cm_managed"),
+        open_agent_client=client,
+    )
+    chunks = [chunk async for chunk in stream]
+
+    assert any(b"open_desk_message_saved" in chunk for chunk in chunks)
+    assert client.active_states == [False, False, False]
+    assert SessionTracker.opens >= 2
+    assert SessionTracker.opens == SessionTracker.closes
+    assert created_messages[-1]["sender_type"] == "bot"
+    assert created_messages[-1]["metadata_"]["client_message_id"] == "cm_managed"
+
+
+@pytest.mark.asyncio
+async def test_managed_auto_handoff_tool_result_closes_db_session_while_waiting(monkeypatch):
+    conversation = FakeConversation(
+        channel=FakeChannel({
+            "open_agent_enabled": True,
+            "open_agent_agent_id": 7,
+            "open_agent_agent_name": "Support Bot",
+            "open_agent_handoff_behavior": "auto",
+        }),
+    )
+    created_messages: list[dict] = []
+
+    class SessionTracker:
+        active = False
+        opens = 0
+        closes = 0
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            assert SessionTracker.active is False
+            SessionTracker.active = True
+            SessionTracker.opens += 1
+            return object()
+
+        async def __aexit__(self, *_exc_info):
+            SessionTracker.active = False
+            SessionTracker.closes += 1
+
+    class SessionAwareRequiredActionClient(FakeRequiredActionHandoffClient):
+        def __init__(self):
+            super().__init__([
+                b"event: content_delta\ndata: {\"content\":\"handoff routed\"}\n\n",
+                b"event: done\ndata: {\"final_content\":\"handoff routed\"}\n\n",
+            ])
+            self.tool_result_active_states: list[bool] = []
+
+        async def stream_tool_result(self, base_url, api_key, agent_id, conversation_id, payload):
+            self.tool_result_active_states.append(SessionTracker.active)
+            async for chunk in super().stream_tool_result(
+                base_url,
+                api_key,
+                agent_id,
+                conversation_id,
+                payload,
+            ):
+                self.tool_result_active_states.append(SessionTracker.active)
+                yield chunk
+
+    patch_required_action_stream_dependencies(monkeypatch, conversation, created_messages)
+    monkeypatch.setattr(
+        "app.services.open_agent_conversation_service.AsyncSessionLocal",
+        lambda: FakeSessionContext(),
+    )
+
+    async def fake_request_handoff(*_args, **_kwargs):
+        conversation.status = ConversationStatus.ACTIVE.value
+        conversation.agent_id = 33
+        return {
+            "ok": True,
+            "conversation": conversation,
+            "message": {
+                "id": 101,
+                "conversation_public_id": conversation.public_id,
+                "sender_type": "system",
+                "content_type": "system",
+                "content": "已为您转接人工客服",
+                "metadata": {"event_type": "open_agent_handoff_success"},
+            },
+            "messages": [],
+            "agent": None,
+        }
+
+    monkeypatch.setattr(ConversationService, "request_human_handoff_for_session", fake_request_handoff)
+
+    client = SessionAwareRequiredActionClient()
+    stream = OpenAgentConversationService.stream_chat_for_session_managed(
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        OpenAgentChatRequest(message="help", client_message_id="cm_managed_auto_handoff"),
+        open_agent_client=client,
+        redis=object(),
+    )
+    chunks = [chunk async for chunk in stream]
+
+    assert any(b"open_desk_conversation_status" in chunk for chunk in chunks)
+    assert client.tool_result_payloads == [{
+        "tool_call_id": "call_handoff",
+        "status": "handoff_success",
+        "message": "已为您转接人工客服",
+    }]
+    assert client.tool_result_active_states == [False, False, False]
+    assert SessionTracker.opens == SessionTracker.closes
+    assert created_messages[-1]["sender_type"] == "bot"
+
+
+@pytest.mark.asyncio
+async def test_managed_submit_handoff_tool_result_closes_db_session_while_waiting(monkeypatch):
+    conversation = FakeConversation(open_agent_conversation_id=42)
+    created_messages: list[dict] = []
+
+    class SessionTracker:
+        active = False
+        opens = 0
+        closes = 0
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            assert SessionTracker.active is False
+            SessionTracker.active = True
+            SessionTracker.opens += 1
+            return object()
+
+        async def __aexit__(self, *_exc_info):
+            SessionTracker.active = False
+            SessionTracker.closes += 1
+
+    class SessionAwareToolResultClient:
+        def __init__(self):
+            self.payloads: list[dict] = []
+            self.active_states: list[bool] = []
+
+        async def stream_tool_result(self, _base_url, _api_key, _agent_id, _conversation_id, payload):
+            self.payloads.append(payload)
+            self.active_states.append(SessionTracker.active)
+            yield b"event: content_delta\ndata: {\"content\":\"handoff recorded\"}\n\n"
+            self.active_states.append(SessionTracker.active)
+            yield b"event: done\ndata: {\"final_content\":\"handoff recorded\"}\n\n"
+            self.active_states.append(SessionTracker.active)
+
+    patch_required_action_stream_dependencies(monkeypatch, conversation, created_messages)
+    monkeypatch.setattr(
+        "app.services.open_agent_conversation_service.AsyncSessionLocal",
+        lambda: FakeSessionContext(),
+    )
+
+    client = SessionAwareToolResultClient()
+    events = await OpenAgentConversationService.submit_handoff_tool_result_for_session_managed(
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        tool_call_id="call_handoff",
+        status=OpenAgentConversationService._HANDOFF_TOOL_RESULT_FAILED,
+        message="用户选择继续咨询智能助手。",
+        open_agent_client=client,
+    )
+
+    assert any(b"open_desk_message_saved" in event for event in events)
+    assert client.payloads == [{
+        "tool_call_id": "call_handoff",
+        "status": "handoff_failed",
+        "message": "用户选择继续咨询智能助手。",
+    }]
+    assert client.active_states == [False, False, False]
+    assert SessionTracker.opens >= 2
+    assert SessionTracker.opens == SessionTracker.closes
+    assert created_messages[-1]["sender_type"] == "bot"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step_id_key", ["feedback_step_id", "assistant_step_id"])
+async def test_stream_chat_saves_done_payload_step_id_for_feedback(monkeypatch, step_id_key):
+    conversation = FakeConversation()
+    created_messages: list[dict] = []
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_get_credentials(*_args, **_kwargs):
+        return "https://openagent.example.com", "sk-test"
+
+    async def fake_get_by_client_message_id(*_args, **_kwargs):
+        return None
+
+    async def fake_send_message(*_args, **_kwargs):
+        return None
+
+    async def fake_update_open_agent_state(_db, conv, data):
+        for key, value in data.items():
+            setattr(conv, key, value)
+        return conv
+
+    async def fake_create(_db, data):
+        created_messages.append(data)
+        return FakeMessage(id=len(created_messages) + 10, **data)
+
+    async def fake_noop(*_args, **_kwargs):
+        return None
+
+    async def fake_get_by_id(*_args, **_kwargs):
+        return conversation
+
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+    monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
+    monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
+    monkeypatch.setattr(ConversationService, "send_message", fake_send_message)
+    monkeypatch.setattr(ConversationRepository, "update_open_agent_state", fake_update_open_agent_state)
+    monkeypatch.setattr(MessageRepository, "create", fake_create)
+    monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
+    monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
+
+    client = CapturingOpenAgentClient([
+        b"event: content_delta\ndata: {\"content\":\"Hello\"}\n\n",
+        (
+            b"event: done\ndata: "
+            + json.dumps({"final_content": "Hello", step_id_key: 88}).encode()
+            + b"\n\n"
+        ),
+    ])
+
+    stream = stream_chat_for_session_under_test(
+        object(),
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        OpenAgentChatRequest(message="hi", client_message_id="cm_feedback"),
+        open_agent_client=client,
+    )
+    _chunks = [chunk async for chunk in stream]
+
+    assert created_messages[-1]["metadata_"]["open_agent_feedback_step_id"] == 88
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_updates_bot_message_metadata(monkeypatch):
+    conversation = FakeConversation(
+        open_agent_conversation_id=42,
+        channel=FakeChannel({
+            "open_agent_enabled": True,
+            "open_agent_agent_id": 7,
+            "open_agent_agent_name": "Support Bot",
+            "open_agent_feedback_enabled": True,
+        }),
+    )
+    message = FakeMessage(
+        id=51,
+        tenant_id=conversation.tenant_id,
+        conversation_id=conversation.id,
+        sender_type="bot",
+        content_type="text",
+        content="Hello",
+        metadata_={
+            "open_agent_feedback_step_id": 88,
+            "open_agent_feedback": {
+                "schema_version": 1,
+                "step_id": 88,
+                "rating": "dislike",
+                "comment": "old",
+                "updated_at": "2026-06-22T00:00:00+00:00",
+            },
+        },
+    )
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_get_message(*_args, **_kwargs):
+        return message
+
+    async def fake_get_credentials(*_args, **_kwargs):
+        return "https://openagent.example.com", "sk-test"
+
+    async def fake_update_metadata(_db, msg, metadata):
+        msg.metadata_ = metadata
+        return msg
+
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+    monkeypatch.setattr(MessageRepository, "get_by_id_for_conversation", fake_get_message)
+    monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
+    monkeypatch.setattr(MessageRepository, "update_metadata", fake_update_metadata)
+
+    client = FakeFeedbackOpenAgentClient()
+    result = await OpenAgentConversationService.submit_feedback_for_session(
+        object(),
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        OpenAgentFeedbackRequest(message_id=51, step_id=88, rating="like", comment="ignored"),
+        open_agent_client=client,
+    )
+
+    assert client.agent_ids == [7]
+    assert client.conversation_ids == [42]
+    assert client.step_ids == [88]
+    assert client.payloads == [{"rating": "like", "comment": None}]
+    assert message.metadata_["open_agent_feedback"]["rating"] == "like"
+    assert message.metadata_["open_agent_feedback"]["comment"] is None
+    assert result["message"]["metadata"]["open_agent_feedback"]["updated_at"] == "2026-06-23T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_rejects_when_open_agent_conversation_missing(monkeypatch):
+    conversation = FakeConversation(
+        channel=FakeChannel({
+            "open_agent_enabled": True,
+            "open_agent_agent_id": 7,
+            "open_agent_feedback_enabled": True,
+        }),
+    )
+    message = FakeMessage(
+        id=51,
+        tenant_id=conversation.tenant_id,
+        conversation_id=conversation.id,
+        sender_type="bot",
+        content_type="text",
+        content="Hello",
+        metadata_={"open_agent_feedback_step_id": 88},
+    )
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_get_message(*_args, **_kwargs):
+        return message
+
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+    monkeypatch.setattr(MessageRepository, "get_by_id_for_conversation", fake_get_message)
+
+    with pytest.raises(ValidationError, match="conversation is not available"):
+        await OpenAgentConversationService.submit_feedback_for_session(
+            object(),
+            "cv_test",
+            {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+            OpenAgentFeedbackRequest(message_id=51, step_id=88, rating="like"),
+            open_agent_client=FakeFeedbackOpenAgentClient(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_submit_feedback_rejects_when_channel_switch_disabled(monkeypatch):
+    conversation = FakeConversation()
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+
+    with pytest.raises(ValidationError, match="feedback is not enabled"):
+        await OpenAgentConversationService.submit_feedback_for_session(
+            object(),
+            "cv_test",
+            {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+            OpenAgentFeedbackRequest(message_id=51, step_id=88, rating="like"),
+            open_agent_client=FakeFeedbackOpenAgentClient(),
+        )
 
 
 @pytest.mark.asyncio
@@ -393,7 +883,7 @@ async def test_stream_chat_saves_tool_blocks_in_bot_metadata(monkeypatch):
     monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
     monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -458,7 +948,7 @@ async def test_stream_chat_preserves_content_between_tool_calls(monkeypatch):
     monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
     monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -518,7 +1008,7 @@ async def test_stream_chat_saves_thinking_blocks_in_bot_metadata(monkeypatch):
     monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
     monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -556,13 +1046,17 @@ async def test_new_chat_does_not_forward_stale_last_event_id(monkeypatch):
             setattr(conv, key, value)
         return conv
 
+    async def fake_get_by_id(*_args, **_kwargs):
+        return conversation
+
     monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
     monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
     monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
     monkeypatch.setattr(ConversationService, "send_message", fake_send_message)
     monkeypatch.setattr(ConversationRepository, "update_open_agent_state", fake_update_open_agent_state)
+    monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -594,12 +1088,16 @@ async def test_resume_chat_uses_saved_last_event_id_when_omitted(monkeypatch):
             setattr(conv, key, value)
         return conv
 
+    async def fake_get_by_id(*_args, **_kwargs):
+        return conversation
+
     monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
     monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
     monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
     monkeypatch.setattr(ConversationRepository, "update_open_agent_state", fake_update_open_agent_state)
+    monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -644,13 +1142,17 @@ async def test_resume_chat_with_explicit_client_id_saves_missing_visitor_message
             setattr(conv, key, value)
         return conv
 
+    async def fake_get_by_id(*_args, **_kwargs):
+        return conversation
+
     monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
     monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
     monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
     monkeypatch.setattr(ConversationService, "send_message", fake_send_message)
     monkeypatch.setattr(ConversationRepository, "update_open_agent_state", fake_update_open_agent_state)
+    monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -742,7 +1244,7 @@ async def test_stream_chat_records_handoff_event_as_system_message(monkeypatch):
     monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
     monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -851,7 +1353,7 @@ async def test_stream_chat_records_tool_result_handoff_as_system_message(monkeyp
     monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
     monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -935,7 +1437,7 @@ async def test_duplicate_handoff_signals_only_create_one_system_message(monkeypa
     monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
     monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -1204,7 +1706,7 @@ async def test_stream_chat_records_handoff_when_tool_result_omits_tool_name(monk
     monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
     monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -1214,8 +1716,14 @@ async def test_stream_chat_records_handoff_when_tool_result_omits_tool_name(monk
     chunks = [chunk async for chunk in stream]
 
     assert any(b"open_desk_message_saved" in chunk for chunk in chunks)
+    assert len(created_messages) == 2
     assert created_messages[0]["sender_type"] == "system"
     assert created_messages[0]["metadata_"]["handoff_source"] == "bot_tool"
+    assert created_messages[0]["metadata_"]["tool_call_id"] == "call_handoff"
+    assert created_messages[1]["sender_type"] == "bot"
+    tool_blocks = created_messages[1]["metadata_"]["open_agent_tool_blocks"]
+    assert tool_blocks[0]["toolCallId"] == "call_handoff"
+    assert tool_blocks[0]["usedForHandoff"] is True
 
 
 @pytest.mark.asyncio
@@ -1225,7 +1733,7 @@ async def test_requires_action_handoff_confirm_mode_saves_pending_without_tool_r
     client = FakeRequiredActionHandoffClient()
     patch_required_action_stream_dependencies(monkeypatch, conversation, created_messages)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -1280,7 +1788,7 @@ async def test_requires_action_handoff_auto_success_submits_success_tool_result(
 
     monkeypatch.setattr(ConversationService, "request_human_handoff_for_session", fake_request_handoff)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
@@ -1341,7 +1849,7 @@ async def test_requires_action_handoff_auto_failure_submits_failed_and_saves_fal
 
     monkeypatch.setattr(ConversationService, "request_human_handoff_for_session", fake_request_handoff)
 
-    stream = OpenAgentConversationService.stream_chat_for_session(
+    stream = stream_chat_for_session_under_test(
         object(),
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},

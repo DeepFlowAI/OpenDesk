@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,14 +15,18 @@ def _task(
     *,
     task_id: int = 11,
     task_ref_id: str = "100",
+    task_type: str = "conversation",
+    channel: str = "online_chat",
     priority: int = 5,
     assignment_strategy: str | None = None,
+    policy_snapshot: dict | None = None,
+    source_context: dict | None = None,
 ):
     return SimpleNamespace(
         id=task_id,
         tenant_id=1,
-        channel="online_chat",
-        task_type="conversation",
+        channel=channel,
+        task_type=task_type,
         task_ref_id=task_ref_id,
         task_ref_public_id=f"cv_{task_ref_id}",
         queue_type="employee_group",
@@ -30,8 +34,8 @@ def _task(
         priority=priority,
         status=status,
         source_type="visitor_waiting",
-        source_context={},
-        policy_snapshot={},
+        source_context=source_context or {},
+        policy_snapshot=policy_snapshot or {},
         assignment_strategy=assignment_strategy,
         assigned_agent_id=None,
         assigned_by=None,
@@ -126,12 +130,13 @@ def _install_dispatch_mocks(monkeypatch, tasks: list, provider: _OnlineProvider)
     monkeypatch.setattr(qs.QueueResourceProviderFactory, "create", lambda _channel: provider)
     monkeypatch.setattr(QueueTaskService, "_assign_business_object", AsyncMock())
     monkeypatch.setattr(QueueTaskService, "_record_event", AsyncMock())
+    monkeypatch.setattr(QueueTaskService, "_materialize_conversation_summary", AsyncMock())
     monkeypatch.setattr(qs.QueueRealtimeService, "emit_queue_updated", AsyncMock())
     return round_robin_state
 
 
-def _dispatch_request() -> QueueDispatchRequest:
-    return QueueDispatchRequest(channel="online_chat", queue_type="employee_group", queue_id=7)
+def _dispatch_request(channel: str = "online_chat") -> QueueDispatchRequest:
+    return QueueDispatchRequest(channel=channel, queue_type="employee_group", queue_id=7)
 
 
 @pytest.mark.asyncio
@@ -169,6 +174,7 @@ async def test_admin_assign_locks_task_and_emits_queue_update(monkeypatch):
     monkeypatch.setattr(qs.QueueResourceProviderFactory, "create", lambda _channel: provider)
     monkeypatch.setattr(QueueTaskService, "_assign_business_object", AsyncMock())
     monkeypatch.setattr(QueueTaskService, "_record_event", AsyncMock())
+    monkeypatch.setattr(QueueTaskService, "_materialize_conversation_summary", AsyncMock())
     monkeypatch.setattr(qs.QueueRealtimeService, "emit_queue_updated", emit_queue_updated)
 
     result = await QueueTaskService.admin_assign(
@@ -189,6 +195,50 @@ async def test_admin_assign_locks_task_and_emits_queue_update(monkeypatch):
         queue_type="employee_group",
         queue_id=7,
     )
+
+
+@pytest.mark.asyncio
+async def test_assign_business_object_anchors_timeout_at_assignment_time(monkeypatch):
+    db = SimpleNamespace()
+    assigned_at = datetime(2026, 6, 22, 12, 24, tzinfo=timezone.utc)
+    captured: dict = {}
+    conversation = SimpleNamespace(
+        id=100,
+        started_at=datetime(2026, 6, 22, 12, 21, tzinfo=timezone.utc),
+    )
+
+    async def assign_conversation(_db, tenant_id, conversation_id, employee_id, now):
+        captured["assign_conversation"] = (tenant_id, conversation_id, employee_id, now)
+        return True
+
+    async def initialize_for_conversation(_db, conversation_arg, *, anchor_at=None, commit=True):
+        captured["initialize"] = (conversation_arg, anchor_at, commit)
+        return None
+
+    monkeypatch.setattr(qs, "_now", lambda: assigned_at)
+    monkeypatch.setattr(QueueTaskService, "_record_reception_assignment", AsyncMock())
+    monkeypatch.setattr(qs.QueueBusinessRepository, "assign_conversation", assign_conversation)
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationService.create_agent_assigned_system_message",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationService.create_welcome_message_on_agent_assignment",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.repositories.conversation_repository.ConversationRepository.get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.initialize_for_conversation",
+        initialize_for_conversation,
+    )
+
+    await QueueTaskService._assign_business_object(db, 1, _task(task_ref_id="100"), 20)
+
+    assert captured["assign_conversation"] == (1, 100, 20, assigned_at)
+    assert captured["initialize"] == (conversation, assigned_at, False)
 
 
 @pytest.mark.asyncio
@@ -256,3 +306,114 @@ async def test_dispatch_skips_full_agents_and_recovers_after_capacity_release(mo
     assert recovered_response.agent_id == 1
     assert recovered_response.task.task_ref_id == "third"
     assert provider.loads == {1: 1, 2: 1}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_prioritizes_returning_online_chat_agent(monkeypatch):
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
+    task = _task(
+        task_id=301,
+        task_ref_id="900",
+        assignment_strategy="round_robin",
+        policy_snapshot={
+            "config": {
+                "returning_agent_priority_enabled": True,
+                "returning_agent_window_hours": 24,
+            }
+        },
+    )
+    provider = _OnlineProvider(
+        loads={1: 0, 2: 0, 3: 0},
+        capacities={1: 3, 2: 3, 3: 3},
+    )
+    round_robin_state = _install_dispatch_mocks(monkeypatch, [task], provider)
+    monkeypatch.setattr(
+        qs.QueueReturningAgentRepository,
+        "find_recent_online_chat_agent",
+        AsyncMock(return_value=3),
+    )
+
+    response = await QueueTaskService.dispatch(db, SimpleNamespace(), 1, _dispatch_request())
+
+    assert response.dispatched is True
+    assert response.agent_id == 3
+    assert provider.loads == {1: 0, 2: 0, 3: 1}
+    assert round_robin_state["last_agent_id"] is None
+    QueueTaskService._record_event.assert_awaited_once()
+    args, kwargs = QueueTaskService._record_event.await_args
+    assert args[2] == "returning_agent_assigned"
+    assert kwargs["reason"] == "returning_agent_priority"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_falls_back_when_returning_agent_is_not_available(monkeypatch):
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
+    task = _task(
+        task_id=302,
+        task_ref_id="901",
+        assignment_strategy="round_robin",
+        policy_snapshot={
+            "config": {
+                "returning_agent_priority_enabled": True,
+                "returning_agent_window_hours": 24,
+            }
+        },
+    )
+    provider = _OnlineProvider(
+        loads={1: 0, 2: 0, 3: 1},
+        capacities={1: 3, 2: 3, 3: 1},
+    )
+    round_robin_state = _install_dispatch_mocks(monkeypatch, [task], provider)
+    monkeypatch.setattr(
+        qs.QueueReturningAgentRepository,
+        "find_recent_online_chat_agent",
+        AsyncMock(return_value=3),
+    )
+
+    response = await QueueTaskService.dispatch(db, SimpleNamespace(), 1, _dispatch_request())
+
+    assert response.dispatched is True
+    assert response.agent_id == 1
+    assert provider.loads == {1: 1, 2: 0, 3: 1}
+    assert round_robin_state["last_agent_id"] == 1
+    args, kwargs = QueueTaskService._record_event.await_args
+    assert args[2] == "auto_assigned"
+    assert kwargs.get("reason") is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_prioritizes_returning_call_center_agent(monkeypatch):
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
+    task = _task(
+        task_id=303,
+        task_ref_id="call-current",
+        task_type="call",
+        channel="call_center",
+        assignment_strategy="round_robin",
+        policy_snapshot={
+            "config": {
+                "returning_agent_priority_enabled": True,
+                "returning_agent_window_hours": 12,
+            }
+        },
+        source_context={"call_id": "call-current"},
+    )
+    provider = _OnlineProvider(
+        loads={1: 0, 2: 0},
+        capacities={1: 1, 2: 1},
+    )
+    _install_dispatch_mocks(monkeypatch, [task], provider)
+    monkeypatch.setattr(
+        qs.QueueReturningAgentRepository,
+        "find_recent_call_center_agent",
+        AsyncMock(return_value=2),
+    )
+
+    response = await QueueTaskService.dispatch(db, SimpleNamespace(), 1, _dispatch_request("call_center"))
+
+    assert response.dispatched is True
+    assert response.agent_id == 2
+    QueueTaskService._record_event.assert_awaited_once()
+    args, kwargs = QueueTaskService._record_event.await_args
+    assert args[2] == "returning_agent_assigned"
+    assert kwargs["reason"] == "returning_agent_priority"

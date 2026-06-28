@@ -1,4 +1,6 @@
 import type { WelcomeMessagePublic } from '@/models/welcome-message-rule'
+import type { ConversationAnnouncementPublic } from '@/models/conversation-announcement'
+import type { ConversationReadStatusPublicConfig } from '@/models/conversation-read-status'
 
 export type OpenAgentWelcomeMessageBlock =
   | {
@@ -35,6 +37,11 @@ export type OpenAgentWelcomeMessage = {
   faq?: OpenAgentFAQ | null
 }
 
+export type OpenAgentAIDisclaimer = {
+  enabled: boolean
+  content: string
+}
+
 export type AssistPanelConfigValue =
   | string
   | number
@@ -64,6 +71,7 @@ export type ChannelConfig = {
   agent_bubble_border_color: string | null
   agent_bubble_radius: [number, number, number, number]
   use_agent_avatar: boolean
+  agent_default_avatar_url: string | null
   user_bubble_bg_color: string | null
   user_bubble_text_color: string | null
   user_bubble_border_color: string | null
@@ -78,6 +86,7 @@ export type ChannelConfig = {
   offline_title: string
   offline_message: string
   leave_message_prompt: string
+  restricted_service_message: string
   queue_message: string
   queue_full_message: string
   queue_full_show_leave_message_button: boolean
@@ -93,6 +102,7 @@ export type ChannelConfig = {
   open_agent_handoff_label: string
   open_agent_handoff_after_messages: number
   open_agent_handoff_behavior: 'confirm' | 'auto'
+  open_agent_feedback_enabled: boolean
   open_agent_custom_buttons_enabled: boolean
   open_agent_custom_buttons: ChannelCustomButton[]
   human_custom_buttons_enabled: boolean
@@ -105,11 +115,13 @@ export type ChannelConfig = {
 
 export type ChannelAvailability = {
   can_start_conversation: boolean
-  reason: 'available' | 'outside_service_hours' | 'no_available_agent' | 'queue_full'
+  reason: 'available' | 'outside_service_hours' | 'no_available_agent' | 'queue_full' | 'restricted'
   offline_title: string
   offline_message: string
   outside_service_hours_strategy: 'offline_message' | 'leave_message'
   leave_message_prompt: string
+  restricted_service_title: string
+  restricted_service_message: string
   queue_message: string
   queue_full_message: string
   queue_full_show_leave_message_button: boolean
@@ -140,8 +152,11 @@ export type ChannelPublic = Pick<
 > & {
   availability: ChannelAvailability | null
   has_conversation_history: boolean
+  announcement: ConversationAnnouncementPublic | null
   welcome_message: WelcomeMessagePublic | null
   open_agent_welcome_message: OpenAgentWelcomeMessage | null
+  open_agent_ai_disclaimer: OpenAgentAIDisclaimer | null
+  read_status?: ConversationReadStatusPublicConfig
 }
 
 export type CreateChannelPayload = {

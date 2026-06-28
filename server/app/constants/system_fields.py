@@ -27,6 +27,9 @@ class SystemFieldDef:
 
 # ── User domain ──
 
+USER_BLACKLIST_FIELD_KEY = "blacklist"
+USER_BLACKLIST_BLOCKED_VALUE = "blocked"
+
 SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
     SystemFieldDef(
         key="public_id",
@@ -124,13 +127,61 @@ SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
         default_sort_order=8,
     ),
     SystemFieldDef(
+        key="assignee_group",
+        name_zh="负责组",
+        name_en="Assignee Group",
+        field_type="group_select",
+        type_config={
+            "entity": "employee_group",
+            "multiple": False,
+            "search_placeholder_zh": "搜索负责组…",
+            "search_placeholder_en": "Search groups...",
+        },
+        description="用户负责组",
+        help_text="选择当前用户所属的负责组",
+        default_sort_order=9,
+    ),
+    SystemFieldDef(
+        key="assignee",
+        name_zh="负责人",
+        name_en="Assignee",
+        field_type="employee_select",
+        type_config={
+            "entity": "employee",
+            "multiple": False,
+            "filter_by_group": True,
+            "search_placeholder_zh": "搜索员工…",
+            "search_placeholder_en": "Search employees...",
+        },
+        description="用户负责人",
+        help_text="选择实际负责当前用户的客服",
+        default_sort_order=10,
+    ),
+    SystemFieldDef(
+        key=USER_BLACKLIST_FIELD_KEY,
+        name_zh="黑名单",
+        name_en="Blacklist",
+        field_type="single_select",
+        type_config={
+            "options": [
+                {
+                    "label": "已拉黑",
+                    "label_en": "Blocked",
+                    "value": USER_BLACKLIST_BLOCKED_VALUE,
+                    "color": "#DC2626",
+                },
+            ],
+        },
+        default_sort_order=11,
+    ),
+    SystemFieldDef(
         key="created_by",
         name_zh="创建人",
         name_en="Created By",
         field_type="single_line_text",
         type_config={"readonly": True, "value_kind": "actor"},
         default_show_in_workspace=False,
-        default_sort_order=9,
+        default_sort_order=12,
     ),
     SystemFieldDef(
         key="updated_by",
@@ -139,7 +190,7 @@ SYSTEM_USER_FIELDS: tuple[SystemFieldDef, ...] = (
         field_type="single_line_text",
         type_config={"readonly": True, "value_kind": "actor"},
         default_show_in_workspace=False,
-        default_sort_order=10,
+        default_sort_order=13,
     ),
 )
 

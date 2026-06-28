@@ -19,6 +19,27 @@ export type TestOpenAgentConnectionResponse = {
   message: string
 }
 
+export type VoiceSpeedSettings = {
+  base_url: string | null
+  has_api_key: boolean
+  updated_at: string | null
+}
+
+export type UpdateVoiceSpeedSettingsPayload = {
+  base_url: string
+  api_key?: string
+}
+
+export type TestVoiceSpeedConnectionPayload = {
+  base_url: string
+  api_key?: string
+}
+
+export type TestVoiceSpeedConnectionResponse = {
+  ok: boolean
+  message: string
+}
+
 export type OpenAgentAgent = {
   id: number
   name: string

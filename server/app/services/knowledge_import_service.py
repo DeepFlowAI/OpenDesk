@@ -226,13 +226,17 @@ class KnowledgeImportService:
             )
 
         try:
-            await KnowledgeImportService._apply_rows(db, tenant_id, preview.parsed_rows, actor_id)
+            document_ids = await KnowledgeImportService._apply_rows(db, tenant_id, preview.parsed_rows, actor_id)
             await db.commit()
         except Exception:
             await db.rollback()
             raise
 
         await redis.delete(KnowledgeImportService._preview_key(preview_token))
+        from app.services.knowledge_recommendation_service import KnowledgeRecommendationService
+
+        for document_id in document_ids:
+            KnowledgeRecommendationService.schedule_document_embedding_refresh(tenant_id, document_id)
         return KnowledgeImportExecuteResponse(
             summary=preview.summary,
             rows=preview.rows,
@@ -441,7 +445,7 @@ class KnowledgeImportService:
         tenant_id: int,
         rows: list[_ParsedImportRow],
         actor_id: int | None,
-    ) -> None:
+    ) -> list[int]:
         directories = await KnowledgeDirectoryRepository.list_all(db, tenant_id)
         directory_state = _DirectoryApplyState(db, tenant_id, directories, actor_id)
         documents_by_id = await KnowledgeDocumentRepository.get_by_ids(
@@ -449,6 +453,7 @@ class KnowledgeImportService:
             tenant_id,
             [row.document_id for row in rows if row.document_id is not None],
         )
+        changed_document_ids: list[int] = []
         for row in rows:
             directory = await directory_state.ensure(row.directory_parts)
             content_plain = html_to_plain_text(row.content_html)
@@ -465,7 +470,7 @@ class KnowledgeImportService:
                 }
             )
             if row.action == "create":
-                await KnowledgeDocumentRepository.create_pending(
+                created = await KnowledgeDocumentRepository.create_pending(
                     db,
                     {
                         **values,
@@ -473,11 +478,12 @@ class KnowledgeImportService:
                         **await KnowledgeService._actor_create(db, tenant_id, actor_id),
                     },
                 )
+                changed_document_ids.append(created.id)
                 continue
 
             if row.document_id is None or row.document_id not in documents_by_id:
                 raise ValidationError("Document id does not exist in current tenant")
-            await KnowledgeDocumentRepository.update_pending(
+            updated = await KnowledgeDocumentRepository.update_pending(
                 db,
                 documents_by_id[row.document_id],
                 {
@@ -485,6 +491,8 @@ class KnowledgeImportService:
                     **await KnowledgeService._actor_update(db, tenant_id, actor_id),
                 },
             )
+            changed_document_ids.append(updated.id)
+        return changed_document_ids
 
     @staticmethod
     def _preview_key(token: str) -> str:

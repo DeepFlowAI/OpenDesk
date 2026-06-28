@@ -8,6 +8,8 @@ import redis.asyncio as aioredis
 from app.db.deps import get_current_principal, get_db, get_redis, require_permission
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.queue_workspace import (
+    QueueAssignAndSendRequest,
+    QueueAssignAndSendResponse,
     QueueAssignableAgentListResponse,
     QueueAssignRequest,
     QueueAssignSelfRequest,
@@ -110,6 +112,22 @@ async def assign_workspace_queue_task_to_self(
 ):
     """Assign a visible queue task to the current agent."""
     return await QueueWorkspaceService.assign_self(db, r, principal, task_id, body or QueueAssignSelfRequest())
+
+
+@router.post(
+    "/tasks/{task_id}/assign-self/send",
+    response_model=QueueAssignAndSendResponse,
+    dependencies=[Depends(require_permission("chat.queue.assign_self"))],
+)
+async def assign_workspace_queue_task_to_self_and_send(
+    task_id: int,
+    body: QueueAssignAndSendRequest,
+    db: AsyncSession = Depends(get_db),
+    r: aioredis.Redis = Depends(get_redis),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+):
+    """Assign a visible queue task to the current agent and send a text reply."""
+    return await QueueWorkspaceService.assign_self_and_send(db, r, principal, task_id, body)
 
 
 @router.post(

@@ -15,19 +15,33 @@ from pydantic import ValidationError as PydanticValidationError
 import redis.asyncio as aioredis
 
 from app.core.exceptions import NotFoundError, BusinessError, ValidationError, ForbiddenError, UnauthorizedError
-from app.enums import ConversationStatus, MessageSenderType, MessageContentType
+from app.enums import (
+    ConversationStatus,
+    MessageSenderType,
+    MessageContentType,
+    ReceptionEventReason,
+    ReceptionEventType,
+)
 from app.repositories.channel_repository import ChannelRepository
+from app.repositories.conversation_collaboration_repository import ConversationCollaborationRepository
+from app.repositories.conversation_pin_repository import ConversationPinRepository
 from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.message_repository import MessageRepository
 from app.repositories.offline_message_repository import OfflineMessageRepository
+from app.repositories.visitor_timeout_close_repository import VisitorTimeoutCloseStateRepository
 from app.schemas.channel import ChannelConfig
 from app.schemas.open_agent_settings import OpenAgentWelcomeMessage
 from app.schemas.message import FileMessageContent
 from app.schemas.permission import EffectivePrincipal
 from app.repositories.user_repository import UserRepository
 from app.services.agent_status_service import AgentStatusService
+from app.services.conversation_collaboration_service import (
+    COLLABORATION_MESSAGE_SEND_PERMISSION,
+    ConversationCollaborationService,
+)
 from app.services.data_scope_service import DataScopeService, RESOURCE_PEER_CONVERSATION
+from app.services.reception_event_service import ReceptionEventService
 from app.services.routing_service import RoutingService
 from app.services.welcome_message_rule_service import WelcomeMessageRuleService
 
@@ -46,6 +60,21 @@ ALLOWED_MESSAGE_CONTENT_TYPES = {
     MessageContentType.SYSTEM.value,
     MessageContentType.INTERNAL_NOTE.value,
 }
+READ_STATUS_MESSAGE_CONTENT_TYPES = {
+    MessageContentType.TEXT.value,
+    MessageContentType.RICH_TEXT.value,
+    MessageContentType.IMAGE.value,
+    MessageContentType.FILE.value,
+}
+RECALLABLE_MESSAGE_CONTENT_TYPES = {
+    MessageContentType.TEXT.value,
+    MessageContentType.RICH_TEXT.value,
+    MessageContentType.IMAGE.value,
+    MessageContentType.FILE.value,
+}
+QUOTABLE_MESSAGE_CONTENT_TYPES = RECALLABLE_MESSAGE_CONTENT_TYPES
+MESSAGE_QUOTE_SUMMARY_MAX_LENGTH = 80
+MESSAGE_RECALL_WINDOW = timedelta(minutes=2)
 MAX_TEXT_MESSAGE_LENGTH = 5000
 VISITOR_HISTORY_PAGE_SIZE = 10
 VISITOR_HISTORY_MESSAGE_LIMIT = 200
@@ -56,12 +85,14 @@ WORKSPACE_MY_HISTORY_PAGE_SIZE = 20
 PEER_VIEW_PERMISSION = "chat.conversation.peer.view"
 PEER_MESSAGE_SEND_PERMISSION = "chat.conversation.peer_message.send"
 INTERNAL_NOTE_CREATE_PERMISSION = "chat.conversation.internal_note.create"
+CONVERSATION_LOCK_PERMISSION = "chat.conversation.lock"
 VISITOR_SYSTEM_MAX_LENGTH = 64
 VISITOR_BROWSER_MAX_LENGTH = 128
 VISITOR_IP_MAX_LENGTH = 45
 QUEUE_ENTERED_SYSTEM_MESSAGE = "已进入人工客服队列"
 AGENT_ASSIGNED_SYSTEM_MESSAGE = "客服已接入会话"
 AGENT_ASSIGNED_EVENT_TYPE = "agent_assigned"
+BOT_DISABLED_ENDED_BY = "bot_disabled"
 
 
 class ConversationService:
@@ -91,6 +122,15 @@ class ConversationService:
             "is_new": False,
             "queue_full": True,
             "availability": payload,
+        }
+
+    @staticmethod
+    def _restricted_response(availability: dict) -> dict:
+        return {
+            "conversation": None,
+            "is_new": False,
+            "restricted": True,
+            "availability": availability,
         }
 
     @staticmethod
@@ -155,28 +195,114 @@ class ConversationService:
     @staticmethod
     def _public_message_item(msg, conversation_public_id: str) -> dict:
         metadata = getattr(msg, "metadata_", None) or {}
+        return ConversationService._message_response_payload(
+            msg,
+            conversation_public_id=conversation_public_id,
+            sender_name=ConversationService._metadata_sender_name(msg.sender_type, metadata),
+            sender_avatar=None,
+            visitor_facing=True,
+        )
+
+    @staticmethod
+    def _message_is_recalled(msg) -> bool:
+        return bool(getattr(msg, "is_recalled", False))
+
+    @staticmethod
+    def _message_response_content(msg) -> str:
+        if ConversationService._message_is_recalled(msg):
+            return ""
+        return msg.content
+
+    @staticmethod
+    def _message_recall_overlay(msg) -> dict:
         return {
-            "id": msg.id,
-            "conversation_public_id": conversation_public_id,
-            "sender_type": msg.sender_type,
-            "sender_id": msg.sender_id,
-            "sender_name": ConversationService._metadata_sender_name(msg.sender_type, metadata),
-            "sender_avatar": None,
-            "content_type": msg.content_type,
-            "content": msg.content,
-            "created_at": msg.created_at,
-            **ConversationService._message_event_overlay(msg),
+            "is_recalled": ConversationService._message_is_recalled(msg),
+            "recalled_at": getattr(msg, "recalled_at", None),
+            "recalled_by_type": getattr(msg, "recalled_by_type", None),
+            "recalled_by_id": getattr(msg, "recalled_by_id", None),
+            "recalled_by_name": getattr(msg, "recalled_by_name", None),
         }
 
     @staticmethod
-    def _message_event_overlay(msg) -> dict:
-        metadata = getattr(msg, "metadata_", None) or {}
+    def _can_include_recall_edit_content(msg, viewer_agent_id: int | None) -> bool:
+        return (
+            ConversationService._message_is_recalled(msg)
+            and viewer_agent_id is not None
+            and msg.sender_type == MessageSenderType.AGENT.value
+            and msg.sender_id == viewer_agent_id
+            and msg.content_type in {MessageContentType.TEXT.value, MessageContentType.RICH_TEXT.value}
+        )
+
+    @staticmethod
+    def _message_event_overlay(msg, *, include_recall_edit_content: bool = False) -> dict:
+        metadata = dict(getattr(msg, "metadata_", None) or {})
+        if ConversationService._message_is_recalled(msg):
+            metadata["is_recalled"] = True
+            metadata["recalled_by_type"] = getattr(msg, "recalled_by_type", None)
+            metadata["recalled_by_name"] = getattr(msg, "recalled_by_name", None)
+            if include_recall_edit_content:
+                metadata["recall_edit_content"] = msg.content
+            else:
+                metadata.pop("recall_edit_content", None)
         return {
             "metadata": metadata,
             "event_type": metadata.get("event_type"),
             "satisfaction_record_id": metadata.get("satisfaction_record_id"),
             "config_version": metadata.get("config_version"),
         }
+
+    @staticmethod
+    def _message_response_payload(
+        msg,
+        *,
+        conversation_public_id: str | None = None,
+        conversation_id: int | None = None,
+        sender_name: str | None = None,
+        sender_avatar: str | None = None,
+        visitor_facing: bool = False,
+        viewer_agent_id: int | None = None,
+    ) -> dict:
+        payload = {
+            "id": msg.id,
+            "sender_type": msg.sender_type,
+            "sender_id": msg.sender_id,
+            "sender_name": sender_name,
+            "sender_avatar": sender_avatar,
+            "content_type": msg.content_type,
+            "content": ConversationService._message_response_content(msg),
+            "created_at": msg.created_at,
+            **ConversationService._message_event_overlay(
+                msg,
+                include_recall_edit_content=ConversationService._can_include_recall_edit_content(
+                    msg,
+                    viewer_agent_id,
+                ),
+            ),
+            **ConversationService._message_recall_overlay(msg),
+            **ConversationService._message_read_status_overlay(msg, visitor_facing=visitor_facing),
+        }
+        if conversation_public_id is not None:
+            payload["conversation_public_id"] = conversation_public_id
+        else:
+            payload["conversation_id"] = conversation_id if conversation_id is not None else msg.conversation_id
+        return payload
+
+    @staticmethod
+    def _message_read_status(msg, *, visitor_facing: bool) -> str | None:
+        if msg.content_type not in READ_STATUS_MESSAGE_CONTENT_TYPES:
+            return None
+        if visitor_facing:
+            if msg.sender_type != MessageSenderType.VISITOR.value:
+                return None
+            return "read" if getattr(msg, "agent_read_at", None) else "unread"
+        if msg.sender_type != MessageSenderType.AGENT.value:
+            return None
+        return "read" if getattr(msg, "visitor_read_at", None) else "unread"
+
+    @staticmethod
+    def _message_read_status_overlay(msg, *, visitor_facing: bool) -> dict:
+        status = ConversationService._message_read_status(msg, visitor_facing=visitor_facing)
+        return {"status": status} if status else {}
 
     @staticmethod
     def _message_visible_to(msg, target: str) -> bool:
@@ -238,6 +364,13 @@ class ConversationService:
     ) -> str:
         if conversation.agent_id == principal.user_id:
             return "own"
+        if await ConversationCollaborationRepository.is_active_collaborator(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            agent_id=principal.user_id,
+        ):
+            return "collaborator"
         if conversation.status == ConversationStatus.CLOSED.value:
             participated = await ConversationRepository.has_agent_participated(
                 db,
@@ -268,6 +401,13 @@ class ConversationService:
         if ConversationService._is_internal_note(content_type):
             if not principal.has_permission(INTERNAL_NOTE_CREATE_PERMISSION):
                 raise ForbiddenError("Permission denied")
+            if await ConversationCollaborationRepository.is_active_collaborator(
+                db,
+                tenant_id=conversation.tenant_id,
+                conversation_id=conversation.id,
+                agent_id=principal.user_id,
+            ):
+                return "collaborator"
             peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
             DataScopeService.assert_conversation_in_scope(
                 principal,
@@ -279,6 +419,15 @@ class ConversationService:
 
         if conversation.agent_id == principal.user_id:
             return "own"
+        if await ConversationCollaborationRepository.is_active_collaborator(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            agent_id=principal.user_id,
+        ):
+            if not principal.has_permission(COLLABORATION_MESSAGE_SEND_PERMISSION):
+                raise ForbiddenError("Permission denied")
+            return "collaborator"
         if not principal.has_permission(PEER_MESSAGE_SEND_PERMISSION):
             raise ForbiddenError("Permission denied")
         peer_ids = await ConversationService._assert_peer_scope(db, principal)
@@ -297,7 +446,11 @@ class ConversationService:
         viewer_relation: str,
         collaborated: bool = False,
         has_history: bool = False,
+        collaborators: list | None = None,
+        pinned_at: datetime | None = None,
+        timeout_state=None,
     ) -> dict:
+        timeout_locked_at = getattr(timeout_state, "timeout_locked_at", None) if timeout_state else None
         return {
             "id": conversation.id,
             "public_id": conversation.public_id,
@@ -317,9 +470,17 @@ class ConversationService:
             "visitor_browser": getattr(conversation, "visitor_browser", None),
             "visitor_ip": getattr(conversation, "visitor_ip", None),
             "unread_count": conversation.unread_count,
+            "is_pinned": pinned_at is not None,
+            "pinned_at": pinned_at,
+            "is_timeout_locked": timeout_locked_at is not None,
+            "timeout_locked_at": timeout_locked_at,
+            "timeout_locked_by_id": (
+                getattr(timeout_state, "timeout_locked_by_id", None) if timeout_state else None
+            ),
             "has_history_conversations": has_history,
             "viewer_relation": viewer_relation,
             "collaborated_by_current_user": collaborated,
+            "collaborators": ConversationCollaborationService.serialize_collaborators(collaborators or []),
             "created_at": conversation.created_at,
         }
 
@@ -398,6 +559,123 @@ class ConversationService:
             return f"[附件] {payload.name}"[:200]
 
         return f"[{content_type}]"
+
+    @staticmethod
+    def build_recalled_message_preview(msg) -> str:
+        actor_type = getattr(msg, "recalled_by_type", None) or getattr(msg, "sender_type", None)
+        if actor_type == MessageSenderType.VISITOR.value:
+            return "访客撤回了一条消息"
+        if actor_type == MessageSenderType.AGENT.value:
+            return "客服撤回了一条消息"
+        return "消息已撤回"
+
+    @staticmethod
+    def _build_message_quote_summary(content_type: str, content: str) -> tuple[str, str | None]:
+        if content_type == MessageContentType.TEXT.value:
+            return content.strip()[:MESSAGE_QUOTE_SUMMARY_MAX_LENGTH], None
+
+        if content_type == MessageContentType.RICH_TEXT.value:
+            plain = ConversationService._html_to_plain_text(content)
+            if plain:
+                return plain[:MESSAGE_QUOTE_SUMMARY_MAX_LENGTH], None
+            if re.search(r"<img\b", content, flags=re.I):
+                return "图片", None
+            return "富文本", None
+
+        if content_type == MessageContentType.IMAGE.value:
+            return "图片", None
+
+        if content_type == MessageContentType.FILE.value:
+            try:
+                payload = FileMessageContent.model_validate(json.loads(content))
+            except (json.JSONDecodeError, PydanticValidationError):
+                return "文件", None
+            return f"文件：{payload.name}"[:MESSAGE_QUOTE_SUMMARY_MAX_LENGTH], payload.name
+
+        return "", None
+
+    @staticmethod
+    async def _quote_sender_name(db: AsyncSession, conversation, msg) -> str | None:
+        metadata = getattr(msg, "metadata_", None) or {}
+        if msg.sender_type == MessageSenderType.AGENT.value and msg.sender_id is not None:
+            agent = await EmployeeRepository.get_by_id(db, msg.sender_id)
+            if agent:
+                return agent.display_name or agent.name
+        if msg.sender_type == MessageSenderType.VISITOR.value:
+            return getattr(getattr(conversation, "visitor", None), "name", None)
+        if msg.sender_type == MessageSenderType.BOT.value:
+            return ConversationService._metadata_sender_name(msg.sender_type, metadata)
+        return None
+
+    @staticmethod
+    async def _build_quote_metadata(
+        db: AsyncSession,
+        conversation,
+        *,
+        quoted_message_id: int,
+        visitor_facing: bool,
+    ) -> dict:
+        if not ConversationService._is_web_channel(conversation.channel):
+            raise ValidationError("This message cannot be quoted")
+
+        quoted = await MessageRepository.get_by_id_for_conversation(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            message_id=quoted_message_id,
+        )
+        if not quoted:
+            raise NotFoundError("Quoted message not found")
+        if visitor_facing and not ConversationService._message_visible_to(quoted, "visitor"):
+            raise NotFoundError("Quoted message not found")
+        if ConversationService._message_is_recalled(quoted):
+            raise ValidationError("The quoted message was recalled. Remove the quote and send again")
+        if quoted.content_type not in QUOTABLE_MESSAGE_CONTENT_TYPES:
+            raise ValidationError("This message cannot be quoted")
+        if quoted.sender_type not in {
+            MessageSenderType.VISITOR.value,
+            MessageSenderType.AGENT.value,
+            MessageSenderType.BOT.value,
+        }:
+            raise ValidationError("This message cannot be quoted")
+
+        summary, file_name = ConversationService._build_message_quote_summary(
+            quoted.content_type,
+            quoted.content,
+        )
+        payload = {
+            "schema_version": 1,
+            "message_id": quoted.id,
+            "sender_type": quoted.sender_type,
+            "sender_id": quoted.sender_id,
+            "sender_name": await ConversationService._quote_sender_name(db, conversation, quoted),
+            "content_type": quoted.content_type,
+            "summary": summary,
+        }
+        if file_name:
+            payload["file_name"] = file_name
+        return payload
+
+    @staticmethod
+    async def _mark_message_quotes_recalled(db: AsyncSession, conversation, recalled_message_id: int) -> None:
+        quoted_messages = await MessageRepository.get_messages_quoting_message(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            message_id=recalled_message_id,
+        )
+        if not quoted_messages:
+            return
+
+        for message in quoted_messages:
+            metadata = dict(getattr(message, "metadata_", None) or {})
+            quote = dict(metadata.get("quote") or {})
+            quote["is_recalled"] = True
+            quote.pop("summary", None)
+            quote.pop("file_name", None)
+            metadata["quote"] = quote
+            message.metadata_ = metadata
+        await db.commit()
 
     @staticmethod
     async def _create_matched_welcome_message(
@@ -576,6 +854,32 @@ class ConversationService:
             visitor_id=user.id,
             channel_id=channel_id,
         )
+        if existing and existing.status in {
+            ConversationStatus.BOT.value,
+            ConversationStatus.HANDOFF_PENDING.value,
+        }:
+            existing_channel = (
+                getattr(existing, "channel", None)
+                or await ChannelRepository.get_by_id(db, channel_id)
+            )
+            raw_existing_channel_config = getattr(existing_channel, "config", None) if existing_channel else None
+            existing_channel_config = ChannelConfig.model_validate(
+                raw_existing_channel_config if isinstance(raw_existing_channel_config, dict) else {}
+            )
+            if not existing_channel_config.open_agent_enabled:
+                await ConversationRepository.end_conversation(db, existing, BOT_DISABLED_ENDED_BY)
+                logger.info(
+                    "open_agent_bot_disabled_closed tenant_id=%s conversation_id=%s visitor_id=%s",
+                    tenant_id,
+                    existing.id,
+                    existing.visitor_id,
+                )
+                existing = None
+            elif existing.status == ConversationStatus.BOT.value:
+                from app.services.open_agent_bot_timeout_service import OpenAgentBotTimeoutService
+
+                if await OpenAgentBotTimeoutService.close_if_stale(db, existing):
+                    existing = None
         if existing:
             if ConversationService._is_web_channel(existing.channel):
                 environment_data = ConversationService._visitor_environment_data(
@@ -592,63 +896,47 @@ class ConversationService:
             newly_assigned = False
             queue_position = None
             if existing.status == ConversationStatus.QUEUED.value and not existing.agent_id:
-                group_id, group_member_ids, max_concurrent_map, _route_block_reason = (
-                    await RoutingService.route_conversation_with_meta(
-                        db, tenant_id, channel_id, r, visitor_id=existing.visitor_id
+                # Resuming an already-queued conversation: do not re-route or
+                # assign an agent here. Assignment is driven by the queue
+                # whenever an agent gains capacity (comes online, changes status,
+                # ends or transfers a conversation). Assigning on visitor
+                # re-entry would bypass queue ordering and could race the pending
+                # queue task into a double assignment. Only make sure the
+                # conversation still has its queue task and report its position.
+                from app.services.queue_workspace_service import QueueWorkspaceService
+
+                try:
+                    enqueue_result = await QueueWorkspaceService.enqueue_conversation_if_needed(
+                        db,
+                        tenant_id,
+                        existing,
+                        source_type="visitor_waiting",
                     )
-                )
-                if group_member_ids:
-                    agent_id = await AgentStatusService.find_available_agent(
-                        r, tenant_id, group_member_ids, max_concurrent_map
+                    queue_position = getattr(
+                        getattr(enqueue_result, "position", None),
+                        "position_overall",
+                        None,
                     )
-                    if agent_id:
-                        existing = await ConversationRepository.assign_agent(
-                            db, existing, agent_id, group_id
-                        )
-                        await AgentStatusService.increment_count(r, tenant_id, agent_id)
-                        from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
-
-                        await VisitorTimeoutCloseService.initialize_for_conversation(db, existing)
-                        newly_assigned = True
-                        logger.info("Queued conv %d assigned to agent %d", existing.id, agent_id)
-                if existing.status == ConversationStatus.QUEUED.value:
-                    if group_id is not None and existing.group_id != group_id:
-                        existing = await ConversationRepository.update_group(db, existing, group_id)
-
-                    from app.services.queue_workspace_service import QueueWorkspaceService
-
-                    try:
-                        enqueue_result = await QueueWorkspaceService.enqueue_conversation_if_needed(
-                            db,
-                            tenant_id,
-                            existing,
-                            source_type="visitor_waiting",
-                        )
-                        queue_position = getattr(
-                            getattr(enqueue_result, "position", None),
-                            "position_overall",
-                            None,
-                        )
-                    except BusinessError as exc:
-                        if exc.code != "QUEUE_LIMIT_REACHED":
-                            raise
-                        logger.info(
-                            "queued_conversation_reenqueue_limited tenant_id=%s conversation_id=%s",
-                            tenant_id,
-                            existing.id,
-                        )
-                        channel = await ChannelRepository.get_by_id(db, channel_id)
-                        raw_channel_config = getattr(channel, "config", None) if channel else None
-                        config = ChannelConfig.model_validate(
-                            raw_channel_config if isinstance(raw_channel_config, dict) else {}
-                        )
-                        return ConversationService._queue_full_response(config)
-                    if (
-                        enqueue_result is None
-                        and existing.group_id is None
-                        and existing.status == ConversationStatus.QUEUED.value
-                    ):
-                        return ConversationService._no_assignable_queue_response()
+                except BusinessError as exc:
+                    if exc.code != "QUEUE_LIMIT_REACHED":
+                        raise
+                    logger.info(
+                        "queued_conversation_reenqueue_limited tenant_id=%s conversation_id=%s",
+                        tenant_id,
+                        existing.id,
+                    )
+                    channel = await ChannelRepository.get_by_id(db, channel_id)
+                    raw_channel_config = getattr(channel, "config", None) if channel else None
+                    config = ChannelConfig.model_validate(
+                        raw_channel_config if isinstance(raw_channel_config, dict) else {}
+                    )
+                    return ConversationService._queue_full_response(config)
+                if (
+                    enqueue_result is None
+                    and existing.group_id is None
+                    and existing.status == ConversationStatus.QUEUED.value
+                ):
+                    return ConversationService._no_assignable_queue_response()
             context_sync = await ConversationService._sync_web_sdk_context_if_present(
                 db,
                 conversation=existing,
@@ -675,6 +963,15 @@ class ConversationService:
 
         raw_channel_config = getattr(channel, "config", None)
         config = ChannelConfig.model_validate(raw_channel_config if isinstance(raw_channel_config, dict) else {})
+        restricted = await ChannelService.check_visitor_restriction(
+            db,
+            tenant_id,
+            config,
+            visitor_id=user.id,
+        )
+        if restricted:
+            return ConversationService._restricted_response(restricted)
+
         environment_data = (
             ConversationService._visitor_environment_data(
                 visitor_system=visitor_system,
@@ -810,6 +1107,17 @@ class ConversationService:
 
         if agent_id:
             await AgentStatusService.increment_count(r, tenant_id, agent_id)
+            await ReceptionEventService.record(
+                db,
+                tenant_id=tenant_id,
+                conversation_id=conversation.id,
+                event_type=ReceptionEventType.ASSIGNED.value,
+                occurred_at=now,
+                agent_id=agent_id,
+                group_id=group_id,
+                to_agent_id=agent_id,
+                reason=ReceptionEventReason.FIRST_HUMAN.value,
+            )
 
         sys_content = "用户发起了新会话" if agent_id else QUEUE_ENTERED_SYSTEM_MESSAGE
         system_msg = await MessageRepository.create(db, {
@@ -930,7 +1238,7 @@ class ConversationService:
         if scope not in {"my", "peers"}:
             raise ValidationError("Invalid conversation scope")
 
-        viewer_relation = "own"
+        conversation_entries: list[tuple[object, str]]
         if scope == "peers":
             if principal is None or not principal.has_permission(PEER_VIEW_PERMISSION):
                 raise ForbiddenError("Permission denied")
@@ -946,9 +1254,34 @@ class ConversationService:
                 agent_id,
                 scope_predicate=scope_predicate,
             )
-            viewer_relation = "peer"
+            conversation_entries = [(conversation, "peer") for conversation in conversations]
         else:
-            conversations = await ConversationRepository.get_active_by_agent(db, tenant_id, agent_id)
+            own_conversations = await ConversationRepository.get_active_by_agent(db, tenant_id, agent_id)
+            collaborator_conversations = await ConversationCollaborationRepository.get_active_conversations_by_agent(
+                db,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+            )
+            seen_ids: set[int] = set()
+            conversation_entries = []
+            for conversation in own_conversations:
+                seen_ids.add(conversation.id)
+                conversation_entries.append((conversation, "own"))
+            for conversation in collaborator_conversations:
+                if conversation.id in seen_ids:
+                    continue
+                seen_ids.add(conversation.id)
+                conversation_entries.append((conversation, "collaborator"))
+            conversation_entries.sort(
+                key=lambda item: (
+                    item[0].last_message_at
+                    or item[0].started_at
+                    or item[0].created_at
+                    or datetime.min.replace(tzinfo=timezone.utc)
+                ),
+                reverse=True,
+            )
+            conversations = [conversation for conversation, _relation in conversation_entries]
         if not conversations:
             logger.debug(
                 "conversation_list_empty tenant_id=%s agent_id=%s scope=%s",
@@ -966,16 +1299,31 @@ class ConversationService:
             history_agent_id = None if can_view_all_history else agent_id
             history_predicate = None
 
-        conversation_ids = [conversation.id for conversation in conversations]
+        conversation_ids = [conversation.id for conversation, _relation in conversation_entries]
         collaborated_ids = await MessageRepository.get_agent_message_conversation_ids(
             db,
             tenant_id,
             conversation_ids,
             agent_id,
         )
+        collaborators_by_conversation = await ConversationCollaborationRepository.get_active_collaborator_agents_by_conversation_ids(
+            db,
+            tenant_id=tenant_id,
+            conversation_ids=conversation_ids,
+        )
+        pins_by_conversation = await ConversationPinRepository.get_by_conversation_ids(
+            db,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            conversation_ids=conversation_ids,
+        )
+        timeout_states_by_conversation = await VisitorTimeoutCloseStateRepository.get_by_conversation_ids(
+            db,
+            conversation_ids,
+        )
 
         items = []
-        for conversation in conversations:
+        for conversation, viewer_relation in conversation_entries:
             has_history = False
             if conversation.visitor_id:
                 history = await ConversationRepository.get_visitor_history(
@@ -993,8 +1341,13 @@ class ConversationService:
             items.append(ConversationService._workspace_conversation_item(
                 conversation,
                 viewer_relation=viewer_relation,
-                collaborated=conversation.id in collaborated_ids,
+                collaborated=viewer_relation == "collaborator" or conversation.id in collaborated_ids,
                 has_history=has_history,
+                collaborators=collaborators_by_conversation.get(conversation.id, []),
+                pinned_at=pins_by_conversation.get(conversation.id).pinned_at
+                if conversation.id in pins_by_conversation
+                else None,
+                timeout_state=timeout_states_by_conversation.get(conversation.id),
             ))
         return items
 
@@ -1053,12 +1406,209 @@ class ConversationService:
             )
             collaborated = conversation.id in collaborated_ids
 
+        collaborators_by_conversation = await ConversationCollaborationRepository.get_active_collaborator_agents_by_conversation_ids(
+            db,
+            tenant_id=tenant_id,
+            conversation_ids=[conversation.id],
+        )
+        pin = await ConversationPinRepository.get_by_agent_conversation(
+            db,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            conversation_id=conversation.id,
+        )
+        timeout_state = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, conversation.id)
+
         return ConversationService._workspace_conversation_item(
             conversation,
             viewer_relation=viewer_relation,
-            collaborated=collaborated,
+            collaborated=viewer_relation == "collaborator" or collaborated,
             has_history=has_history,
+            collaborators=collaborators_by_conversation.get(conversation.id, []),
+            pinned_at=pin.pinned_at if pin else None,
+            timeout_state=timeout_state,
         )
+
+    @staticmethod
+    async def _assert_pinnable_conversation(
+        db: AsyncSession,
+        *,
+        conversation_id: int,
+        principal: EffectivePrincipal,
+    ):
+        conversation = await ConversationRepository.get_by_id(db, conversation_id)
+        if not conversation or conversation.tenant_id != principal.tenant_id:
+            raise NotFoundError("Conversation not found")
+        await ConversationService._assert_conversation_view_access(db, principal, conversation)
+        if conversation.status == ConversationStatus.CLOSED.value:
+            raise ValidationError("Conversation ended. Cannot pin")
+        return conversation
+
+    @staticmethod
+    async def pin_agent_conversation(
+        db: AsyncSession,
+        *,
+        conversation_id: int,
+        principal: EffectivePrincipal,
+    ) -> dict:
+        conversation = await ConversationService._assert_pinnable_conversation(
+            db,
+            conversation_id=conversation_id,
+            principal=principal,
+        )
+        await ConversationPinRepository.upsert(
+            db,
+            tenant_id=principal.tenant_id,
+            agent_id=principal.user_id,
+            conversation_id=conversation.id,
+            pinned_at=datetime.now(timezone.utc),
+        )
+        return await ConversationService.get_agent_conversation(
+            db,
+            conversation_id=conversation.id,
+            tenant_id=principal.tenant_id,
+            agent_id=principal.user_id,
+            principal=principal,
+        )
+
+    @staticmethod
+    async def unpin_agent_conversation(
+        db: AsyncSession,
+        *,
+        conversation_id: int,
+        principal: EffectivePrincipal,
+    ) -> dict:
+        conversation = await ConversationService._assert_pinnable_conversation(
+            db,
+            conversation_id=conversation_id,
+            principal=principal,
+        )
+        await ConversationPinRepository.delete(
+            db,
+            tenant_id=principal.tenant_id,
+            agent_id=principal.user_id,
+            conversation_id=conversation.id,
+        )
+        return await ConversationService.get_agent_conversation(
+            db,
+            conversation_id=conversation.id,
+            tenant_id=principal.tenant_id,
+            agent_id=principal.user_id,
+            principal=principal,
+        )
+
+    @staticmethod
+    async def _assert_timeout_lockable_conversation(
+        db: AsyncSession,
+        *,
+        conversation_id: int,
+        principal: EffectivePrincipal,
+    ):
+        if not principal.has_permission(CONVERSATION_LOCK_PERMISSION):
+            raise ForbiddenError("Permission denied")
+        conversation = await ConversationRepository.get_by_id(db, conversation_id)
+        if not conversation or conversation.tenant_id != principal.tenant_id:
+            raise NotFoundError("Conversation not found")
+        if conversation.status == ConversationStatus.CLOSED.value:
+            raise ValidationError("Conversation ended. Cannot lock")
+        if conversation.status != ConversationStatus.ACTIVE.value or not conversation.agent_id:
+            raise ValidationError("Conversation cannot be locked")
+        if conversation.agent_id != principal.user_id:
+            raise ForbiddenError("Permission denied")
+        return conversation
+
+    @staticmethod
+    async def lock_agent_conversation_timeout(
+        db: AsyncSession,
+        *,
+        conversation_id: int,
+        principal: EffectivePrincipal,
+    ) -> dict:
+        conversation = await ConversationService._assert_timeout_lockable_conversation(
+            db,
+            conversation_id=conversation_id,
+            principal=principal,
+        )
+        from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
+
+        state = await VisitorTimeoutCloseService.lock_conversation_timeout(
+            db,
+            conversation,
+            actor_id=principal.user_id,
+        )
+        await ConversationService._emit_timeout_lock_updated(conversation, state)
+        return await ConversationService.get_agent_conversation(
+            db,
+            conversation_id=conversation.id,
+            tenant_id=principal.tenant_id,
+            agent_id=principal.user_id,
+            principal=principal,
+        )
+
+    @staticmethod
+    async def unlock_agent_conversation_timeout(
+        db: AsyncSession,
+        *,
+        conversation_id: int,
+        principal: EffectivePrincipal,
+    ) -> dict:
+        conversation = await ConversationService._assert_timeout_lockable_conversation(
+            db,
+            conversation_id=conversation_id,
+            principal=principal,
+        )
+        from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
+
+        state = await VisitorTimeoutCloseService.unlock_conversation_timeout(db, conversation)
+        await ConversationService._emit_timeout_lock_updated(conversation, state)
+        return await ConversationService.get_agent_conversation(
+            db,
+            conversation_id=conversation.id,
+            tenant_id=principal.tenant_id,
+            agent_id=principal.user_id,
+            principal=principal,
+        )
+
+    @staticmethod
+    async def _emit_timeout_lock_updated(conversation, timeout_state) -> None:
+        try:
+            from app.libs.realtime import get_realtime_transport
+            from app.services.conversation_realtime_service import ConversationRealtimeService
+
+            rt = get_realtime_transport()
+        except RuntimeError:
+            return
+        locked_at = getattr(timeout_state, "timeout_locked_at", None) if timeout_state else None
+        payload = {
+            "conversation_id": conversation.id,
+            "is_timeout_locked": locked_at is not None,
+            "timeout_locked_at": locked_at.isoformat() if locked_at else None,
+            "timeout_locked_by_id": (
+                getattr(timeout_state, "timeout_locked_by_id", None) if timeout_state else None
+            ),
+        }
+        conv_room = f"conv:{conversation.id}"
+        try:
+            if conversation.agent_id:
+                await rt.emit(
+                    "conversation_updated",
+                    payload,
+                    room=f"agent:{conversation.tenant_id}:{conversation.agent_id}",
+                    namespace="/chat",
+                )
+            await rt.emit("conversation_updated", payload, room=conv_room, namespace="/chat")
+            await ConversationRealtimeService.emit_conversation_list_updated(
+                conversation.tenant_id,
+                action="timeout_lock_updated",
+                conversation_id=conversation.id,
+                rt=rt,
+            )
+        except Exception:
+            logger.exception(
+                "conversation_timeout_lock_realtime_emit_failed tenant_id=%s conversation_id=%s",
+                conversation.tenant_id,
+                conversation.id,
+            )
 
     @staticmethod
     async def get_agent_history_conversations(
@@ -1290,6 +1840,10 @@ class ConversationService:
         except Exception:
             logger.exception("Failed to send session-end satisfaction invitation for conversation %s", conv.id)
 
+        from app.services.reception_segment_service import ReceptionSegmentService
+
+        await ReceptionSegmentService.generate_for_conversation(db, conv.id)
+
         return conv
 
     @staticmethod
@@ -1303,6 +1857,7 @@ class ConversationService:
         tenant_id: int,
         metadata: dict | None = None,
         principal: EffectivePrincipal | None = None,
+        quoted_message_id: int | None = None,
     ):
         conv = await ConversationRepository.get_by_id(db, conversation_id)
         if not conv:
@@ -1323,9 +1878,18 @@ class ConversationService:
 
         normalized_content = ConversationService.validate_message_content(content_type, content)
         now = datetime.now(timezone.utc)
-        message_metadata = metadata or {}
+        message_metadata = dict(metadata or {})
         if ConversationService._is_internal_note(content_type):
+            if quoted_message_id is not None:
+                raise ValidationError("Internal notes cannot quote public messages")
             message_metadata = {**message_metadata, "visibility": "internal"}
+        elif quoted_message_id is not None:
+            message_metadata["quote"] = await ConversationService._build_quote_metadata(
+                db,
+                conv,
+                quoted_message_id=quoted_message_id,
+                visitor_facing=sender_type == MessageSenderType.VISITOR.value,
+            )
         msg = await MessageRepository.create(db, {
             "tenant_id": tenant_id,
             "conversation_id": conversation_id,
@@ -1367,7 +1931,204 @@ class ConversationService:
             from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 
             await VisitorTimeoutCloseService.reset_on_visitor_message(db, conv, msg)
+            if content_type in {MessageContentType.TEXT.value, MessageContentType.RICH_TEXT.value}:
+                from app.services.knowledge_recommendation_service import KnowledgeRecommendationService
+
+                KnowledgeRecommendationService.schedule_conversation_embedding_refresh(tenant_id, conversation_id)
         return msg
+
+    @staticmethod
+    def _aware_utc(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _assert_message_actor_ownership(
+        msg,
+        *,
+        actor_type: str,
+        actor_id: int | None,
+    ) -> None:
+        if msg.sender_type != actor_type:
+            raise ForbiddenError("You can only recall your own messages")
+        if actor_type == MessageSenderType.AGENT.value and msg.sender_id != actor_id:
+            raise ForbiddenError("You can only recall your own messages")
+        if (
+            actor_type == MessageSenderType.VISITOR.value
+            and msg.sender_id is not None
+            and actor_id is not None
+            and msg.sender_id != actor_id
+        ):
+            raise ForbiddenError("You can only recall your own messages")
+
+    @staticmethod
+    def _assert_message_recallable(
+        conversation,
+        msg,
+        *,
+        actor_type: str,
+        actor_id: int | None,
+        now: datetime,
+    ) -> None:
+        if conversation.status == ConversationStatus.CLOSED.value:
+            raise BusinessError("This conversation has ended. Messages cannot be recalled")
+        if not ConversationService._is_web_channel(conversation.channel):
+            raise ValidationError("This message cannot be recalled")
+        ConversationService._assert_message_actor_ownership(msg, actor_type=actor_type, actor_id=actor_id)
+        if ConversationService._message_is_recalled(msg):
+            raise BusinessError("Message already recalled")
+        if msg.content_type not in RECALLABLE_MESSAGE_CONTENT_TYPES:
+            raise ValidationError("This message cannot be recalled")
+        created_at = ConversationService._aware_utc(getattr(msg, "created_at", None))
+        if created_at is None or now - created_at > MESSAGE_RECALL_WINDOW:
+            raise ValidationError("The recall window has expired")
+
+    @staticmethod
+    async def _update_last_message_after_recall(
+        db: AsyncSession,
+        conversation,
+        msg,
+        recalled_at: datetime,
+    ) -> dict | None:
+        latest = await MessageRepository.get_latest_by_conversation_id(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+        )
+        if not latest or latest.id != msg.id:
+            return None
+
+        preview = ConversationService.build_recalled_message_preview(msg)
+        await ConversationRepository.update_last_message(
+            db,
+            conversation.id,
+            preview,
+            recalled_at,
+            increment_unread=False,
+        )
+        return {
+            "conversation_id": conversation.id,
+            "last_message_preview": preview,
+            "last_message_at": recalled_at.isoformat(),
+        }
+
+    @staticmethod
+    async def recall_agent_message(
+        db: AsyncSession,
+        *,
+        conversation_id: int,
+        message_id: int,
+        tenant_id: int,
+        principal: EffectivePrincipal,
+    ) -> tuple[object, object, dict | None]:
+        conversation = await ConversationRepository.get_by_id(db, conversation_id)
+        if not conversation or conversation.tenant_id != tenant_id:
+            raise NotFoundError("Conversation not found")
+
+        msg = await MessageRepository.get_by_id_for_conversation(
+            db,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+        )
+        if not msg:
+            raise NotFoundError("Message not found")
+
+        await ConversationService._assert_conversation_send_access(
+            db,
+            principal,
+            conversation,
+            MessageContentType.TEXT.value,
+        )
+        now = datetime.now(timezone.utc)
+        ConversationService._assert_message_recallable(
+            conversation,
+            msg,
+            actor_type=MessageSenderType.AGENT.value,
+            actor_id=principal.user_id,
+            now=now,
+        )
+        employee = await EmployeeRepository.get_by_id(db, principal.user_id)
+        actor_name = (employee.display_name or employee.name) if employee else None
+        recalled = await MessageRepository.recall_message(
+            db,
+            msg,
+            recalled_at=now,
+            recalled_by_type=MessageSenderType.AGENT.value,
+            recalled_by_id=principal.user_id,
+            recalled_by_name=actor_name,
+        )
+        await ConversationService._mark_message_quotes_recalled(db, conversation, recalled.id)
+        conversation_update = await ConversationService._update_last_message_after_recall(
+            db,
+            conversation,
+            recalled,
+            now,
+        )
+        return recalled, conversation, conversation_update
+
+    @staticmethod
+    async def recall_visitor_message_for_session(
+        db: AsyncSession,
+        *,
+        conversation_public_id: str,
+        visitor_context: dict,
+        message_id: int,
+    ) -> tuple[object, object, dict | None]:
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        visitor = await UserRepository.get_by_external_id(
+            db,
+            visitor_context["tenant_id"],
+            visitor_context["visitor_external_id"],
+        )
+        visitor_id = visitor.id if visitor else None
+        msg = await MessageRepository.get_by_id_for_conversation(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            message_id=message_id,
+        )
+        if not msg:
+            raise NotFoundError("Message not found")
+
+        now = datetime.now(timezone.utc)
+        ConversationService._assert_message_recallable(
+            conversation,
+            msg,
+            actor_type=MessageSenderType.VISITOR.value,
+            actor_id=visitor_id,
+            now=now,
+        )
+        recalled = await MessageRepository.recall_message(
+            db,
+            msg,
+            recalled_at=now,
+            recalled_by_type=MessageSenderType.VISITOR.value,
+            recalled_by_id=visitor_id,
+            recalled_by_name=visitor.name if visitor else None,
+        )
+        await ConversationService._mark_message_quotes_recalled(db, conversation, recalled.id)
+        if getattr(recalled, "agent_read_at", None) is None:
+            await ConversationRepository.decrement_unread(db, conversation.id)
+            refreshed = await ConversationRepository.get_by_id(db, conversation.id)
+            if refreshed:
+                conversation = refreshed
+        conversation_update = await ConversationService._update_last_message_after_recall(
+            db,
+            conversation,
+            recalled,
+            now,
+        )
+        return recalled, conversation, conversation_update
 
     @staticmethod
     async def get_conversation_for_visitor_session(
@@ -1422,6 +2183,7 @@ class ConversationService:
         visitor_context: dict,
         content_type: str,
         content: str,
+        quoted_message_id: int | None = None,
     ) -> tuple[dict, int | None, object | None]:
         conversation = await ConversationService.get_conversation_for_visitor_session(
             db,
@@ -1444,36 +2206,32 @@ class ConversationService:
             content_type=content_type,
             content=content,
             tenant_id=visitor_context["tenant_id"],
+            quoted_message_id=quoted_message_id,
         )
         msg_payload = {
-            "id": msg.id,
-            "conversation_public_id": conversation.public_id,
-            "sender_type": msg.sender_type,
-            "sender_id": msg.sender_id,
-            "sender_name": visitor.name if visitor else None,
-            "sender_avatar": None,
-            "content_type": msg.content_type,
-            "content": msg.content,
+            **ConversationService._message_response_payload(
+                msg,
+                conversation_public_id=conversation.public_id,
+                sender_name=visitor.name if visitor else None,
+                sender_avatar=None,
+                visitor_facing=True,
+            ),
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
-            **ConversationService._message_event_overlay(msg),
         }
         return msg_payload, conversation.agent_id, conversation
 
     @staticmethod
     def _public_message_payload(msg, conversation) -> dict:
         metadata = getattr(msg, "metadata_", None) or {}
-        return {
-            "id": msg.id,
-            "conversation_public_id": conversation.public_id,
-            "sender_type": msg.sender_type,
-            "sender_id": msg.sender_id,
-            "sender_name": ConversationService._metadata_sender_name(msg.sender_type, metadata),
-            "sender_avatar": None,
-            "content_type": msg.content_type,
-            "content": msg.content,
-            "created_at": msg.created_at.isoformat() if msg.created_at else None,
-            **ConversationService._message_event_overlay(msg),
-        }
+        payload = ConversationService._message_response_payload(
+            msg,
+            conversation_public_id=conversation.public_id,
+            sender_name=ConversationService._metadata_sender_name(msg.sender_type, metadata),
+            sender_avatar=None,
+            visitor_facing=True,
+        )
+        payload["created_at"] = msg.created_at.isoformat() if msg.created_at else None
+        return payload
 
     @staticmethod
     async def _save_confirmed_by_visitor_handoff_event(
@@ -1853,6 +2611,17 @@ class ConversationService:
                 "reason": "handoff_in_progress",
             }
         await AgentStatusService.increment_count(r, conversation.tenant_id, agent_id)
+        await ReceptionEventService.record(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            event_type=ReceptionEventType.ASSIGNED.value,
+            occurred_at=conversation.started_at or datetime.now(timezone.utc),
+            agent_id=agent_id,
+            group_id=conversation.group_id,
+            to_agent_id=agent_id,
+            reason=ReceptionEventReason.BOT_HANDOFF.value,
+        )
         from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 
         await VisitorTimeoutCloseService.initialize_for_conversation(db, conversation)
@@ -2018,18 +2787,14 @@ class ConversationService:
             elif msg.sender_type == MessageSenderType.BOT.value:
                 sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
-            items.append({
-                "id": msg.id,
-                "conversation_id": msg.conversation_id,
-                "sender_type": msg.sender_type,
-                "sender_id": msg.sender_id,
-                "sender_name": sender_name,
-                "sender_avatar": sender_avatar,
-                "content_type": msg.content_type,
-                "content": msg.content,
-                "created_at": msg.created_at,
-                **ConversationService._message_event_overlay(msg),
-            })
+            items.append(ConversationService._message_response_payload(
+                msg,
+                conversation_id=msg.conversation_id,
+                sender_name=sender_name,
+                sender_avatar=sender_avatar,
+                visitor_facing=visitor_facing,
+                viewer_agent_id=None if visitor_facing or principal is None else principal.user_id,
+            ))
 
         return {"items": items, "has_more": has_more}
 
@@ -2160,18 +2925,13 @@ class ConversationService:
                 elif msg.sender_type == MessageSenderType.BOT.value:
                     sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
-                message_items.append({
-                    "id": msg.id,
-                    "conversation_id": msg.conversation_id,
-                    "sender_type": msg.sender_type,
-                    "sender_id": msg.sender_id,
-                    "sender_name": sender_name,
-                    "sender_avatar": sender_avatar,
-                    "content_type": msg.content_type,
-                    "content": msg.content,
-                    "created_at": msg.created_at,
-                    **ConversationService._message_event_overlay(msg),
-                })
+                message_items.append(ConversationService._message_response_payload(
+                    msg,
+                    conversation_id=msg.conversation_id,
+                    sender_name=sender_name,
+                    sender_avatar=sender_avatar,
+                    visitor_facing=True,
+                ))
 
             agent_name = None
             agent_avatar = None
@@ -2288,18 +3048,13 @@ class ConversationService:
                 elif msg.sender_type == MessageSenderType.BOT.value:
                     sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
-                message_items.append({
-                    "id": msg.id,
-                    "conversation_public_id": conversation.public_id,
-                    "sender_type": msg.sender_type,
-                    "sender_id": msg.sender_id,
-                    "sender_name": sender_name,
-                    "sender_avatar": sender_avatar,
-                    "content_type": msg.content_type,
-                    "content": msg.content,
-                    "created_at": msg.created_at,
-                    **ConversationService._message_event_overlay(msg),
-                })
+                message_items.append(ConversationService._message_response_payload(
+                    msg,
+                    conversation_public_id=conversation.public_id,
+                    sender_name=sender_name,
+                    sender_avatar=sender_avatar,
+                    visitor_facing=True,
+                ))
 
             agent_name = None
             agent_avatar = None
@@ -2395,18 +3150,13 @@ class ConversationService:
                 elif msg.sender_type == MessageSenderType.BOT.value:
                     sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
-                message_items.append({
-                    "id": msg.id,
-                    "conversation_public_id": conversation.public_id,
-                    "sender_type": msg.sender_type,
-                    "sender_id": msg.sender_id,
-                    "sender_name": sender_name,
-                    "sender_avatar": sender_avatar,
-                    "content_type": msg.content_type,
-                    "content": msg.content,
-                    "created_at": msg.created_at,
-                    **ConversationService._message_event_overlay(msg),
-                })
+                message_items.append(ConversationService._message_response_payload(
+                    msg,
+                    conversation_public_id=conversation.public_id,
+                    sender_name=sender_name,
+                    sender_avatar=sender_avatar,
+                    visitor_facing=True,
+                ))
 
             agent_name = None
             agent_avatar = None
@@ -2558,18 +3308,13 @@ class ConversationService:
                 elif msg.sender_type == MessageSenderType.BOT.value:
                     sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
 
-                message_items.append({
-                    "id": msg.id,
-                    "conversation_id": msg.conversation_id,
-                    "sender_type": msg.sender_type,
-                    "sender_id": msg.sender_id,
-                    "sender_name": sender_name,
-                    "sender_avatar": sender_avatar,
-                    "content_type": msg.content_type,
-                    "content": msg.content,
-                    "created_at": msg.created_at,
-                    **ConversationService._message_event_overlay(msg),
-                })
+                message_items.append(ConversationService._message_response_payload(
+                    msg,
+                    conversation_id=msg.conversation_id,
+                    sender_name=sender_name,
+                    sender_avatar=sender_avatar,
+                    visitor_facing=False,
+                ))
 
             channel = None
             if conversation.channel:
@@ -2680,28 +3425,89 @@ class ConversationService:
                     "channel_type": conversation.channel.channel_type,
                 }
 
-            items.append({
-                "id": message.id,
-                "conversation_id": message.conversation_id,
-                "sender_type": message.sender_type,
-                "sender_id": message.sender_id,
-                "sender_name": sender_name,
-                "sender_avatar": sender_avatar,
-                "content_type": message.content_type,
-                "content": message.content,
-                "created_at": message.created_at,
-                "conversation": {
+            payload = ConversationService._message_response_payload(
+                message,
+                conversation_id=message.conversation_id,
+                sender_name=sender_name,
+                sender_avatar=sender_avatar,
+                visitor_facing=False,
+            )
+            payload["conversation"] = {
                     "id": conversation.id,
                     "share_code": conversation.share_code,
                     "status": conversation.status,
                     "started_at": conversation.started_at or conversation.created_at,
                     "channel": channel,
-                },
-            })
+            }
+            items.append(payload)
 
         return {"items": items, "total": len(items), "has_more": has_more}
 
     @staticmethod
-    async def mark_read(db: AsyncSession, conversation_id: int) -> None:
+    async def mark_read(db: AsyncSession, conversation_id: int) -> list[int]:
+        conversation = await ConversationRepository.get_by_id(db, conversation_id)
+        if not conversation:
+            raise NotFoundError("Conversation not found")
+        read_message_ids = await MessageRepository.mark_visitor_messages_agent_read(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation_id,
+            read_at=datetime.now(timezone.utc),
+        )
         await ConversationRepository.reset_unread(db, conversation_id)
-        logger.info("conversation_marked_read conversation_id=%s", conversation_id)
+        logger.info(
+            "conversation_marked_read conversation_id=%s read_message_count=%s",
+            conversation_id,
+            len(read_message_ids),
+        )
+        return read_message_ids
+
+    @staticmethod
+    async def mark_agent_messages_visitor_read_for_session(
+        db: AsyncSession,
+        *,
+        visitor_context: dict,
+        conversation_public_id: str,
+        before_message_id: int | None = None,
+    ) -> dict:
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        read_message_ids = await MessageRepository.mark_agent_messages_visitor_read(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            read_at=datetime.now(timezone.utc),
+            before_message_id=before_message_id,
+        )
+        recipient_agent_ids = set()
+        if conversation.agent_id:
+            recipient_agent_ids.add(int(conversation.agent_id))
+        recipient_agent_ids.update(
+            await ConversationCollaborationRepository.get_active_collaborator_agent_ids(
+                db,
+                tenant_id=conversation.tenant_id,
+                conversation_id=conversation.id,
+            )
+        )
+        logger.info(
+            "conversation_visitor_marked_agent_messages_read tenant_id=%s conversation_id=%s "
+            "conversation_public_id=%s before_message_id=%s read_message_count=%s recipient_count=%s",
+            conversation.tenant_id,
+            conversation.id,
+            conversation.public_id,
+            before_message_id,
+            len(read_message_ids),
+            len(recipient_agent_ids),
+        )
+        return {
+            "tenant_id": conversation.tenant_id,
+            "conversation_id": conversation.id,
+            "conversation_public_id": conversation.public_id,
+            "message_ids": read_message_ids,
+            "recipient_agent_ids": sorted(recipient_agent_ids),
+        }

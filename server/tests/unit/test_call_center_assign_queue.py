@@ -1,13 +1,37 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from app.services.call_center.assign_queue import AssignQueueCandidate, AssignQueueSelector
 from app.services.call_center.nodes import AssignQueueExecutor, ExecutionContext
+from app.services.call_center.queue import QueuePicker
+from app.services.cc_agent_resource_service import CcAgentResourceService
 
 
 class _MissingRedisClient:
     @property
     def client(self):
         raise RuntimeError("Redis not initialized")
+
+
+class _ScalarResult:
+    def __init__(self, items):
+        self.items = items
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self.items
+
+
+class _FakeDb:
+    def __init__(self, employees):
+        self.employees = employees
+
+    async def execute(self, _query):
+        return _ScalarResult(self.employees)
 
 
 @pytest.mark.asyncio
@@ -29,6 +53,39 @@ async def test_assign_queue_requires_redis(monkeypatch):
                 "data": {"employee_group_id": 9, "timeout_seconds": 30},
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_queue_picker_prioritizes_preferred_ready_agent(monkeypatch):
+    picker = QueuePicker()
+    employees = [
+        SimpleNamespace(id=1, display_name="Agent 1", nickname=None, name="Agent 1", username="a1"),
+        SimpleNamespace(id=2, display_name="Agent 2", nickname=None, name="Agent 2", username="a2"),
+    ]
+    db = _FakeDb(employees)
+    reserve = AsyncMock(return_value={"resource_state": "ringing"})
+    next_index = AsyncMock(side_effect=AssertionError("preferred hit should not advance queue pointer"))
+    monkeypatch.setattr(CcAgentResourceService, "ensure_from_visible", AsyncMock())
+    monkeypatch.setattr(CcAgentResourceService, "reserve_inbound", reserve)
+    monkeypatch.setattr(CcAgentResourceService, "next_queue_index", next_index)
+
+    pick = await picker.pick_ready_agent_for_queue(
+        db,
+        tenant_id=7,
+        queue_type="employee_group",
+        queue_id=9,
+        r=object(),
+        call_id="call-1",
+        offer_id="offer-1",
+        ttl_seconds=30,
+        preferred_employee_id=2,
+    )
+
+    assert pick["employee_id"] == 2
+    reserve.assert_awaited_once()
+    assert reserve.await_args.kwargs["call_id"] == "call-1"
+    assert reserve.await_args.args[2] == 2
+    next_index.assert_not_awaited()
 
 
 def _candidate(

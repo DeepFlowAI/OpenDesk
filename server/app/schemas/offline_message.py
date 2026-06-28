@@ -13,11 +13,15 @@ from app.schemas.message import MessageResponse, PublicMessageResponse
 class OfflineMessageCreateRequest(BaseModel):
     visitor_name: str | None = Field(default=None, max_length=128)
     metadata: dict | None = None
+    system: str | None = Field(default=None, max_length=64)
+    browser: str | None = Field(default=None, max_length=128)
 
 
 class OfflineMessageSendRequest(BaseModel):
     content_type: Literal["text", "image", "file"] = "text"
     content: str = Field(..., max_length=20000)
+    system: str | None = Field(default=None, max_length=64)
+    browser: str | None = Field(default=None, max_length=128)
 
 
 class OfflineMessageEntryResponse(BaseModel):

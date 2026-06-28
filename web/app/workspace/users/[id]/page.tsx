@@ -20,13 +20,18 @@ import { FieldType } from '@/types/field-enums'
 import {
   FieldValueDisplay,
   formatActorFieldValue,
+  isEntitySelectFieldType,
 } from '@/app/components/features/field-system/field-value-display'
 import { UserRelatedTimeline } from '@/app/components/features/user-related-timeline'
 import { UserFormModal } from '../user-form-modal'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { hasPermission } from '@/utils/permissions'
 
-const SYSTEM_KEY_ALIAS: Record<string, string> = { nickname: 'name' }
+const SYSTEM_KEY_ALIAS: Record<string, string> = {
+  nickname: 'name',
+  assignee: 'agent_id',
+  assignee_group: 'assignee_group_id',
+}
 const DATETIME_KEYS = new Set(['created_at', 'updated_at'])
 const SYSTEM_INFO_SYSTEM_KEYS = new Set(['public_id', 'created_by', 'updated_by'])
 const GENDER_LABELS: Record<string, { zh: string; en: string }> = {
@@ -295,6 +300,10 @@ export default function UserDetailPage() {
                   ) : f.field_type === FieldType.URL ? (
                     <div className="min-w-0 flex-1 text-sm">
                       <FieldValueDisplay fieldType={FieldType.URL} value={getFieldRaw(f)} />
+                    </div>
+                  ) : isEntitySelectFieldType(f.field_type) ? (
+                    <div className="min-w-0 flex-1 text-sm">
+                      <FieldValueDisplay fieldType={f.field_type} value={getFieldRaw(f)} />
                     </div>
                   ) : (
                     <span className="min-w-0 flex-1 break-words text-sm text-foreground">

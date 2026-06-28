@@ -318,6 +318,7 @@ class AssignQueueExecutor(BaseNodeExecutor):
         import logging
         import uuid
         from contextlib import suppress
+        from datetime import datetime, timedelta, timezone
 
         log = logging.getLogger(__name__)
         data = node.get("data") or {}
@@ -325,12 +326,23 @@ class AssignQueueExecutor(BaseNodeExecutor):
 
         from app.db.session import AsyncSessionLocal
         from app.db.redis import redis_client
+        from app.enums import QueueChannel, QueueType
+        from app.repositories.queue_repository import QueueReturningAgentRepository
+        from app.schemas.queue import (
+            RETURNING_AGENT_DEFAULT_WINDOW_HOURS,
+            RETURNING_AGENT_MAX_WINDOW_HOURS,
+            RETURNING_AGENT_MIN_WINDOW_HOURS,
+            RETURNING_AGENT_PRIORITY_ENABLED_KEY,
+            RETURNING_AGENT_WINDOW_HOURS_KEY,
+        )
         from app.services.call_record_service import CallRecordService
         from app.services.cc_agent_resource_service import CcAgentResourceService
         from app.services.call_center.assign_queue import AssignQueueSelector
+        from app.services.queue_service import QueuePolicyResolver
 
         picker = get_queue_picker()
         pick: dict | None = None
+        preferred_agent_id: int | None = None
         offer_id = uuid.uuid4().hex
         try:
             redis = redis_client.client
@@ -362,6 +374,33 @@ class AssignQueueExecutor(BaseNodeExecutor):
             if selected.queue_type == "employee_group":
                 ctx.variables["sys._assigned_group_id"] = selected.queue_id
 
+            if selected.queue_type == QueueType.EMPLOYEE_GROUP.value and selected.available_agent_count > 1:
+                policy = await QueuePolicyResolver.resolve(
+                    db,
+                    ctx.tenant_id,
+                    channel=QueueChannel.CALL_CENTER.value,
+                    queue_type=selected.queue_type,
+                    queue_id=selected.queue_id,
+                )
+                config = policy.get("config") or {}
+                if config.get(RETURNING_AGENT_PRIORITY_ENABLED_KEY) is True:
+                    try:
+                        window_hours = int(
+                            config.get(
+                                RETURNING_AGENT_WINDOW_HOURS_KEY,
+                                RETURNING_AGENT_DEFAULT_WINDOW_HOURS,
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        window_hours = 0
+                    if RETURNING_AGENT_MIN_WINDOW_HOURS <= window_hours <= RETURNING_AGENT_MAX_WINDOW_HOURS:
+                        preferred_agent_id = await QueueReturningAgentRepository.find_recent_call_center_agent(
+                            db,
+                            ctx.tenant_id,
+                            call_id=ctx.call_id,
+                            cutoff=datetime.now(timezone.utc) - timedelta(hours=window_hours),
+                        )
+
             pick = await picker.pick_ready_agent_for_queue(
                 db,
                 ctx.tenant_id,
@@ -371,6 +410,7 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 call_id=ctx.call_id,
                 offer_id=offer_id,
                 ttl_seconds=timeout_s,
+                preferred_employee_id=preferred_agent_id,
             )
             if pick:
                 await CallRecordService.bind_queue(
@@ -478,6 +518,12 @@ class AssignQueueExecutor(BaseNodeExecutor):
             "assign_queue: offered to agent=%s offer_id=%s timeout=%ss call_id=%s",
             pick["employee_id"], offer_id, timeout_s, ctx.call_id,
         )
+        if preferred_agent_id and pick["employee_id"] == preferred_agent_id:
+            log.info(
+                "assign_queue: returning agent prioritized agent=%s call_id=%s",
+                preferred_agent_id,
+                ctx.call_id,
+            )
         try:
             decision = await asyncio.wait_for(future, timeout=timeout_s)
         except asyncio.TimeoutError:

@@ -82,6 +82,21 @@ export type KnowledgeDocumentPayload = {
 
 export type KnowledgeDocumentListResponse = PaginatedResponse<KnowledgeDocument>
 
+export type KnowledgeRecommendationStatus = 'no_conversation' | 'updating' | 'no_vector' | 'ready' | 'failed'
+
+export type KnowledgeRecommendationParams = {
+  conversation_id?: number | null
+  limit?: number
+}
+
+export type KnowledgeRecommendationResponse = {
+  status: KnowledgeRecommendationStatus
+  items: KnowledgeDocument[]
+  limit: number
+  vector_updated_at: string | null
+  message: string | null
+}
+
 export type KnowledgeImportAction = 'create' | 'update' | 'skip' | 'error'
 
 export type KnowledgeImportSummary = {

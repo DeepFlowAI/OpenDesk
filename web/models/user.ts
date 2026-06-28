@@ -16,9 +16,12 @@ export type User = {
   address: string | null
   remark: string | null
   web_id: string | null
+  blacklist: string | null
   avatar_color: string | null
   channel_id: number | null
   organization_id: number | null
+  agent_id: number | null
+  assignee_group_id: number | null
   created_by: AuditActorRef | null
   updated_by: AuditActorRef | null
   custom_fields: Record<string, CustomFieldValue>
@@ -41,7 +44,10 @@ export type CreateUserPayload = {
   address?: string | null
   remark?: string | null
   web_id?: string | null
+  blacklist?: string | null
   organization_id?: number | null
+  agent_id?: number | null
+  assignee_group_id?: number | null
   custom_fields?: Record<string, CustomFieldValue>
 }
 
@@ -54,7 +60,10 @@ export type UpdateUserPayload = {
   address?: string | null
   remark?: string | null
   web_id?: string | null
+  blacklist?: string | null
   organization_id?: number | null
+  agent_id?: number | null
+  assignee_group_id?: number | null
   custom_fields?: Record<string, CustomFieldValue>
 }
 

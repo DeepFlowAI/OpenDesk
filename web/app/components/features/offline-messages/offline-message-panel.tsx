@@ -81,7 +81,11 @@ const STATUS_COLOR: Record<string, string> = {
   offline: '#9CA3AF',
 }
 
-const SYSTEM_KEY_ALIAS: Record<string, keyof User> = { nickname: 'name' }
+const SYSTEM_KEY_ALIAS: Record<string, keyof User> = {
+  nickname: 'name',
+  assignee: 'agent_id',
+  assignee_group: 'assignee_group_id',
+}
 
 function formatTime(value: string | null | undefined, locale: string): string {
   if (!value) return '-'

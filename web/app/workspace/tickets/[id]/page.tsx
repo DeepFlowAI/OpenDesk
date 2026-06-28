@@ -222,9 +222,25 @@ export default function TicketDetailPage() {
     // User fields
     if (relatedUser) {
       const userObj = relatedUser as Record<string, unknown>
-      for (const k of ['name', 'email', 'phone', 'gender', 'level', 'address', 'remark', 'external_id', 'nickname', 'created_by', 'updated_by']) {
+      for (const k of [
+        'name',
+        'email',
+        'phone',
+        'gender',
+        'level',
+        'address',
+        'remark',
+        'external_id',
+        'nickname',
+        'agent_id',
+        'assignee_group_id',
+        'created_by',
+        'updated_by',
+      ]) {
         if (userObj[k] != null) vals[`user:${k}`] = userObj[k]
       }
+      if (relatedUser.agent_id != null) vals['user:assignee'] = relatedUser.agent_id
+      if (relatedUser.assignee_group_id != null) vals['user:assignee_group'] = relatedUser.assignee_group_id
       if (relatedUser.custom_fields) {
         for (const [k, v] of Object.entries(relatedUser.custom_fields)) {
           if (v != null) addScopedCustomFieldValueAliases(vals, 'user', 'user', k, v, fieldDefMap)
@@ -1550,16 +1566,26 @@ function FieldDisplay({
 
   const editorTypeConfig = useMemo(() => {
     const base = { ...((fieldDef?.type_config ?? {}) as Record<string, unknown>) }
-    if (fieldType === FieldType.EMPLOYEE_SELECT) {
+    if (
+      editorField.source === 'system' &&
+      editorField.domain === 'ticket' &&
+      editorField.key === 'assignee' &&
+      fieldType === FieldType.EMPLOYEE_SELECT
+    ) {
       const groupValue = editValues.assignee_group ?? editValues.assignee_group_id
       if (typeof groupValue === 'number') base.group_id = groupValue
     }
-    if (fieldType === FieldType.GROUP_SELECT) {
+    if (
+      editorField.source === 'system' &&
+      editorField.domain === 'ticket' &&
+      editorField.key === 'assignee_group' &&
+      fieldType === FieldType.GROUP_SELECT
+    ) {
       const assigneeValue = editValues.assignee ?? editValues.agent_id
       if (typeof assigneeValue === 'number') base.member_id = assigneeValue
     }
     return base
-  }, [fieldDef, fieldType, editValues.assignee_group, editValues.assignee_group_id, editValues.assignee, editValues.agent_id])
+  }, [fieldDef, fieldType, editorField, editValues.assignee_group, editValues.assignee_group_id, editValues.assignee, editValues.agent_id])
 
   const needsDoneButton =
     fieldType === FieldType.RICH_TEXT ||

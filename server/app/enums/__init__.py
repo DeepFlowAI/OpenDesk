@@ -85,6 +85,24 @@ class QueueAssignmentType(str, enum.Enum):
     ADMIN_ASSIGN = "admin_assign"
 
 
+# ── Reception segment (manual-reception) enums ──
+
+
+class ReceptionEventType(str, enum.Enum):
+    """Structured reception event kinds logged at runtime ownership changes."""
+    ASSIGNED = "assigned"
+    TRANSFERRED = "transferred"
+    ENDED = "ended"
+
+
+class ReceptionEventReason(str, enum.Enum):
+    """Why a reception ownership change happened (entry/transition detail)."""
+    FIRST_HUMAN = "first_human"
+    BOT_HANDOFF = "bot_handoff"
+    REASSIGN = "reassign"
+    TRANSFER = "transfer"
+
+
 # ── Dynamic Field System enums ──
 
 

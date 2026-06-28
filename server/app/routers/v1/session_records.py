@@ -13,6 +13,7 @@ from app.schemas.session_record import (
     SessionRecordListResponse,
     SessionRecordDetailResponse,
     SessionRecordMessageListResponse,
+    ReceptionTrajectoryResponse,
 )
 from app.schemas.satisfaction_survey_record import (
     SatisfactionFilterOptionsResponse,
@@ -47,6 +48,7 @@ async def list_session_records(
         None,
         description="Session type: human, bot, bot_human",
     ),
+    has_queue: bool | None = Query(None, description="Filter by substantial queue wait"),
     db: AsyncSession = Depends(get_db),
     principal: EffectivePrincipal = Depends(get_current_principal),
 ):
@@ -68,6 +70,7 @@ async def list_session_records(
         product_rating_options=SatisfactionSurveyRecordService._normalize_list_param(satisfaction_product_option),
         product_labels=SatisfactionSurveyRecordService._normalize_list_param(satisfaction_product_label),
         session_type=session_type,
+        has_queue=has_queue,
         principal=principal,
     )
 
@@ -104,6 +107,21 @@ async def get_session_record_satisfaction(
         record_id=record_id,
         tenant_id=principal.tenant_id,
         user=user,
+        principal=principal,
+    )
+
+
+@router.get("/{record_id}/reception-segments", response_model=ReceptionTrajectoryResponse)
+async def get_session_record_reception_trajectory(
+    record_id: int,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+):
+    """Get the reception trajectory (segments) for a session record."""
+    return await SessionRecordService.get_reception_trajectory(
+        db,
+        conversation_id=record_id,
+        tenant_id=principal.tenant_id,
         principal=principal,
     )
 

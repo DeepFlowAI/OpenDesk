@@ -10,6 +10,7 @@ import {
   IconLoader2,
   IconSearch,
   IconSend,
+  IconX,
 } from '@tabler/icons-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -24,7 +25,13 @@ import { Input } from '@/components/ui/input'
 import { SafeHtml } from '@/components/safe-html'
 import { useLocaleStore } from '@/context/locale-store'
 import type { KnowledgeDocument } from '@/models/knowledge'
-import { useKnowledgeDirectories, useKnowledgeDocument, useKnowledgeDocuments } from '@/service/use-knowledge'
+import {
+  useKnowledgeDirectories,
+  useKnowledgeDocument,
+  useKnowledgeDocuments,
+  useKnowledgeRecommendations,
+  useRetryKnowledgeRecommendations,
+} from '@/service/use-knowledge'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import {
@@ -45,11 +52,13 @@ export type KnowledgeAssistantActionContext = {
 type KnowledgeAssistantProps = {
   className?: string
   mode?: 'chat' | 'drawer'
+  conversationId?: number | null
   canUse?: boolean
   useDisabledReason?: string
   canSend?: boolean
   sendDisabledReason?: string
   showCopy?: boolean
+  showRecommendations?: boolean
   onUse?: (context: KnowledgeAssistantActionContext) => void | Promise<void>
   onSend?: (context: KnowledgeAssistantActionContext) => void | Promise<void>
 }
@@ -80,22 +89,32 @@ function actionBlockReason(document: KnowledgeDocument, action: 'use' | 'send'):
 export function KnowledgeAssistant({
   className,
   mode = 'chat',
+  conversationId = null,
   canUse = false,
   useDisabledReason,
   canSend = false,
   sendDisabledReason,
   showCopy = false,
+  showRecommendations = false,
   onUse,
   onSend,
 }: KnowledgeAssistantProps) {
   const { locale } = useLocaleStore()
   const [search, setSearch] = useState('')
-  const [directoryId, setDirectoryId] = useState<number | null>(null)
+  const [category, setCategory] = useState<'recommended' | 'all' | number>(showRecommendations ? 'recommended' : 'all')
   const [page, setPage] = useState(1)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [confirmDoc, setConfirmDoc] = useState<KnowledgeDocument | null>(null)
   const [sending, setSending] = useState(false)
   const query = useDebouncedValue(search)
+  const isRecommendedCategory = showRecommendations && category === 'recommended'
+  const hasSearch = search.trim().length > 0
+  const isRecommendationMode = isRecommendedCategory && !hasSearch
+  const directoryId = typeof category === 'number' ? category : null
+  const shouldShowAllCategory = (!showRecommendations && category === 'recommended') || (hasSearch && isRecommendedCategory)
+  const categoryValue = shouldShowAllCategory
+    ? 'all'
+    : typeof category === 'number' ? String(category) : category
 
   const directoriesQuery = useKnowledgeDirectories()
   const directories = directoriesQuery.data?.items ?? []
@@ -110,14 +129,34 @@ export function KnowledgeAssistant({
     display_status: 'published',
     page,
     per_page: PER_PAGE,
-  })
+  }, { enabled: !isRecommendationMode })
+  const recommendationParams = useMemo(() => ({
+    conversation_id: conversationId,
+    limit: 20,
+  }), [conversationId])
+  const recommendationsQuery = useKnowledgeRecommendations(recommendationParams, { enabled: isRecommendationMode })
+  const retryRecommendations = useRetryKnowledgeRecommendations()
   const selectedQuery = useKnowledgeDocument(selectedId)
-  const documents = documentsQuery.data?.items ?? []
+  const documents = isRecommendationMode
+    ? recommendationsQuery.data?.items ?? []
+    : documentsQuery.data?.items ?? []
   const selectedDocument = selectedQuery.data ?? documents.find((item) => item.id === selectedId) ?? null
+  const recommendationStatus = recommendationsQuery.data?.status
+  const isRecommendationUpdating = isRecommendationMode && recommendationStatus === 'updating'
 
   useEffect(() => {
     setPage(1)
-  }, [directoryId, query])
+  }, [category, query, hasSearch])
+
+  useEffect(() => {
+    if (!showRecommendations && category === 'recommended') {
+      setCategory('all')
+    }
+  }, [category, showRecommendations])
+
+  useEffect(() => {
+    setSelectedId(null)
+  }, [conversationId])
 
   const reasonText = (reason: string | null | undefined): string => {
     if (!reason) return ''
@@ -165,6 +204,14 @@ export function KnowledgeAssistant({
     }
   }
 
+  const handleRetry = () => {
+    if (isRecommendationMode) {
+      retryRecommendations.mutate(recommendationParams)
+      return
+    }
+    void documentsQuery.refetch()
+  }
+
   const renderActions = (document: KnowledgeDocument, compact = false) => {
     const useReason = reasonText(actionBlockReason(document, 'use')) || (!canUse ? useDisabledReason : '')
     const sendReason = reasonText(actionBlockReason(document, 'send')) || (!canSend ? sendDisabledReason : '')
@@ -207,7 +254,10 @@ export function KnowledgeAssistant({
   }
 
   const renderList = () => {
-    if (documentsQuery.isLoading || directoriesQuery.isLoading) {
+    if (
+      directoriesQuery.isLoading
+      || (isRecommendationMode ? recommendationsQuery.isLoading : documentsQuery.isLoading)
+    ) {
       return (
         <div className="flex flex-col gap-2">
           {Array.from({ length: 4 }).map((_, index) => (
@@ -217,14 +267,43 @@ export function KnowledgeAssistant({
       )
     }
 
-    if (documentsQuery.isError || directoriesQuery.isError) {
+    if (
+      directoriesQuery.isError
+      || (isRecommendationMode ? recommendationsQuery.isError || recommendationStatus === 'failed' : documentsQuery.isError)
+    ) {
       return (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-12 text-center">
           <IconBook2 size={28} className="text-muted-foreground" />
-          <p className="text-sm text-muted-foreground">{t('ws.knowledge.loadFailed', locale)}</p>
-          <Button type="button" variant="outline" size="sm" onClick={() => void documentsQuery.refetch()}>
+          <p className="text-sm text-muted-foreground">
+            {isRecommendationMode ? t('ws.knowledge.recommendationLoadFailed', locale) : t('ws.knowledge.loadFailed', locale)}
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={isRecommendationMode && retryRecommendations.isPending}
+            onClick={handleRetry}
+          >
             {t('ws.knowledge.retry', locale)}
           </Button>
+        </div>
+      )
+    }
+
+    if (isRecommendationMode && recommendationStatus === 'no_conversation') {
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-12 text-center">
+          <IconBook2 size={28} className="text-muted-foreground" />
+          <p className="text-sm text-muted-foreground">{t('ws.knowledge.recommendationSelectConversation', locale)}</p>
+        </div>
+      )
+    }
+
+    if (isRecommendationMode && recommendationStatus === 'no_vector') {
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-12 text-center">
+          <IconBook2 size={28} className="text-muted-foreground" />
+          <p className="text-sm text-muted-foreground">{t('ws.knowledge.recommendationNoVector', locale)}</p>
         </div>
       )
     }
@@ -234,7 +313,18 @@ export function KnowledgeAssistant({
         <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-12 text-center">
           <IconBook2 size={28} className="text-muted-foreground" />
           <p className="text-sm text-muted-foreground">
-            {query ? t('ws.knowledge.noResults', locale) : t('ws.knowledge.empty', locale)}
+            {query
+              ? t('ws.knowledge.noResults', locale)
+              : isRecommendationUpdating
+                ? (
+                    <span className="inline-flex items-center justify-center gap-1.5">
+                      <IconLoader2 size={14} className="animate-spin" />
+                      {t('ws.knowledge.recommendationUpdating', locale)}
+                    </span>
+                  )
+                : isRecommendationMode
+                  ? t('ws.knowledge.recommendationEmpty', locale)
+                : t('ws.knowledge.empty', locale)}
           </p>
         </div>
       )
@@ -275,26 +365,66 @@ export function KnowledgeAssistant({
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
                 placeholder={t('ws.knowledge.search', locale)}
-                className="h-9 pl-8"
+                className="h-9 pl-8 pr-8"
               />
+              {hasSearch && (
+                <button
+                  type="button"
+                  aria-label={t('ws.knowledge.clearSearch', locale)}
+                  title={t('ws.knowledge.clearSearch', locale)}
+                  className="absolute right-2 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
+                  onClick={() => setSearch('')}
+                >
+                  <IconX size={14} stroke={1.8} />
+                </button>
+              )}
             </div>
             <select
-              value={directoryId ?? ''}
-              onChange={(event) => setDirectoryId(event.target.value ? Number(event.target.value) : null)}
+              value={categoryValue}
+              onChange={(event) => {
+                const value = event.target.value
+                setCategory(value === 'recommended' || value === 'all' ? value : Number(value))
+              }}
               className="mt-2 h-9 w-full rounded-lg border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
             >
-              <option value="">{t('ws.knowledge.allArticles', locale)}</option>
-              {flatDirectories.map(({ node, depth, path }) => (
-                <option key={node.id} value={node.id}>
-                  {`${'  '.repeat(Math.max(0, depth - 1))}${path}`}
-                </option>
-              ))}
+              {hasSearch ? (
+                <>
+                  <option value="all">{t('ws.knowledge.allArticles', locale)}</option>
+                  {flatDirectories.map(({ node, depth, path }) => (
+                    <option key={node.id} value={node.id}>
+                      {`${'  '.repeat(Math.max(0, depth - 1))}${path}`}
+                    </option>
+                  ))}
+                </>
+              ) : (
+                <>
+                  {showRecommendations && (
+                    <option value="recommended">{t('ws.knowledge.recommended', locale)}</option>
+                  )}
+                  <option value="all">{t('ws.knowledge.allArticles', locale)}</option>
+                  {flatDirectories.map(({ node, depth, path }) => (
+                    <option key={node.id} value={node.id}>
+                      {`${'  '.repeat(Math.max(0, depth - 1))}${path}`}
+                    </option>
+                  ))}
+                </>
+              )}
             </select>
+            {isRecommendationMode && (
+              <div className="mt-2 flex items-center gap-1.5 rounded-md border border-border bg-muted px-3 py-2 text-xs leading-5 text-muted-foreground">
+                {isRecommendationUpdating && <IconLoader2 size={13} className="shrink-0 animate-spin" />}
+                <span>
+                  {isRecommendationUpdating
+                    ? t('ws.knowledge.recommendationUpdating', locale)
+                    : t('ws.knowledge.recommendationHint', locale)}
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto p-3">{renderList()}</div>
 
-          {documentsQuery.data && documentsQuery.data.total > 0 && (
+          {!isRecommendationMode && documentsQuery.data && documentsQuery.data.total > 0 && (
             <div className="flex shrink-0 items-center justify-between border-t border-border px-3 py-2 text-xs text-muted-foreground">
               <span>{t('ws.knowledge.total', locale, { total: documentsQuery.data.total })}</span>
               {documentsQuery.data.pages > 1 && (

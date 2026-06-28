@@ -16,11 +16,13 @@ type Props = {
   end: string
   /** Forwarded to the detail page navigation so URL params (start/end/trend) are preserved */
   carriedSearch: string
+  refreshToken?: number
   onExportStateChange?: (state: {
     q: string
     sort: EmployeeSortField
     order: SortOrder
     loading: boolean
+    asOf: string | null
   }) => void
 }
 
@@ -34,9 +36,12 @@ const COLS: { key: EmployeeSortField; labelKey: string; width: string; sortable:
   { key: 'user_message_count', labelKey: 'ws.records.sessionReports.overview.userMessageCount', width: 'w-[110px]', sortable: true },
   { key: 'agent_message_count', labelKey: 'ws.records.sessionReports.overview.agentMessageCount', width: 'w-[110px]', sortable: true },
   { key: 'avg_duration_seconds', labelKey: 'ws.records.sessionReports.overview.avgDuration', width: 'w-[130px]', sortable: true },
+  { key: 'reception_segment_count', labelKey: 'ws.records.sessionReports.overview.receptionSegmentCount', width: 'w-[110px]', sortable: true },
+  { key: 'reception_transfer_in_count', labelKey: 'ws.records.sessionReports.overview.receptionTransferInCount', width: 'w-[110px]', sortable: true },
+  { key: 'reception_transfer_out_count', labelKey: 'ws.records.sessionReports.overview.receptionTransferOutCount', width: 'w-[110px]', sortable: true },
 ]
 
-export function EmployeesTable({ start, end, carriedSearch, onExportStateChange }: Props) {
+export function EmployeesTable({ start, end, carriedSearch, refreshToken = 0, onExportStateChange }: Props) {
   const { locale } = useLocaleStore()
   const router = useRouter()
 
@@ -47,7 +52,7 @@ export function EmployeesTable({ start, end, carriedSearch, onExportStateChange 
   const [page, setPage] = useState(1)
   const [perPage, setPerPage] = useState(20)
 
-  const { data, isLoading, isFetching } = useSessionReportsEmployees({
+  const { data, isLoading, isFetching, refetch } = useSessionReportsEmployees({
     start,
     end,
     q: committedQ || undefined,
@@ -63,8 +68,15 @@ export function EmployeesTable({ start, end, carriedSearch, onExportStateChange 
       sort,
       order,
       loading: isFetching,
+      asOf: data?.as_of ?? null,
     })
-  }, [committedQ, sort, order, isFetching, onExportStateChange])
+  }, [committedQ, sort, order, isFetching, data?.as_of, onExportStateChange])
+
+  useEffect(() => {
+    if (refreshToken > 0) {
+      refetch()
+    }
+  }, [refreshToken, refetch])
 
   const items = data?.items ?? []
   const total = data?.total ?? 0
@@ -107,85 +119,101 @@ export function EmployeesTable({ start, end, carriedSearch, onExportStateChange 
       </div>
 
       {/* Table */}
-      <div className="overflow-hidden rounded-lg border border-border">
-        {/* Header */}
-        <div className="flex h-12 items-center gap-4 bg-[#F8F8F8] px-6 text-xs font-semibold text-muted-foreground">
-          <div className="w-[240px]">
-            {t('ws.records.sessionReports.employees.colEmployee', locale)}
-          </div>
-          <div className="w-[80px] text-center">
-            {t('ws.records.sessionReports.employees.colStatus', locale)}
-          </div>
-          {COLS.filter((c) => c.sortable).map((col) => (
-            <button
-              type="button"
-              key={col.key}
-              onClick={() => toggleSort(col.key)}
-              className={cn(col.width, 'flex items-center justify-center gap-1 transition-colors hover:text-foreground')}
-            >
-              <span>{t(col.labelKey, locale)}</span>
-              {sort === col.key && (order === 'desc' ? <IconArrowDown size={12} /> : <IconArrowUp size={12} />)}
-            </button>
-          ))}
-        </div>
-
-        {/* Rows */}
-        {isLoading ? (
-          <div className="px-6 py-16 text-center text-sm text-muted-foreground">
-            {t('ws.records.sessionReports.common.loading', locale)}
-          </div>
-        ) : items.length === 0 ? (
-          <div className="px-6 py-16 text-center text-sm text-muted-foreground">
-            {committedQ
-              ? t('ws.records.sessionReports.employees.emptyByQuery', locale)
-              : t('ws.records.sessionReports.employees.empty', locale)}
-          </div>
-        ) : (
-          items.map((row, idx) => {
-            const e = row.employee
-            const m = row.metrics
-            return (
+      <div className="overflow-x-auto rounded-lg border border-border">
+        <div className="min-w-max">
+          {/* Header */}
+          <div className="flex h-12 items-center gap-4 bg-[#F8F8F8] px-6 text-xs font-semibold text-muted-foreground">
+            <div className="w-[240px]">
+              {t('ws.records.sessionReports.employees.colEmployee', locale)}
+            </div>
+            <div className="w-[80px] text-center">
+              {t('ws.records.sessionReports.employees.colStatus', locale)}
+            </div>
+            {COLS.filter((c) => c.sortable).map((col) => (
               <button
                 type="button"
-                key={e.id}
-                onClick={() => router.push(`/workspace/records/session-reports/employees/${e.id}${tail}`)}
-                className={cn(
-                  'flex h-[56px] w-full items-center gap-4 border-b border-[#F0F0F0] px-6 text-left text-[13px] transition-colors last:border-b-0 hover:bg-muted/30',
-                  idx % 2 === 1 ? 'bg-[#FAFAFA]' : 'bg-background'
-                )}
+                key={col.key}
+                onClick={() => toggleSort(col.key)}
+                className={cn(col.width, 'flex items-center justify-center gap-1 transition-colors hover:text-foreground')}
               >
-                <div className="flex w-[240px] items-center gap-3">
-                  <EmployeeAvatar employee={e} />
-                  <div className="flex flex-col gap-0.5">
-                    <span className="font-semibold text-foreground">
-                      {e.display_name ?? e.name}
-                    </span>
-                    {e.email && (
-                      <span className="text-xs text-muted-foreground">{e.email}</span>
-                    )}
-                  </div>
-                </div>
-                <div className="w-[80px] text-center">
-                  <span
-                    className={cn(
-                      'inline-flex items-center rounded-md px-2 py-0.5 text-xs',
-                      e.is_active ? 'bg-[#F0FDF4] text-[#16A34A]' : 'bg-[#F5F5F5] text-[#737373]'
-                    )}
-                  >
-                    {e.is_active
-                      ? t('ws.records.sessionReports.employees.statusActive', locale)
-                      : t('ws.records.sessionReports.employees.statusInactive', locale)}
-                  </span>
-                </div>
-                <div className="w-[100px] text-center">{m.session_count.toLocaleString()}</div>
-                <div className="w-[100px] text-center">{m.message_count.toLocaleString()}</div>
-                <div className="w-[110px] text-center">{m.user_message_count.toLocaleString()}</div>
-                <div className="w-[110px] text-center">{m.agent_message_count.toLocaleString()}</div>
-                <div className="w-[130px] text-center">{formatDuration(m.avg_duration_seconds)}</div>
+                <span>{t(col.labelKey, locale)}</span>
+                {sort === col.key && (order === 'desc' ? <IconArrowDown size={12} /> : <IconArrowUp size={12} />)}
               </button>
-            )
-          })
-        )}
+            ))}
+          </div>
+
+          {/* Rows */}
+          {isLoading ? (
+            <div className="px-6 py-16 text-center text-sm text-muted-foreground">
+              {t('ws.records.sessionReports.common.loading', locale)}
+            </div>
+          ) : items.length === 0 ? (
+            <div className="px-6 py-16 text-center text-sm text-muted-foreground">
+              {committedQ
+                ? t('ws.records.sessionReports.employees.emptyByQuery', locale)
+                : t('ws.records.sessionReports.employees.empty', locale)}
+            </div>
+          ) : (
+            items.map((row, idx) => {
+              const e = row.employee
+              const m = row.metrics
+              const href = `/workspace/records/session-reports/employees/${e.id}${tail}`
+              return (
+                <div
+                  role="button"
+                  tabIndex={0}
+                  key={e.id}
+                  onClick={() => {
+                    if (window.getSelection()?.toString()) return
+                    router.push(href)
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      router.push(href)
+                    }
+                  }}
+                  className={cn(
+                    'flex h-[56px] cursor-pointer select-text items-center gap-4 border-b border-[#F0F0F0] px-6 text-left text-[13px] transition-colors last:border-b-0 hover:bg-muted/30',
+                    idx % 2 === 1 ? 'bg-[#FAFAFA]' : 'bg-background'
+                  )}
+                >
+                  <div className="flex w-[240px] items-center gap-3">
+                    <EmployeeAvatar employee={e} />
+                    <div className="flex flex-col gap-0.5">
+                      <span className="font-semibold text-foreground">
+                        {e.display_name ?? e.name}
+                      </span>
+                      {e.email && (
+                        <span className="text-xs text-muted-foreground">{e.email}</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="w-[80px] text-center">
+                    <span
+                      className={cn(
+                        'inline-flex items-center rounded-md px-2 py-0.5 text-xs',
+                        e.is_active ? 'bg-[#F0FDF4] text-[#16A34A]' : 'bg-[#F5F5F5] text-[#737373]'
+                      )}
+                    >
+                      {e.is_active
+                        ? t('ws.records.sessionReports.employees.statusActive', locale)
+                        : t('ws.records.sessionReports.employees.statusInactive', locale)}
+                    </span>
+                  </div>
+                  <div className="w-[100px] text-center">{m.session_count.toLocaleString()}</div>
+                  <div className="w-[100px] text-center">{m.message_count.toLocaleString()}</div>
+                  <div className="w-[110px] text-center">{m.user_message_count.toLocaleString()}</div>
+                  <div className="w-[110px] text-center">{m.agent_message_count.toLocaleString()}</div>
+                  <div className="w-[130px] text-center">{formatDuration(m.avg_duration_seconds)}</div>
+                  <div className="w-[110px] text-center">{(m.reception_segment_count ?? 0).toLocaleString()}</div>
+                  <div className="w-[110px] text-center">{(m.reception_transfer_in_count ?? 0).toLocaleString()}</div>
+                  <div className="w-[110px] text-center">{(m.reception_transfer_out_count ?? 0).toLocaleString()}</div>
+                </div>
+              )
+            })
+          )}
+        </div>
       </div>
 
       {/* Pagination */}

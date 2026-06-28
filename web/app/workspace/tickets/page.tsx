@@ -21,9 +21,6 @@ import {
   useTicketViewCounts,
   useTicketViewGroups,
 } from '@/service/use-tickets'
-import { useUser } from '@/service/use-users'
-import { useEmployee } from '@/service/use-employees'
-import { useEmployeeGroup } from '@/service/use-employee-groups'
 import { useUnifiedFields } from '@/service/use-field-definitions'
 import type { TicketView, ConditionItem, ColumnConfigItem } from '@/models/ticket-view'
 import type { Ticket, TicketQueryPayload } from '@/models/ticket'
@@ -34,8 +31,10 @@ import { ColumnsDrawer } from './columns-drawer'
 import { TicketFormModal } from './ticket-form-modal'
 import { GroupBar } from '@/components/workspace/group-bar'
 import {
+  FieldValueDisplay,
   formatActorFieldValue,
   formatFileFieldValue,
+  isEntitySelectFieldType,
 } from '@/app/components/features/field-system/field-value-display'
 import { richTextToPlainCell } from '@/lib/rich-text-plain'
 import { FieldOptionPill } from '@/app/components/features/field-system/field-select-pill-editors'
@@ -466,7 +465,7 @@ export default function WorkspaceTicketsPage() {
             className={cn(
               'flex h-9 items-center gap-1.5 rounded-lg border px-3 text-sm transition-colors',
               hasColumnOverride
-                ? 'border-ring bg-info/10 text-primary'
+                ? 'border-border bg-muted text-foreground hover:bg-muted/80'
                 : 'border-border text-foreground/80 hover:bg-accent'
             )}
           >
@@ -539,6 +538,7 @@ export default function WorkspaceTicketsPage() {
                   >
                     {displayColumns.map((col, idx) => {
                       const val = getCellValue(ticket, col, fieldLookup, locale, fieldByKey)
+                      const raw = getRawCellValue(ticket, col)
                       const isStatusCol = col.field_key === 'status'
                       const isPriorityCol = col.field_key === 'priority'
                       return (
@@ -560,12 +560,12 @@ export default function WorkspaceTicketsPage() {
                                 ticket.priority,
                               )}
                             />
-                          ) : col.field_key === 'user_id' ? (
-                            <UserCell userId={ticket.user_id} />
-                          ) : col.field_key === 'assignee' ? (
-                            <EmployeeCell employeeId={ticket.agent_id} />
-                          ) : col.field_key === 'assignee_group' ? (
-                            <EmployeeGroupCell groupId={ticket.assignee_group_id} />
+                          ) : isEntitySelectFieldType(col.field_type) && raw != null && raw !== '' ? (
+                            <FieldValueDisplay
+                              fieldType={col.field_type}
+                              value={raw}
+                              className="block truncate"
+                            />
                           ) : (
                             <span className="block truncate">{val}</span>
                           )}
@@ -673,29 +673,6 @@ export default function WorkspaceTicketsPage() {
 
 // ── Helpers ──
 
-function UserCell({ userId }: { userId: number | null | undefined }) {
-  const { data: user } = useUser(userId ?? 0)
-  if (!userId) return <span className="block truncate">-</span>
-  const secondary = user?.public_id || user?.phone || user?.email
-  const label = user ? (secondary ? `${user.name} · ${secondary}` : user.name) : `User #${userId}`
-  return <span className="block truncate">{label}</span>
-}
-
-function EmployeeCell({ employeeId }: { employeeId: number | null | undefined }) {
-  const { data: employee } = useEmployee(employeeId ?? 0)
-  if (!employeeId) return <span className="block truncate">-</span>
-  const label = employee
-    ? (employee.nickname || employee.name || employee.username)
-    : `Employee #${employeeId}`
-  return <span className="block truncate">{label}</span>
-}
-
-function EmployeeGroupCell({ groupId }: { groupId: number | null | undefined }) {
-  const { data: group } = useEmployeeGroup(groupId ?? 0)
-  if (!groupId) return <span className="block truncate">-</span>
-  return <span className="block truncate">{group?.name ?? `Group #${groupId}`}</span>
-}
-
 function buildTicketsUrl(
   viewId: number | 'all',
   group: string | undefined,
@@ -771,12 +748,7 @@ function getCellValue(
     if (field_key === 'conversation_id') {
       return ticket.conversation_public_id ?? ticket.call_record_call_id ?? ''
     }
-    const raw =
-      field_key === 'assignee'
-        ? ticket.agent_id
-        : field_key === 'assignee_group'
-          ? ticket.assignee_group_id
-          : (ticket as Record<string, unknown>)[field_key]
+    const raw = getRawCellValue(ticket, col)
     if (raw == null) return ''
     if (fieldByKey.get(field_key)?.type_config?.value_kind === 'actor') {
       return formatActorFieldValue(raw)
@@ -808,11 +780,7 @@ function getCellValue(
     const customKey = field_key && !SYSTEM_KEYS.has(field_key) ? field_key : null
     const legacyIdKey = field_id != null ? String(field_id) : null
     const lookupKey = customKey ?? legacyIdKey ?? ''
-    const val = customKey && ticket.custom_fields[customKey] != null
-      ? ticket.custom_fields[customKey]
-      : legacyIdKey
-        ? ticket.custom_fields[legacyIdKey]
-        : null
+    const val = getRawCellValue(ticket, col)
     if (val == null) return ''
     if (field_type === 'file') {
       return formatFileFieldValue(val, locale === 'zh')
@@ -829,6 +797,28 @@ function getCellValue(
   }
 
   return ''
+}
+
+function getRawCellValue(
+  ticket: Ticket,
+  col: { field_key: string | null; field_id: number | null },
+): unknown {
+  const { field_key, field_id } = col
+  if (field_key && SYSTEM_KEYS.has(field_key)) {
+    if (field_key === 'assignee') return ticket.agent_id
+    if (field_key === 'assignee_group') return ticket.assignee_group_id
+    return (ticket as Record<string, unknown>)[field_key]
+  }
+
+  const customKey = field_key && !SYSTEM_KEYS.has(field_key) ? field_key : null
+  const legacyIdKey = field_id != null ? String(field_id) : null
+  if (customKey && ticket.custom_fields?.[customKey] != null) {
+    return ticket.custom_fields[customKey]
+  }
+  if (legacyIdKey) {
+    return ticket.custom_fields?.[legacyIdKey]
+  }
+  return null
 }
 
 function getColumnMinWidth(fieldType: string, fieldKey: string | null): number {

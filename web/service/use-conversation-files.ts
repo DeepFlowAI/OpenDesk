@@ -3,7 +3,10 @@ import type {
   ConversationFileAccessResponse,
   ConversationFileUploadResponse,
 } from '@/models/conversation-file'
-import type { PublicOfflineMessageSendResponse } from '@/service/use-visitor-chat'
+import type {
+  PublicOfflineMessageSendResponse,
+  VisitorEnvironmentPayload,
+} from '@/service/use-visitor-chat'
 import { get, postForm } from './base'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? ''
@@ -46,9 +49,16 @@ export async function uploadVisitorOfflineMessageFile(params: {
 export async function sendVisitorOfflineMessageFile(params: {
   visitorSessionToken: string
   file: File
+  visitorEnvironment?: VisitorEnvironmentPayload | null
 }): Promise<PublicOfflineMessageSendResponse> {
   const formData = new FormData()
   formData.append('file', params.file)
+  if (params.visitorEnvironment?.system) {
+    formData.append('system', params.visitorEnvironment.system)
+  }
+  if (params.visitorEnvironment?.browser) {
+    formData.append('browser', params.visitorEnvironment.browser)
+  }
 
   return publicClient
     .post('v1/public/offline-messages/files', {

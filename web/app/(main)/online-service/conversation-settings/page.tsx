@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconClock, IconGripVertical, IconHistory, IconMoodSmile, IconPencil, IconPlus, IconSettings, IconTrash } from '@tabler/icons-react'
+import { IconBell, IconClock, IconGripVertical, IconHistory, IconMoodSmile, IconPencil, IconPlus, IconSettings, IconTrash } from '@tabler/icons-react'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { Switch } from '@/components/ui/switch'
@@ -14,6 +14,12 @@ import {
   useWelcomeMessageRules,
 } from '@/service/use-welcome-message-rules'
 import {
+  useConversationAnnouncements,
+  useDeleteConversationAnnouncement,
+  usePatchConversationAnnouncementEnabled,
+  useReorderConversationAnnouncements,
+} from '@/service/use-conversation-announcements'
+import {
   usePatchSatisfactionSurveyEnabled,
   useSatisfactionSurveyConfig,
 } from '@/service/use-satisfaction-survey'
@@ -22,8 +28,16 @@ import {
   useSaveUserStatFieldSettings,
   useUserStatFieldSettings,
 } from '@/service/use-conversation-user-statistics'
+import {
+  useReadStatusSettings,
+  useSaveReadStatusSettings,
+} from '@/service/use-conversation-read-status'
 import { useVisitorTimeoutCloseSettings } from '@/service/use-visitor-timeout-close'
 import type { Channel } from '@/models/channel'
+import type {
+  ConversationReadStatusConfig,
+  ConversationReadStatusPayload,
+} from '@/models/conversation-read-status'
 import type {
   UserStatFieldSettings,
   UserStatFieldSettingsPayload,
@@ -36,6 +50,10 @@ import type {
   WelcomeMessageCondition,
   WelcomeMessageRuleListItem,
 } from '@/models/welcome-message-rule'
+import type {
+  ConversationAnnouncementCondition,
+  ConversationAnnouncementListItem,
+} from '@/models/conversation-announcement'
 
 function formatDate(iso: string | null, locale: Locale): string {
   if (!iso) return '—'
@@ -81,6 +99,25 @@ function conditionSummary(
       return `${t('wm.cond.type.webSdk', locale)} ${opLabel(condition.operator, locale)} ${names}`
     })
     .join(' · ')
+}
+
+function announcementConditionSummary(
+  conditions: ConversationAnnouncementCondition[],
+  channelById: Record<string, Channel>,
+  locale: Locale,
+): string {
+  return conditionSummary(conditions, channelById, locale)
+}
+
+function announcementTimeText(row: ConversationAnnouncementListItem, locale: Locale): string {
+  if (row.time_range_type === 'permanent') return t('ann.time.permanent', locale)
+  return `${formatDate(row.start_at, locale)} ~ ${formatDate(row.end_at, locale)}`
+}
+
+function announcementTimeStatusText(row: ConversationAnnouncementListItem, locale: Locale): string | null {
+  if (row.time_status === 'not_started') return t('ann.time.notStarted', locale)
+  if (row.time_status === 'expired') return t('ann.time.expired', locale)
+  return null
 }
 
 function satText(locale: Locale, key: string) {
@@ -147,6 +184,13 @@ function userStatPayload(settings: UserStatFieldSettings): UserStatFieldSettings
   }
 }
 
+function readStatusPayload(settings: ConversationReadStatusConfig): ConversationReadStatusPayload {
+  return {
+    agent_workspace_enabled: settings.agent_workspace_enabled,
+    web_sdk_enabled: settings.web_sdk_enabled,
+  }
+}
+
 function DeleteModal({
   item,
   onCancel,
@@ -191,11 +235,60 @@ function DeleteModal({
   )
 }
 
+function AnnouncementDeleteModal({
+  item,
+  onCancel,
+  onConfirm,
+  loading,
+}: {
+  item: ConversationAnnouncementListItem
+  onCancel: () => void
+  onConfirm: () => void
+  loading: boolean
+}) {
+  const { locale } = useLocaleStore()
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="w-[420px] rounded-xl bg-white p-6">
+        <h2 className="text-lg font-semibold text-foreground">{t('ann.delete.title', locale)}</h2>
+        <p className="mt-3 text-sm text-muted-foreground">
+          {t('ann.delete.confirm', locale, { name: item.name })}
+        </p>
+        <div className="mt-3 rounded-lg border border-border p-3">
+          <p className="text-sm font-medium text-foreground">{item.name}</p>
+        </div>
+        <div className="mt-6 flex justify-end gap-3">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="h-9 rounded-lg border border-border px-4 text-sm font-medium text-foreground/80 hover:bg-accent"
+          >
+            {t('ann.delete.cancel', locale)}
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={loading}
+            className="h-9 rounded-lg bg-destructive px-4 text-sm font-medium text-white hover:bg-destructive/80 disabled:opacity-50"
+          >
+            {loading ? '...' : t('ann.delete.ok', locale)}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function ConversationSettingsPage() {
   const router = useRouter()
   const { locale } = useLocaleStore()
   const perPage = 100
-  const { data, isLoading, refetch } = useWelcomeMessageRules({ page: 1, per_page: perPage })
+  const { data, isLoading, refetch: refetchWelcomeRules } = useWelcomeMessageRules({ page: 1, per_page: perPage })
+  const {
+    data: announcementData,
+    isLoading: announcementsLoading,
+    refetch: refetchAnnouncements,
+  } = useConversationAnnouncements({ page: 1, per_page: perPage })
   const {
     data: satisfaction,
     isPending: satisfactionPending,
@@ -220,14 +313,25 @@ export default function ConversationSettingsPage() {
     isError: visitorTimeoutError,
     refetch: refetchVisitorTimeoutSettings,
   } = useVisitorTimeoutCloseSettings()
+  const {
+    data: readStatusSettings,
+    isPending: readStatusPending,
+    isError: readStatusError,
+    refetch: refetchReadStatusSettings,
+  } = useReadStatusSettings()
   const { data: channelsData } = useChannels()
   const deleteMut = useDeleteWelcomeMessageRule()
   const reorderMut = useReorderWelcomeMessageRules()
   const patchEnabledMut = usePatchWelcomeMessageRuleEnabled()
+  const announcementDeleteMut = useDeleteConversationAnnouncement()
+  const announcementReorderMut = useReorderConversationAnnouncements()
+  const announcementPatchEnabledMut = usePatchConversationAnnouncementEnabled()
   const patchSatisfactionMut = usePatchSatisfactionSurveyEnabled()
   const saveUserStatMut = useSaveUserStatFieldSettings()
+  const saveReadStatusMut = useSaveReadStatusSettings()
 
   const items = useMemo(() => data?.items ?? [], [data?.items])
+  const announcementItems = useMemo(() => announcementData?.items ?? [], [announcementData?.items])
   const channels = (channelsData ?? []) as Channel[]
   const channelById = useMemo(
     () => Object.fromEntries(channels.map((channel) => [String(channel.id), channel])),
@@ -235,16 +339,30 @@ export default function ConversationSettingsPage() {
   )
 
   const [orderedIds, setOrderedIds] = useState<number[]>([])
+  const [announcementOrderedIds, setAnnouncementOrderedIds] = useState<number[]>([])
   const [deleteTarget, setDeleteTarget] = useState<WelcomeMessageRuleListItem | null>(null)
+  const [announcementDeleteTarget, setAnnouncementDeleteTarget] = useState<ConversationAnnouncementListItem | null>(null)
   const [dragIndex, setDragIndex] = useState<number | null>(null)
+  const [announcementDragIndex, setAnnouncementDragIndex] = useState<number | null>(null)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   useEffect(() => {
     setOrderedIds(items.map((item) => item.id))
   }, [items])
 
+  useEffect(() => {
+    setAnnouncementOrderedIds(announcementItems.map((item) => item.id))
+  }, [announcementItems])
+
   const byId = useMemo(() => Object.fromEntries(items.map((item) => [item.id, item])), [items])
   const displayRows = orderedIds.map((id) => byId[id]).filter(Boolean) as WelcomeMessageRuleListItem[]
+  const announcementById = useMemo(
+    () => Object.fromEntries(announcementItems.map((item) => [item.id, item])),
+    [announcementItems],
+  )
+  const announcementRows = announcementOrderedIds
+    .map((id) => announcementById[id])
+    .filter(Boolean) as ConversationAnnouncementListItem[]
 
   const showToast = (type: 'success' | 'error', text: string) => {
     setToast({ type, text })
@@ -266,7 +384,26 @@ export default function ConversationSettingsPage() {
       showToast('success', t('wm.reorderSuccess', locale))
     } catch {
       showToast('error', t('wm.reorderFailed', locale))
-      refetch()
+      refetchWelcomeRules()
+    }
+  }
+
+  const handleAnnouncementDrop = async (toIndex: number) => {
+    if (announcementDragIndex == null || announcementDragIndex === toIndex) {
+      setAnnouncementDragIndex(null)
+      return
+    }
+    const next = [...announcementOrderedIds]
+    const [removed] = next.splice(announcementDragIndex, 1)
+    next.splice(toIndex, 0, removed)
+    setAnnouncementOrderedIds(next)
+    setAnnouncementDragIndex(null)
+    try {
+      await announcementReorderMut.mutateAsync(next)
+      showToast('success', t('ann.reorderSuccess', locale))
+    } catch {
+      showToast('error', t('ann.reorderFailed', locale))
+      refetchAnnouncements()
     }
   }
 
@@ -281,13 +418,34 @@ export default function ConversationSettingsPage() {
     }
   }
 
+  const handleAnnouncementDelete = async () => {
+    if (!announcementDeleteTarget) return
+    try {
+      await announcementDeleteMut.mutateAsync(announcementDeleteTarget.id)
+      setAnnouncementDeleteTarget(null)
+      showToast('success', t('ann.deleteSuccess', locale))
+    } catch {
+      showToast('error', t('ann.deleteFailed', locale))
+    }
+  }
+
   const handleToggleEnabled = async (item: WelcomeMessageRuleListItem) => {
     try {
       await patchEnabledMut.mutateAsync({ id: item.id, enabled: !item.enabled })
       showToast('success', t('wm.toggleSuccess', locale))
     } catch {
       showToast('error', t('wm.toggleFailed', locale))
-      refetch()
+      refetchWelcomeRules()
+    }
+  }
+
+  const handleToggleAnnouncementEnabled = async (item: ConversationAnnouncementListItem) => {
+    try {
+      await announcementPatchEnabledMut.mutateAsync({ id: item.id, enabled: !item.enabled })
+      showToast('success', t('ann.toggleSuccess', locale))
+    } catch {
+      showToast('error', t('ann.toggleFailed', locale))
+      refetchAnnouncements()
     }
   }
 
@@ -314,6 +472,21 @@ export default function ConversationSettingsPage() {
     } catch {
       showToast('error', t('userStats.settings.saveFailed', locale))
       refetchUserStatSettings()
+    }
+  }
+
+  const handleToggleReadStatus = async (key: keyof ConversationReadStatusPayload) => {
+    if (!readStatusSettings) return
+    const next = {
+      ...readStatusPayload(readStatusSettings),
+      [key]: !readStatusSettings[key],
+    }
+    try {
+      await saveReadStatusMut.mutateAsync(next)
+      showToast('success', t('readStatus.settings.saveSuccess', locale))
+    } catch {
+      showToast('error', t('readStatus.settings.saveFailed', locale))
+      refetchReadStatusSettings()
     }
   }
 
@@ -422,6 +595,111 @@ export default function ConversationSettingsPage() {
                 </div>
               </div>
             ))}
+          </div>
+        )}
+      </section>
+
+      <section className="flex flex-col gap-4 border-t border-border pt-6">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-foreground">{t('ann.section.title', locale)}</h2>
+          <button
+            type="button"
+            onClick={() => router.push('/online-service/conversation-settings/announcements/new')}
+            className="flex h-10 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-white transition-colors hover:bg-primary/80"
+          >
+            <IconPlus size={18} />
+            {t('ann.new', locale)}
+          </button>
+        </div>
+
+        {announcementsLoading ? (
+          <p className="text-sm text-muted-foreground">{t('ann.loading', locale)}</p>
+        ) : announcementRows.length === 0 ? (
+          <div className="flex flex-col items-center justify-center gap-4 py-20">
+            <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-muted text-muted-foreground">
+              <IconBell size={24} />
+            </div>
+            <p className="text-sm text-muted-foreground">{t('ann.empty', locale)}</p>
+            <button
+              type="button"
+              onClick={() => router.push('/online-service/conversation-settings/announcements/new')}
+              className="flex h-10 items-center gap-2 rounded-lg bg-primary px-5 text-sm font-medium text-white"
+            >
+              <IconPlus size={18} />
+              {t('ann.new', locale)}
+            </button>
+          </div>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border border-border">
+            <div className="min-w-[1180px]">
+              <div className="flex h-12 items-center gap-5 rounded-t-lg border-b border-border bg-muted px-6 text-sm font-semibold text-foreground/80">
+                <div className="w-8 shrink-0" />
+                <div className="w-[72px] shrink-0">{t('ann.col.priority', locale)}</div>
+                <div className="w-[180px] shrink-0">{t('ann.col.name', locale)}</div>
+                <div className="w-[210px] shrink-0">{t('ann.col.timeRange', locale)}</div>
+                <div className="w-[200px] shrink-0">{t('ann.col.conditions', locale)}</div>
+                <div className="w-[100px] shrink-0">{t('ann.col.enabled', locale)}</div>
+                <div className="w-[150px] shrink-0">{t('ann.col.updatedAt', locale)}</div>
+                <div className="w-[80px] shrink-0 text-center">{t('ann.col.actions', locale)}</div>
+              </div>
+              {announcementRows.map((row, index) => {
+                const statusText = announcementTimeStatusText(row, locale)
+                return (
+                  <div
+                    key={row.id}
+                    className="flex min-h-14 items-center gap-5 border-b border-border px-6 py-2 last:border-b-0"
+                    onDragOver={(event) => event.preventDefault()}
+                    onDrop={() => handleAnnouncementDrop(index)}
+                  >
+                    <div
+                      className="flex w-8 shrink-0 cursor-grab items-center justify-center text-muted-foreground active:cursor-grabbing"
+                      draggable
+                      onDragStart={() => setAnnouncementDragIndex(index)}
+                      onDragEnd={() => setAnnouncementDragIndex(null)}
+                    >
+                      <IconGripVertical size={16} />
+                    </div>
+                    <div className="w-[72px] shrink-0 text-sm text-foreground">{index + 1}</div>
+                    <div className="w-[180px] shrink-0 truncate text-sm text-foreground">{row.name}</div>
+                    <div className="flex w-[210px] shrink-0 flex-col gap-1 text-sm">
+                      <span className="truncate text-foreground">{announcementTimeText(row, locale)}</span>
+                      {statusText && (
+                        <span className="w-fit rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                          {statusText}
+                        </span>
+                      )}
+                    </div>
+                    <div className="w-[200px] shrink-0 truncate text-sm text-muted-foreground">
+                      {announcementConditionSummary(row.conditions, channelById, locale)}
+                    </div>
+                    <div className="w-[100px] shrink-0">
+                      <Switch checked={row.enabled} onCheckedChange={() => handleToggleAnnouncementEnabled(row)} />
+                    </div>
+                    <div className="w-[150px] shrink-0 text-sm text-muted-foreground">
+                      {formatDate(row.updated_at, locale)}
+                    </div>
+                    <div className="flex w-[80px] shrink-0 items-center justify-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => router.push(`/online-service/conversation-settings/announcements/${row.id}`)}
+                        className="text-foreground/80 transition-colors hover:text-foreground"
+                        aria-label={t('ann.action.edit', locale)}
+                      >
+                        <IconPencil size={18} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAnnouncementDeleteTarget(row)}
+                        className="text-foreground/80 transition-colors hover:text-destructive"
+                        aria-label={t('ann.action.delete', locale)}
+                      >
+                        <IconTrash size={18} />
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           </div>
         )}
       </section>
@@ -711,6 +989,60 @@ export default function ConversationSettingsPage() {
 
       <section className="flex flex-col gap-4 border-t border-border pt-6">
         <div>
+          <h2 className="text-lg font-semibold text-foreground">{t('readStatus.settings.title', locale)}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">{t('readStatus.settings.description', locale)}</p>
+        </div>
+
+        {readStatusPending ? (
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="h-24 animate-pulse rounded-md border border-border bg-muted/50" />
+            <div className="h-24 animate-pulse rounded-md border border-border bg-muted/50" />
+          </div>
+        ) : readStatusError ? (
+          <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border py-12">
+            <p className="text-sm text-muted-foreground">{t('readStatus.settings.loadFailed', locale)}</p>
+            <button
+              type="button"
+              onClick={() => refetchReadStatusSettings()}
+              className="inline-flex h-9 items-center rounded-md border border-border px-4 text-sm font-medium text-foreground hover:bg-accent"
+            >
+              {t('vc.retry', locale)}
+            </button>
+          </div>
+        ) : readStatusSettings ? (
+          <div className="overflow-hidden rounded-md border border-border bg-background">
+            <div className="grid divide-y divide-border md:grid-cols-2 md:divide-x md:divide-y-0">
+              {([
+                ['agent_workspace_enabled', 'agentWorkspace'],
+                ['web_sdk_enabled', 'webSdk'],
+              ] as const).map(([key, labelKey]) => (
+                <div key={key} className="flex min-w-0 items-start justify-between gap-4 p-5">
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-foreground">
+                      {t(`readStatus.settings.${labelKey}`, locale)}
+                    </h3>
+                    <p className="mt-1 text-sm leading-5 text-muted-foreground">
+                      {t(`readStatus.settings.${labelKey}.description`, locale)}
+                    </p>
+                    <p className="mt-3 text-xs text-muted-foreground">
+                      {t('readStatus.settings.updatedAt', locale)}: {formatDate(readStatusSettings.updated_at, locale)}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={readStatusSettings[key]}
+                    disabled={saveReadStatusMut.isPending}
+                    aria-label={t(`readStatus.settings.${labelKey}`, locale)}
+                    onCheckedChange={() => handleToggleReadStatus(key)}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="flex flex-col gap-4 border-t border-border pt-6">
+        <div>
           <h2 className="text-lg font-semibold text-foreground">{t('userStats.settings.title', locale)}</h2>
         </div>
 
@@ -757,6 +1089,14 @@ export default function ConversationSettingsPage() {
           onCancel={() => setDeleteTarget(null)}
           onConfirm={handleDelete}
           loading={deleteMut.isPending}
+        />
+      )}
+      {announcementDeleteTarget && (
+        <AnnouncementDeleteModal
+          item={announcementDeleteTarget}
+          onCancel={() => setAnnouncementDeleteTarget(null)}
+          onConfirm={handleAnnouncementDelete}
+          loading={announcementDeleteMut.isPending}
         />
       )}
     </div>

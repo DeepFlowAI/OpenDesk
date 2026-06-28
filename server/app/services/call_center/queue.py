@@ -49,6 +49,7 @@ class QueuePicker:
         call_id: str | None = None,
         offer_id: str | None = None,
         ttl_seconds: float | None = None,
+        preferred_employee_id: int | None = None,
     ) -> dict | None:
         """
         Pick the next `ready` agent in the group without requiring a
@@ -87,9 +88,31 @@ class QueuePicker:
             for emp in employees
         ]
         if r is not None and call_id and offer_id:
+            preferred = next(
+                (candidate for candidate in candidates if candidate["employee_id"] == preferred_employee_id),
+                None,
+            )
+            if preferred is not None:
+                await CcAgentResourceService.ensure_from_visible(
+                    r, tenant_id, preferred["employee_id"], "ready"
+                )
+                reserved = await CcAgentResourceService.reserve_inbound(
+                    r,
+                    tenant_id,
+                    preferred["employee_id"],
+                    call_id=call_id,
+                    offer_id=offer_id,
+                    queue_id=group_id,
+                    ttl_seconds=ttl_seconds,
+                )
+                if reserved is not None:
+                    return preferred | {"resource_state": reserved["resource_state"]}
+
             start = await CcAgentResourceService.next_queue_index(r, tenant_id, group_id)
             for offset in range(len(candidates)):
                 pick = candidates[(start + offset) % len(candidates)]
+                if pick["employee_id"] == preferred_employee_id:
+                    continue
                 await CcAgentResourceService.ensure_from_visible(
                     r, tenant_id, pick["employee_id"], "ready"
                 )
@@ -105,6 +128,13 @@ class QueuePicker:
                 if reserved is not None:
                     return pick | {"resource_state": reserved["resource_state"]}
             return None
+
+        preferred = next(
+            (candidate for candidate in candidates if candidate["employee_id"] == preferred_employee_id),
+            None,
+        )
+        if preferred is not None:
+            return preferred
 
         key = (tenant_id, group_id)
         idx = self._pointers.get(key, 0)
@@ -123,6 +153,7 @@ class QueuePicker:
         call_id: str | None = None,
         offer_id: str | None = None,
         ttl_seconds: float | None = None,
+        preferred_employee_id: int | None = None,
     ) -> dict | None:
         if queue_type == "employee_group":
             return await self.pick_ready_agent(
@@ -133,6 +164,7 @@ class QueuePicker:
                 call_id=call_id,
                 offer_id=offer_id,
                 ttl_seconds=ttl_seconds,
+                preferred_employee_id=preferred_employee_id,
             )
 
         from sqlalchemy import select

@@ -154,6 +154,7 @@ async def permission_gate_context():
         create_employee_id = await create_employee(f"create_{suffix}", [])
         edit_employee_id = await create_employee(f"edit_{suffix}", [])
         group_employee_id = await create_employee(f"group_{suffix}", [])
+        plain_employee_id = await create_employee(f"field_option_{suffix}", [])
 
         await assign_role(view_employee_id, view_role_id)
         await assign_role(create_employee_id, create_role_id)
@@ -168,6 +169,8 @@ async def permission_gate_context():
         "employee_create": _auth_headers(create_employee_id, tenant_id),
         "employee_edit": _auth_headers(edit_employee_id, tenant_id),
         "group_manage": _auth_headers(group_employee_id, tenant_id),
+        "plain": _auth_headers(plain_employee_id, tenant_id),
+        "plain_id": plain_employee_id,
     }
     return _PERMISSION_GATE_CONTEXT
 
@@ -250,3 +253,53 @@ async def test_employee_groups_require_group_manage_permission(
         headers=permission_gate_context["group_manage"],
     )
     assert allowed_resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_field_reference_options_do_not_require_org_permissions(
+    client: AsyncClient,
+    permission_gate_context: dict,
+):
+    group_resp = await client.post(
+        "/api/v1/employee-groups",
+        json={"name": _unique("Field Option Group")},
+        headers=permission_gate_context["group_manage"],
+    )
+    assert group_resp.status_code == 201
+    group_id = group_resp.json()["id"]
+
+    employees_denied = await client.get(
+        "/api/v1/employees",
+        headers=permission_gate_context["plain"],
+    )
+    assert employees_denied.status_code == 403
+
+    groups_denied = await client.get(
+        "/api/v1/employee-groups",
+        headers=permission_gate_context["plain"],
+    )
+    assert groups_denied.status_code == 403
+
+    employees_resp = await client.get(
+        "/api/v1/field-definitions/reference-options/employees",
+        headers=permission_gate_context["plain"],
+    )
+    assert employees_resp.status_code == 200
+
+    employee_detail_resp = await client.get(
+        f"/api/v1/field-definitions/reference-options/employees/{permission_gate_context['plain_id']}",
+        headers=permission_gate_context["plain"],
+    )
+    assert employee_detail_resp.status_code == 200
+
+    groups_resp = await client.get(
+        "/api/v1/field-definitions/reference-options/employee-groups",
+        headers=permission_gate_context["plain"],
+    )
+    assert groups_resp.status_code == 200
+
+    group_detail_resp = await client.get(
+        f"/api/v1/field-definitions/reference-options/employee-groups/{group_id}",
+        headers=permission_gate_context["plain"],
+    )
+    assert group_detail_resp.status_code == 200

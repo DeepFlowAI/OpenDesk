@@ -185,7 +185,7 @@ async def _emit_conversation_created(result: dict) -> None:
             namespace="/visitor",
         )
 
-    if conversation.agent_id:
+    if conversation.agent_id and not result.get("reused_existing_conversation"):
         await rt.emit(
             "new_conversation",
             jsonable_encoder({

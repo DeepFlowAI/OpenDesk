@@ -539,6 +539,9 @@ class KnowledgeService:
             },
         )
         directories = await KnowledgeDirectoryRepository.list_all(db, tenant_id)
+        from app.services.knowledge_recommendation_service import KnowledgeRecommendationService
+
+        KnowledgeRecommendationService.schedule_document_embedding_refresh(tenant_id, document.id)
         return KnowledgeService._document_response(
             document,
             KnowledgeService._directory_path(directories, document.directory_id),
@@ -610,6 +613,9 @@ class KnowledgeService:
         )
         updated = await KnowledgeDocumentRepository.update(db, document, update_data)
         directories = await KnowledgeDirectoryRepository.list_all(db, tenant_id)
+        from app.services.knowledge_recommendation_service import KnowledgeRecommendationService
+
+        KnowledgeRecommendationService.schedule_document_embedding_refresh(tenant_id, updated.id)
         return KnowledgeService._document_response(
             updated,
             KnowledgeService._directory_path(directories, updated.directory_id),

@@ -5,6 +5,7 @@ Tracks visitor-side Web SDK Socket.IO connections in Redis and exposes the
 agent-facing status for a workspace conversation.
 """
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 CHAT_NAMESPACE = "/chat"
 VISITOR_WEB_STATUS_EVENT = "visitor_web_status_updated"
 VISITOR_WEB_DISCONNECT_GRACE_SECONDS = 3
+VISITOR_WEB_PRESENCE_TIMEOUT_SECONDS = 24
+VISITOR_WEB_CONNECTION_KEY_TTL_SECONDS = VISITOR_WEB_PRESENCE_TIMEOUT_SECONDS + 60
 
 VisitorWebStatus = Literal["online", "offline", "unknown"]
 
@@ -43,6 +46,29 @@ class VisitorWebStatusService:
         )
 
     @staticmethod
+    async def _ensure_zset_key(r: aioredis.Redis, key: str) -> None:
+        key_type = await r.type(key)
+        if isinstance(key_type, bytes):
+            key_type = key_type.decode()
+        if key_type not in {"none", "zset"}:
+            await r.delete(key)
+
+    @staticmethod
+    async def _prune_stale_connections(
+        r: aioredis.Redis,
+        key: str,
+        *,
+        now: float,
+    ) -> int:
+        await VisitorWebStatusService._ensure_zset_key(r, key)
+        cutoff = now - VISITOR_WEB_PRESENCE_TIMEOUT_SECONDS
+        await r.zremrangebyscore(key, "-inf", cutoff)
+        count = int(await r.zcard(key))
+        if count <= 0:
+            await r.delete(key)
+        return count
+
+    @staticmethod
     def is_web_conversation(conversation: Conversation) -> bool:
         channel_type = getattr(conversation.channel, "channel_type", None)
         return str(channel_type or "").lower() == "web"
@@ -57,16 +83,45 @@ class VisitorWebStatusService:
         )
 
     @staticmethod
+    async def refresh_connection(
+        r: aioredis.Redis,
+        tenant_id: int,
+        channel_id: int,
+        visitor_external_id: str,
+        sid: str,
+    ) -> bool:
+        """Refresh one visitor Web SDK socket lease.
+
+        Returns True when this refresh transitions the visitor from offline to
+        online, so callers can avoid noisy status broadcasts on every ping.
+        """
+        key = VisitorWebStatusService._key(tenant_id, channel_id, visitor_external_id)
+        now = time.time()
+        count_before = await VisitorWebStatusService._prune_stale_connections(
+            r,
+            key,
+            now=now,
+        )
+        await r.zadd(key, {sid: now})
+        await r.expire(key, VISITOR_WEB_CONNECTION_KEY_TTL_SECONDS)
+        return count_before <= 0
+
+    @staticmethod
     async def mark_connected(
         r: aioredis.Redis,
         tenant_id: int,
         channel_id: int,
         visitor_external_id: str,
         sid: str,
-    ) -> None:
+    ) -> bool:
         """Record an active visitor Web SDK socket connection."""
-        key = VisitorWebStatusService._key(tenant_id, channel_id, visitor_external_id)
-        await r.sadd(key, sid)
+        return await VisitorWebStatusService.refresh_connection(
+            r,
+            tenant_id=tenant_id,
+            channel_id=channel_id,
+            visitor_external_id=visitor_external_id,
+            sid=sid,
+        )
 
     @staticmethod
     async def mark_disconnected(
@@ -78,10 +133,15 @@ class VisitorWebStatusService:
     ) -> VisitorWebStatus:
         """Remove a visitor socket connection and return the resulting status."""
         key = VisitorWebStatusService._key(tenant_id, channel_id, visitor_external_id)
-        await r.srem(key, sid)
-        count = await r.scard(key)
+        now = time.time()
+        await VisitorWebStatusService._ensure_zset_key(r, key)
+        await r.zrem(key, sid)
+        count = await VisitorWebStatusService._prune_stale_connections(
+            r,
+            key,
+            now=now,
+        )
         if count <= 0:
-            await r.delete(key)
             return "offline"
         return "online"
 
@@ -94,7 +154,12 @@ class VisitorWebStatusService:
     ) -> VisitorWebStatus:
         """Return online when any Web SDK connection remains for the visitor."""
         key = VisitorWebStatusService._key(tenant_id, channel_id, visitor_external_id)
-        return "online" if await r.scard(key) > 0 else "offline"
+        count = await VisitorWebStatusService._prune_stale_connections(
+            r,
+            key,
+            now=time.time(),
+        )
+        return "online" if count > 0 else "offline"
 
     @staticmethod
     def _response(

@@ -7,14 +7,13 @@ from typing import Literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError
-from app.enums import QueueChannel, QueueTaskType, QueueType
 from app.repositories.employee_repository import EmployeeRepository
+from app.repositories.reception_segment_repository import ReceptionSegmentRepository
 from app.repositories.session_record_repository import SessionRecordRepository
 from app.repositories.satisfaction_survey_record_repository import SatisfactionSurveyRecordRepository
 from app.repositories.ticket_repository import TicketRepository
 from app.schemas.permission import EffectivePrincipal
 from app.services.data_scope_service import DataScopeService, RESOURCE_SESSION_RECORD
-from app.services.queue_history_service import QueueHistoryService
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
 
@@ -39,12 +38,11 @@ class SessionRecordService:
 
     @staticmethod
     def _session_type(conversation) -> str | None:
-        if (
-            getattr(conversation, "open_agent_agent_id", None)
-            or getattr(conversation, "open_agent_conversation_id", None)
-            or getattr(conversation, "open_agent_conversation_external_id", None)
-        ):
-            if getattr(conversation, "open_agent_handoff_state", None) == "success":
+        # Read the materialized bot flags (same caliber as the list filter), so
+        # display and filtering never diverge and we avoid re-deriving the OR
+        # over the three OpenAgent identity fields.
+        if getattr(conversation, "had_bot_session", False):
+            if getattr(conversation, "bot_handoff_succeeded", False):
                 return "bot_human"
             return "bot"
         return "human"
@@ -76,6 +74,7 @@ class SessionRecordService:
         product_rating_options: list[str] | None = None,
         product_labels: list[str] | None = None,
         session_type: Literal["human", "bot", "bot_human"] | None = None,
+        has_queue: bool | None = None,
         principal: EffectivePrincipal | None = None,
     ) -> dict:
         peer_ids: list[int] = []
@@ -109,18 +108,12 @@ class SessionRecordService:
             product_rating_options=product_rating_options,
             product_labels=product_labels,
             session_type=session_type,
+            has_queue=has_queue,
             scope_predicate=scope_predicate,
         )
         satisfaction_by_conversation = await SatisfactionSurveyRecordRepository.get_by_conversation_ids(
             db,
             [item.id for item in items],
-        )
-        queue_summaries = await QueueHistoryService.summaries_for_refs(
-            db,
-            tenant_id,
-            channel=QueueChannel.ONLINE_CHAT.value,
-            task_types=[QueueTaskType.CONVERSATION.value, QueueTaskType.OPEN_AGENT_HANDOFF.value],
-            ref_ids=[str(item.id) for item in items],
         )
         pages = (total + per_page - 1) // per_page if total > 0 else 0
         return {
@@ -128,7 +121,6 @@ class SessionRecordService:
                 SessionRecordService._conversation_to_response(
                     item,
                     satisfaction_by_conversation.get(item.id),
-                    queue_summary=queue_summaries.get(str(item.id)),
                 )
                 for item in items
             ],
@@ -153,10 +145,10 @@ class SessionRecordService:
         conversation,
         satisfaction_record=None,
         related_tickets=None,
-        queue_summary: dict | None = None,
     ) -> dict:
-        queue_summary = _effective_queue_summary(conversation, queue_summary)
         session_type = SessionRecordService._session_type(conversation)
+        visitor_message_count = getattr(conversation, "visitor_message_count", 0) or 0
+        agent_message_count = getattr(conversation, "agent_message_count", 0) or 0
         return {
             "id": conversation.id,
             "public_id": conversation.public_id,
@@ -170,12 +162,39 @@ class SessionRecordService:
             "started_at": conversation.started_at,
             "ended_at": conversation.ended_at,
             "ended_by": conversation.ended_by,
+            "duration_seconds": getattr(conversation, "duration_seconds", None),
+            "visitor_system": getattr(conversation, "visitor_system", None),
+            "visitor_browser": getattr(conversation, "visitor_browser", None),
+            "visitor_ip": getattr(conversation, "visitor_ip", None),
             "created_at": conversation.created_at,
+            "message_count": visitor_message_count + agent_message_count,
+            "visitor_message_count": visitor_message_count,
+            "agent_message_count": agent_message_count,
+            "bot_phase_message_count": getattr(conversation, "bot_phase_message_count", 0) or 0,
+            "human_phase_message_count": getattr(conversation, "human_phase_message_count", 0) or 0,
+            "human_phase_visitor_message_count": getattr(
+                conversation, "human_phase_visitor_message_count", 0
+            ) or 0,
+            "human_phase_agent_message_count": getattr(
+                conversation, "human_phase_agent_message_count", 0
+            ) or 0,
             "last_message_preview": getattr(conversation, "last_message_preview", None),
             "satisfaction": SatisfactionSurveyRecordService.record_summary(satisfaction_record),
             "related_tickets": SessionRecordService._ticket_briefs(related_tickets or []),
-            "last_assigned_queue": queue_summary.get("last_assigned_queue"),
-            "queue_duration_seconds": queue_summary.get("queue_duration_seconds"),
+            "last_assigned_queue": _last_assigned_queue(conversation),
+            "queue_duration_seconds": getattr(conversation, "total_queue_duration_seconds", None),
+            "first_human_response_seconds": getattr(conversation, "first_human_response_seconds", None),
+            "agent_response_count": getattr(conversation, "agent_response_count", None),
+            "agent_avg_response_seconds": getattr(conversation, "agent_avg_response_seconds", None),
+            "has_queue": bool((getattr(conversation, "total_queue_duration_seconds", None) or 0) > 0),
+            "queue_entered_at": getattr(conversation, "queue_entered_at", None),
+            "queue_assigned_at": getattr(conversation, "queue_assigned_at", None),
+            "queue_result": getattr(conversation, "queue_result", None),
+            "reception_segment_count": getattr(conversation, "reception_segment_count", 0) or 0,
+            "reception_transfer_count": getattr(conversation, "reception_transfer_count", 0) or 0,
+            "reception_final_agent_id": getattr(conversation, "reception_final_agent_id", None),
+            "reception_participants": getattr(conversation, "reception_participants", None) or [],
+            "reception_generation_status": getattr(conversation, "reception_generation_status", None),
         }
 
     @staticmethod
@@ -197,19 +216,53 @@ class SessionRecordService:
             tenant_id=tenant_id,
             conversation_id=conversation_id,
         )
-        queue_summaries = await QueueHistoryService.summaries_for_refs(
-            db,
-            tenant_id,
-            channel=QueueChannel.ONLINE_CHAT.value,
-            task_types=[QueueTaskType.CONVERSATION.value, QueueTaskType.OPEN_AGENT_HANDOFF.value],
-            ref_ids=[str(conversation_id)],
-        )
         return SessionRecordService._conversation_to_response(
             item,
             satisfaction,
             related_tickets,
-            queue_summary=queue_summaries.get(str(conversation_id)),
         )
+
+    @staticmethod
+    async def get_reception_trajectory(
+        db: AsyncSession,
+        conversation_id: int,
+        tenant_id: int,
+        principal: EffectivePrincipal | None = None,
+    ) -> dict:
+        """Return the conversation's reception segments and generation status."""
+        item = await SessionRecordRepository.get_by_id(db, conversation_id, tenant_id)
+        if not item:
+            raise NotFoundError("Session record not found")
+        if principal is not None:
+            peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            DataScopeService.assert_conversation_in_scope(principal, item, peer_ids)
+        segments = await ReceptionSegmentRepository.list_for_conversation(db, conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "conversation_status": item.status,
+            "generation_status": getattr(item, "reception_generation_status", None),
+            "segments": [
+                {
+                    "seq_no": segment.seq_no,
+                    "agent_id": segment.agent_id,
+                    "agent_name": segment.agent_name_snapshot,
+                    "group_id": segment.group_id,
+                    "group_name": segment.group_name_snapshot,
+                    "started_at": segment.started_at,
+                    "ended_at": segment.ended_at,
+                    "duration_seconds": segment.duration_seconds,
+                    "entry_reason": segment.entry_reason,
+                    "end_reason": segment.end_reason,
+                    "from_agent_id": segment.from_agent_id,
+                    "to_agent_id": segment.to_agent_id,
+                    "visitor_message_count": segment.visitor_message_count,
+                    "agent_message_count": segment.agent_message_count,
+                    "first_response_seconds": segment.first_response_seconds,
+                    "avg_response_seconds": segment.avg_response_seconds,
+                }
+                for segment in segments
+            ],
+        }
 
     @staticmethod
     async def get_messages(
@@ -243,6 +296,7 @@ class SessionRecordService:
         })
         agents = {agent.id: agent for agent in await EmployeeRepository.get_by_ids(db, agent_ids)}
 
+        from app.services.conversation_service import ConversationService
         for msg in messages:
             metadata = msg.metadata_ or {}
             entry = {
@@ -253,12 +307,10 @@ class SessionRecordService:
                 "sender_name": None,
                 "sender_avatar": None,
                 "content_type": msg.content_type,
-                "content": msg.content,
-                "metadata": metadata,
+                "content": ConversationService._message_response_content(msg),
                 "created_at": msg.created_at,
-                "event_type": metadata.get("event_type"),
-                "satisfaction_record_id": metadata.get("satisfaction_record_id"),
-                "config_version": metadata.get("config_version"),
+                **ConversationService._message_event_overlay(msg),
+                **ConversationService._message_recall_overlay(msg),
             }
             if msg.sender_type == "visitor" and item.visitor:
                 entry["sender_name"] = item.visitor.name
@@ -273,51 +325,11 @@ class SessionRecordService:
         return {"items": enriched, "has_more": has_more}
 
 
-def _effective_queue_summary(conversation, queue_summary: dict | None) -> dict:
-    fallback = _queue_summary_from_conversation(conversation)
-    queue_summary = queue_summary or {}
-    return {
-        "last_assigned_queue": (
-            queue_summary.get("last_assigned_queue")
-            or fallback.get("last_assigned_queue")
-        ),
-        "queue_duration_seconds": (
-            queue_summary.get("queue_duration_seconds")
-            if queue_summary.get("queue_duration_seconds") is not None
-            else fallback.get("queue_duration_seconds")
-        ),
-    }
-
-
-def _queue_summary_from_conversation(conversation) -> dict:
-    queue = None
-    group = getattr(conversation, "group", None)
-    if group is not None and getattr(group, "name", None):
-        queue = {
-            "queue_type": QueueType.EMPLOYEE_GROUP.value,
-            "queue_id": group.id,
-            "name": group.name,
-        }
-    else:
-        agent = getattr(conversation, "agent", None)
-        if agent is not None:
-            name = (
-                getattr(agent, "display_name", None)
-                or getattr(agent, "nickname", None)
-                or getattr(agent, "name", None)
-                or getattr(agent, "username", None)
-            )
-            if name:
-                queue = {
-                    "queue_type": QueueType.EMPLOYEE.value,
-                    "queue_id": agent.id,
-                    "name": name,
-                }
-
-    if queue is None:
-        return {}
-
-    return {
-        "last_assigned_queue": queue,
-        "queue_duration_seconds": None,
-    }
+def _last_assigned_queue(conversation) -> dict | None:
+    """Build the last-assigned-queue brief from materialized conversation columns."""
+    queue_type = getattr(conversation, "last_assigned_queue_type", None)
+    queue_id = getattr(conversation, "last_assigned_queue_id", None)
+    name = getattr(conversation, "last_assigned_queue_name", None)
+    if not queue_type or queue_id is None or not name:
+        return None
+    return {"queue_type": queue_type, "queue_id": queue_id, "name": name}

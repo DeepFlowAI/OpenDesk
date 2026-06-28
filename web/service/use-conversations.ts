@@ -1,9 +1,10 @@
 import { useQuery, useInfiniteQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query'
-import { get, post, put } from './base'
+import { del, get, post, put } from './base'
 import type {
   Conversation,
   ConversationHistoryListResponse,
   ConversationListResponse,
+  Message,
   MessageListResponse,
   StartConversationFromHistoryResponse,
   WorkspaceConversationHistoryResponse,
@@ -48,6 +49,35 @@ export const patchConversationListCache = (
       return { ...item, ...updates }
     })
     return touched ? { ...prev, items } : prev
+  })
+}
+
+const visitorWebStatusTimestamp = (value: VisitorWebStatusResponse | undefined) => {
+  const timestamp = Date.parse(value?.checked_at ?? '')
+  return Number.isNaN(timestamp) ? 0 : timestamp
+}
+
+export const setVisitorWebStatusQueryData = (
+  qc: QueryClient,
+  payload: VisitorWebStatusResponse,
+) => {
+  qc.setQueryData<VisitorWebStatusResponse>(
+    conversationKeys.visitorWebStatus(payload.conversation_id),
+    (prev) =>
+      visitorWebStatusTimestamp(payload) >= visitorWebStatusTimestamp(prev)
+        ? payload
+      : prev,
+  )
+}
+
+const syncConversationCache = (qc: QueryClient, conversation: Conversation) => {
+  qc.setQueryData(conversationKeys.detail(conversation.id), conversation)
+  patchConversationListCache(qc, conversation.id, {
+    is_pinned: conversation.is_pinned,
+    pinned_at: conversation.pinned_at,
+    is_timeout_locked: conversation.is_timeout_locked,
+    timeout_locked_at: conversation.timeout_locked_at,
+    timeout_locked_by_id: conversation.timeout_locked_by_id,
   })
 }
 
@@ -113,7 +143,7 @@ export const useMessages = (conversationId: number, beforeId?: number) =>
 
 export const useVisitorWebStatus = (
   conversationId: number,
-  options?: { enabled?: boolean },
+  options?: { enabled?: boolean; refetchInterval?: number | false },
 ) =>
   useQuery({
     queryKey: conversationKeys.visitorWebStatus(conversationId),
@@ -123,6 +153,7 @@ export const useVisitorWebStatus = (
       ),
     enabled: !!conversationId && (options?.enabled ?? true),
     staleTime: 10_000,
+    refetchInterval: options?.refetchInterval ?? false,
     retry: 1,
   })
 
@@ -220,6 +251,50 @@ export const useStartConversationFromHistory = () => {
       qc.invalidateQueries({ queryKey: conversationKeys.lists() })
       qc.invalidateQueries({ queryKey: conversationKeys.historyLists() })
       qc.invalidateQueries({ queryKey: agentKeys.stats })
+    },
+  })
+}
+
+export const usePinConversation = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => post<Conversation>(`v1/conversations/${id}/pin`),
+    onSuccess: (conversation) => syncConversationCache(qc, conversation),
+  })
+}
+
+export const useUnpinConversation = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => del<Conversation>(`v1/conversations/${id}/pin`),
+    onSuccess: (conversation) => syncConversationCache(qc, conversation),
+  })
+}
+
+export const useLockConversationTimeout = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => post<Conversation>(`v1/conversations/${id}/timeout-lock`),
+    onSuccess: (conversation) => syncConversationCache(qc, conversation),
+  })
+}
+
+export const useUnlockConversationTimeout = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => del<Conversation>(`v1/conversations/${id}/timeout-lock`),
+    onSuccess: (conversation) => syncConversationCache(qc, conversation),
+  })
+}
+
+export const useRecallMessage = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ conversationId, messageId }: { conversationId: number; messageId: number }) =>
+      post<Message>(`v1/conversations/${conversationId}/messages/${messageId}/recall`),
+    onSuccess: (message) => {
+      qc.invalidateQueries({ queryKey: conversationKeys.messages(message.conversation_id) })
+      qc.invalidateQueries({ queryKey: conversationKeys.lists() })
     },
   })
 }

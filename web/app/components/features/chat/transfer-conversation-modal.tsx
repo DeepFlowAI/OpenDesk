@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { IconLoader2, IconSearch } from '@tabler/icons-react'
+import { IconLoader2 } from '@tabler/icons-react'
 import {
   Dialog,
   DialogContent,
@@ -11,16 +11,19 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { cn } from '@/lib/utils'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
+import {
+  AgentTargetPicker,
+  type AgentTargetPickerItem,
+  type AgentTargetStatus,
+} from '@/app/components/features/chat/agent-target-picker'
 import {
   useTransferTargets,
   useTransferConversation,
 } from '@/service/use-transfer'
 import type { Conversation } from '@/models/conversation'
-import type { TransferOnlineStatus, TransferTarget } from '@/models/transfer'
+import type { TransferTarget } from '@/models/transfer'
 
 type Props = {
   conversation: Conversation
@@ -29,13 +32,7 @@ type Props = {
   onTransferred: (toName: string) => void
 }
 
-const STATUS_DOT_COLOR: Record<TransferOnlineStatus, string> = {
-  online: '#22C55E',
-  busy: '#F59E0B',
-  offline: '#9CA3AF',
-}
-
-function statusLabel(status: TransferOnlineStatus, locale: Locale): string {
+function statusLabel(status: AgentTargetStatus, locale: Locale): string {
   switch (status) {
     case 'online':
       return t('ws.chat.transferStatusOnline', locale)
@@ -46,13 +43,23 @@ function statusLabel(status: TransferOnlineStatus, locale: Locale): string {
   }
 }
 
-function pickInitial(target: TransferTarget): string {
-  const text = target.display_name || target.name || ''
-  return text.trim().charAt(0).toUpperCase() || '?'
-}
-
 function pickDisplayName(target: TransferTarget): string {
   return target.display_name || target.name || `#${target.id}`
+}
+
+function toPickerItem(target: TransferTarget, locale: Locale): AgentTargetPickerItem {
+  const isOnline = target.online_status === 'online'
+  return {
+    id: target.id,
+    displayName: pickDisplayName(target),
+    avatar: target.avatar,
+    jobNumber: target.job_number,
+    onlineStatus: target.online_status,
+    currentCount: target.current_count,
+    maxConcurrent: target.max_concurrent,
+    available: isOnline,
+    disabledText: isOnline ? null : t('ws.chat.transferUnavailable', locale),
+  }
 }
 
 export function TransferConversationModal({
@@ -94,10 +101,13 @@ export function TransferConversationModal({
   )
   const transferMutation = useTransferConversation()
 
-  const items = data?.items ?? []
+  const items = useMemo(
+    () => (data?.items ?? []).map((item) => toPickerItem(item, locale)),
+    [data?.items, locale],
+  )
   const selectedTarget = useMemo(
-    () => items.find((item) => item.id === selectedId) ?? null,
-    [items, selectedId],
+    () => (data?.items ?? []).find((item) => item.id === selectedId) ?? null,
+    [data?.items, selectedId],
   )
   const canSubmit =
     !!selectedTarget &&
@@ -130,7 +140,6 @@ export function TransferConversationModal({
     }
   }
 
-  const showEmpty = !isLoading && items.length === 0
   const emptyText = debouncedKeyword
     ? t('ws.chat.transferNoMatch', locale)
     : t('ws.chat.transferEmpty', locale)
@@ -148,110 +157,29 @@ export function TransferConversationModal({
           <DialogDescription>{t('ws.chat.transferDesc', locale)}</DialogDescription>
         </DialogHeader>
 
-        <div className="relative">
-          <IconSearch
-            size={16}
-            stroke={1.5}
-            className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
-          />
-          <Input
-            value={keyword}
-            onChange={(e) => setKeyword(e.target.value)}
-            placeholder={t('ws.chat.transferSearchPlaceholder', locale)}
-            className="pl-8 pr-8"
-            autoFocus
-          />
-          {isFetching && (
-            <IconLoader2
-              size={16}
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground"
-            />
-          )}
-        </div>
-
-        {errorMessage && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            {errorMessage}
-          </div>
-        )}
-
-        <div className="-mx-1 max-h-[360px] min-h-[200px] overflow-y-auto px-1">
-          {isLoading ? (
-            <div className="space-y-2 py-2">
-              {[0, 1, 2].map((i) => (
-                <div
-                  key={i}
-                  className="h-12 animate-pulse rounded-md bg-muted/60"
-                />
-              ))}
-            </div>
-          ) : showEmpty ? (
-            <div className="flex h-full min-h-[200px] items-center justify-center text-sm text-muted-foreground">
-              {emptyText}
-            </div>
-          ) : (
-            <ul className="divide-y divide-border/60">
-              {items.map((item) => {
-                const isOnline = item.online_status === 'online'
-                const isSelected = selectedId === item.id
-                return (
-                  <li
-                    key={item.id}
-                    className={cn(
-                      'flex items-center gap-3 rounded-md px-2 py-2 transition-colors',
-                      isOnline
-                        ? 'cursor-pointer hover:bg-muted'
-                        : 'cursor-not-allowed opacity-60',
-                      isSelected && 'bg-primary/10 hover:bg-primary/10',
-                    )}
-                    aria-disabled={!isOnline}
-                    onClick={() => {
-                      if (!isOnline) return
-                      setSelectedId(item.id)
-                      setErrorMessage(null)
-                    }}
-                  >
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
-                      {item.avatar ? (
-                        // Avatars come from a trusted internal upload, no external URL handling needed.
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img
-                          src={item.avatar}
-                          alt={pickDisplayName(item)}
-                          className="h-9 w-9 rounded-full object-cover"
-                        />
-                      ) : (
-                        pickInitial(item)
-                      )}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2 truncate text-sm font-medium">
-                        <span className="truncate">{pickDisplayName(item)}</span>
-                        {item.job_number && (
-                          <span className="shrink-0 text-xs text-muted-foreground">
-                            #{item.job_number}
-                          </span>
-                        )}
-                      </div>
-                      {!isOnline && (
-                        <div className="mt-0.5 text-xs text-muted-foreground">
-                          {t('ws.chat.transferUnavailable', locale)}
-                        </div>
-                      )}
-                    </div>
-                    <div className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
-                      <span
-                        className="inline-block h-2 w-2 rounded-full"
-                        style={{ backgroundColor: STATUS_DOT_COLOR[item.online_status] }}
-                      />
-                      <span>{statusLabel(item.online_status, locale)}</span>
-                    </div>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
-        </div>
+        <AgentTargetPicker
+          keyword={keyword}
+          onKeywordChange={setKeyword}
+          searchPlaceholder={t('ws.chat.transferSearchPlaceholder', locale)}
+          isLoading={isLoading}
+          isFetching={isFetching}
+          items={items}
+          selectedId={selectedId}
+          onSelect={(item) => {
+            setSelectedId(item.id)
+            setErrorMessage(null)
+          }}
+          emptyText={emptyText}
+          statusLabel={(status) => statusLabel(status, locale)}
+          listMinHeightClassName="min-h-[200px]"
+          feedback={
+            errorMessage ? (
+              <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {errorMessage}
+              </div>
+            ) : null
+          }
+        />
 
         <DialogFooter className="pt-3 pb-0">
           <Button

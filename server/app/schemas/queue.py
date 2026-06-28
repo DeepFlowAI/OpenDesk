@@ -32,6 +32,12 @@ QUEUE_ASSIGNMENT_STRATEGIES_BY_CHANNEL: dict[QueueChannel, set[QueueAssignmentSt
     },
 }
 
+RETURNING_AGENT_PRIORITY_ENABLED_KEY = "returning_agent_priority_enabled"
+RETURNING_AGENT_WINDOW_HOURS_KEY = "returning_agent_window_hours"
+RETURNING_AGENT_DEFAULT_WINDOW_HOURS = 24
+RETURNING_AGENT_MIN_WINDOW_HOURS = 1
+RETURNING_AGENT_MAX_WINDOW_HOURS = 720
+
 
 def normalize_queue_assignment_strategy(channel: str, strategy: str | None) -> str | None:
     if strategy is None:
@@ -61,7 +67,8 @@ class QueuePolicyUpsert(BaseModel):
         if self.scope_type == QueuePolicyScopeType.GLOBAL:
             self.scope_id = None
         elif self.scope_id is None or self.scope_id <= 0:
-                raise ValueError("scope_id is required for non-global policies")
+            raise ValueError("scope_id is required for non-global policies")
+        self.config = normalize_returning_agent_config(self.config)
         if self.scope_type == QueuePolicyScopeType.EMPLOYEE:
             self.assignment_strategy = None
             return self
@@ -71,6 +78,39 @@ class QueuePolicyUpsert(BaseModel):
         if self.assignment_strategy not in supported:
             raise ValueError(f"{self.assignment_strategy.value} is not supported for {self.channel.value}")
         return self
+
+
+def normalize_returning_agent_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(config or {})
+    enabled = normalized.get(RETURNING_AGENT_PRIORITY_ENABLED_KEY, False)
+    if not isinstance(enabled, bool):
+        raise ValueError("returning_agent_priority_enabled must be a boolean")
+    normalized[RETURNING_AGENT_PRIORITY_ENABLED_KEY] = enabled
+
+    has_window = RETURNING_AGENT_WINDOW_HOURS_KEY in normalized
+    raw_hours = normalized.get(RETURNING_AGENT_WINDOW_HOURS_KEY)
+    if not has_window and enabled:
+        raw_hours = RETURNING_AGENT_DEFAULT_WINDOW_HOURS
+    elif raw_hours is None and enabled:
+        raise ValueError("returning_agent_window_hours must be an integer from 1 to 720")
+    if raw_hours is None:
+        normalized.pop(RETURNING_AGENT_WINDOW_HOURS_KEY, None)
+        return normalized
+    if isinstance(raw_hours, bool):
+        raise ValueError("returning_agent_window_hours must be an integer from 1 to 720")
+    if isinstance(raw_hours, str):
+        raw_hours = raw_hours.strip()
+        if not raw_hours.isdigit():
+            raise ValueError("returning_agent_window_hours must be an integer from 1 to 720")
+        hours = int(raw_hours)
+    elif isinstance(raw_hours, int):
+        hours = raw_hours
+    else:
+        raise ValueError("returning_agent_window_hours must be an integer from 1 to 720")
+    if hours < RETURNING_AGENT_MIN_WINDOW_HOURS or hours > RETURNING_AGENT_MAX_WINDOW_HOURS:
+        raise ValueError("returning_agent_window_hours must be an integer from 1 to 720")
+    normalized[RETURNING_AGENT_WINDOW_HOURS_KEY] = hours
+    return normalized
 
 
 class QueuePolicyResponse(BaseModel):

@@ -13,11 +13,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import NotFoundError, ValidationError
+from app.constants.system_fields import USER_BLACKLIST_BLOCKED_VALUE
 from app.libs.excel import build_xlsx
 from app.models.user import User
 from app.models.user_view import UserView
 from app.models.fd_field_definition import FdFieldDefinition
+from app.models.employee_group import EmployeeGroup
 from app.repositories.entity_change_repository import EntityChangeRepository
+from app.repositories.employee_group_repository import EmployeeGroupRepository
+from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import UserCreate, UserUpdate, UserQueryRequest, UserResponse, UserExportRequest, UserExportColumn
@@ -30,6 +34,7 @@ USER_EXPORT_MAX_ROWS = 5000
 USER_LEVEL_NORMAL = "normal"
 USER_LEVEL_VIP = "vip"
 USER_LEVEL_VALUES = {USER_LEVEL_NORMAL, USER_LEVEL_VIP}
+USER_BLACKLIST_VALUES = {USER_BLACKLIST_BLOCKED_VALUE}
 
 
 USER_SYSTEM_FIELD_LABELS: dict[str, str] = {
@@ -44,7 +49,12 @@ USER_SYSTEM_FIELD_LABELS: dict[str, str] = {
     "address": "地址",
     "remark": "备注",
     "web_id": "Web ID",
+    "blacklist": "黑名单",
     "organization_id": "组织",
+    "assignee": "负责人",
+    "agent_id": "负责人",
+    "assignee_group": "负责组",
+    "assignee_group_id": "负责组",
     "created_by": "创建人",
     "updated_by": "更新人",
     "created_at": "创建时间",
@@ -72,9 +82,14 @@ USER_EXPORT_SYSTEM_FIELDS = {
     "address",
     "remark",
     "web_id",
+    "blacklist",
     "avatar_color",
     "channel_id",
     "organization_id",
+    "assignee",
+    "agent_id",
+    "assignee_group",
+    "assignee_group_id",
     "created_by",
     "updated_by",
     "created_at",
@@ -83,6 +98,8 @@ USER_EXPORT_SYSTEM_FIELDS = {
 
 USER_EXPORT_KEY_ALIASES = {
     "nickname": "name",
+    "assignee": "agent_id",
+    "assignee_group": "assignee_group_id",
 }
 
 GENDER_EXPORT_LABELS = {
@@ -97,6 +114,10 @@ USER_LEVEL_EXPORT_LABELS = {
     USER_LEVEL_VIP: {"zh": "VIP", "en": "VIP"},
 }
 
+USER_BLACKLIST_EXPORT_LABELS = {
+    USER_BLACKLIST_BLOCKED_VALUE: {"zh": "已拉黑", "en": "Blocked"},
+}
+
 
 class UserService:
 
@@ -108,6 +129,17 @@ class UserService:
         if level not in USER_LEVEL_VALUES:
             raise ValidationError("Invalid user level")
         return level
+
+    @staticmethod
+    def _normalize_blacklist(value: object) -> str | None:
+        if value is None or value == "":
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        if normalized not in USER_BLACKLIST_VALUES:
+            raise ValidationError("Invalid blacklist value")
+        return normalized
 
     @staticmethod
     def _normalize_custom_field_value(val: object) -> object:
@@ -261,6 +293,28 @@ class UserService:
             raise NotFoundError("Organization not found")
 
     @staticmethod
+    async def _validate_assignee_values(
+        db: AsyncSession,
+        tenant_id: int,
+        assignee_group_id: int | None,
+        agent_id: int | None,
+    ) -> None:
+        if assignee_group_id is not None:
+            group = await EmployeeGroupRepository.get_by_id(db, assignee_group_id)
+            if not group or group.tenant_id != tenant_id:
+                raise ValidationError("Assignee group not found")
+
+        if agent_id is not None:
+            employee = await EmployeeRepository.get_by_id(db, agent_id)
+            if not employee or employee.tenant_id != tenant_id or not employee.is_active:
+                raise ValidationError("Assignee not found")
+
+        if assignee_group_id is not None and agent_id is not None:
+            is_member = await EmployeeGroupRepository.has_member(db, assignee_group_id, agent_id)
+            if not is_member:
+                raise ValidationError("所选负责人不属于该负责组")
+
+    @staticmethod
     async def get_by_id(db: AsyncSession, tenant_id: int, user_id: int):
         item = await UserRepository.get_by_id(db, user_id)
         if not item or item.tenant_id != tenant_id:
@@ -300,11 +354,31 @@ class UserService:
         }
         created_field_keys = ["name", "level"]
         field_labels: dict[str, str] = dict(USER_SYSTEM_FIELD_LABELS)
-        for field in ("email", "phone", "gender", "address", "remark", "web_id", "organization_id"):
+        for field in (
+            "email",
+            "phone",
+            "gender",
+            "address",
+            "remark",
+            "web_id",
+            "blacklist",
+            "organization_id",
+            "agent_id",
+            "assignee_group_id",
+        ):
             val = getattr(data, field, None)
+            if field == "blacklist":
+                val = UserService._normalize_blacklist(val)
             if val is not None:
                 model_data[field] = val
                 created_field_keys.append(field)
+
+        await UserService._validate_assignee_values(
+            db,
+            tenant_id,
+            model_data.get("assignee_group_id"),
+            model_data.get("agent_id"),
+        )
 
         key_to_meta = await UserService._get_key_to_field_meta(db, tenant_id) if data.custom_fields else {}
         for cf_key, cf_val in data.custom_fields.items():
@@ -358,7 +432,20 @@ class UserService:
         fields_set = data.model_fields_set
         update_data: dict = {}
         field_labels: dict[str, str] = dict(USER_SYSTEM_FIELD_LABELS)
-        for field in ("name", "email", "phone", "gender", "level", "address", "remark", "web_id", "organization_id"):
+        for field in (
+            "name",
+            "email",
+            "phone",
+            "gender",
+            "level",
+            "address",
+            "remark",
+            "web_id",
+            "blacklist",
+            "organization_id",
+            "agent_id",
+            "assignee_group_id",
+        ):
             if field not in fields_set:
                 continue
             val = getattr(data, field)
@@ -366,10 +453,21 @@ class UserService:
                 continue
             if field == "level":
                 val = UserService._normalize_level(val)
+            if field == "blacklist":
+                val = UserService._normalize_blacklist(val)
             update_data[field] = val
 
         if "organization_id" in update_data:
             await UserService._validate_organization(db, tenant_id, update_data["organization_id"])
+
+        final_assignee_group_id = update_data.get("assignee_group_id", item.assignee_group_id)
+        final_agent_id = update_data.get("agent_id", item.agent_id)
+        await UserService._validate_assignee_values(
+            db,
+            tenant_id,
+            final_assignee_group_id,
+            final_agent_id,
+        )
 
         if data.custom_fields:
             key_to_meta = await UserService._get_key_to_field_meta(db, tenant_id)
@@ -501,13 +599,23 @@ class UserService:
 
         columns = UserService._normalize_export_columns(req.columns)
         organization_names = await UserService._get_export_organization_names(db, tenant_id, items)
+        employee_names = await UserService._get_export_employee_names(db, tenant_id, items)
+        group_names = await UserService._get_export_group_names(db, tenant_id, items)
         option_lookup = await UserService._get_custom_field_option_lookup(db, tenant_id, "user")
 
         headers = [column.name for column in columns]
         enriched = [UserService._enrich_user_response(user, slot_to_key) for user in items]
         rows = [
             [
-                UserService._export_cell_value(row, column, req.locale, organization_names, option_lookup)
+                UserService._export_cell_value(
+                    row,
+                    column,
+                    req.locale,
+                    organization_names,
+                    employee_names,
+                    group_names,
+                    option_lookup,
+                )
                 for column in columns
             ]
             for row in enriched
@@ -541,11 +649,48 @@ class UserService:
         return {organization.id: organization.name for organization in organizations}
 
     @staticmethod
+    async def _get_export_employee_names(
+        db: AsyncSession,
+        tenant_id: int,
+        users: list[User],
+    ) -> dict[int, str]:
+        employee_ids = [agent_id for user in users if (agent_id := getattr(user, "agent_id", None)) is not None]
+        employees = await EmployeeRepository.get_by_ids(db, employee_ids)
+        return {
+            employee.id: employee.display_name or employee.nickname or employee.name or employee.username
+            for employee in employees
+            if employee.tenant_id == tenant_id
+        }
+
+    @staticmethod
+    async def _get_export_group_names(
+        db: AsyncSession,
+        tenant_id: int,
+        users: list[User],
+    ) -> dict[int, str]:
+        group_ids = [
+            group_id
+            for user in users
+            if (group_id := getattr(user, "assignee_group_id", None)) is not None
+        ]
+        if not group_ids:
+            return {}
+        result = await db.execute(
+            select(EmployeeGroup.id, EmployeeGroup.name).where(
+                EmployeeGroup.tenant_id == tenant_id,
+                EmployeeGroup.id.in_(group_ids),
+            )
+        )
+        return {group_id: name for group_id, name in result.all()}
+
+    @staticmethod
     def _export_cell_value(
         row: dict,
         column: UserExportColumn,
         locale: str,
         organization_names: dict[int, str],
+        employee_names: dict[int, str],
+        group_names: dict[int, str],
         option_lookup: dict[str, dict[str, str]],
     ) -> str:
         key = column.field_key
@@ -556,11 +701,18 @@ class UserService:
                 return ""
             if key == "organization_id":
                 return organization_names.get(int(value), str(value))
+            if key in {"assignee", "agent_id"}:
+                return employee_names.get(int(value), str(value))
+            if key in {"assignee_group", "assignee_group_id"}:
+                return group_names.get(int(value), str(value))
             if key == "gender":
                 label = GENDER_EXPORT_LABELS.get(str(value))
                 return label.get(locale, label["zh"]) if label else str(value)
             if key == "level":
                 label = USER_LEVEL_EXPORT_LABELS.get(str(value))
+                return label.get(locale, label["zh"]) if label else str(value)
+            if key == "blacklist":
+                label = USER_BLACKLIST_EXPORT_LABELS.get(str(value))
                 return label.get(locale, label["zh"]) if label else str(value)
             if key in {"created_by", "updated_by"}:
                 return UserService._format_actor_value(value)

@@ -1,6 +1,7 @@
 """
 Channel service — business logic layer
 """
+from copy import deepcopy
 from datetime import datetime, time, timezone
 from typing import Any
 import re
@@ -10,6 +11,7 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.configs.settings import settings
+from app.constants.system_fields import USER_BLACKLIST_BLOCKED_VALUE
 from app.core.exceptions import ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
 from app.core.security import (
     create_visitor_identity_secret,
@@ -32,6 +34,8 @@ from app.schemas.channel import (
     DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL,
     DEFAULT_QUEUE_FULL_MESSAGE,
     DEFAULT_QUEUE_MESSAGE,
+    DEFAULT_RESTRICTED_SERVICE_MESSAGE,
+    DEFAULT_RESTRICTED_SERVICE_TITLE,
 )
 from app.schemas.visitor_session import VisitorSessionRequest
 from app.services.agent_status_service import AgentStatusService
@@ -41,6 +45,7 @@ from app.services.web_sdk_context_service import WebSdkContextService
 CHANNEL_KEY_RE = re.compile(r"^ch_[A-Za-z0-9_-]{24,}$")
 VISITOR_EXTERNAL_ID_PREFIX = "v_"
 VISITOR_EXTERNAL_ID_RANDOM_BYTES = 24
+MAX_CHANNEL_NAME_LENGTH = 64
 
 
 class ChannelService:
@@ -125,6 +130,10 @@ class ChannelService:
                 config.outside_service_hours_strategy or DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY
             ),
             "leave_message_prompt": config.leave_message_prompt or DEFAULT_LEAVE_MESSAGE_PROMPT,
+            "restricted_service_title": DEFAULT_RESTRICTED_SERVICE_TITLE,
+            "restricted_service_message": (
+                config.restricted_service_message or DEFAULT_RESTRICTED_SERVICE_MESSAGE
+            ),
             "queue_message": config.queue_message or DEFAULT_QUEUE_MESSAGE,
             "queue_full_message": config.queue_full_message or DEFAULT_QUEUE_FULL_MESSAGE,
             "queue_full_show_leave_message_button": config.queue_full_show_leave_message_button,
@@ -148,6 +157,9 @@ class ChannelService:
         payload["offline_title"] = (payload.get("offline_title") or DEFAULT_OFFLINE_TITLE).strip()
         payload["offline_message"] = payload.get("offline_message") or DEFAULT_OFFLINE_MESSAGE
         payload["leave_message_prompt"] = payload.get("leave_message_prompt") or DEFAULT_LEAVE_MESSAGE_PROMPT
+        payload["restricted_service_message"] = (
+            payload.get("restricted_service_message") or DEFAULT_RESTRICTED_SERVICE_MESSAGE
+        )
         payload["queue_message"] = payload.get("queue_message") or DEFAULT_QUEUE_MESSAGE
         payload["queue_full_message"] = payload.get("queue_full_message") or DEFAULT_QUEUE_FULL_MESSAGE
         payload["queue_full_show_leave_message_button"] = bool(
@@ -160,10 +172,14 @@ class ChannelService:
         payload["open_agent_input_placeholder"] = (
             payload.get("open_agent_input_placeholder") or None
         )
+        payload["agent_default_avatar_url"] = payload.get("agent_default_avatar_url") or None
         payload["open_agent_avatar_url"] = payload.get("open_agent_avatar_url") or None
         payload["open_agent_handoff_label"] = (
             payload.get("open_agent_handoff_label") or "转人工"
         ).strip()
+        payload["open_agent_feedback_enabled"] = bool(
+            payload.get("open_agent_feedback_enabled", False)
+        )
         payload["open_agent_custom_buttons_enabled"] = bool(
             payload.get("open_agent_custom_buttons_enabled", False)
         )
@@ -253,6 +269,41 @@ class ChannelService:
         return await ChannelRepository.create(db, payload)
 
     @staticmethod
+    def _generate_copy_name(source_name: str, existing_names: list[str]) -> str:
+        existing = set(existing_names)
+        base_name = source_name.strip() or "Web SDK"
+
+        for index in range(1, 10000):
+            suffix = f"副本{index}"
+            candidate = f"{base_name[:MAX_CHANNEL_NAME_LENGTH - len(suffix)]}{suffix}"
+            if candidate not in existing:
+                return candidate
+
+        raise ValidationError("No available channel copy name")
+
+    @staticmethod
+    async def copy(db: AsyncSession, channel_id: int, tenant_id: int):
+        item = await ChannelRepository.get_by_id(db, channel_id)
+        if not item or item.tenant_id != tenant_id:
+            raise NotFoundError("Channel not found")
+
+        existing_names = await ChannelRepository.get_names_by_tenant(db, tenant_id)
+        payload = {
+            "tenant_id": tenant_id,
+            "name": ChannelService._generate_copy_name(item.name, existing_names),
+            "channel_type": item.channel_type,
+            "access_mode": item.access_mode,
+            "channel_key": await ChannelRepository.generate_unique_channel_key(db),
+            "channel_key_version": 1,
+            "public_access_enabled": item.public_access_enabled,
+            "key_rotated_at": None,
+            "logo_url": item.logo_url,
+            "favicon_url": item.favicon_url,
+            "config": deepcopy(item.config or {}),
+        }
+        return await ChannelRepository.create(db, payload)
+
+    @staticmethod
     async def update(db: AsyncSession, channel_id: int, tenant_id: int, data: ChannelUpdate):
         item = await ChannelRepository.get_by_id(db, channel_id)
         if not item or item.tenant_id != tenant_id:
@@ -295,17 +346,42 @@ class ChannelService:
         return item
 
     @staticmethod
-    async def _get_open_agent_welcome_message(
+    async def _get_open_agent_runtime_config(
         db: AsyncSession,
         item,
         config: dict,
     ):
         if not config.get("open_agent_enabled") or not config.get("open_agent_agent_id"):
             return None
-        return await OpenAgentSettingsService.get_agent_welcome_message(
+        return await OpenAgentSettingsService.get_agent_visitor_runtime_config(
             db,
             item.tenant_id,
             int(config["open_agent_agent_id"]),
+        )
+
+    @staticmethod
+    async def check_visitor_restriction(
+        db: AsyncSession,
+        tenant_id: int,
+        config: ChannelConfig,
+        *,
+        visitor_id: int | None = None,
+        visitor_external_id: str | None = None,
+    ) -> dict | None:
+        visitor = None
+        if visitor_id is not None:
+            visitor = await UserRepository.get_by_id(db, visitor_id)
+        elif visitor_external_id:
+            visitor = await UserRepository.get_by_external_id(db, tenant_id, visitor_external_id)
+        if not visitor or visitor.tenant_id != tenant_id:
+            return None
+        if getattr(visitor, "blacklist", None) != USER_BLACKLIST_BLOCKED_VALUE:
+            return None
+        return ChannelService._availability_payload(
+            config,
+            can_start_conversation=False,
+            reason="restricted",
+            checked_at=datetime.now(timezone.utc),
         )
 
     @staticmethod
@@ -321,6 +397,14 @@ class ChannelService:
             raise NotFoundError("Channel not found")
 
         config = ChannelConfig.model_validate(item.config or {})
+        restricted = await ChannelService.check_visitor_restriction(
+            db,
+            item.tenant_id,
+            config,
+            visitor_id=visitor_id,
+        )
+        if restricted:
+            return restricted
         if config.open_agent_enabled:
             return await ChannelService.check_open_agent_bot_availability(db, item, config)
 
@@ -593,13 +677,21 @@ class ChannelService:
                 current_conversation_id=current_conversation_id,
             )
         availability = await ChannelService.check_channel_availability(db, r, channel_id, visitor_id=visitor_id)
+        from app.services.conversation_announcement_rule_service import ConversationAnnouncementRuleService
+        from app.services.conversation_read_status_service import ConversationReadStatusService
         from app.services.welcome_message_rule_service import WelcomeMessageRuleService
+        announcement = await ConversationAnnouncementRuleService.match_public_announcement(db, item)
+        read_status = await ConversationReadStatusService.get_public_config(db, item.tenant_id)
         welcome_message = None
         open_agent_welcome_message = None
+        open_agent_ai_disclaimer = None
         if not config.get("open_agent_enabled"):
             welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
         else:
-            open_agent_welcome_message = await ChannelService._get_open_agent_welcome_message(db, item, config)
+            open_agent_runtime_config = await ChannelService._get_open_agent_runtime_config(db, item, config)
+            if open_agent_runtime_config:
+                open_agent_welcome_message = open_agent_runtime_config.welcome_message
+                open_agent_ai_disclaimer = open_agent_runtime_config.ai_disclaimer
         return {
             "id": item.id,
             "tenant_id": item.tenant_id,
@@ -611,8 +703,11 @@ class ChannelService:
             "config": config,
             "availability": availability,
             "has_conversation_history": has_conversation_history,
+            "announcement": announcement,
             "welcome_message": welcome_message,
             "open_agent_welcome_message": open_agent_welcome_message,
+            "open_agent_ai_disclaimer": open_agent_ai_disclaimer,
+            "read_status": read_status,
         }
 
     @staticmethod
@@ -640,13 +735,21 @@ class ChannelService:
                 current_conversation_public_id=current_conversation_public_id,
             )
         availability = await ChannelService.check_channel_availability(db, r, item.id, visitor_id=visitor_id)
+        from app.services.conversation_announcement_rule_service import ConversationAnnouncementRuleService
+        from app.services.conversation_read_status_service import ConversationReadStatusService
         from app.services.welcome_message_rule_service import WelcomeMessageRuleService
+        announcement = await ConversationAnnouncementRuleService.match_public_announcement(db, item)
+        read_status = await ConversationReadStatusService.get_public_config(db, item.tenant_id)
         welcome_message = None
         open_agent_welcome_message = None
+        open_agent_ai_disclaimer = None
         if not config.get("open_agent_enabled"):
             welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
         else:
-            open_agent_welcome_message = await ChannelService._get_open_agent_welcome_message(db, item, config)
+            open_agent_runtime_config = await ChannelService._get_open_agent_runtime_config(db, item, config)
+            if open_agent_runtime_config:
+                open_agent_welcome_message = open_agent_runtime_config.welcome_message
+                open_agent_ai_disclaimer = open_agent_runtime_config.ai_disclaimer
         return {
             "channel_key": item.channel_key,
             "name": item.name,
@@ -657,8 +760,11 @@ class ChannelService:
             "config": config,
             "availability": availability,
             "has_conversation_history": has_conversation_history,
+            "announcement": announcement,
             "welcome_message": welcome_message,
             "open_agent_welcome_message": open_agent_welcome_message,
+            "open_agent_ai_disclaimer": open_agent_ai_disclaimer,
+            "read_status": read_status,
         }
 
     @staticmethod

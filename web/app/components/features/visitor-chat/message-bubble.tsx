@@ -2,7 +2,16 @@
 
 import type { Message, OpenAgentTextBlock, OpenAgentToolBlock } from '@/models/conversation'
 import type { ChannelConfig } from '@/models/channel'
-import { useMemo, useState, type CSSProperties, type PropsWithChildren } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type PropsWithChildren,
+  type TouchEvent as ReactTouchEvent,
+} from 'react'
 import {
   MessagePrimitive,
   type EmptyMessagePartProps,
@@ -11,6 +20,8 @@ import {
   type ToolCallMessagePartProps,
 } from '@assistant-ui/react'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
+import { MessageQuoteBlock } from '@/app/components/features/chat/message-quote'
+import { OpenAgentFeedback } from '@/app/components/features/chat/open-agent-feedback'
 import { RichTextMessageContent } from '@/app/components/features/chat/rich-text-message-content'
 import {
   getOpenAgentThinkingBlocks,
@@ -19,12 +30,16 @@ import {
   useVisitorChatConfig,
 } from '@/components/assistant-ui/visitor-chat-runtime'
 import { AssistantMarkdownText, MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
+import type { Locale } from '@/context/locale-store'
+import {
+  canQuoteMessage,
+  messageQuoteFromMetadata,
+} from '@/lib/message-quote'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { cn } from '@/lib/utils'
-import { IconChevronRight, IconLoader2, IconTool } from '@tabler/icons-react'
+import { t } from '@/utils/i18n'
+import { IconChevronRight, IconInfoCircle, IconLoader2, IconTool } from '@tabler/icons-react'
 import { getAssistantAvatarSrc } from './avatar'
-
-const DEFAULT_AGENT_AVATAR_SRC = '/default-avatar.jpg'
 
 function toCssBorderRadius(radius: [number, number, number, number]): string {
   const [topLeft, topRight, bottomLeft, bottomRight] = radius
@@ -40,6 +55,85 @@ type MessageBubbleProps = {
   messageStatus?: string
   showTime?: boolean
   renderAssistantParts?: boolean
+  allMessages?: Message[]
+  onEditRecalledMessage?: (request: { text: string; contentType?: 'text' | 'rich_text'; quotedMessage?: Message | null }) => void
+}
+
+const MESSAGE_RECALL_WINDOW_MS = 2 * 60 * 1000
+
+function isRecallableContentType(contentType: string): boolean {
+  return contentType === 'text' || contentType === 'rich_text' || contentType === 'image' || contentType === 'file'
+}
+
+function isWithinRecallWindow(createdAt: string): boolean {
+  const timestamp = Date.parse(createdAt)
+  return !Number.isNaN(timestamp) && Date.now() - timestamp <= MESSAGE_RECALL_WINDOW_MS
+}
+
+function scrollToVisitorMessage(messageId: number, locale: string) {
+  if (typeof document === 'undefined') return
+  const node = document.querySelector<HTMLElement>(`[data-visitor-message-id="${messageId}"]`)
+  if (!node) {
+    window.alert(t('ws.chat.quote.locateFailed', locale as Locale))
+    return
+  }
+  node.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  node.classList.add('bg-warning/15')
+  window.setTimeout(() => {
+    node.classList.remove('bg-warning/15')
+  }, 1800)
+}
+
+export function shouldShowVisitorRecalledNotice(
+  message: Pick<Message, 'is_recalled' | 'sender_type'>,
+): boolean {
+  return Boolean(message.is_recalled && message.sender_type === 'visitor')
+}
+
+function recallText(message: Message, locale: string): string {
+  if (message.sender_type === 'visitor') {
+    return locale === 'zh' ? '你撤回了一条消息' : 'You recalled a message'
+  }
+  if (message.sender_name) {
+    return locale === 'zh'
+      ? `${message.sender_name} 撤回了一条消息`
+      : `${message.sender_name} recalled a message`
+  }
+  return locale === 'zh' ? '对方撤回了一条消息' : 'The other party recalled a message'
+}
+
+function RecallNotice({
+  text,
+  time,
+  alignEnd,
+  editLabel,
+  onEdit,
+}: {
+  text: string
+  time?: string
+  alignEnd?: boolean
+  editLabel?: string
+  onEdit?: () => void
+}) {
+  return (
+    <div className={cn('flex min-w-0 max-w-[75%] flex-col', alignEnd ? 'items-end' : 'items-start')}>
+      <div className="max-w-full rounded-[18px] border border-dashed border-[#D8D8D8] bg-[#F5F5F5] px-3.5 py-2 text-sm leading-normal text-[#737373]">
+        <span>{text}</span>
+        {onEdit && editLabel && (
+          <button
+            type="button"
+            className="ml-2 text-primary underline-offset-2 hover:underline"
+            onClick={onEdit}
+          >
+            {editLabel}
+          </button>
+        )}
+      </div>
+      {time && (
+        <span className="mt-1 text-[11px] text-[#999999]">{time}</span>
+      )}
+    </div>
+  )
 }
 
 function formatTime(dateStr: string, locale: string): string {
@@ -74,8 +168,31 @@ function statusLabel(status: string | undefined, locale: string): string | null 
   if (!status) return null
   if (status === 'sending') return locale === 'zh' ? '发送中' : 'Sending'
   if (status === 'delivered') return locale === 'zh' ? '已送达' : 'Delivered'
+  if (status === 'unread') return locale === 'zh' ? '未读' : 'Unread'
   if (status === 'read') return locale === 'zh' ? '已读' : 'Read'
   return null
+}
+
+function OpenAgentAIDisclaimerNotice({
+  content,
+  locale,
+}: {
+  content: string
+  locale: string
+}) {
+  const label = locale === 'zh' ? 'AI 免责声明' : 'AI disclaimer'
+
+  return (
+    <div className="mt-2 flex max-w-full items-start gap-1.5 text-[12px] leading-4 text-muted-foreground">
+      <IconInfoCircle
+        size={14}
+        className="mt-px shrink-0"
+        role="img"
+        aria-label={label}
+      />
+      <span className="min-w-0 flex-1 break-words">{content}</span>
+    </div>
+  )
 }
 
 type OpenAgentToolArtifact = {
@@ -421,18 +538,23 @@ export function MessageBubble({
   messageStatus,
   showTime = true,
   renderAssistantParts = false,
+  allMessages = [],
+  onEditRecalledMessage,
 }: MessageBubbleProps) {
   const isUser = message.sender_type === 'visitor'
   const isAssistant = message.sender_type === 'agent' || message.sender_type === 'bot'
   const isBot = message.sender_type === 'bot'
-  const assistantAvatarSrc = getAssistantAvatarSrc(message, config) || (!isBot ? DEFAULT_AGENT_AVATAR_SRC : null)
+  const assistantAvatarSrc = getAssistantAvatarSrc(message, config)
   const visitorChat = useVisitorChatConfig()
-  const statusText = isUser ? statusLabel(messageStatus || message.status, locale) : null
+  const [messageMenu, setMessageMenu] = useState<{ x: number; y: number } | null>(null)
+  const [longPressTimer, setLongPressTimer] = useState<ReturnType<typeof setTimeout> | null>(null)
   const textBlocks = isBot ? getOpenAgentTextBlocks(message.metadata) : []
   const thinkingBlocks = isBot ? getOpenAgentThinkingBlocks(message.metadata) : []
   const toolBlocks = isBot ? getOpenAgentToolBlocks(message.metadata) : []
   const visibleToolBlocks = toolBlocks.filter((block) => !isHumanHandoffToolBlock(block))
   const hasMessageText = message.content.trim().length > 0
+  const hasVisibleOpenAgentText =
+    hasMessageText || textBlocks.some((block) => block.content.trim().length > 0)
   const hasVisibleOpenAgentBlocks =
     textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0
   const openAgentTraceStreaming =
@@ -497,10 +619,42 @@ export function MessageBubble({
   const attachmentContentType =
     message.content_type === 'image' ? 'image' : message.content_type === 'file' ? 'file' : null
   const isRichText = message.content_type === 'rich_text'
+  const aiDisclaimerContent =
+    config.open_agent_enabled && visitorChat.channel.open_agent_ai_disclaimer?.enabled
+      ? visitorChat.channel.open_agent_ai_disclaimer.content.trim()
+      : ''
+  const isBotReplyContentType = message.content_type === 'text' || message.content_type === 'rich_text'
+  const showAIDisclaimer =
+    Boolean(aiDisclaimerContent)
+    && isBot
+    && isBotReplyContentType
+    && !isThinking
+    && !openAgentTraceStreaming
+    && hasVisibleOpenAgentText
+    && message.metadata?.event_type !== 'open_agent_handoff_event'
+  const aiDisclaimerNotice = showAIDisclaimer ? (
+    <OpenAgentAIDisclaimerNotice content={aiDisclaimerContent} locale={locale} />
+  ) : null
   const offlineMessagePublicId =
     typeof message.metadata?.offline_message_public_id === 'string'
       ? message.metadata.offline_message_public_id
       : undefined
+  const webSdkReadStatusEnabled = visitorChat.channel.read_status?.web_sdk_enabled ?? true
+  const canShowReadStatus = isUser && webSdkReadStatusEnabled && !offlineMessagePublicId
+  const effectiveStatus = messageStatus || message.status
+  const statusText = canShowReadStatus ? statusLabel(effectiveStatus, locale) : null
+  const quote = messageQuoteFromMetadata(message.metadata)
+  const quotedOriginal = quote
+    ? allMessages.find((item) => item.id === quote.message_id) ?? null
+    : null
+  const reeditQuotedMessage =
+    quotedOriginal && canQuoteMessage(quotedOriginal, {
+      canSend: !visitorChat.ended && !visitorChat.offlineMode,
+      webChannel: true,
+      closed: visitorChat.ended,
+    })
+      ? quotedOriginal
+      : null
   const isEmptyBotBubble =
     isBot
     && !attachmentContentType
@@ -512,12 +666,188 @@ export function MessageBubble({
     && !isBot
     && !attachmentContentType
     && !hasMessageText
+  const canRecall =
+    isUser
+    && !message.is_recalled
+    && !visitorChat.ended
+    && !visitorChat.offlineMode
+    && message.id > 0
+    && isRecallableContentType(message.content_type)
+    && isWithinRecallWindow(message.created_at)
+  const recallEditContent = typeof message.metadata?.recall_edit_content === 'string'
+    ? message.metadata.recall_edit_content
+    : ''
+  const canEditRecalled =
+    Boolean(onEditRecalledMessage)
+    && isUser
+    && message.is_recalled
+    && !visitorChat.ended
+    && !visitorChat.offlineMode
+    && message.content_type === 'text'
+    && recallEditContent.trim().length > 0
+  const canQuoteCurrentMessage = canQuoteMessage(message, {
+    canSend: !visitorChat.ended && !visitorChat.offlineMode,
+    webChannel: true,
+    closed: visitorChat.ended,
+  })
+  const hasMessageActions = canQuoteCurrentMessage || canRecall
+
+  useEffect(() => {
+    if (!messageMenu) return
+    const close = () => setMessageMenu(null)
+    window.addEventListener('click', close)
+    window.addEventListener('scroll', close, true)
+    window.addEventListener('keydown', close)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('scroll', close, true)
+      window.removeEventListener('keydown', close)
+    }
+  }, [messageMenu])
+
+  useEffect(() => {
+    if (!longPressTimer) return
+    return () => clearTimeout(longPressTimer)
+  }, [longPressTimer])
+
+  const openMessageMenu = useCallback((x: number, y: number) => {
+    if (!hasMessageActions) return
+    setMessageMenu({ x, y })
+  }, [hasMessageActions])
+
+  const handleRecall = useCallback(async () => {
+    setMessageMenu(null)
+    await visitorChat.onRecallMessage(message)
+  }, [message, visitorChat])
+
+  const handleQuote = useCallback(() => {
+    setMessageMenu(null)
+    visitorChat.onQuoteMessage(message)
+  }, [message, visitorChat])
+
+  const handleEditRecalled = useCallback(() => {
+    if (!canEditRecalled || !onEditRecalledMessage) return
+    onEditRecalledMessage({
+      text: recallEditContent,
+      contentType: 'text',
+      quotedMessage: reeditQuotedMessage,
+    })
+  }, [canEditRecalled, onEditRecalledMessage, recallEditContent, reeditQuotedMessage])
+
+  const handleContextMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!hasMessageActions) return
+    event.preventDefault()
+    openMessageMenu(event.clientX, event.clientY)
+  }, [hasMessageActions, openMessageMenu])
+
+  const handleTouchStart = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
+    if (!hasMessageActions) return
+    const touch = event.touches[0]
+    if (!touch) return
+    const x = touch.clientX
+    const y = touch.clientY
+    const timer = setTimeout(() => {
+      openMessageMenu(x, y)
+    }, 550)
+    setLongPressTimer(timer)
+  }, [hasMessageActions, openMessageMenu])
+
+  const clearLongPress = useCallback(() => {
+    if (longPressTimer) clearTimeout(longPressTimer)
+    setLongPressTimer(null)
+  }, [longPressTimer])
+
+  const messageMenuNode = messageMenu ? (
+    <div
+      className="fixed z-50 min-w-28 rounded-md border border-border bg-background p-1 text-sm shadow-lg"
+      style={{ left: messageMenu.x, top: messageMenu.y }}
+      onClick={(event) => event.stopPropagation()}
+    >
+      {canQuoteCurrentMessage && (
+        <button
+          type="button"
+          className="flex w-full items-center rounded px-3 py-1.5 text-left text-foreground hover:bg-muted"
+          onClick={handleQuote}
+        >
+          {t('ws.chat.quote.action', locale as Locale)}
+        </button>
+      )}
+      {canRecall && (
+        <button
+          type="button"
+          className="flex w-full items-center rounded px-3 py-1.5 text-left text-foreground hover:bg-muted"
+          onClick={handleRecall}
+        >
+          {locale === 'zh' ? '撤回' : 'Recall'}
+        </button>
+      )}
+    </div>
+  ) : null
+  const quoteAttachmentContext = {
+    conversationId: message.conversation_id,
+    conversationPublicId: message.conversation_public_id,
+    visitorSessionToken: visitorChat.visitorSessionToken,
+  }
+  const quoteBlock = quote ? (
+    <MessageQuoteBlock
+      quote={quote}
+      locale={locale as Locale}
+      original={quotedOriginal}
+      onClick={() => scrollToVisitorMessage(quote.message_id, locale)}
+      audience="visitor"
+      attachmentContext={quoteAttachmentContext}
+      className="max-w-full rounded-lg"
+    />
+  ) : null
+  const embeddedQuoteBlock = quote ? (
+    <MessageQuoteBlock
+      quote={quote}
+      locale={locale as Locale}
+      original={quotedOriginal}
+      onClick={() => scrollToVisitorMessage(quote.message_id, locale)}
+      variant="embedded"
+      audience="visitor"
+      attachmentContext={quoteAttachmentContext}
+      className="mb-2"
+    />
+  ) : null
+
+  if (message.is_recalled) {
+    if (!shouldShowVisitorRecalledNotice(message)) return null
+
+    return (
+      <div className={cn('flex gap-2 px-5', isUser ? 'flex-row-reverse items-end' : 'flex-row items-start')}>
+        {showAvatar && !isUser && assistantAvatarSrc && (
+          <img
+            src={assistantAvatarSrc}
+            alt={message.sender_name || ''}
+            className="h-9 w-9 shrink-0 rounded-full object-cover"
+          />
+        )}
+        <RecallNotice
+          text={recallText(message, locale)}
+          time={showTime ? formatTime(message.created_at, locale) : undefined}
+          alignEnd={isUser}
+          editLabel={canEditRecalled ? t('ws.chat.recall.editAgain', locale as Locale) : undefined}
+          onEdit={canEditRecalled ? handleEditRecalled : undefined}
+        />
+      </div>
+    )
+  }
 
   if (isEmptyBotBubble || isEmptyAssistantBubble) return null
 
   if (isBot && !attachmentContentType && renderAssistantParts && !hasVisibleOpenAgentBlocks && !isThinking) {
     return (
-      <div className="flex flex-row items-start gap-2 px-5">
+      <div
+        className="flex flex-row items-start gap-2 px-5"
+        onContextMenu={handleContextMenu}
+        onTouchStart={handleTouchStart}
+        onTouchMove={clearLongPress}
+        onTouchEnd={clearLongPress}
+        onTouchCancel={clearLongPress}
+      >
+        {messageMenuNode}
         {showAvatar && assistantAvatarSrc && (
           <img
             src={assistantAvatarSrc}
@@ -534,14 +864,24 @@ export function MessageBubble({
           )}
 
           <div className="w-full min-w-0 space-y-2">
+            {quoteBlock}
             <MessagePrimitive.Parts components={assistantPartsComponents} />
           </div>
 
+          {aiDisclaimerNotice}
           {showTime && (
             <div className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground">
               <span>{formatTime(message.created_at, locale)}</span>
             </div>
           )}
+          <OpenAgentFeedback
+            messageId={message.id}
+            senderType={message.sender_type}
+            metadata={message.metadata}
+            locale={locale}
+            enabled={config.open_agent_enabled && config.open_agent_feedback_enabled}
+            onSubmit={visitorChat.onSubmitOpenAgentFeedback}
+          />
         </div>
       </div>
     )
@@ -553,7 +893,15 @@ export function MessageBubble({
     && (isThinking || textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0)
   ) {
     return (
-      <div className="flex flex-row items-start gap-2 px-5">
+      <div
+        className="flex flex-row items-start gap-2 px-5"
+        onContextMenu={handleContextMenu}
+        onTouchStart={handleTouchStart}
+        onTouchMove={clearLongPress}
+        onTouchEnd={clearLongPress}
+        onTouchCancel={clearLongPress}
+      >
+        {messageMenuNode}
         {showAvatar && assistantAvatarSrc && (
           <img
             src={assistantAvatarSrc}
@@ -570,6 +918,7 @@ export function MessageBubble({
           )}
 
           <div className="w-full min-w-0 space-y-2">
+            {quoteBlock}
             {isThinking && thinkingBlocks.length === 0 && visibleToolBlocks.length === 0 && (
               <OpenAgentFakeThinkingBubble />
             )}
@@ -586,18 +935,35 @@ export function MessageBubble({
             )}
           </div>
 
+          {aiDisclaimerNotice}
           {showTime && (
             <div className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground">
               <span>{formatTime(message.created_at, locale)}</span>
             </div>
           )}
+          <OpenAgentFeedback
+            messageId={message.id}
+            senderType={message.sender_type}
+            metadata={message.metadata}
+            locale={locale}
+            enabled={config.open_agent_enabled && config.open_agent_feedback_enabled}
+            onSubmit={visitorChat.onSubmitOpenAgentFeedback}
+          />
         </div>
       </div>
     )
   }
 
   return (
-    <div className={`flex ${isUser ? 'flex-row-reverse' : 'flex-row'} items-end gap-2 px-5`}>
+    <div
+      className={cn('flex gap-2 px-5', isUser ? 'flex-row-reverse items-end' : 'flex-row items-start')}
+      onContextMenu={handleContextMenu}
+      onTouchStart={handleTouchStart}
+      onTouchMove={clearLongPress}
+      onTouchEnd={clearLongPress}
+      onTouchCancel={clearLongPress}
+    >
+      {messageMenuNode}
       {/* Avatar */}
       {showAvatar && !isUser && assistantAvatarSrc && (
         <img
@@ -616,33 +982,53 @@ export function MessageBubble({
         )}
 
         {attachmentContentType ? (
-          <MessageAttachment
-            conversationId={message.conversation_id}
-            conversationPublicId={message.conversation_public_id}
-            offlineMessagePublicId={offlineMessagePublicId}
-            visitorSessionToken={visitorChat.visitorSessionToken}
-            contentType={attachmentContentType}
-            content={message.content}
-          />
+          <>
+            {quoteBlock}
+            <MessageAttachment
+              conversationId={message.conversation_id}
+              conversationPublicId={message.conversation_public_id}
+              offlineMessagePublicId={offlineMessagePublicId}
+              visitorSessionToken={visitorChat.visitorSessionToken}
+              contentType={attachmentContentType}
+              content={message.content}
+            />
+          </>
         ) : isRichText ? (
-          <RichTextMessageContent
-            html={message.content}
-            conversationId={message.conversation_id}
-            conversationPublicId={message.conversation_public_id}
-            visitorSessionToken={visitorChat.visitorSessionToken}
-            className={cn('max-w-full px-3 py-2 text-sm break-words break-all', !isUser && 'min-h-[42px]')}
-            style={bubbleStyle}
-          />
+          quote ? (
+            <div
+              className={cn('max-w-full px-3 py-2 text-sm break-words break-all', !isUser && 'min-h-[42px]')}
+              style={bubbleStyle}
+            >
+              {embeddedQuoteBlock}
+              <RichTextMessageContent
+                html={message.content}
+                conversationId={message.conversation_id}
+                conversationPublicId={message.conversation_public_id}
+                visitorSessionToken={visitorChat.visitorSessionToken}
+                className="max-w-full text-sm break-words break-all"
+              />
+            </div>
+          ) : (
+            <RichTextMessageContent
+              html={message.content}
+              conversationId={message.conversation_id}
+              conversationPublicId={message.conversation_public_id}
+              visitorSessionToken={visitorChat.visitorSessionToken}
+              className={cn('max-w-full px-3 py-2 text-sm break-words break-all', !isUser && 'min-h-[42px]')}
+              style={bubbleStyle}
+            />
+          )
         ) : (
           <div
             className={cn(
               'min-h-[42px] max-w-full px-3 py-2 text-sm',
-              !isBot && 'flex items-center',
+              !isBot && !quote && 'flex items-center',
               isBot && 'break-words break-all whitespace-pre-wrap',
               isBot && [markdownTextRootClass, richTextListStyleClass],
             )}
             style={bubbleStyle}
           >
+            {embeddedQuoteBlock}
             {isBot ? (
               <MarkdownText>{message.content}</MarkdownText>
             ) : (
@@ -653,15 +1039,22 @@ export function MessageBubble({
           </div>
         )}
 
+        {aiDisclaimerNotice}
         {(showTime || statusText) && (
           <div className={`mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground ${isUser ? 'flex-row-reverse' : ''}`}>
             {showTime && <span>{formatTime(message.created_at, locale)}</span>}
-            {statusText && (
-              <span className={messageStatus === 'read' || message.status === 'read' ? 'text-primary' : ''}>
-                {statusText}
-              </span>
-            )}
+            {statusText && <span>{statusText}</span>}
           </div>
+        )}
+        {isBot && (
+          <OpenAgentFeedback
+            messageId={message.id}
+            senderType={message.sender_type}
+            metadata={message.metadata}
+            locale={locale}
+            enabled={config.open_agent_enabled && config.open_agent_feedback_enabled}
+            onSubmit={visitorChat.onSubmitOpenAgentFeedback}
+          />
         )}
       </div>
     </div>

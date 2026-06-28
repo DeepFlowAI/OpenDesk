@@ -46,9 +46,25 @@ class VisitorTimeoutCloseStateRepository:
     @staticmethod
     async def get_by_conversation(db: AsyncSession, conversation_id: int) -> VisitorTimeoutCloseState | None:
         result = await db.execute(
-            select(VisitorTimeoutCloseState).where(VisitorTimeoutCloseState.conversation_id == conversation_id)
+            select(VisitorTimeoutCloseState)
+            .where(VisitorTimeoutCloseState.conversation_id == conversation_id)
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_conversation_ids(
+        db: AsyncSession,
+        conversation_ids: list[int],
+    ) -> dict[int, VisitorTimeoutCloseState]:
+        if not conversation_ids:
+            return {}
+        result = await db.execute(
+            select(VisitorTimeoutCloseState)
+            .where(VisitorTimeoutCloseState.conversation_id.in_(conversation_ids))
+            .execution_options(populate_existing=True)
+        )
+        return {state.conversation_id: state for state in result.scalars().all()}
 
     @staticmethod
     async def upsert_for_conversation(
@@ -119,6 +135,7 @@ class VisitorTimeoutCloseStateRepository:
                 VisitorTimeoutCloseState.next_check_at.is_not(None),
                 VisitorTimeoutCloseState.next_check_at <= now,
                 VisitorTimeoutCloseState.closed_at.is_(None),
+                VisitorTimeoutCloseState.timeout_locked_at.is_(None),
             )
             .order_by(VisitorTimeoutCloseState.next_check_at.asc(), VisitorTimeoutCloseState.id.asc())
             .limit(1)

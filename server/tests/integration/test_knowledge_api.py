@@ -295,6 +295,27 @@ async def test_knowledge_api_requires_view_permission(
 
     assert response.status_code == 403
 
+    recommendation_response = await client.get(
+        "/api/v1/knowledge/recommendations",
+        headers=knowledge_context["none"],
+    )
+    assert recommendation_response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_knowledge_recommendations_without_conversation_returns_empty_state(
+    client: AsyncClient,
+    knowledge_context: dict,
+) -> None:
+    response = await client.get(
+        "/api/v1/knowledge/recommendations",
+        headers=knowledge_context["view"],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "no_conversation"
+    assert response.json()["items"] == []
+
 
 @pytest.mark.asyncio
 async def test_knowledge_import_export_flow(

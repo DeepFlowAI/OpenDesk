@@ -18,6 +18,7 @@ import {
   createQueuePolicyDraft,
   formatQueueLimit,
   formatQueueWait,
+  returningAgentLabel,
   strategyLabel,
   validateQueuePolicyDraft,
   type QueuePolicyDraft,
@@ -69,6 +70,8 @@ function policySignature(policies: QueuePolicy[] | undefined): string {
     assignment_strategy: policy.assignment_strategy,
     max_waiting_count: policy.max_waiting_count,
     max_wait_seconds: policy.max_wait_seconds,
+    returning_agent_priority_enabled: policy.config?.returning_agent_priority_enabled,
+    returning_agent_window_hours: policy.config?.returning_agent_window_hours,
   })))
 }
 
@@ -86,6 +89,7 @@ export function ScopedQueueSettings({
   const { locale } = useLocaleStore()
   const defaultSignature = useMemo(() => policySignature(defaultPolicies), [defaultPolicies])
   const scopedSignature = useMemo(() => policySignature(scopedPolicies), [scopedPolicies])
+  const includeReturningAgent = scopeType === 'employee_group'
   const [drafts, setDrafts] = useState<Record<QueueChannel, ScopedDraft>>(() =>
     createScopedDrafts(defaultPolicies, scopedPolicies)
   )
@@ -108,11 +112,12 @@ export function ScopedQueueSettings({
         scopeId,
         enabled: draft.enabled,
         includeStrategy,
+        includeReturningAgent,
         draft,
       }))
     }
     onChange(payloads, valid)
-  }, [drafts, includeStrategy, locale, onChange, scopeId, scopeType])
+  }, [drafts, includeReturningAgent, includeStrategy, locale, onChange, scopeId, scopeType])
 
   const updateDraft = (channel: QueueChannel, patch: Partial<ScopedDraft>) => {
     setDrafts((prev) => ({
@@ -179,6 +184,22 @@ export function ScopedQueueSettings({
                   {t('queue.summary.maxWait', locale)}
                   {formatQueueWait(parseValue(effectiveDraft.max_wait_seconds), locale)}
                 </span>
+                {includeReturningAgent && (
+                  <>
+                    <span className="ml-3">
+                      {t('queue.summary.returningAgent', locale)}
+                      {effectiveDraft.returning_agent_priority_enabled
+                        ? t('queue.status.on', locale)
+                        : t('queue.status.off', locale)}
+                    </span>
+                    {effectiveDraft.returning_agent_priority_enabled && (
+                      <span className="ml-3">
+                        {t('queue.summary.returningAgentWindow', locale)}
+                        {t('queue.hours', locale, { value: effectiveDraft.returning_agent_window_hours })}
+                      </span>
+                    )}
+                  </>
+                )}
               </div>
             )}
 
@@ -201,6 +222,47 @@ export function ScopedQueueSettings({
                         <option key={strategy} value={strategy}>{strategyLabel(strategy, locale)}</option>
                       ))}
                     </select>
+                  </div>
+                )}
+                {includeReturningAgent && (
+                  <div className="flex max-w-[360px] flex-col gap-3">
+                    <div className="flex items-center justify-between gap-4">
+                      <label className="text-sm font-medium text-foreground/80">
+                        {returningAgentLabel(channel, locale)}
+                      </label>
+                      <Switch
+                        checked={draft.returning_agent_priority_enabled}
+                        disabled={disabled}
+                        onCheckedChange={(checked) => updateDraft(channel, {
+                          returning_agent_priority_enabled: checked,
+                        })}
+                      />
+                    </div>
+                    {draft.returning_agent_priority_enabled && (
+                      <div className="flex flex-col gap-2">
+                        <label className="text-sm font-medium text-foreground/80">
+                          {t('queue.field.returningAgentWindow', locale)}
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            value={draft.returning_agent_window_hours}
+                            disabled={disabled}
+                            inputMode="numeric"
+                            onChange={(e) => updateDraft(channel, {
+                              returning_agent_window_hours: e.target.value,
+                            })}
+                            placeholder={t('queue.placeholder.returningAgentWindow', locale)}
+                            className={`h-10 w-[220px] rounded-lg border px-3 text-sm focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50 ${
+                              errors.returning_agent_window_hours ? 'border-destructive' : 'border-border'
+                            }`}
+                          />
+                          <span className="text-sm text-muted-foreground">{t('queue.unit.hours', locale)}</span>
+                        </div>
+                        {errors.returning_agent_window_hours && (
+                          <span className="text-xs text-destructive">{errors.returning_agent_window_hours}</span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
                 <div className="flex max-w-[220px] flex-col gap-2">

@@ -69,3 +69,8 @@ export type QueueAssignmentWorkspaceResponse = {
   assigned_agent: AgentBrief | null
   assigned_to_current_user: boolean
 }
+
+export type QueueAssignAndSendResponse = QueueAssignmentWorkspaceResponse & {
+  message: Message | null
+  message_sent: boolean
+}

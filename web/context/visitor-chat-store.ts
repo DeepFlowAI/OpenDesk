@@ -5,8 +5,53 @@ import type { SatisfactionSurveyRecord } from '@/models/satisfaction-survey'
 import type { HumanHandoffEventPayload } from '@/service/use-open-agent-conversation'
 
 const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:5001'
+const VISITOR_PRESENCE_PING_INTERVAL_MS = 8_000
 
 let optimisticSeq = 0
+let presencePingTimer: ReturnType<typeof setInterval> | null = null
+
+function mergeMessageUpdate(current: Message, incoming: Message): Message {
+  const merged: Message = { ...current, ...incoming }
+
+  if (
+    incoming.is_recalled
+    && current.sender_type === 'visitor'
+    && (current.content_type === 'text' || current.content_type === 'rich_text')
+  ) {
+    const incomingEditContent = typeof incoming.metadata?.recall_edit_content === 'string'
+      ? incoming.metadata.recall_edit_content
+      : ''
+    const currentEditContent = typeof current.metadata?.recall_edit_content === 'string'
+      ? current.metadata.recall_edit_content
+      : ''
+    const editContent = incomingEditContent || currentEditContent || current.content
+    if (editContent.trim()) {
+      merged.metadata = {
+        ...(current.metadata || {}),
+        ...(incoming.metadata || {}),
+        recall_edit_content: editContent,
+      }
+    }
+  }
+
+  return merged
+}
+
+function stopPresencePing() {
+  if (presencePingTimer) {
+    clearInterval(presencePingTimer)
+    presencePingTimer = null
+  }
+}
+
+function startPresencePing(socket: Socket) {
+  stopPresencePing()
+  const ping = () => {
+    if (socket.connected) socket.emit('visitor_presence_ping')
+  }
+  ping()
+  presencePingTimer = setInterval(ping, VISITOR_PRESENCE_PING_INTERVAL_MS)
+}
 
 type VisitorChatState = {
   socket: Socket | null
@@ -40,7 +85,13 @@ type VisitorChatState = {
   setMessages: (msgs: Message[]) => void
   prependMessages: (msgs: Message[]) => void
   addMessage: (msg: Message) => void
-  addOptimisticMessage: (conversationPublicId: string, content: string, contentType?: string) => number
+  updateMessage: (msg: Message) => void
+  addOptimisticMessage: (
+    conversationPublicId: string,
+    content: string,
+    contentType?: string,
+    metadata?: Record<string, unknown>,
+  ) => number
   addBotStreamingMessage: (conversationPublicId: string, senderName: string | null) => number
   appendMessageContent: (messageId: number, delta: string) => void
   setMessageContent: (messageId: number, content: string) => void
@@ -245,10 +296,12 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     })
 
     socket.on('connect', () => {
+      startPresencePing(socket)
       set({ connected: true, connecting: false, authFailed: false })
     })
 
     socket.on('disconnect', () => {
+      stopPresencePing()
       set({ connected: false })
     })
 
@@ -257,6 +310,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       // retrying, so stop and let the page surface it instead of spinning in a
       // reconnect loop that re-fires on every `connecting: false`.
       if (isVisitorAuthError(err)) {
+        stopPresencePing()
         socket.disconnect()
         set({ socket: null, connected: false, connecting: false, authFailed: true })
         return
@@ -282,7 +336,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
         )
         if (idx !== -1) {
           const updated = [...state.messages]
-          updated[idx] = { ...msg, status: 'delivered' }
+          updated[idx] = { ...msg, status: msg.status ?? 'delivered' }
           set({ messages: updated })
           return
         }
@@ -334,7 +388,15 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       set({ messages: [...state.messages, msg], ...handoffPatch })
     })
 
-    socket.on('agent_typing', () => {
+    socket.on('message_recalled', (msg: Message) => {
+      get().updateMessage(msg)
+    })
+
+    socket.on('agent_typing', (data?: { stop?: boolean }) => {
+      if (data?.stop) {
+        set({ agentTyping: false })
+        return
+      }
       set({ agentTyping: true })
       setTimeout(() => {
         set({ agentTyping: false })
@@ -373,6 +435,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
   disconnect: () => {
     const { socket } = get()
     if (socket) {
+      stopPresencePing()
       socket.disconnect()
       set({
         socket: null,
@@ -407,7 +470,16 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     }
   },
 
-  addOptimisticMessage: (conversationPublicId, content, contentType = 'text') => {
+  updateMessage: (msg) => {
+    const state = get()
+    set({
+      messages: state.messages.map((message) =>
+        message.id === msg.id ? mergeMessageUpdate(message, msg) : message,
+      ),
+    })
+  },
+
+  addOptimisticMessage: (conversationPublicId, content, contentType = 'text', metadata) => {
     optimisticSeq -= 1
     const tempId = optimisticSeq
     const msg: Message = {
@@ -420,6 +492,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       sender_avatar: null,
       content_type: contentType as Message['content_type'],
       content,
+      metadata,
       created_at: new Date().toISOString(),
       status: 'sending',
     }
@@ -508,7 +581,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
   confirmOptimisticMessage: (tempId, serverMsg) => {
     const state = get()
     const updated = state.messages.map((m) =>
-      m.id === tempId ? { ...serverMsg, status: 'delivered' as const } : m,
+      m.id === tempId ? { ...serverMsg, status: serverMsg.status ?? 'delivered' as const } : m,
     )
     set({ messages: updated })
   },

@@ -45,6 +45,10 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "chat.workspace.use", "name": "启用在线客服工作台", "name_en": "Use chat workspace", "type": "switch"},
                     {"key": "chat.workspace.max_concurrent.edit", "name": "修改自己的最大接待人数", "name_en": "Edit own max concurrent sessions", "type": "action", "requires": "chat.workspace.use"},
                     {"key": "chat.conversation.transfer", "name": "会话转接", "name_en": "Transfer conversations", "type": "action", "requires": "chat.workspace.use"},
+                    {"key": "chat.conversation.lock", "name": "锁定会话", "name_en": "Lock conversations", "type": "action", "requires": "chat.workspace.use"},
+                    {"key": "chat.conversation.collaboration.invite", "name": "邀请客服协作", "name_en": "Invite conversation collaborators", "type": "action", "requires": "chat.workspace.use", "data_scope_resource": "session_record"},
+                    {"key": "chat.conversation.collaboration.respond", "name": "响应协作邀请", "name_en": "Respond to collaboration invites", "type": "action", "requires": "chat.workspace.use"},
+                    {"key": "chat.conversation.collaboration.message.send", "name": "协作会话发送消息", "name_en": "Send messages as collaborator", "type": "action", "requires": "chat.conversation.collaboration.respond"},
                     {"key": "chat.conversation.peer.view", "name": "查看同事会话", "name_en": "View peer conversations", "type": "action", "requires": "chat.workspace.use", "data_scope_resource": RESOURCE_PEER_CONVERSATION},
                     {"key": "chat.conversation.peer_message.send", "name": "同事会话发送消息", "name_en": "Send messages in peer conversations", "type": "action", "requires": "chat.conversation.peer.view"},
                     {"key": "chat.conversation.internal_note.create", "name": "发送内部消息", "name_en": "Create internal notes", "type": "action", "requires": "chat.workspace.use"},
@@ -251,6 +255,9 @@ AGENT_PERMISSION_KEYS = [
     "chat.queue.assign_self",
     "call.record.view",
     "chat.conversation.transfer",
+    "chat.conversation.lock",
+    "chat.conversation.collaboration.respond",
+    "chat.conversation.collaboration.message.send",
     "chat.conversation.internal_note.create",
 ]
 

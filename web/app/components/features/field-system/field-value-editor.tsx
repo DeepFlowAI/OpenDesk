@@ -86,6 +86,7 @@ export function UnifiedFieldValueEditor({
   )
 }
 
+
 function toStringArray(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean)
   if (typeof value === 'string') return value.split(',').map((item) => item.trim()).filter(Boolean)
@@ -170,7 +171,7 @@ export function FieldValueEditor({
   disabled = false,
   className,
   autoFocus = false,
-  dropdownPlacement = 'bottom',
+  dropdownPlacement,
 }: FieldValueEditorProps) {
   const ph = placeholder ?? (typeConfig.placeholder as string) ?? DEFAULT_PLACEHOLDERS[fieldType] ?? ''
 
@@ -758,4 +759,3 @@ function MultiSelectEditor({
     />
   )
 }
-

@@ -19,12 +19,16 @@ import {
   useAgentStatus,
   useAgentStats,
   useStartConversationFromHistory,
+  usePinConversation,
+  useUnpinConversation,
+  useLockConversationTimeout,
+  useUnlockConversationTimeout,
   agentKeys,
   conversationKeys,
   patchConversationListCache,
-  type ConversationListScope,
 } from '@/service/use-conversations'
 import { get } from '@/service/base'
+import { knowledgeKeys } from '@/service/use-knowledge'
 import { useUpdateCurrentUserPreferences } from '@/service/use-auth'
 import {
   useQueueTasks,
@@ -66,6 +70,9 @@ import type { OfflineMessageListResponse } from '@/models/offline-message'
 import type { QueueAssignmentWorkspaceResponse } from '@/models/queue-workspace'
 import type { ComposerInsertRequest } from '@/components/assistant-ui/agent-composer'
 import { useWorkspaceNotificationAlert } from '@/hooks/use-workspace-notification-alert'
+import {
+  conversationCollaborationKeys,
+} from '@/service/use-conversation-collaboration'
 
 type QueueUpdatedEvent = {
   action?: string
@@ -130,13 +137,31 @@ export default function ChatPage() {
   const { locale } = useLocaleStore()
   const { socket, connected, connecting, authFailed, connect } = useSocketStore()
   const queryClient = useQueryClient()
-  const [conversationScope, setConversationScope] = useState<ConversationListScope>('my')
-  const [myConversationView, setMyConversationView] = useState<MyConversationView>('current')
   const peerConversationScope = getDataScope(user, 'chat.conversation.peer.view')
   const canPeerTab = hasPermission(user, 'chat.conversation.peer.view') && peerConversationScope !== 'self'
   const canOfflineMessages = hasPermission(user, 'chat.offline_message.view')
   const canQueueTab = hasPermission(user, 'chat.queue.view')
-  const [workspaceChatTab, setWorkspaceChatTab] = useState<'messages' | 'offline' | 'queue'>('messages')
+  const canRespondCollaboration = hasPermission(user, 'chat.conversation.collaboration.respond')
+  const {
+    conversations,
+    selectedConversationId,
+    conversationScope,
+    myConversationView,
+    workspaceChatTab,
+    setConversations,
+    selectConversation,
+    setConversationScope,
+    setMyConversationView,
+    setWorkspaceChatTab,
+    addConversation,
+    updateConversation,
+    removeConversation,
+    addMessage,
+    updateMessage,
+    setVisitorTyping,
+    markConversationRead,
+    markAgentMessagesReadByVisitor,
+  } = useChatStore()
   const [selectedOfflineMessageId, setSelectedOfflineMessageId] = useState<number | null>(null)
   const skipOfflineAutoSelectRef = useRef(false)
   const [selectedQueueTaskId, setSelectedQueueTaskId] = useState<number | null>(null)
@@ -182,20 +207,25 @@ export default function ChatPage() {
   const { data: agentStatus } = useAgentStatus()
   const { data: agentStats } = useAgentStats()
   const startConversationFromHistory = useStartConversationFromHistory()
+  const pinConversation = usePinConversation()
+  const unpinConversation = useUnpinConversation()
+  const lockConversationTimeout = useLockConversationTimeout()
+  const unlockConversationTimeout = useUnlockConversationTimeout()
+  const pinningConversationId = pinConversation.isPending
+    ? pinConversation.variables ?? null
+    : unpinConversation.isPending
+      ? unpinConversation.variables ?? null
+      : null
+  const lockingConversationTimeoutId = lockConversationTimeout.isPending
+    ? lockConversationTimeout.variables ?? null
+    : unlockConversationTimeout.isPending
+      ? unlockConversationTimeout.variables ?? null
+      : null
 
-  const {
-    conversations,
-    selectedConversationId,
-    setConversations,
-    selectConversation,
-    addConversation,
-    updateConversation,
-    removeConversation,
-    addMessage,
-    setVisitorTyping,
-    markConversationRead,
-  } = useChatStore()
-
+  const isMyCurrentConversationView =
+    workspaceChatTab === 'messages' && conversationScope === 'my' && myConversationView === 'current'
+  const readableConversationId = isMyCurrentConversationView ? selectedConversationId : null
+  const readableConversationIdRef = useRef<number | null>(null)
   const typingTimerRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map())
   const [ticketDraftConversationIds, setTicketDraftConversationIds] = useState<Set<number>>(new Set())
   const [transferToast, setTransferToast] = useState<string | null>(null)
@@ -204,7 +234,7 @@ export default function ChatPage() {
   const [messageSearchOpen, setMessageSearchOpen] = useState(false)
   const transferToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const { playMessageAlert, playSessionAlert } = useWorkspaceNotificationAlert()
-  // Tracks the currently opened peer conversation so socket handlers can skip
+  // Tracks the currently opened non-owner conversation so socket handlers can skip
   // its unread badge and notification sound without stale closures.
   const selectedPeerConversationIdRef = useRef<number | null>(null)
   const chatShellRef = useRef<HTMLDivElement | null>(null)
@@ -234,20 +264,20 @@ export default function ChatPage() {
     if (!canPeerTab && conversationScope === 'peers') {
       setConversationScope('my')
     }
-  }, [canPeerTab, conversationScope])
+  }, [canPeerTab, conversationScope, setConversationScope])
 
   useEffect(() => {
     if (!canOfflineMessages && workspaceChatTab === 'offline') {
       setWorkspaceChatTab('messages')
     }
-  }, [canOfflineMessages, workspaceChatTab])
+  }, [canOfflineMessages, setWorkspaceChatTab, workspaceChatTab])
 
   useEffect(() => {
     if (!canQueueTab && workspaceChatTab === 'queue') {
       setWorkspaceChatTab('messages')
       setSelectedQueueTaskId(null)
     }
-  }, [canQueueTab, workspaceChatTab])
+  }, [canQueueTab, setWorkspaceChatTab, workspaceChatTab])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -260,12 +290,19 @@ export default function ChatPage() {
     } else if (tab === 'peers' && canPeerTab) {
       setConversationScope('peers')
       setWorkspaceChatTab('messages')
-    } else if (tab === 'my' || myView === 'history') {
+    } else if (tab === 'my' || myView === 'history' || myView === 'collaborating') {
       setConversationScope('my')
       setWorkspaceChatTab('messages')
-      setMyConversationView(myView === 'history' ? 'history' : 'current')
+      setMyConversationView(myView === 'history' || myView === 'collaborating' ? myView : 'current')
     }
-  }, [canOfflineMessages, canPeerTab, canQueueTab])
+  }, [
+    canOfflineMessages,
+    canPeerTab,
+    canQueueTab,
+    setConversationScope,
+    setMyConversationView,
+    setWorkspaceChatTab,
+  ])
 
   useEffect(() => {
     if (!canOfflineMessages) {
@@ -324,6 +361,9 @@ export default function ChatPage() {
         queryClient.invalidateQueries({ queryKey: agentKeys.status })
         queryClient.invalidateQueries({ queryKey: agentKeys.stats })
         queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+        if (canRespondCollaboration) {
+          queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.pending() })
+        }
         if (canQueueTab) {
           queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.counts() })
           if (isQueueTabActive) {
@@ -340,7 +380,7 @@ export default function ChatPage() {
     }
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
-  }, [canOfflineMessages, canQueueTab, isOfflineTabActive, isQueueTabActive, queryClient])
+  }, [canOfflineMessages, canQueueTab, canRespondCollaboration, isOfflineTabActive, isQueueTabActive, queryClient])
 
   // Sync server conversations to store
   useEffect(() => {
@@ -357,6 +397,9 @@ export default function ChatPage() {
       queryClient.invalidateQueries({ queryKey: agentKeys.status })
       queryClient.invalidateQueries({ queryKey: agentKeys.stats })
       queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+      if (canRespondCollaboration) {
+        queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.pending() })
+      }
       if (canQueueTab) {
         queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.counts() })
         if (isQueueTabActive) {
@@ -374,7 +417,7 @@ export default function ChatPage() {
     return () => {
       socket.off('connect', handleConnect)
     }
-  }, [socket, canOfflineMessages, canQueueTab, isOfflineTabActive, isQueueTabActive, queryClient])
+  }, [socket, canOfflineMessages, canQueueTab, canRespondCollaboration, isOfflineTabActive, isQueueTabActive, queryClient])
 
   useEffect(() => {
     if (!socket || !connected) return
@@ -431,13 +474,20 @@ export default function ChatPage() {
               queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.lists() })
             }
           }
-          if (conversationScope === 'my') addConversation(conv)
+          if (conversationScope === 'my') {
+            addConversation(conv)
+            const selectedId = useChatStore.getState().selectedConversationId
+            if (selectedId == null) {
+              setSelectedConversationSnapshot(conv)
+              selectConversation(conv.id)
+            }
+          }
         })
         .catch(() => {})
     }
 
     const handleNewMessage = (msg: Message) => {
-      // Peer conversations belong to a colleague: they must not raise an unread
+      // Non-owner conversations belong to a colleague: they must not raise an unread
       // badge or play the notification sound for the current agent.
       const isPeerMessage = msg.conversation_id === selectedPeerConversationIdRef.current
       if (msg.sender_type === 'visitor') {
@@ -445,6 +495,11 @@ export default function ChatPage() {
           playMessageAlert()
         }
         setVisitorTyping(msg.conversation_id, false)
+        // A new visitor text message changes the conversation user vector, so the
+        // knowledge recommendation for the conversation being viewed is now stale.
+        if (msg.conversation_id === readableConversationIdRef.current) {
+          queryClient.invalidateQueries({ queryKey: knowledgeKeys.recommendations() })
+        }
       }
       addMessage(msg.conversation_id, msg)
       const preview = buildMessagePreview(msg, locale)
@@ -457,8 +512,8 @@ export default function ChatPage() {
       if (canQueueTab && isQueueTabActive) {
         queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.lists() })
       }
-      // Increment unread if not the selected conversation
-      const selected = useChatStore.getState().selectedConversationId
+      // Increment unread unless the agent is actually viewing this current conversation.
+      const selected = readableConversationIdRef.current
       let nextUnread: number | undefined
       if (!isPeerMessage && msg.sender_type === 'visitor') {
         if (msg.conversation_id === selected) {
@@ -479,6 +534,24 @@ export default function ChatPage() {
       })
     }
 
+    const handleMessageRecalled = (msg: Message) => {
+      if (!msg.conversation_id) return
+      updateMessage(msg.conversation_id, msg)
+      queryClient.setQueriesData<{ items: Message[]; has_more: boolean }>(
+        { queryKey: conversationKeys.messages(msg.conversation_id) },
+        (prev) => {
+          if (!prev) return prev
+          return {
+            ...prev,
+            items: prev.items.map((item) => (item.id === msg.id ? { ...item, ...msg } : item)),
+          }
+        },
+      )
+      if (canQueueTab && isQueueTabActive) {
+        queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.lists() })
+      }
+    }
+
     const handleSatisfactionEvent = (data: { message?: Message; conversation_id: number }) => {
       if (data.message) {
         addMessage(data.conversation_id, data.message)
@@ -488,8 +561,18 @@ export default function ChatPage() {
       })
     }
 
+    const handleMessagesRead = (data: {
+      reader?: string
+      conversation_id?: number
+      message_ids?: number[]
+    }) => {
+      if (data.reader !== 'visitor' || typeof data.conversation_id !== 'number') return
+      markAgentMessagesReadByVisitor(data.conversation_id, data.message_ids)
+    }
+
     const handleConversationEnded = (data: { conversation_id: number }) => {
       removeConversation(data.conversation_id)
+      queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
       queryClient.invalidateQueries({ queryKey: conversationKeys.historyLists() })
     }
 
@@ -558,6 +641,45 @@ export default function ChatPage() {
       }
     }
 
+    const openCollaborationConversation = (conversation: Conversation) => {
+      addConversation(conversation)
+      setSelectedConversationSnapshot(conversation)
+      selectConversation(conversation.id)
+      setConversationScope('my')
+      setMyConversationView('collaborating')
+      setWorkspaceChatTab('messages')
+    }
+
+    const handleCollaborationConversationAdded = (data: Conversation | {
+      conversation_id?: number | null
+      conversation?: Conversation | null
+    }) => {
+      playSessionAlert()
+      const conversation = 'public_id' in data ? data : data.conversation
+      const conversationId = 'public_id' in data ? data.id : data.conversation_id
+      if (conversation) {
+        openCollaborationConversation(conversation)
+      } else if (conversationId) {
+        const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001/api/'
+        fetch(`${apiBase}v1/conversations/${conversationId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+          .then((r) => r.json())
+          .then((conv: Conversation) => openCollaborationConversation(conv))
+          .catch(() => {})
+      }
+      queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+      queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.pending() })
+      queryClient.invalidateQueries({ queryKey: agentKeys.stats })
+    }
+
+    const handleCollaborationMembersUpdated = (data?: { conversation_id?: number | null }) => {
+      queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+      if (typeof data?.conversation_id === 'number') {
+        queryClient.invalidateQueries({ queryKey: conversationKeys.detail(data.conversation_id) })
+      }
+    }
+
     const handleVisitorTyping = (data: { conversation_id: number; content?: string }) => {
       const content = data.content
       const hasContent = typeof content === 'string'
@@ -583,20 +705,36 @@ export default function ChatPage() {
       last_message_preview?: string
       last_message_at?: string
       unread_count?: number
+      is_timeout_locked?: boolean
+      timeout_locked_at?: string | null
+      timeout_locked_by_id?: number | null
     }) => {
       const updates: Partial<Conversation> = {}
       if (data.last_message_preview !== undefined) updates.last_message_preview = data.last_message_preview
       if (data.last_message_at !== undefined) updates.last_message_at = data.last_message_at
+      if (data.is_timeout_locked !== undefined) updates.is_timeout_locked = data.is_timeout_locked
+      if (data.timeout_locked_at !== undefined) updates.timeout_locked_at = data.timeout_locked_at
+      if (data.timeout_locked_by_id !== undefined) updates.timeout_locked_by_id = data.timeout_locked_by_id
       if (data.unread_count !== undefined) {
         // The conversation the agent is actively viewing should never carry an
         // unread badge: the server still increments unread on every visitor
         // message and we'd otherwise flash a count until the next mark_read
         // round-trip lands.
-        const selected = useChatStore.getState().selectedConversationId
+        const selected = readableConversationIdRef.current
         updates.unread_count = data.conversation_id === selected ? 0 : data.unread_count
       }
       updateConversation(data.conversation_id, updates)
+      // Read the selected id from the store at event time so this handler does
+      // not close over selectedConversationId and force the socket effect to
+      // re-subscribe on every conversation switch.
+      if (useChatStore.getState().selectedConversationId === data.conversation_id) {
+        setSelectedConversationSnapshot((prev) => (prev ? { ...prev, ...updates } : prev))
+      }
       patchConversationListCache(queryClient, data.conversation_id, updates)
+      queryClient.setQueryData<Conversation>(
+        conversationKeys.detail(data.conversation_id),
+        (prev) => (prev ? { ...prev, ...updates } : prev),
+      )
       if (canQueueTab && isQueueTabActive) {
         queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.lists() })
       }
@@ -622,15 +760,26 @@ export default function ChatPage() {
       queryClient.invalidateQueries({ queryKey: agentKeys.stats })
     }
 
-    const handleConversationListUpdated = (_data?: ConversationListUpdatedEvent) => {
+    const handleConversationListUpdated = (data?: ConversationListUpdatedEvent) => {
+      if (data?.action === 'timeout_lock_updated') {
+        queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+        if (typeof data.conversation_id === 'number') {
+          queryClient.invalidateQueries({ queryKey: conversationKeys.detail(data.conversation_id) })
+        }
+        return
+      }
       if (!canPeerTab || !isPeerTabActive) return
       queryClient.invalidateQueries({ queryKey: conversationKeys.list('peers') })
     }
 
     socket.on('new_conversation', handleNewConversation)
     socket.on('new_message', handleNewMessage)
+    socket.on('message_recalled', handleMessageRecalled)
+    socket.on('messages_read', handleMessagesRead)
     socket.on('conversation_ended', handleConversationEnded)
     socket.on('conversation_transferred', handleConversationTransferred)
+    socket.on('collaboration_conversation_added', handleCollaborationConversationAdded)
+    socket.on('collaboration_members_updated', handleCollaborationMembersUpdated)
     socket.on('visitor_typing', handleVisitorTyping)
     socket.on('conversation_updated', handleConversationUpdated)
     socket.on('queue_count_updated', handleQueueCountUpdated)
@@ -645,8 +794,12 @@ export default function ChatPage() {
     return () => {
       socket.off('new_conversation', handleNewConversation)
       socket.off('new_message', handleNewMessage)
+      socket.off('message_recalled', handleMessageRecalled)
+      socket.off('messages_read', handleMessagesRead)
       socket.off('conversation_ended', handleConversationEnded)
       socket.off('conversation_transferred', handleConversationTransferred)
+      socket.off('collaboration_conversation_added', handleCollaborationConversationAdded)
+      socket.off('collaboration_members_updated', handleCollaborationMembersUpdated)
       socket.off('visitor_typing', handleVisitorTyping)
       socket.off('conversation_updated', handleConversationUpdated)
       socket.off('queue_count_updated', handleQueueCountUpdated)
@@ -658,7 +811,35 @@ export default function ChatPage() {
       socket.off('satisfaction_invitation_sent', handleSatisfactionEvent)
       socket.off('satisfaction_feedback_submitted', handleSatisfactionEvent)
     }
-  }, [socket, token, queryClient, addConversation, addMessage, updateConversation, removeConversation, setVisitorTyping, markConversationRead, playMessageAlert, playSessionAlert, conversationScope, locale, canOfflineMessages, canPeerTab, canQueueTab, isOfflineTabActive, isPeerTabActive, isQueueTabActive, selectedQueueTaskId])
+  }, [
+    socket,
+    token,
+    queryClient,
+    addConversation,
+    addMessage,
+    updateMessage,
+    updateConversation,
+    removeConversation,
+    setVisitorTyping,
+    markConversationRead,
+    markAgentMessagesReadByVisitor,
+    playMessageAlert,
+    playSessionAlert,
+    selectConversation,
+    setConversationScope,
+    setMyConversationView,
+    setWorkspaceChatTab,
+    conversationScope,
+    locale,
+    canOfflineMessages,
+    canPeerTab,
+    canQueueTab,
+    canRespondCollaboration,
+    isOfflineTabActive,
+    isPeerTabActive,
+    isQueueTabActive,
+    selectedQueueTaskId,
+  ])
 
   const listSelectedConversation = conversations.find((c) => c.id === selectedConversationId) || null
   const selectedConversation =
@@ -667,7 +848,12 @@ export default function ChatPage() {
   const selectedPeerConversationId = useMemo(() => {
     if (workspaceChatTab !== 'messages') return null
     if (!selectedConversation) return null
-    if (selectedConversation.viewer_relation === 'peer') return selectedConversation.id
+    if (
+      selectedConversation.viewer_relation === 'peer'
+      || selectedConversation.viewer_relation === 'collaborator'
+    ) {
+      return selectedConversation.id
+    }
     if (
       selectedConversation.agent?.id != null
       && user?.id != null
@@ -681,6 +867,10 @@ export default function ChatPage() {
   useEffect(() => {
     selectedPeerConversationIdRef.current = selectedPeerConversationId
   }, [selectedPeerConversationId])
+
+  useEffect(() => {
+    readableConversationIdRef.current = readableConversationId
+  }, [readableConversationId])
 
   useEffect(() => {
     if (listSelectedConversation) {
@@ -803,14 +993,53 @@ export default function ChatPage() {
     }
   }, [auxiliaryPanelResizing])
 
-  const handleKnowledgeUse = useCallback((messageText: string) => {
+  const requestComposerInsert = useCallback((request: Omit<ComposerInsertRequest, 'id'>) => {
     setComposerInsertRequest((prev) => ({
       id: (prev?.id ?? 0) + 1,
-      text: messageText,
+      ...request,
     }))
   }, [])
 
-  const visibleConversationItems = isMyHistoryActive ? historyConversations : conversations
+  const handleKnowledgeUse = useCallback((messageText: string) => {
+    requestComposerInsert({ text: messageText })
+  }, [requestComposerInsert])
+
+  const myCurrentConversations = useMemo(
+    () => conversations.filter((conversation) => conversation.viewer_relation !== 'collaborator'),
+    [conversations],
+  )
+  const myCollaboratingConversations = useMemo(
+    () => conversations.filter((conversation) => conversation.viewer_relation === 'collaborator'),
+    [conversations],
+  )
+  const myUnreadTotal = useMemo(() => {
+    const items = myConversationsQuery.data?.items ?? (conversationScope === 'my' ? conversations : [])
+    return items
+      .filter((conversation) => conversation.viewer_relation !== 'collaborator')
+      .reduce((sum, conversation) => sum + Math.max(0, conversation.unread_count || 0), 0)
+  }, [conversationScope, conversations, myConversationsQuery.data?.items])
+
+  useEffect(() => {
+    if (conversationScope !== 'my' || myConversationView !== 'collaborating') return
+    if (myConversationsQuery.isLoading || myConversationsQuery.isFetching) return
+    if (myCollaboratingConversations.length > 0) return
+    setMyConversationView('current')
+  }, [
+    conversationScope,
+    myCollaboratingConversations.length,
+    myConversationView,
+    myConversationsQuery.isFetching,
+    myConversationsQuery.isLoading,
+    setMyConversationView,
+  ])
+
+  const visibleConversationItems = isMyHistoryActive
+    ? historyConversations
+    : conversationScope === 'my' && myConversationView === 'collaborating'
+      ? myCollaboratingConversations
+      : conversationScope === 'my'
+        ? myCurrentConversations
+        : conversations
 
   const handleConversationSelect = useCallback(
     (conversationId: number) => {
@@ -821,11 +1050,98 @@ export default function ChatPage() {
     [selectConversation, visibleConversationItems],
   )
 
+  useEffect(() => {
+    if (!isMessagesTabActive) return
+    if (visibleConversationItems.length !== 1) return
+
+    const onlyConversation = visibleConversationItems[0]
+    if (selectedConversationId === onlyConversation.id) return
+
+    handleConversationSelect(onlyConversation.id)
+  }, [
+    handleConversationSelect,
+    isMessagesTabActive,
+    selectedConversationId,
+    visibleConversationItems,
+  ])
+
   const showWorkspaceToast = useCallback((text: string) => {
     setTransferToast(text)
     if (transferToastTimerRef.current) clearTimeout(transferToastTimerRef.current)
     transferToastTimerRef.current = setTimeout(() => setTransferToast(null), 2500)
   }, [])
+
+  const handleTogglePinConversation = useCallback(
+    async (conversation: Conversation) => {
+      if (pinConversation.isPending || unpinConversation.isPending) return
+      try {
+        const next = conversation.is_pinned
+          ? await unpinConversation.mutateAsync(conversation.id)
+          : await pinConversation.mutateAsync(conversation.id)
+        updateConversation(next.id, {
+          is_pinned: next.is_pinned,
+          pinned_at: next.pinned_at,
+        })
+        if (selectedConversationId === next.id) {
+          setSelectedConversationSnapshot(next)
+        }
+        showWorkspaceToast(
+          next.is_pinned
+            ? t('ws.chat.pinSuccess', locale)
+            : t('ws.chat.unpinSuccess', locale),
+        )
+      } catch {
+        queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+        showWorkspaceToast(t('ws.chat.pinFailed', locale))
+      }
+    },
+    [
+      locale,
+      pinConversation,
+      queryClient,
+      selectedConversationId,
+      showWorkspaceToast,
+      unpinConversation,
+      updateConversation,
+    ],
+  )
+
+  const handleToggleConversationTimeoutLock = useCallback(
+    async (conversation: Conversation) => {
+      if (lockConversationTimeout.isPending || unlockConversationTimeout.isPending) return
+      try {
+        const next = conversation.is_timeout_locked
+          ? await unlockConversationTimeout.mutateAsync(conversation.id)
+          : await lockConversationTimeout.mutateAsync(conversation.id)
+        const updates = {
+          is_timeout_locked: next.is_timeout_locked,
+          timeout_locked_at: next.timeout_locked_at,
+          timeout_locked_by_id: next.timeout_locked_by_id,
+        }
+        updateConversation(next.id, updates)
+        if (selectedConversationId === next.id) {
+          setSelectedConversationSnapshot(next)
+        }
+        showWorkspaceToast(
+          next.is_timeout_locked
+            ? t('ws.chat.timeoutLockSuccess', locale)
+            : t('ws.chat.timeoutUnlockSuccess', locale),
+        )
+      } catch {
+        queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+        showWorkspaceToast(t('ws.chat.timeoutLockFailed', locale))
+      }
+    },
+    [
+      locale,
+      lockConversationTimeout,
+      queryClient,
+      selectedConversationId,
+      showWorkspaceToast,
+      unlockConversationTimeout,
+      updateConversation,
+    ],
+  )
 
   const handleOpenMessageSearch = useCallback(() => {
     if (!selectedConversation?.visitor) return
@@ -846,10 +1162,18 @@ export default function ChatPage() {
       const isPeerConversation =
         selectedConversation.viewer_relation === 'peer'
         || (
-          selectedConversation.agent?.id != null
+          selectedConversation.viewer_relation == null
+          && selectedConversation.agent?.id != null
           && user?.id != null
           && selectedConversation.agent.id !== user.id
         )
+      const isCollaboratorConversation = selectedConversation.viewer_relation === 'collaborator'
+      if (
+        isCollaboratorConversation
+        && !hasPermission(user, 'chat.conversation.collaboration.message.send')
+      ) {
+        throw new Error('No permission to send collaboration conversation message')
+      }
       if (isPeerConversation && !hasPermission(user, 'chat.conversation.peer_message.send')) {
         throw new Error('No permission to send peer conversation message')
       }
@@ -917,6 +1241,9 @@ export default function ChatPage() {
       locale,
       queryClient,
       selectConversation,
+      setConversationScope,
+      setMyConversationView,
+      setWorkspaceChatTab,
       showWorkspaceToast,
       startConversationFromHistory,
     ],
@@ -957,13 +1284,13 @@ export default function ChatPage() {
     }
     setConversationScope(tab)
     setWorkspaceChatTab('messages')
-  }, [queryClient])
+  }, [queryClient, setConversationScope, setWorkspaceChatTab])
 
   const handleMyConversationViewChange = useCallback((view: MyConversationView) => {
     setConversationScope('my')
     setWorkspaceChatTab('messages')
     setMyConversationView(view)
-  }, [])
+  }, [setConversationScope, setMyConversationView, setWorkspaceChatTab])
 
   const activeConversationPanelTab: ConversationPanelTab = workspaceChatTab === 'offline'
     ? 'offline'
@@ -982,17 +1309,35 @@ export default function ChatPage() {
   }, [queueTaskItems])
 
   const handleQueueAssigned = useCallback(
-    async (response: QueueAssignmentWorkspaceResponse) => {
+    async (
+      response: QueueAssignmentWorkspaceResponse,
+      options?: { openConversation?: boolean; messageSent?: boolean },
+    ) => {
       queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.counts() })
       queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.lists() })
       queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
       queryClient.invalidateQueries({ queryKey: agentKeys.stats })
       if (response.assigned_to_current_user && response.conversation_id) {
+        let conversation: Conversation | null = null
         try {
-          const conversation = await get<Conversation>(`v1/conversations/${response.conversation_id}`)
+          conversation = await get<Conversation>(`v1/conversations/${response.conversation_id}`)
           addConversation(conversation)
         } catch {
           // Keep processing the queue list even if conversation fetch fails.
+        }
+        if (options?.openConversation) {
+          if (conversation) setSelectedConversationSnapshot(conversation)
+          selectConversation(response.conversation_id)
+          setConversationScope('my')
+          setMyConversationView('current')
+          setWorkspaceChatTab('messages')
+          setSelectedQueueTaskId(null)
+          showWorkspaceToast(
+            options.messageSent === false
+              ? t('ws.chat.queueQuickReplyAssignedMessageFailed', locale)
+              : t('ws.chat.queueQuickReplyAssignedAndSent', locale),
+          )
+          return
         }
         advanceQueueTaskSelection(response.task.id)
         return
@@ -1000,7 +1345,18 @@ export default function ChatPage() {
       setSelectedQueueTaskId((current) => (current === response.task.id ? null : current))
       void queueTasksQuery.refetch()
     },
-    [addConversation, advanceQueueTaskSelection, queryClient, queueTasksQuery],
+    [
+      addConversation,
+      advanceQueueTaskSelection,
+      locale,
+      queryClient,
+      queueTasksQuery,
+      selectConversation,
+      setConversationScope,
+      setMyConversationView,
+      setWorkspaceChatTab,
+      showWorkspaceToast,
+    ],
   )
 
   const auxiliaryPanelResizeHandle = (
@@ -1069,8 +1425,10 @@ export default function ChatPage() {
         canOfflineTab={canOfflineMessages}
         canQueueTab={canQueueTab}
         peerConversationScope={peerConversationScope}
+        myUnreadTotal={myUnreadTotal}
         offlineTotal={offlineTotal}
         queueTotal={queueTotal}
+        socket={socket}
         loading={
           workspaceChatTab === 'queue'
             ? queueTasksQuery.isFetching
@@ -1089,8 +1447,11 @@ export default function ChatPage() {
           }
           void activeConversationsQuery.refetch()
         }}
+        onTogglePin={handleTogglePinConversation}
+        pinningConversationId={pinningConversationId}
         historyHasMore={Boolean(historyConversationsQuery.hasNextPage)}
         historyLoadingMore={historyConversationsQuery.isFetchingNextPage}
+        hasCollaboratingConversations={myCollaboratingConversations.length > 0}
         onHistoryLoadMore={() => {
           if (historyConversationsQuery.hasNextPage && !historyConversationsQuery.isFetchingNextPage) {
             void historyConversationsQuery.fetchNextPage()
@@ -1111,6 +1472,7 @@ export default function ChatPage() {
           <QueueTaskListSidebar
             items={queueTaskItems}
             visibleQueues={queueTasksQuery.data?.visible_queues ?? []}
+            itemsUpdatedAt={queueTasksQuery.dataUpdatedAt}
             selectedId={selectedQueueTaskId}
             loading={queueTasksQuery.isLoading || queueTasksQuery.isFetching}
             queueFilter={queueFilter}
@@ -1134,10 +1496,21 @@ export default function ChatPage() {
             startingNewConversation={startConversationFromHistory.isPending}
             onTransferred={handleTransferred}
             composerInsertRequest={composerInsertRequest}
+            onComposerInsertRequest={requestComposerInsert}
             composerInputHeight={workspaceChatPreferences?.composer_input_height}
             onComposerInputHeightCommit={(height) => saveWorkspaceChatPreference({ composer_input_height: height })}
             messageSearchOpen={messageSearchOpen}
             onOpenMessageSearch={handleOpenMessageSearch}
+            markReadOnOpen={isMyCurrentConversationView}
+            onCollaborationInvitationSent={(name) => {
+              showWorkspaceToast(t('ws.chat.collabInviteSent', locale, { name }))
+            }}
+            pinningConversation={selectedConversation ? pinningConversationId === selectedConversation.id : false}
+            onTogglePinConversation={handleTogglePinConversation}
+            lockingConversationTimeout={
+              selectedConversation ? lockingConversationTimeoutId === selectedConversation.id : false
+            }
+            onToggleConversationTimeoutLock={handleToggleConversationTimeoutLock}
           />
 
           {auxiliaryPanelResizeHandle}

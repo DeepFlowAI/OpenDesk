@@ -9,6 +9,8 @@ import type {
   KnowledgeDocumentListParams,
   KnowledgeDocumentListResponse,
   KnowledgeDocumentPayload,
+  KnowledgeRecommendationParams,
+  KnowledgeRecommendationResponse,
   KnowledgeImportExecuteResponse,
   KnowledgeImportPreviewResponse,
 } from '@/models/knowledge'
@@ -22,6 +24,8 @@ export const knowledgeKeys = {
   documentList: (params: KnowledgeDocumentListParams) => [...knowledgeKeys.documents(), params] as const,
   documentDetails: () => [...knowledgeKeys.all, 'documentDetail'] as const,
   documentDetail: (id: number | string) => [...knowledgeKeys.documentDetails(), id] as const,
+  recommendations: () => [...knowledgeKeys.all, 'recommendations'] as const,
+  recommendation: (params: KnowledgeRecommendationParams) => [...knowledgeKeys.recommendations(), params] as const,
 }
 
 function buildDocumentListQuery(params: KnowledgeDocumentListParams): string {
@@ -41,6 +45,14 @@ function buildKnowledgeExportQuery(params: Pick<KnowledgeDocumentListParams, 'di
   if (params.directory != null) searchParams.set('directory', String(params.directory))
   if (params.q?.trim()) searchParams.set('q', params.q.trim())
   return `?${searchParams.toString()}`
+}
+
+function buildRecommendationQuery(params: KnowledgeRecommendationParams): string {
+  const searchParams = new URLSearchParams()
+  if (params.conversation_id != null) searchParams.set('conversation_id', String(params.conversation_id))
+  if (params.limit) searchParams.set('limit', String(params.limit))
+  const qs = searchParams.toString()
+  return qs ? `?${qs}` : ''
 }
 
 export const useKnowledgeDirectories = () =>
@@ -98,11 +110,45 @@ export const useDeleteKnowledgeDirectory = () => {
   })
 }
 
-export const useKnowledgeDocuments = (params: KnowledgeDocumentListParams) =>
+export const useKnowledgeDocuments = (
+  params: KnowledgeDocumentListParams,
+  options?: { enabled?: boolean },
+) =>
   useQuery({
     queryKey: knowledgeKeys.documentList(params),
     queryFn: () => get<KnowledgeDocumentListResponse>(`v1/knowledge/documents${buildDocumentListQuery(params)}`),
+    enabled: options?.enabled ?? true,
   })
+
+const RECOMMENDATION_POLL_INTERVAL_MS = 2000
+
+export const useKnowledgeRecommendations = (
+  params: KnowledgeRecommendationParams,
+  options?: { enabled?: boolean },
+) =>
+  useQuery({
+    queryKey: knowledgeKeys.recommendation(params),
+    queryFn: () => get<KnowledgeRecommendationResponse>(`v1/knowledge/recommendations${buildRecommendationQuery(params)}`),
+    enabled: options?.enabled ?? true,
+    // The embedding behind a recommendation is computed asynchronously, so the
+    // first request usually returns "updating". Always treat the result as
+    // stale so re-opening the panel re-fetches, and keep polling while the
+    // backend is still computing the vector.
+    staleTime: 0,
+    refetchInterval: (query) =>
+      query.state.data?.status === 'updating' ? RECOMMENDATION_POLL_INTERVAL_MS : false,
+  })
+
+export const useRetryKnowledgeRecommendations = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (params: KnowledgeRecommendationParams) =>
+      post<KnowledgeRecommendationResponse>(`v1/knowledge/recommendations/retry${buildRecommendationQuery(params)}`),
+    onSuccess: (data, params) => {
+      qc.setQueryData(knowledgeKeys.recommendation(params), data)
+    },
+  })
+}
 
 export const downloadKnowledgeImportTemplate = async (locale: string) => {
   const { blob, headers } = await getBlob(`v1/knowledge/import/template?locale=${encodeURIComponent(locale)}`)

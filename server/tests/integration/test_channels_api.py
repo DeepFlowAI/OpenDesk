@@ -1,6 +1,8 @@
 """
 Integration tests for Channel API
 """
+from uuid import uuid4
+
 import pytest
 from httpx import AsyncClient
 from unittest.mock import AsyncMock
@@ -32,6 +34,7 @@ SAMPLE_PAYLOAD = {
         "agent_bubble_border_color": "#e5e5e5",
         "agent_bubble_radius": [10, 10, 10, 0],
         "use_agent_avatar": True,
+        "agent_default_avatar_url": "https://cdn.example.com/default-agent.png",
         "user_bubble_bg_color": "#1a1a1a",
         "user_bubble_text_color": "#ffffff",
         "user_bubble_border_color": None,
@@ -72,6 +75,7 @@ class TestChannelAPI:
         assert data["config"]["title"] == "Help Center"
         assert data["config"]["agent_bubble_radius"] == [10, 10, 10, 0]
         assert data["config"]["use_agent_avatar"] is True
+        assert data["config"]["agent_default_avatar_url"] == "https://cdn.example.com/default-agent.png"
         assert data["config"]["send_button_bg_color"] == "#2563eb"
         assert data["config"]["assist_panel_enabled"] is True
         assert data["config"]["assist_panel_title"] == "Help"
@@ -122,6 +126,52 @@ class TestChannelAPI:
         assert resp2.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_copy_returns_201_with_same_config_and_new_key(self, client: AsyncClient):
+        """Copy should create a new channel with the same configuration and a new key."""
+        headers = _auth_header()
+        source_name = f"Copy Source {uuid4().hex[:8]}"
+        payload = {
+            **SAMPLE_PAYLOAD,
+            "name": source_name,
+            "access_mode": "embed",
+            "logo_url": "https://cdn.example.com/logo.png",
+            "favicon_url": "https://cdn.example.com/favicon.png",
+        }
+        create_resp = await client.post("/api/v1/channels", json=payload, headers=headers)
+        source = create_resp.json()
+
+        copy_resp = await client.post(f"/api/v1/channels/{source['id']}/copy", headers=headers)
+
+        assert copy_resp.status_code == 201
+        copied = copy_resp.json()
+        assert copied["id"] != source["id"]
+        assert copied["name"] == f"{source_name}副本1"
+        assert copied["channel_key"] != source["channel_key"]
+        assert copied["channel_key_version"] == 1
+        assert copied["public_access_enabled"] == source["public_access_enabled"]
+        assert copied["access_mode"] == "embed"
+        assert copied["logo_url"] == "https://cdn.example.com/logo.png"
+        assert copied["favicon_url"] == "https://cdn.example.com/favicon.png"
+        assert copied["config"] == source["config"]
+
+        second_copy_resp = await client.post(f"/api/v1/channels/{source['id']}/copy", headers=headers)
+        assert second_copy_resp.status_code == 201
+        assert second_copy_resp.json()["name"] == f"{source_name}副本2"
+
+    @pytest.mark.asyncio
+    async def test_copy_other_tenant_channel_returns_404(self, client: AsyncClient):
+        """Copy should not expose channels from another tenant."""
+        headers_a = _auth_header(tenant_id=7)
+        headers_b = _auth_header(tenant_id=5555)
+        payload = {**SAMPLE_PAYLOAD, "name": f"Other Tenant Source {uuid4().hex[:8]}"}
+        create_resp = await client.post("/api/v1/channels", json=payload, headers=headers_a)
+        created_id = create_resp.json()["id"]
+
+        resp = await client.post(f"/api/v1/channels/{created_id}/copy", headers=headers_b)
+
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
     async def test_create_empty_name_returns_422(self, client: AsyncClient):
         """Empty name should return 422."""
         headers = _auth_header()
@@ -147,6 +197,7 @@ class TestChannelAPI:
         data = resp.json()
         assert data["config"]["agent_bubble_radius"] == [10, 10, 10, 10]
         assert data["config"]["use_agent_avatar"] is False
+        assert data["config"]["agent_default_avatar_url"] is None
         assert data["config"]["send_button_bg_color"] is None
         assert data["config"]["input_placeholder"] is None
         assert data["config"]["open_agent_avatar_url"] is None

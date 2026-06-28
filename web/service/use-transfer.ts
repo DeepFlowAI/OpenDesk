@@ -7,6 +7,7 @@ import type {
 } from '@/models/transfer'
 
 const NS = 'transfer'
+const TARGET_REFRESH_INTERVAL_MS = 5_000
 
 export const transferKeys = {
   all: [NS] as const,
@@ -33,7 +34,9 @@ export const useTransferTargets = (
       })
     },
     enabled,
-    staleTime: 10_000,
+    staleTime: TARGET_REFRESH_INTERVAL_MS,
+    refetchInterval: enabled ? TARGET_REFRESH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
   })
 
 export const useTransferConversation = () => {

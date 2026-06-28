@@ -14,7 +14,12 @@ import type { AssistPanelConfigValue, ChannelConfig, ChannelCustomButton, Create
 import { useChannel, useCreateChannel, useUpdateChannel } from '@/service/use-channels'
 import { useOpenAgentAgents, useOpenAgentSettings } from '@/service/use-open-agent-settings'
 import { useServiceHours } from '@/service/use-service-hours'
-import { useUploadChannelLogo, useUploadChannelFavicon, useUploadChannelBotAvatar } from '@/service/use-upload'
+import {
+  useUploadChannelLogo,
+  useUploadChannelFavicon,
+  useUploadChannelBotAvatar,
+  useUploadChannelAgentDefaultAvatar,
+} from '@/service/use-upload'
 import { CHANNEL_COLOR_PREVIEW, channelColorPreview } from '@/utils/channel-config-display'
 import { ChannelColorField } from '@/components/channel/channel-color-field'
 import { Switch } from '@/components/ui/switch'
@@ -33,6 +38,7 @@ import {
 const DEFAULT_OFFLINE_TITLE = '当前客服不在线'
 const DEFAULT_OFFLINE_MESSAGE = '您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。'
 const DEFAULT_LEAVE_MESSAGE_PROMPT = '请留下您的问题和联系方式，我们上线后会尽快联系您。'
+const DEFAULT_RESTRICTED_SERVICE_MESSAGE = '抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。'
 const DEFAULT_QUEUE_MESSAGE = '您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。客服接入后会立即回复您。'
 const DEFAULT_QUEUE_FULL_MESSAGE = '当前排队人数较多，暂时无法进入排队。您可以稍后再试，或点击留言，我们上线后会尽快联系您。'
 const DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL = '留言'
@@ -100,6 +106,7 @@ const DEFAULT_CONFIG: ChannelConfig = {
   agent_bubble_border_color: null,
   agent_bubble_radius: [10, 10, 10, 10],
   use_agent_avatar: false,
+  agent_default_avatar_url: null,
   user_bubble_bg_color: null,
   user_bubble_text_color: null,
   user_bubble_border_color: null,
@@ -114,6 +121,7 @@ const DEFAULT_CONFIG: ChannelConfig = {
   offline_title: DEFAULT_OFFLINE_TITLE,
   offline_message: DEFAULT_OFFLINE_MESSAGE,
   leave_message_prompt: DEFAULT_LEAVE_MESSAGE_PROMPT,
+  restricted_service_message: DEFAULT_RESTRICTED_SERVICE_MESSAGE,
   queue_message: DEFAULT_QUEUE_MESSAGE,
   queue_full_message: DEFAULT_QUEUE_FULL_MESSAGE,
   queue_full_show_leave_message_button: true,
@@ -129,6 +137,7 @@ const DEFAULT_CONFIG: ChannelConfig = {
   open_agent_handoff_label: DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
   open_agent_handoff_after_messages: 2,
   open_agent_handoff_behavior: 'confirm',
+  open_agent_feedback_enabled: false,
   open_agent_custom_buttons_enabled: false,
   open_agent_custom_buttons: [],
   human_custom_buttons_enabled: false,
@@ -808,9 +817,11 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const logoUploadMut = useUploadChannelLogo()
   const faviconUploadMut = useUploadChannelFavicon()
   const botAvatarUploadMut = useUploadChannelBotAvatar()
+  const agentDefaultAvatarUploadMut = useUploadChannelAgentDefaultAvatar()
   const logoFileRef = useRef<HTMLInputElement>(null)
   const faviconFileRef = useRef<HTMLInputElement>(null)
   const botAvatarFileRef = useRef<HTMLInputElement>(null)
+  const agentDefaultAvatarFileRef = useRef<HTMLInputElement>(null)
 
   const [name, setName] = useState('')
   const [accessMode, setAccessMode] = useState<'url' | 'embed'>('url')
@@ -819,6 +830,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [faviconUrl, setFaviconUrl] = useState('')
   const [faviconError, setFaviconError] = useState('')
   const [botAvatarError, setBotAvatarError] = useState('')
+  const [agentDefaultAvatarError, setAgentDefaultAvatarError] = useState('')
   const [config, setConfig] = useState<ChannelConfig>({ ...DEFAULT_CONFIG })
   const [initialized, setInitialized] = useState(false)
   const [savedId, setSavedId] = useState<number | null>(channelId ?? null)
@@ -836,6 +848,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [offlineTitleError, setOfflineTitleError] = useState('')
   const [offlineMessageError, setOfflineMessageError] = useState('')
   const [leaveMessagePromptError, setLeaveMessagePromptError] = useState('')
+  const [restrictedServiceMessageError, setRestrictedServiceMessageError] = useState('')
   const [queueMessageError, setQueueMessageError] = useState('')
   const [queueFullMessageError, setQueueFullMessageError] = useState('')
   const [queueFullButtonLabelError, setQueueFullButtonLabelError] = useState('')
@@ -967,6 +980,29 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     if (botAvatarFileRef.current) botAvatarFileRef.current.value = ''
   }
 
+  const handleAgentDefaultAvatarClick = () => {
+    setAgentDefaultAvatarError('')
+    agentDefaultAvatarFileRef.current?.click()
+  }
+
+  const handleAgentDefaultAvatarFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setAgentDefaultAvatarError('')
+    if (file.size > MAX_BOT_AVATAR_BYTES) {
+      setAgentDefaultAvatarError(t('ch.form.agentDefaultAvatar.tooLarge', locale))
+      if (agentDefaultAvatarFileRef.current) agentDefaultAvatarFileRef.current.value = ''
+      return
+    }
+    try {
+      const url = await agentDefaultAvatarUploadMut.mutateAsync(file)
+      updateConfig('agent_default_avatar_url', url)
+    } catch {
+      setAgentDefaultAvatarError(t('ch.form.agentDefaultAvatar.failed', locale))
+    }
+    if (agentDefaultAvatarFileRef.current) agentDefaultAvatarFileRef.current.value = ''
+  }
+
   const goBack = () => {
     if (isDirty && typeof window !== 'undefined' && !window.confirm(t('ch.form.leaveConfirm', locale))) return
     router.push('/channels/web')
@@ -1020,6 +1056,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     setOfflineTitleError('')
     setOfflineMessageError('')
     setLeaveMessagePromptError('')
+    setRestrictedServiceMessageError('')
     setQueueMessageError('')
     setQueueFullMessageError('')
     setQueueFullButtonLabelError('')
@@ -1105,6 +1142,11 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       setLeaveMessagePromptError(t('ch.form.leaveMessagePrompt.required', locale))
       return
     }
+    if (!stripHtml(config.restricted_service_message)) {
+      setActiveTab('service')
+      setRestrictedServiceMessageError(t('ch.form.restrictedServiceMessage.required', locale))
+      return
+    }
     if (!stripHtml(config.queue_message)) {
       setActiveTab('service')
       setQueueMessageError(t('ch.form.queueMessage.required', locale))
@@ -1164,6 +1206,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       outside_service_hours_strategy: config.outside_service_hours_strategy,
       offline_title: config.offline_title.trim(),
       leave_message_prompt: config.leave_message_prompt || DEFAULT_LEAVE_MESSAGE_PROMPT,
+      restricted_service_message: config.restricted_service_message || DEFAULT_RESTRICTED_SERVICE_MESSAGE,
       queue_message: config.queue_message || DEFAULT_QUEUE_MESSAGE,
       queue_full_message: config.queue_full_message || DEFAULT_QUEUE_FULL_MESSAGE,
       queue_full_leave_message_button_label: (
@@ -1173,6 +1216,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       open_agent_agent_name: selectedOpenAgent?.name ?? config.open_agent_agent_name,
       open_agent_bot_service_hours_id:
         config.open_agent_bot_strategy === 'service_hours' ? config.open_agent_bot_service_hours_id : null,
+      agent_default_avatar_url: config.agent_default_avatar_url?.trim() || null,
       open_agent_avatar_url: config.open_agent_avatar_url?.trim() || null,
       open_agent_input_placeholder: config.open_agent_input_placeholder?.trim() || null,
       open_agent_handoff_label: config.open_agent_handoff_label.trim() || DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
@@ -1467,6 +1511,48 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                 onCheckedChange={(v) => updateConfig('use_agent_avatar', v)}
               />
             </div>
+            <div className="mt-4 flex flex-col gap-2 border-t border-border pt-4">
+              <FieldLabel label={t('ch.form.agentDefaultAvatar', locale)} />
+              <input
+                ref={agentDefaultAvatarFileRef}
+                type="file"
+                accept="image/jpeg,image/png,image/gif,image/webp"
+                onChange={handleAgentDefaultAvatarFileChange}
+                className="hidden"
+              />
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleAgentDefaultAvatarClick}
+                  disabled={agentDefaultAvatarUploadMut.isPending}
+                  className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full border border-dashed border-border bg-white transition-colors hover:bg-accent/50 disabled:opacity-50"
+                >
+                  {agentDefaultAvatarUploadMut.isPending ? (
+                    <IconLoader2 size={20} className="animate-spin text-muted-foreground" />
+                  ) : config.agent_default_avatar_url ? (
+                    <img src={config.agent_default_avatar_url} alt="" className="h-full w-full object-cover" />
+                  ) : (
+                    <IconUpload size={20} className="text-border" />
+                  )}
+                </button>
+                {config.agent_default_avatar_url && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      updateConfig('agent_default_avatar_url', null)
+                      setAgentDefaultAvatarError('')
+                    }}
+                    className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+                  >
+                    <IconTrash size={16} />
+                  </button>
+                )}
+              </div>
+              {agentDefaultAvatarError
+                ? <span className="text-xs text-destructive">{agentDefaultAvatarError}</span>
+                : <span className="text-xs text-muted-foreground">{t('ch.form.agentDefaultAvatar.hint', locale)}</span>
+              }
+            </div>
           </div>
 
           <Separator />
@@ -1623,6 +1709,24 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                     {leaveMessagePromptError && <p className="text-xs text-destructive">{leaveMessagePromptError}</p>}
                   </div>
                 )}
+              </div>
+
+              <div className="rounded-lg border border-border bg-card p-5">
+                <div className="flex flex-col gap-2">
+                  <FieldLabel label={t('ch.form.restrictedServiceMessage', locale)} required />
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {t('ch.form.restrictedServiceMessage.hint', locale)}
+                  </p>
+                  <RichTextFieldEditor
+                    value={config.restricted_service_message}
+                    onChange={(v) => {
+                      updateConfig('restricted_service_message', v ?? '')
+                      setRestrictedServiceMessageError('')
+                    }}
+                    placeholder={t('ch.form.restrictedServiceMessage.placeholder', locale)}
+                  />
+                  {restrictedServiceMessageError && <p className="text-xs text-destructive">{restrictedServiceMessageError}</p>}
+                </div>
               </div>
 
               <div className="rounded-lg border border-border bg-card p-5">
@@ -1986,6 +2090,21 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                         value={config.open_agent_handoff_behavior}
                         onChange={(v) => updateConfig('open_agent_handoff_behavior', v)}
                       />
+                    </div>
+
+                    <div className="rounded-lg border border-border bg-white p-4">
+                      <div className="flex items-start justify-between gap-6">
+                        <div className="flex flex-col gap-1">
+                          <FieldLabel label={t('ch.form.openAgent.feedbackEnabled', locale)} />
+                          <p className="text-xs leading-5 text-muted-foreground">
+                            {t('ch.form.openAgent.feedbackEnabled.hint', locale)}
+                          </p>
+                        </div>
+                        <Switch
+                          checked={config.open_agent_feedback_enabled}
+                          onCheckedChange={(v) => updateConfig('open_agent_feedback_enabled', v)}
+                        />
+                      </div>
                     </div>
                   </div>
                 )}

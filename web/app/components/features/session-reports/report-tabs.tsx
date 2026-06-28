@@ -6,7 +6,7 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 
 type Props = {
-  active: 'overall' | 'employees'
+  active: 'overall' | 'employees' | 'queues'
   /** Preserved query string (start/end/trend) to keep state across the tab switch. */
   search?: string
 }
@@ -15,7 +15,7 @@ export function ReportTabs({ active, search = '' }: Props) {
   const { locale } = useLocaleStore()
   const tail = search ? `?${search.replace(/^\?/, '')}` : ''
 
-  const items: { key: 'overall' | 'employees'; href: string; labelKey: string }[] = [
+  const items: { key: 'overall' | 'employees' | 'queues'; href: string; labelKey: string }[] = [
     {
       key: 'overall',
       href: `/workspace/records/session-reports${tail}`,
@@ -25,6 +25,11 @@ export function ReportTabs({ active, search = '' }: Props) {
       key: 'employees',
       href: `/workspace/records/session-reports/employees${tail}`,
       labelKey: 'ws.records.sessionReports.tabs.employees',
+    },
+    {
+      key: 'queues',
+      href: `/workspace/records/session-reports/queues${tail}`,
+      labelKey: 'ws.records.sessionReports.tabs.queues',
     },
   ]
 

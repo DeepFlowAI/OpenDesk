@@ -51,7 +51,8 @@ def register_routers(app: FastAPI) -> None:
     # extension (see app.extensions). Single-tenant deployments rely on the
     # auto-provisioned default tenant from app.db.seed instead.
 
-    from app.routers.v1 import conversations, public, session_records, field_definitions, transfer, offline_messages, queue_workspace, telemetry
+    from app.routers.v1 import conversations, public, session_records, field_definitions, transfer, conversation_collaboration, offline_messages, queue_workspace, telemetry
+    app.include_router(conversations.file_router, prefix="/api/v1")
     app.include_router(conversations.router, prefix="/api/v1")
     app.include_router(conversations.agent_router, prefix="/api/v1")
     app.include_router(public.router, prefix="/api/v1")
@@ -59,6 +60,7 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(session_records.router, prefix="/api/v1")
     app.include_router(field_definitions.router, prefix="/api/v1")
     app.include_router(transfer.router, prefix="/api/v1")
+    app.include_router(conversation_collaboration.router, prefix="/api/v1")
     app.include_router(offline_messages.router, prefix="/api/v1")
     app.include_router(queue_workspace.router, prefix="/api/v1")
 

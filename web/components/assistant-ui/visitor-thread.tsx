@@ -8,11 +8,15 @@ import {
 } from './visitor-chat-runtime'
 import { useVisitorChatStore } from '@/context/visitor-chat-store'
 import { ChatHeader } from '@/app/components/features/visitor-chat/chat-header'
-import { MessageBubble } from '@/app/components/features/visitor-chat/message-bubble'
+import {
+  MessageBubble,
+  shouldShowVisitorRecalledNotice,
+} from '@/app/components/features/visitor-chat/message-bubble'
 import { SystemMessage } from '@/app/components/features/visitor-chat/system-message'
 import { resolveVisitorSystemEventContent } from '@/lib/workspace-agent-display'
 import {
   isVisitorQueueEnteredContent,
+  isVisitorQueueEnteredMessage,
   QUEUE_ENTERED_SYSTEM_MESSAGE,
 } from '@/lib/visitor-queue-notice'
 import {
@@ -29,9 +33,10 @@ import {
 } from '@/app/components/features/visitor-chat/welcome-message'
 import { SafeHtml } from '@/components/safe-html'
 import { TypingIndicator } from '@/app/components/features/visitor-chat/typing-indicator'
-import { VisitorComposer } from './visitor-composer'
+import { VisitorComposer, type VisitorComposerInsertRequest } from './visitor-composer'
 import { IconLoader2, IconArrowDown, IconAlertCircle, IconStar, IconX } from '@tabler/icons-react'
 import { SatisfactionSurveyModal } from '@/app/components/features/satisfaction-survey-modal'
+import { VisitorAnnouncement } from '@/app/components/features/visitor-chat/announcement'
 import { submitPublicSatisfaction } from '@/service/use-satisfaction-survey'
 import { isLeaveMessagePromptMessage, leaveMessagePromptToPlainText } from '@/lib/offline-message-event'
 import { t } from '@/utils/i18n'
@@ -42,7 +47,9 @@ import type {
   VisitorUnreadOfflineReplyItem,
 } from '@/models/conversation'
 import {
+  getAgentAvatarUrl,
   getOpenAgentAvatarUrl,
+  shouldShowAgentAvatar,
   shouldShowAssistantAvatar,
 } from '@/app/components/features/visitor-chat/avatar'
 import {
@@ -92,6 +99,12 @@ function shouldShowAvatar(cur: Message, next: Message | null): boolean {
   return next.sender_type !== cur.sender_type
 }
 
+function isCurrentNavigationReload(): boolean {
+  if (typeof performance === 'undefined') return false
+  const nav = performance.getEntriesByType('navigation')[0]
+  return Boolean(nav && 'type' in nav && (nav as PerformanceNavigationTiming).type === 'reload')
+}
+
 // ─── Reconstruct a Message object from assistant-ui state ───────
 
 function toOriginalMessage(
@@ -127,6 +140,11 @@ function toOriginalMessage(
     sender_avatar: meta?.senderAvatar ?? null,
     content_type: (meta?.contentType || 'text') as Message['content_type'],
     content,
+    is_recalled: meta?.isRecalled || meta?.metadata?.is_recalled === true,
+    recalled_at: meta?.recalledAt ?? null,
+    recalled_by_type: meta?.recalledByType ?? null,
+    recalled_by_id: meta?.recalledById ?? null,
+    recalled_by_name: meta?.recalledByName ?? null,
     metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
     created_at: message.createdAt?.toISOString() || new Date().toISOString(),
   }
@@ -295,6 +313,7 @@ function VisitorWelcomeBubble({
             <OpenAgentFAQMessage
               faq={faq}
               config={config}
+              reserveAvatarSpace={shouldShowAssistantAvatar('bot', config)}
               faqDisabled={faqDisabled}
               onFAQQuestionClick={onFAQQuestionClick}
             />
@@ -308,7 +327,8 @@ function VisitorWelcomeBubble({
     <WelcomeMessage
       content={message.content}
       config={config}
-      showAvatar={config.use_agent_avatar === true}
+      showAvatar={shouldShowAgentAvatar(null, config)}
+      avatarSrc={getAgentAvatarUrl(null, config)}
     />
   )
 }
@@ -349,8 +369,12 @@ function HistoryConversationBlock({
         const prev = idx > 0 ? conversation.messages[idx - 1] : null
         const next = idx < conversation.messages.length - 1 ? conversation.messages[idx + 1] : null
         const showAvatar = msg.sender_type === 'agent' || msg.sender_type === 'bot'
-          ? shouldShowAssistantAvatar(msg.sender_type, config)
+          ? shouldShowAssistantAvatar(msg, config)
           : shouldShowAvatar(msg, next)
+
+        if (msg.is_recalled && !shouldShowVisitorRecalledNotice(msg)) {
+          return null
+        }
 
         if (msg.sender_type === 'system') {
           if (isOpenAgentHandoffEventMessage(msg)) {
@@ -376,7 +400,11 @@ function HistoryConversationBlock({
         }
 
         return (
-          <div key={msg.id}>
+          <div
+            key={msg.id}
+            data-visitor-message-id={msg.id}
+            className="rounded-2xl transition-colors duration-300"
+          >
             {shouldShowTimestamp(msg, prev) && (
               <div className="py-2 text-center text-[10px] text-muted-foreground">
                 {formatTimestamp(new Date(msg.created_at), locale)}
@@ -390,6 +418,7 @@ function HistoryConversationBlock({
               locale={locale}
               messageStatus={msg.status}
               showTime={false}
+              allMessages={conversation.messages}
             />
           </div>
         )
@@ -481,6 +510,8 @@ export function VisitorThread({
   const [surveySubmitting, setSurveySubmitting] = useState(false)
   const [surveySuccess, setSurveySuccess] = useState(false)
   const [surveyError, setSurveyError] = useState<string | null>(null)
+  const [composerInsertRequest, setComposerInsertRequest] = useState<VisitorComposerInsertRequest | null>(null)
+  const [suppressAnnouncementAutoPopup] = useState(isCurrentNavigationReload)
   const sendButtonStyle = {
     '--opendesk-send-button-bg': config.send_button_bg_color || 'var(--color-primary)',
   } as CSSProperties
@@ -497,11 +528,6 @@ export function VisitorThread({
     () => getValidOpenAgentFAQ(channel.open_agent_welcome_message?.faq),
     [channel.open_agent_welcome_message?.faq],
   )
-  const hasConversationMessages = messages.some((msg) =>
-    msg.sender_type !== 'system'
-    && msg.content_type !== 'system'
-    && !isWelcomeLikeContentType(msg.content_type),
-  )
   const hasWelcomeMessage = messages.some((msg) => isWelcomeLikeContentType(msg.content_type))
   const hasLeaveMessagePromptMessage = messages.some((msg) => isLeaveMessagePromptMessage(msg))
   // Match the server-persisted prompt so the client preview and the server
@@ -517,13 +543,19 @@ export function VisitorThread({
     && !loadingMore
   const isOffline = Boolean(offlineMessage)
   const isQueued = conversationStatus === 'queued'
+  const hasQueueEnteredMessage = useMemo(
+    () => messages.some(isVisitorQueueEnteredMessage),
+    [messages],
+  )
+  const conversationEnded = ended || conversationStatus === 'closed'
   const showOpenAgentWelcomeMessage = !offlineMode
-    && !isQueued
+    && !conversationEnded
     && config.open_agent_enabled
     && openAgentWelcomeBlocks.length > 0
-    && !hasConversationMessages
     && !hasWelcomeMessage
     && !loadingMore
+  const showAnnouncement = Boolean(channel.announcement)
+    && !initializing
   const oldestHistoryId = historyConversations[0]?.conversation_public_id
   const showCurrentDivider =
     unreadReplyConversations.length > 0
@@ -578,6 +610,13 @@ export function VisitorThread({
       }
     })()
   }, [locale, onSatisfactionInitiate, satisfactionInvitation])
+
+  const requestComposerInsert = useCallback((request: Omit<VisitorComposerInsertRequest, 'id'>) => {
+    setComposerInsertRequest((prev) => ({
+      ...request,
+      id: (prev?.id || 0) + 1,
+    }))
+  }, [])
 
   const handleSubmitSatisfaction = async (payload: SatisfactionSubmissionPayload) => {
     if (!conversationPublicId || !visitorSessionToken) return
@@ -646,6 +685,13 @@ export function VisitorThread({
           onEmbedClose={onEmbedClose}
         />
       )}
+
+      <VisitorAnnouncement
+        announcement={channel.announcement}
+        visible={showAnnouncement}
+        locale={locale}
+        suppressAutoPopup={suppressAnnouncementAutoPopup}
+      />
 
       <ThreadPrimitive.Viewport
         ref={viewportRef}
@@ -798,7 +844,7 @@ export function VisitorThread({
           </div>
         ) : (
           <>
-            {isQueued && (
+            {isQueued && !hasQueueEnteredMessage && (
               <QueueStatusNotice
                 locale={locale}
                 html={config.queue_message}
@@ -812,7 +858,8 @@ export function VisitorThread({
                 <WelcomeMessage
                   content={initialPromptPlainText}
                   config={config}
-                  showAvatar={config.use_agent_avatar === true}
+                  showAvatar={shouldShowAgentAvatar(null, config)}
+                  avatarSrc={getAgentAvatarUrl(null, config)}
                 />
               </div>
             )}
@@ -841,24 +888,56 @@ export function VisitorThread({
               </button>
             )}
 
+            {showOpenAgentWelcomeMessage && (
+              <div className={msgCount === 0 ? 'py-2' : 'py-1'}>
+                <OpenAgentWelcomeMessage
+                  blocks={openAgentWelcomeBlocks}
+                  config={config}
+                  showAvatar={shouldShowAssistantAvatar('bot', config)}
+                  avatarSrc={getOpenAgentAvatarUrl(config)}
+                />
+                {openAgentFAQ && (
+                  <div className="mt-2">
+                    <OpenAgentFAQMessage
+                      faq={openAgentFAQ}
+                      config={config}
+                      reserveAvatarSpace={shouldShowAssistantAvatar('bot', config)}
+                      faqDisabled={botRunning || !conversationPublicId}
+                      onFAQQuestionClick={onAssistSendMessage}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* ── Messages (via assistant-ui) ── */}
             {msgCount > 0 && (
               <ThreadPrimitive.Messages>
                 {({ message }: { message: MessageState }) => {
                   const meta = message.metadata?.custom as VisitorMessageMeta | undefined
                   const original = toOriginalMessage(message, meta)
-                  const isWelcomeLikeMessage = (meta?.contentType && isWelcomeLikeContentType(meta.contentType))
-                    || isLeaveMessagePromptMessage(original)
+                  const isWelcomeMessage = isWelcomeLikeContentType(original.content_type)
+                  const isWelcomeLikeMessage = isWelcomeMessage || isLeaveMessagePromptMessage(original)
+                  const isQueueEnteredSystemMessage =
+                    message.role === 'system' && isVisitorQueueEnteredContent(original.content)
+                  const shouldHideEndedWelcomeMessage = conversationEnded && isWelcomeMessage
+                  const shouldHideAgentRecalledMessage =
+                    original.is_recalled && !shouldShowVisitorRecalledNotice(original)
+
+                  if (shouldHideAgentRecalledMessage) return null
 
                   return (
-                    <div>
+                    <div
+                      data-visitor-message-id={original.id}
+                      className="rounded-2xl transition-colors duration-300"
+                    >
                       {meta?.showTimestamp && message.createdAt && (
                         <div className="py-2 text-center text-[10px] text-muted-foreground">
                           {formatTimestamp(message.createdAt, locale)}
                         </div>
                       )}
 
-                      {isQueued && isWelcomeLikeMessage ? null : isWelcomeLikeMessage ? (
+                      {shouldHideEndedWelcomeMessage ? null : isWelcomeLikeMessage ? (
                         <VisitorWelcomeBubble
                           message={original}
                           config={config}
@@ -897,7 +976,16 @@ export function VisitorThread({
                             )
                           })()
                         ) : (
-                          <SystemMessage content={displaySystemMessageContent(original.content, original.metadata, locale)} />
+                          <>
+                            <SystemMessage content={displaySystemMessageContent(original.content, original.metadata, locale)} />
+                            {isQueued && isQueueEnteredSystemMessage && (
+                              <QueueStatusNotice
+                                locale={locale}
+                                html={config.queue_message}
+                                currentQueueCount={currentQueueCount}
+                              />
+                            )}
+                          </>
                         )
                       ) : (
                         <MessageBubble
@@ -909,33 +997,14 @@ export function VisitorThread({
                           messageStatus={meta?.messageStatus}
                           showTime={false}
                           renderAssistantParts
+                          allMessages={messages}
+                          onEditRecalledMessage={requestComposerInsert}
                         />
                       )}
                     </div>
                   )
                 }}
               </ThreadPrimitive.Messages>
-            )}
-
-            {showOpenAgentWelcomeMessage && (
-              <div className={msgCount === 0 ? 'py-2' : 'py-1'}>
-                <OpenAgentWelcomeMessage
-                  blocks={openAgentWelcomeBlocks}
-                  config={config}
-                  showAvatar={shouldShowAssistantAvatar('bot', config)}
-                  avatarSrc={getOpenAgentAvatarUrl(config)}
-                />
-                {openAgentFAQ && (
-                  <div className="mt-2">
-                    <OpenAgentFAQMessage
-                      faq={openAgentFAQ}
-                      config={config}
-                      faqDisabled={botRunning || !conversationPublicId}
-                      onFAQQuestionClick={onAssistSendMessage}
-                    />
-                  </div>
-                )}
-              </div>
             )}
 
             {/* ── Typing indicator ── */}
@@ -945,8 +1014,8 @@ export function VisitorThread({
                 agentBubbleTextColor={config.agent_bubble_text_color || undefined}
                 agentBubbleRadius={config.agent_bubble_radius}
                 agentBubbleBorder={config.agent_bubble_border_color || undefined}
-                showAvatar={config.use_agent_avatar === true}
-                agentAvatar={typingAgent.avatar}
+                showAvatar={shouldShowAgentAvatar(typingAgent.avatar, config)}
+                agentAvatar={getAgentAvatarUrl(typingAgent.avatar, config)}
                 agentName={typingAgent.name}
                 locale={locale}
               />
@@ -1013,10 +1082,11 @@ export function VisitorThread({
             onRestartConversation={onRestartConversation}
           />
         ) : (
-              <VisitorComposer
+          <VisitorComposer
             disabled={false}
             isMobile={isMobile}
             isEmbed={isEmbed}
+            insertRequest={composerInsertRequest}
             showSatisfactionButton={showComposerSatisfactionButton}
             satisfactionLoading={satisfactionLoading}
             onSatisfactionClick={handleComposerSatisfactionClick}

@@ -1,7 +1,7 @@
 'use client'
 
-import { useState, useCallback, useMemo } from 'react'
-import { IconSearch, IconLoader2, IconCalendar, IconChevronDown, IconChevronRight } from '@tabler/icons-react'
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react'
+import { IconSearch, IconLoader2, IconCalendar, IconChevronDown, IconChevronRight, IconColumns3 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
@@ -11,25 +11,14 @@ import { useSatisfactionFilterOptions } from '@/service/use-satisfaction-survey'
 import { useAuthStore } from '@/context/auth-store'
 import { getDataScope } from '@/utils/permissions'
 import { DateInput } from '@/components/ui/time-input'
-import type { BotHandoffStatus, SessionRecord, SessionRecordFilters, SessionRecordType } from '@/models/session-record'
+import { WorkspaceColumnsDrawer, type WorkspaceColumnConfigItem } from '@/components/workspace/columns-drawer'
+import { formatSessionDuration } from './session-duration'
+import type { BotHandoffStatus, QueueResult, SessionRecord, SessionRecordFilters, SessionRecordType } from '@/models/session-record'
 
 function formatDateTime(dateStr: string | null): string {
   if (!dateStr) return '-'
   const d = new Date(dateStr)
   return d.toLocaleString('sv-SE').replace('T', ' ')
-}
-
-function formatDuration(startStr: string | null, endStr: string | null): string {
-  if (!startStr) return '-'
-  const start = new Date(startStr).getTime()
-  const end = endStr ? new Date(endStr).getTime() : Date.now()
-  const diff = Math.max(0, Math.floor((end - start) / 1000))
-  const h = Math.floor(diff / 3600)
-  const m = Math.floor((diff % 3600) / 60)
-  const s = diff % 60
-  const mm = String(m).padStart(2, '0')
-  const ss = String(s).padStart(2, '0')
-  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
 }
 
 function formatQueueDuration(seconds: number | null): string {
@@ -40,6 +29,51 @@ function formatQueueDuration(seconds: number | null): string {
   const mm = String(m).padStart(2, '0')
   const ss = String(s).padStart(2, '0')
   return h > 0 ? `${String(h).padStart(2, '0')}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
+function formatSeconds(seconds: number | null): string {
+  if (seconds == null || seconds < 0) return '-'
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = seconds % 60
+  const mm = String(m).padStart(2, '0')
+  const ss = String(s).padStart(2, '0')
+  return h > 0 ? `${String(h).padStart(2, '0')}:${mm}:${ss}` : `${mm}:${ss}`
+}
+
+function formatCount(value: number | null | undefined): string {
+  return value == null ? '-' : String(value)
+}
+
+const ENDED_BY_LABEL_KEYS = new Set(['agent', 'visitor', 'bot_timeout', 'system_timeout'])
+
+function endedByLabel(value: string | null, locale: Locale): string {
+  if (!value) return '-'
+  if (ENDED_BY_LABEL_KEYS.has(value)) return t(`ws.records.sessions.endedBy.${value}`, locale)
+  return value
+}
+
+function receptionFinalAgentName(record: SessionRecord): string {
+  if (record.reception_final_agent_id == null) return '-'
+  const match = record.reception_participants.find((p) => p.agent_id === record.reception_final_agent_id)
+  return match?.name || `#${record.reception_final_agent_id}`
+}
+
+function ReceptionParticipantsCell({ record, locale }: { record: SessionRecord; locale: Locale }) {
+  const participants = record.reception_participants
+  if (!participants.length) return <span>-</span>
+  const head = participants.slice(0, 2).map((p) => p.name || `#${p.agent_id}`)
+  const extra = participants.length - head.length
+  return (
+    <span className="truncate">
+      {head.join('、')}
+      {extra > 0 && (
+        <span className="ml-1 text-xs text-muted-foreground">
+          {t('ws.records.sessions.col.receptionParticipantsMore', locale).replace('{count}', String(extra))}
+        </span>
+      )}
+    </span>
+  )
 }
 
 function QueueNameCell({
@@ -78,6 +112,14 @@ const botHandoffClassName: Record<BotHandoffStatus, string> = {
   dismissed: 'bg-muted text-muted-foreground',
 }
 
+const queueResultClassName: Record<QueueResult, string> = {
+  assigned: 'bg-success/10 text-success',
+  canceled: 'bg-muted text-muted-foreground',
+  timeout: 'bg-warning/10 text-warning',
+  waiting: 'bg-warning/10 text-warning',
+  failed: 'bg-destructive/10 text-destructive',
+}
+
 function StatusBadge({ label, className }: { label: string; className: string }) {
   return (
     <span className={cn('inline-flex whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium', className)}>
@@ -102,6 +144,34 @@ function BotHandoffBadge({ value, locale }: { value: BotHandoffStatus | null; lo
     <StatusBadge
       label={t(`ws.records.sessions.botHandoff.${value}`, locale)}
       className={botHandoffClassName[value]}
+    />
+  )
+}
+
+function QueueResultBadge({ value, locale }: { value: QueueResult | null; locale: Locale }) {
+  if (!value) return <span className="text-sm text-muted-foreground">-</span>
+  return (
+    <StatusBadge
+      label={t(`ws.records.sessions.queueResult.${value}`, locale)}
+      className={queueResultClassName[value]}
+    />
+  )
+}
+
+const sessionStatusClassName: Record<SessionRecord['status'], string> = {
+  queued: 'bg-warning/10 text-warning',
+  active: 'bg-success/10 text-success',
+  bot: 'bg-info/10 text-info',
+  handoff_pending: 'bg-warning/10 text-warning',
+  closed: 'bg-muted text-muted-foreground',
+}
+
+function SessionStatusBadge({ value, locale }: { value: SessionRecord['status']; locale: Locale }) {
+  if (!value) return <span className="text-sm text-muted-foreground">-</span>
+  return (
+    <StatusBadge
+      label={t(`ws.records.sessions.status.${value}`, locale)}
+      className={sessionStatusClassName[value] ?? 'bg-muted text-muted-foreground'}
     />
   )
 }
@@ -140,6 +210,343 @@ function SatisfactionSummaryCell({ record, locale }: { record: SessionRecord; lo
   )
 }
 
+// ── Column definitions ──
+// Fixed session-record columns. Each entry owns its header label, cell styling
+// and render logic so the table body can be driven by a visibility/order config.
+
+type SessionColumnDef = {
+  key: string
+  labelKey: string
+  thClass: string
+  tdClass: string
+  /** Whether the column is shown by default (when the user has no saved override). */
+  defaultVisible?: boolean
+  render: (record: SessionRecord, locale: Locale) => React.ReactNode
+}
+
+const SESSION_COLUMN_DEFS: SessionColumnDef[] = [
+  {
+    key: 'visitor',
+    labelKey: 'ws.records.sessions.col.visitor',
+    thClass: '',
+    tdClass: 'text-foreground',
+    render: (record) => record.visitor?.name || '-',
+  },
+  {
+    key: 'shareCode',
+    labelKey: 'ws.records.sessions.col.shareCode',
+    thClass: 'w-[120px]',
+    tdClass: 'font-mono text-muted-foreground',
+    render: (record) => record.share_code || record.public_id || '-',
+  },
+  {
+    key: 'sessionType',
+    labelKey: 'ws.records.sessions.col.sessionType',
+    thClass: 'w-[96px]',
+    tdClass: '',
+    render: (record, locale) => <SessionTypeBadge value={record.session_type} locale={locale} />,
+  },
+  {
+    key: 'botHandoff',
+    labelKey: 'ws.records.sessions.col.botHandoff',
+    thClass: 'w-[160px]',
+    tdClass: '',
+    render: (record, locale) => <BotHandoffBadge value={record.bot_handoff_status} locale={locale} />,
+  },
+  {
+    key: 'channelType',
+    labelKey: 'ws.records.sessions.col.channelType',
+    thClass: 'w-[100px]',
+    tdClass: 'text-muted-foreground',
+    render: (record) => record.channel?.channel_type || '-',
+  },
+  {
+    key: 'channelName',
+    labelKey: 'ws.records.sessions.col.channelName',
+    thClass: 'w-[150px]',
+    tdClass: 'text-muted-foreground',
+    render: (record) => record.channel?.name || '-',
+  },
+  {
+    key: 'lastAssignedQueue',
+    labelKey: 'ws.records.sessions.col.lastAssignedQueue',
+    thClass: 'w-[160px]',
+    tdClass: 'max-w-[160px] text-muted-foreground',
+    render: (record, locale) => <QueueNameCell queue={record.last_assigned_queue} locale={locale} />,
+  },
+  {
+    key: 'queueDuration',
+    labelKey: 'ws.records.sessions.col.queueDuration',
+    thClass: 'w-[110px]',
+    tdClass: 'font-mono text-muted-foreground',
+    render: (record) => formatQueueDuration(record.queue_duration_seconds),
+  },
+  {
+    key: 'hasQueue',
+    labelKey: 'ws.records.sessions.col.hasQueue',
+    thClass: 'w-[92px]',
+    tdClass: 'text-muted-foreground',
+    render: (record, locale) =>
+      record.has_queue
+        ? t('ws.records.sessions.hasQueue.yes', locale)
+        : t('ws.records.sessions.hasQueue.no', locale),
+  },
+  {
+    key: 'queueResult',
+    labelKey: 'ws.records.sessions.col.queueResult',
+    thClass: 'w-[110px]',
+    tdClass: '',
+    render: (record, locale) => <QueueResultBadge value={record.queue_result} locale={locale} />,
+  },
+  {
+    key: 'queueEnteredAt',
+    labelKey: 'ws.records.sessions.col.queueEnteredAt',
+    thClass: 'min-w-[170px] whitespace-nowrap',
+    tdClass: 'min-w-[170px] whitespace-nowrap text-muted-foreground',
+    render: (record) => formatDateTime(record.queue_entered_at),
+  },
+  {
+    key: 'queueAssignedAt',
+    labelKey: 'ws.records.sessions.col.queueAssignedAt',
+    thClass: 'min-w-[170px] whitespace-nowrap',
+    tdClass: 'min-w-[170px] whitespace-nowrap text-muted-foreground',
+    render: (record) => formatDateTime(record.queue_assigned_at),
+  },
+  {
+    key: 'agent',
+    labelKey: 'ws.records.sessions.col.agent',
+    thClass: 'w-[120px]',
+    tdClass: 'text-muted-foreground',
+    render: (record) => record.agent?.display_name || record.agent?.name || '-',
+  },
+  {
+    key: 'satisfaction',
+    labelKey: 'ws.records.sessions.col.satisfaction',
+    thClass: 'w-[180px]',
+    tdClass: '',
+    render: (record, locale) => <SatisfactionSummaryCell record={record} locale={locale} />,
+  },
+  {
+    key: 'startTime',
+    labelKey: 'ws.records.sessions.col.startTime',
+    thClass: 'min-w-[170px] whitespace-nowrap',
+    tdClass: 'min-w-[170px] whitespace-nowrap text-muted-foreground',
+    render: (record) => formatDateTime(record.started_at),
+  },
+  {
+    key: 'endTime',
+    labelKey: 'ws.records.sessions.col.endTime',
+    thClass: 'min-w-[170px] whitespace-nowrap',
+    tdClass: 'min-w-[170px] whitespace-nowrap text-muted-foreground',
+    render: (record, locale) =>
+      record.ended_at ? (
+        formatDateTime(record.ended_at)
+      ) : (
+        <span className="inline-flex items-center rounded-full bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
+          {t('ws.records.sessions.status.active', locale)}
+        </span>
+      ),
+  },
+  {
+    key: 'duration',
+    labelKey: 'ws.records.sessions.col.duration',
+    thClass: 'w-[100px]',
+    tdClass: 'text-muted-foreground',
+    render: (record) => formatSessionDuration(record),
+  },
+  // Fields exposed by the API but hidden by default — toggle on via the column drawer.
+  {
+    key: 'status',
+    labelKey: 'ws.records.sessions.col.status',
+    thClass: 'w-[110px]',
+    tdClass: '',
+    defaultVisible: false,
+    render: (record, locale) => <SessionStatusBadge value={record.status} locale={locale} />,
+  },
+  {
+    key: 'firstResponse',
+    labelKey: 'ws.records.sessions.col.firstResponse',
+    thClass: 'w-[120px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatSeconds(record.first_human_response_seconds),
+  },
+  {
+    key: 'agentResponseCount',
+    labelKey: 'ws.records.sessions.col.agentResponseCount',
+    thClass: 'w-[110px]',
+    tdClass: 'text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => (record.agent_response_count == null ? '-' : String(record.agent_response_count)),
+  },
+  {
+    key: 'agentAvgResponse',
+    labelKey: 'ws.records.sessions.col.agentAvgResponse',
+    thClass: 'w-[120px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatSeconds(record.agent_avg_response_seconds),
+  },
+  {
+    key: 'messageCount',
+    labelKey: 'ws.records.sessions.col.messageCount',
+    thClass: 'w-[110px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.message_count),
+  },
+  {
+    key: 'visitorMessageCount',
+    labelKey: 'ws.records.sessions.col.visitorMessageCount',
+    thClass: 'w-[120px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.visitor_message_count),
+  },
+  {
+    key: 'agentMessageCount',
+    labelKey: 'ws.records.sessions.col.agentMessageCount',
+    thClass: 'w-[120px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.agent_message_count),
+  },
+  {
+    key: 'botPhaseMessageCount',
+    labelKey: 'ws.records.sessions.col.botPhaseMessageCount',
+    thClass: 'w-[150px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.bot_phase_message_count),
+  },
+  {
+    key: 'humanPhaseMessageCount',
+    labelKey: 'ws.records.sessions.col.humanPhaseMessageCount',
+    thClass: 'w-[150px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.human_phase_message_count),
+  },
+  {
+    key: 'humanPhaseVisitorMessageCount',
+    labelKey: 'ws.records.sessions.col.humanPhaseVisitorMessageCount',
+    thClass: 'w-[170px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.human_phase_visitor_message_count),
+  },
+  {
+    key: 'humanPhaseAgentMessageCount',
+    labelKey: 'ws.records.sessions.col.humanPhaseAgentMessageCount',
+    thClass: 'w-[170px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.human_phase_agent_message_count),
+  },
+  {
+    key: 'createdAt',
+    labelKey: 'ws.records.sessions.col.createdAt',
+    thClass: 'min-w-[170px] whitespace-nowrap',
+    tdClass: 'min-w-[170px] whitespace-nowrap text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatDateTime(record.created_at),
+  },
+  {
+    key: 'endedBy',
+    labelKey: 'ws.records.sessions.col.endedBy',
+    thClass: 'w-[110px]',
+    tdClass: 'text-muted-foreground',
+    defaultVisible: false,
+    render: (record, locale) => endedByLabel(record.ended_by, locale),
+  },
+  {
+    key: 'visitorSystem',
+    labelKey: 'ws.records.sessions.col.visitorSystem',
+    thClass: 'w-[130px]',
+    tdClass: 'text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => record.visitor_system || '-',
+  },
+  {
+    key: 'visitorBrowser',
+    labelKey: 'ws.records.sessions.col.visitorBrowser',
+    thClass: 'w-[130px]',
+    tdClass: 'text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => record.visitor_browser || '-',
+  },
+  {
+    key: 'visitorIp',
+    labelKey: 'ws.records.sessions.col.visitorIp',
+    thClass: 'w-[130px]',
+    tdClass: 'text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => record.visitor_ip || '-',
+  },
+  {
+    key: 'receptionSegmentCount',
+    labelKey: 'ws.records.sessions.col.receptionSegmentCount',
+    thClass: 'w-[110px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.reception_segment_count),
+  },
+  {
+    key: 'receptionTransferCount',
+    labelKey: 'ws.records.sessions.col.receptionTransferCount',
+    thClass: 'w-[110px]',
+    tdClass: 'font-mono text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => formatCount(record.reception_transfer_count),
+  },
+  {
+    key: 'receptionParticipants',
+    labelKey: 'ws.records.sessions.col.receptionParticipants',
+    thClass: 'w-[180px]',
+    tdClass: 'max-w-[180px] text-muted-foreground',
+    defaultVisible: false,
+    render: (record, locale) => <ReceptionParticipantsCell record={record} locale={locale} />,
+  },
+  {
+    key: 'receptionFinalAgent',
+    labelKey: 'ws.records.sessions.col.receptionFinalAgent',
+    thClass: 'w-[130px]',
+    tdClass: 'text-muted-foreground',
+    defaultVisible: false,
+    render: (record) => receptionFinalAgentName(record),
+  },
+]
+
+// ── localStorage helpers for personal column config (per tenant) ──
+
+const COL_STORAGE_PREFIX = 'ws_session_cols_'
+
+function getColStorageKey(tenantId: number | null): string {
+  return `${COL_STORAGE_PREFIX}${tenantId ?? 'unknown'}`
+}
+
+function readColsFromStorage(tenantId: number | null): WorkspaceColumnConfigItem[] | null {
+  try {
+    const raw = localStorage.getItem(getColStorageKey(tenantId))
+    if (!raw) return null
+    return JSON.parse(raw) as WorkspaceColumnConfigItem[]
+  } catch {
+    return null
+  }
+}
+
+function writeColsToStorage(tenantId: number | null, cols: WorkspaceColumnConfigItem[]): void {
+  try {
+    localStorage.setItem(getColStorageKey(tenantId), JSON.stringify(cols))
+  } catch { /* quota exceeded – ignore */ }
+}
+
+function removeColsFromStorage(tenantId: number | null): void {
+  try {
+    localStorage.removeItem(getColStorageKey(tenantId))
+  } catch { /* ignore */ }
+}
+
 type Props = {
   onSelectRecord: (record: SessionRecord) => void
 }
@@ -152,6 +559,70 @@ export function SessionTable({ onSelectRecord }: Props) {
   const sessionScope = getDataScope(user, 'session_record')
   const canFilterByAgent = sessionScope === 'all' || sessionScope === 'group'
   const userGroupIds = useMemo(() => new Set(user?.group_ids ?? []), [user?.group_ids])
+  const tenantId = user?.tenant_id ?? null
+
+  // Column visibility/order — persisted per tenant in localStorage.
+  const [columnsDrawerOpen, setColumnsDrawerOpen] = useState(false)
+  const [columnOverrides, setColumnOverrides] = useState<WorkspaceColumnConfigItem[] | null>(null)
+  const colInitRef = useRef(false)
+  useEffect(() => {
+    if (colInitRef.current) return
+    colInitRef.current = true
+    setColumnOverrides(readColsFromStorage(tenantId))
+  }, [tenantId])
+  const hasColumnOverride = columnOverrides !== null
+
+  const columnFields = useMemo(
+    () => SESSION_COLUMN_DEFS.map((c) => ({ id: null, key: c.key, name: t(c.labelKey, locale) })),
+    [locale],
+  )
+  const defaultColumnConfig = useMemo<WorkspaceColumnConfigItem[]>(
+    () => SESSION_COLUMN_DEFS.map((c, i) => ({
+      field_id: null,
+      field_key: c.key,
+      visible: c.defaultVisible !== false,
+      sort_order: i,
+    })),
+    [],
+  )
+  // Reconcile a saved override against the current column defs: append any
+  // column keys missing from the saved config (e.g. newly shipped columns) as
+  // hidden so they still surface in the column drawer instead of disappearing.
+  const reconciledOverrides = useMemo<WorkspaceColumnConfigItem[] | null>(() => {
+    if (!columnOverrides) return null
+    const savedKeys = new Set(columnOverrides.map((c) => c.field_key))
+    const missing = SESSION_COLUMN_DEFS.filter((c) => !savedKeys.has(c.key))
+    if (missing.length === 0) return columnOverrides
+    const base = columnOverrides.reduce((max, c) => Math.max(max, c.sort_order), -1)
+    return [
+      ...columnOverrides,
+      ...missing.map((c, i) => ({
+        field_id: null,
+        field_key: c.key,
+        visible: false,
+        sort_order: base + 1 + i,
+      })),
+    ]
+  }, [columnOverrides])
+
+  const visibleColumns = useMemo<SessionColumnDef[]>(() => {
+    if (!reconciledOverrides) return SESSION_COLUMN_DEFS.filter((c) => c.defaultVisible !== false)
+    const defByKey = new Map(SESSION_COLUMN_DEFS.map((c) => [c.key, c]))
+    return reconciledOverrides
+      .filter((c) => c.visible && c.field_key != null && defByKey.has(c.field_key))
+      .sort((a, b) => a.sort_order - b.sort_order)
+      .map((c) => defByKey.get(c.field_key as string) as SessionColumnDef)
+  }, [reconciledOverrides])
+
+  const handleApplyColumns = useCallback((cols: WorkspaceColumnConfigItem[]) => {
+    setColumnOverrides(cols)
+    writeColsToStorage(tenantId, cols)
+  }, [tenantId])
+
+  const handleResetColumns = useCallback(() => {
+    setColumnOverrides(null)
+    removeColsFromStorage(tenantId)
+  }, [tenantId])
 
   const now = new Date()
   const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
@@ -167,6 +638,7 @@ export function SessionTable({ onSelectRecord }: Props) {
   const [draftEndDate, setDraftEndDate] = useState(now.toISOString().slice(0, 10))
   const [draftAgentId, setDraftAgentId] = useState<number | undefined>(undefined)
   const [draftSessionType, setDraftSessionType] = useState<SessionRecordType | ''>('')
+  const [draftHasQueue, setDraftHasQueue] = useState<'true' | 'false' | ''>('')
   const [draftSatisfactionStatus, setDraftSatisfactionStatus] = useState('')
   const [draftResolved, setDraftResolved] = useState('')
   const [draftServiceOption, setDraftServiceOption] = useState('')
@@ -208,6 +680,7 @@ export function SessionTable({ onSelectRecord }: Props) {
       end_date: draftEndDate ? new Date(draftEndDate + 'T23:59:59').toISOString() : undefined,
       agent_id: draftAgentId,
       session_type: draftSessionType || undefined,
+      has_queue: draftHasQueue ? draftHasQueue === 'true' : undefined,
       keyword: draftKeyword || undefined,
       satisfaction_status: draftSatisfactionStatus || undefined,
       satisfaction_resolved: draftResolved || undefined,
@@ -216,7 +689,7 @@ export function SessionTable({ onSelectRecord }: Props) {
       satisfaction_product_option: draftProductOption || undefined,
       satisfaction_product_label: draftProductLabel || undefined,
     })
-  }, [filters, draftStartDate, draftEndDate, draftAgentId, draftSessionType, draftKeyword, draftSatisfactionStatus, draftResolved, draftServiceOption, draftServiceLabel, draftProductOption, draftProductLabel])
+  }, [filters, draftStartDate, draftEndDate, draftAgentId, draftSessionType, draftHasQueue, draftKeyword, draftSatisfactionStatus, draftResolved, draftServiceOption, draftServiceLabel, draftProductOption, draftProductLabel])
 
   const handleReset = useCallback(() => {
     const resetStart = sevenDaysAgo.toISOString().slice(0, 10)
@@ -226,6 +699,7 @@ export function SessionTable({ onSelectRecord }: Props) {
     setDraftEndDate(resetEnd)
     setDraftAgentId(undefined)
     setDraftSessionType('')
+    setDraftHasQueue('')
     setDraftSatisfactionStatus('')
     setDraftResolved('')
     setDraftServiceOption('')
@@ -257,6 +731,7 @@ export function SessionTable({ onSelectRecord }: Props) {
     filters.keyword
     || filters.agent_id
     || filters.session_type
+    || filters.has_queue !== undefined
     || filters.satisfaction_status
     || filters.satisfaction_resolved
     || filters.satisfaction_service_option
@@ -268,7 +743,8 @@ export function SessionTable({ onSelectRecord }: Props) {
   return (
     <div className="flex h-full min-w-0 flex-col">
       {/* Filter bar — horizontal padding matches .pen Content Area (24px) */}
-      <div className="flex shrink-0 flex-wrap items-end gap-3 px-6 py-4">
+      <div className="flex shrink-0 items-end gap-3 px-6 py-4">
+        <div className="flex min-w-0 flex-1 flex-wrap items-end gap-3">
         {/* Date range — single grouped control (Date Range Picker) */}
         <div className="flex flex-col gap-1.5">
           <span className="text-xs text-muted-foreground" id="session-records-date-range-label">
@@ -328,6 +804,21 @@ export function SessionTable({ onSelectRecord }: Props) {
             <option value="human">{t('ws.records.sessions.sessionType.human', locale)}</option>
             <option value="bot">{t('ws.records.sessions.sessionType.bot', locale)}</option>
             <option value="bot_human">{t('ws.records.sessions.sessionType.bot_human', locale)}</option>
+          </select>
+        </div>
+
+        <div className="flex flex-col gap-1">
+          <label className="text-xs text-muted-foreground">
+            {t('ws.records.sessions.filter.hasQueue', locale)}
+          </label>
+          <select
+            value={draftHasQueue}
+            onChange={(e) => setDraftHasQueue(e.target.value as 'true' | 'false' | '')}
+            className="h-9 min-w-[120px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+          >
+            <option value="">{t('ws.records.sessions.filter.all', locale)}</option>
+            <option value="true">{t('ws.records.sessions.hasQueue.yes', locale)}</option>
+            <option value="false">{t('ws.records.sessions.hasQueue.no', locale)}</option>
           </select>
         </div>
 
@@ -495,6 +986,21 @@ export function SessionTable({ onSelectRecord }: Props) {
             {t('ws.records.sessions.filter.reset', locale)}
           </button>
         </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setColumnsDrawerOpen(true)}
+          className={cn(
+            'flex h-9 shrink-0 items-center gap-1.5 rounded-md border px-3 text-sm transition-colors',
+            hasColumnOverride
+              ? 'border-border bg-muted text-foreground hover:bg-muted/80'
+              : 'border-border bg-background text-foreground hover:bg-accent',
+          )}
+        >
+          <IconColumns3 size={16} />
+          {locale === 'zh' ? '列字段' : 'Columns'}
+        </button>
       </div>
 
       {/* Table — outer frame + horizontal inset so rules do not run flush to the card edges (.pen) */}
@@ -517,101 +1023,53 @@ export function SessionTable({ onSelectRecord }: Props) {
               <table className="w-max min-w-full border-separate border-spacing-0 table-auto">
                 <thead>
                   <tr>
-                <th className="sticky top-0 z-10 rounded-tl-lg border-b border-border bg-muted py-3 pl-4 pr-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.visitor', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[120px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.shareCode', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[96px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.sessionType', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[160px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.botHandoff', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[100px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.channelType', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[150px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.channelName', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[160px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.lastAssignedQueue', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[110px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.queueDuration', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[120px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.agent', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[180px] border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.satisfaction', locale)}
-                </th>
-                <th className="sticky top-0 z-10 min-w-[170px] whitespace-nowrap border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.startTime', locale)}
-                </th>
-                <th className="sticky top-0 z-10 min-w-[170px] whitespace-nowrap border-b border-border bg-muted px-3 py-3 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.endTime', locale)}
-                </th>
-                <th className="sticky top-0 z-10 w-[100px] rounded-tr-lg border-b border-border bg-muted py-3 pl-3 pr-4 text-left text-xs font-semibold text-muted-foreground">
-                  {t('ws.records.sessions.col.duration', locale)}
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((record) => (
-                <tr
-                  key={record.id}
-                  onClick={(e) => handleRowClick(record, e)}
-                  className="cursor-pointer transition-colors hover:bg-accent/30"
-                >
-                  <td className="border-b border-border py-3 pl-4 pr-3 text-sm text-foreground">
-                    {record.visitor?.name || '-'}
-                  </td>
-                  <td className="border-b border-border px-3 py-3 font-mono text-sm text-muted-foreground">
-                    {record.share_code || record.public_id || '-'}
-                  </td>
-                  <td className="border-b border-border px-3 py-3">
-                    <SessionTypeBadge value={record.session_type} locale={locale} />
-                  </td>
-                  <td className="border-b border-border px-3 py-3">
-                    <BotHandoffBadge value={record.bot_handoff_status} locale={locale} />
-                  </td>
-                  <td className="border-b border-border px-3 py-3 text-sm text-muted-foreground">
-                    {record.channel?.channel_type || '-'}
-                  </td>
-                  <td className="border-b border-border px-3 py-3 text-sm text-muted-foreground">
-                    {record.channel?.name || '-'}
-                  </td>
-                  <td className="max-w-[160px] border-b border-border px-3 py-3 text-sm text-muted-foreground">
-                    <QueueNameCell queue={record.last_assigned_queue} locale={locale} />
-                  </td>
-                  <td className="border-b border-border px-3 py-3 font-mono text-sm text-muted-foreground">
-                    {formatQueueDuration(record.queue_duration_seconds)}
-                  </td>
-                  <td className="border-b border-border px-3 py-3 text-sm text-muted-foreground">
-                    {record.agent?.display_name || record.agent?.name || '-'}
-                  </td>
-                  <td className="border-b border-border px-3 py-3">
-                    <SatisfactionSummaryCell record={record} locale={locale} />
-                  </td>
-                  <td className="min-w-[170px] whitespace-nowrap border-b border-border px-3 py-3 text-sm text-muted-foreground">
-                    {formatDateTime(record.started_at)}
-                  </td>
-                  <td className="min-w-[170px] whitespace-nowrap border-b border-border px-3 py-3 text-sm text-muted-foreground">
-                    {record.ended_at
-                      ? formatDateTime(record.ended_at)
-                      : (
-                        <span className="inline-flex items-center rounded-full bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
-                          {t('ws.records.sessions.status.active', locale)}
-                        </span>
-                      )}
-                  </td>
-                  <td className="border-b border-border py-3 pl-3 pr-4 text-sm text-muted-foreground">
-                    {formatDuration(record.started_at, record.ended_at)}
-                  </td>
-                </tr>
-              ))}
+                    {visibleColumns.map((col, idx) => {
+                      const isFirst = idx === 0
+                      const isLast = idx === visibleColumns.length - 1
+                      return (
+                        <th
+                          key={col.key}
+                          className={cn(
+                            'sticky top-0 z-10 border-b border-border bg-muted py-3 text-left text-xs font-semibold text-muted-foreground',
+                            isFirst ? 'pl-4' : 'pl-3',
+                            isLast ? 'pr-4' : 'pr-3',
+                            isFirst && 'rounded-tl-lg',
+                            isLast && 'rounded-tr-lg',
+                            col.thClass,
+                          )}
+                        >
+                          {t(col.labelKey, locale)}
+                        </th>
+                      )
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map((record) => (
+                    <tr
+                      key={record.id}
+                      onClick={(e) => handleRowClick(record, e)}
+                      className="cursor-pointer transition-colors hover:bg-accent/30"
+                    >
+                      {visibleColumns.map((col, idx) => {
+                        const isFirst = idx === 0
+                        const isLast = idx === visibleColumns.length - 1
+                        return (
+                          <td
+                            key={col.key}
+                            className={cn(
+                              'border-b border-border py-3 text-sm',
+                              isFirst ? 'pl-4' : 'pl-3',
+                              isLast ? 'pr-4' : 'pr-3',
+                              col.tdClass,
+                            )}
+                          >
+                            {col.render(record, locale)}
+                          </td>
+                        )
+                      })}
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             )}
@@ -665,6 +1123,18 @@ export function SessionTable({ onSelectRecord }: Props) {
             </div>
           </div>
         </div>
+      )}
+
+      {columnsDrawerOpen && (
+        <WorkspaceColumnsDrawer
+          locale={locale}
+          fields={columnFields}
+          baselineConfig={defaultColumnConfig}
+          currentOverride={reconciledOverrides}
+          onApply={handleApplyColumns}
+          onReset={handleResetColumns}
+          onClose={() => setColumnsDrawerOpen(false)}
+        />
       )}
     </div>
   )

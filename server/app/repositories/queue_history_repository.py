@@ -57,6 +57,26 @@ class QueueHistoryRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def list_events_for_tasks(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        task_ids: list[int],
+    ) -> list[QueueAssignmentEvent]:
+        """All assignment events for the given tasks, ordered by created_at."""
+        if not task_ids:
+            return []
+        result = await db.execute(
+            select(QueueAssignmentEvent)
+            .where(
+                QueueAssignmentEvent.tenant_id == tenant_id,
+                QueueAssignmentEvent.task_id.in_(task_ids),
+            )
+            .order_by(QueueAssignmentEvent.created_at.asc(), QueueAssignmentEvent.id.asc())
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
     async def current_queue_names(
         db: AsyncSession,
         tenant_id: int,

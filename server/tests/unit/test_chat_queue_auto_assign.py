@@ -130,6 +130,39 @@ async def test_connect_auto_assign_uses_queue_service(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_assign_skips_when_agent_is_at_capacity(monkeypatch):
+    db = SimpleNamespace()
+    rt = SimpleNamespace(emit=AsyncMock())
+    r = SimpleNamespace()
+    get_queued = AsyncMock(return_value=[_conversation()])
+    pull_next = AsyncMock()
+
+    monkeypatch.setattr(chat_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(
+        chat_handlers.AgentStatusService,
+        "get_status",
+        AsyncMock(return_value={"status": "online", "current_count": 1, "max_concurrent": 1}),
+    )
+
+    from app.repositories.conversation_repository import ConversationRepository
+    from app.repositories.employee_repository import EmployeeRepository
+    from app.services.queue_service import QueueTaskService
+
+    monkeypatch.setattr(
+        EmployeeRepository,
+        "get_by_id",
+        AsyncMock(return_value=SimpleNamespace(id=20, max_concurrent=1)),
+    )
+    monkeypatch.setattr(ConversationRepository, "get_queued_by_tenant", get_queued)
+    monkeypatch.setattr(QueueTaskService, "pull_next", pull_next)
+
+    await chat_handlers._assign_queued_conversations(rt, r, tenant_id=1, agent_id=20)
+
+    get_queued.assert_not_awaited()
+    pull_next.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_join_conversation_validates_access_and_joins_room(monkeypatch):
     db = SimpleNamespace()
     rt = _RealtimeHarness()
@@ -187,10 +220,12 @@ async def _invoke_update_status(monkeypatch, status: str, backfill: AsyncMock):
     db = SimpleNamespace()
     rt = _RealtimeHarness(session={"user_id": 10, "tenant_id": 1})
     redis_stub = SimpleNamespace(client=SimpleNamespace())
+    set_status = AsyncMock()
+    count_active = AsyncMock(return_value=1)
 
     monkeypatch.setattr(chat_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
     monkeypatch.setattr(chat_handlers, "redis_client", redis_stub)
-    monkeypatch.setattr(chat_handlers.AgentStatusService, "set_status", AsyncMock())
+    monkeypatch.setattr(chat_handlers.AgentStatusService, "set_status", set_status)
     monkeypatch.setattr(
         chat_handlers.AgentStatusService,
         "get_status",
@@ -206,26 +241,52 @@ async def _invoke_update_status(monkeypatch, status: str, backfill: AsyncMock):
         AsyncMock(return_value=SimpleNamespace(max_concurrent=4)),
     )
 
+    from app.repositories.conversation_repository import ConversationRepository
+
+    monkeypatch.setattr(ConversationRepository, "count_active_by_agent", count_active)
+
     chat_handlers.register_chat_handlers(rt)
     response = await rt.handlers[("/chat", "update_status")]("sid-1", {"status": status})
-    return response, rt, redis_stub
+    return SimpleNamespace(
+        response=response,
+        rt=rt,
+        redis_stub=redis_stub,
+        set_status=set_status,
+        count_active=count_active,
+        db=db,
+    )
 
 
 @pytest.mark.asyncio
 async def test_update_status_online_triggers_backfill(monkeypatch):
     backfill = AsyncMock()
-    response, rt, redis_stub = await _invoke_update_status(monkeypatch, "online", backfill)
+    ctx = await _invoke_update_status(monkeypatch, "online", backfill)
 
-    assert response["ok"] is True
-    backfill.assert_awaited_once_with(rt, redis_stub.client, 1, 10)
+    assert ctx.response["ok"] is True
+    ctx.count_active.assert_awaited_once_with(ctx.db, 1, 10)
+    ctx.set_status.assert_awaited_once_with(
+        ctx.redis_stub.client,
+        1,
+        10,
+        "online",
+        current_count=1,
+    )
+    backfill.assert_awaited_once_with(ctx.rt, ctx.redis_stub.client, 1, 10)
 
 
 @pytest.mark.asyncio
 async def test_update_status_busy_does_not_trigger_backfill(monkeypatch):
     backfill = AsyncMock()
-    response, _rt, _redis_stub = await _invoke_update_status(monkeypatch, "busy", backfill)
+    ctx = await _invoke_update_status(monkeypatch, "busy", backfill)
 
-    assert response["ok"] is True
+    assert ctx.response["ok"] is True
+    ctx.set_status.assert_awaited_once_with(
+        ctx.redis_stub.client,
+        1,
+        10,
+        "busy",
+        current_count=1,
+    )
     backfill.assert_not_awaited()
 
 

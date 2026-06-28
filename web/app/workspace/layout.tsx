@@ -46,6 +46,13 @@ import type { Conversation, Message } from '@/models/conversation'
 import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 import { logAuthEvent } from '@/utils/auth-log'
 import { useWorkspaceNotificationAlert } from '@/hooks/use-workspace-notification-alert'
+import { CollaborationInvitationDialog } from '@/app/components/features/chat/collaboration-invitation-dialog'
+import {
+  conversationCollaborationKeys,
+  setPendingCollaborationInvitationCache,
+  usePendingCollaborationInvitations,
+} from '@/service/use-conversation-collaboration'
+import type { CollaborationInvitation } from '@/models/conversation-collaboration'
 
 type NavItem = {
   labelKey: string
@@ -102,12 +109,23 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     !pathname.startsWith('/workspace/chat') &&
     !pathname.startsWith('/workspace/knowledge')
   const canUseChat = hasPermission(user, 'chat.workspace.use')
-  const syncChatNotifications = mounted && !authRefreshing && Boolean(token) && canUseChat && !isChatPage
+  const canUseCall = hasPermission(user, 'call.workspace.use')
+  const canViewCallRecords = hasPermission(user, 'call.record.view')
+  const canRespondCollaboration = hasPermission(user, 'chat.conversation.collaboration.respond')
+  const syncChatSocket = mounted && !authRefreshing && Boolean(token) && canUseChat
+  const syncChatNotifications = syncChatSocket && !isChatPage
+  const syncCollaborationInvitations = syncChatSocket && canRespondCollaboration
   const { data: convData } = useConversations({ enabled: syncChatNotifications })
+  const pendingCollaborationInvitationsQuery = usePendingCollaborationInvitations(syncCollaborationInvitations)
+  const pendingCollaborationInvitation = pendingCollaborationInvitationsQuery.data?.items[0] ?? null
   const { socket, connected, connecting, authFailed, connect } = useSocketStore()
   const {
     conversations,
     setConversations,
+    selectConversation,
+    setConversationScope,
+    setMyConversationView,
+    setWorkspaceChatTab,
     addConversation,
     updateConversation,
     removeConversation,
@@ -150,10 +168,10 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   }, [authFailed])
 
   useEffect(() => {
-    if (syncChatNotifications && token && !connected && !connecting && !authFailed) {
+    if (syncChatSocket && token && !connected && !connecting && !authFailed) {
       connect(token)
     }
-  }, [syncChatNotifications, token, connected, connecting, authFailed, connect])
+  }, [syncChatSocket, token, connected, connecting, authFailed, connect])
 
   useEffect(() => {
     if (syncChatNotifications && convData?.items) {
@@ -162,7 +180,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   }, [syncChatNotifications, convData, setConversations])
 
   useEffect(() => {
-    if (!syncChatNotifications) return
+    if (!syncChatNotifications && !syncCollaborationInvitations) return
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
@@ -171,13 +189,18 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
         if (state.socket && !state.socket.connected) {
           state.socket.connect()
         }
-        queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+        if (syncChatNotifications) {
+          queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+        }
+        if (syncCollaborationInvitations) {
+          queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.pending() })
+        }
       }
     }
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
-  }, [syncChatNotifications, queryClient])
+  }, [syncChatNotifications, syncCollaborationInvitations, queryClient])
 
   useEffect(() => {
     if (!syncChatNotifications || !socket) return
@@ -193,6 +216,40 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   }, [syncChatNotifications, socket, queryClient])
 
   useEffect(() => {
+    if (!syncCollaborationInvitations || !socket) return
+
+    const handleConnect = () => {
+      queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.pending() })
+    }
+
+    const handleCollaborationInvitationReceived = (invitation?: CollaborationInvitation) => {
+      playSessionAlert()
+      if (invitation) {
+        setPendingCollaborationInvitationCache(queryClient, invitation)
+      }
+      queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.pending() })
+    }
+
+    const handleCollaborationInvitationUpdated = (invitation?: CollaborationInvitation) => {
+      if (invitation) {
+        setPendingCollaborationInvitationCache(queryClient, invitation)
+      }
+      queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.pending() })
+      queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.all })
+    }
+
+    socket.on('connect', handleConnect)
+    socket.on('collaboration_invitation_received', handleCollaborationInvitationReceived)
+    socket.on('collaboration_invitation_updated', handleCollaborationInvitationUpdated)
+
+    return () => {
+      socket.off('connect', handleConnect)
+      socket.off('collaboration_invitation_received', handleCollaborationInvitationReceived)
+      socket.off('collaboration_invitation_updated', handleCollaborationInvitationUpdated)
+    }
+  }, [syncCollaborationInvitations, socket, queryClient, playSessionAlert])
+
+  useEffect(() => {
     if (!syncChatNotifications || !socket) return
 
     const handleNewConversation = (data: { conversation_id: number; visitor: Conversation['visitor'] }) => {
@@ -202,7 +259,12 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
         headers: { Authorization: `Bearer ${token}` },
       })
         .then((r) => r.json())
-        .then((conv: Conversation) => addConversation(conv))
+        .then((conv: Conversation) => {
+          addConversation(conv)
+          if (useChatStore.getState().selectedConversationId == null) {
+            selectConversation(conv.id)
+          }
+        })
         .catch(() => {
           queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
         })
@@ -231,6 +293,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
 
     const handleConversationEnded = (data: { conversation_id: number }) => {
       removeConversation(data.conversation_id)
+      queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
     }
 
     const handleConversationUpdated = (data: {
@@ -243,10 +306,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
       if (data.last_message_preview !== undefined) updates.last_message_preview = data.last_message_preview
       if (data.last_message_at !== undefined) updates.last_message_at = data.last_message_at
       if (data.unread_count !== undefined) {
-        // Mirror chat-page logic: the conversation the agent is currently
-        // viewing must never accumulate unread inside the workspace badge.
-        const selected = useChatStore.getState().selectedConversationId
-        updates.unread_count = data.conversation_id === selected ? 0 : data.unread_count
+        updates.unread_count = data.unread_count
       }
       updateConversation(data.conversation_id, updates)
       patchConversationListCache(queryClient, data.conversation_id, updates)
@@ -311,9 +371,8 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   if (routeRule && !hasAnyPermission(user, routeRule.permissions)) return null
   if (visibleNavItems.length === 0) return null
 
-  return (
-    <CallCenterProvider>
-      <div className="flex h-screen">
+  const workspaceShell = (
+    <div className="flex h-screen">
         {/* Sidebar — full height icon navigation */}
         <aside className="relative z-30 flex w-16 shrink-0 flex-col justify-between border-r border-[#E5E5E5] bg-[#F5F5F5] py-4">
         {/* Top: Logo + Nav — 2.1 pen: Sidebar 64px #F5F5F5 */}
@@ -380,7 +439,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
           {/* Top Bar */}
           <header className="relative flex h-14 shrink-0 items-center justify-end border-b border-border bg-white px-6">
             <div className="absolute left-1/2 top-1/2 flex min-w-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
-              <GlobalCallBar hidden={pathname.startsWith('/workspace/call')} />
+              {canUseCall && <GlobalCallBar hidden={pathname.startsWith('/workspace/call')} />}
             </div>
             <div className="flex items-center gap-2">
               <NetworkMonitor />
@@ -392,9 +451,31 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
           <main className="flex-1 overflow-y-auto bg-surface">
             {children}
           </main>
+          <CollaborationInvitationDialog
+            invitation={pendingCollaborationInvitation}
+            onAccepted={(conversation) => {
+              addConversation(conversation)
+              selectConversation(conversation.id)
+              setConversationScope('my')
+              setMyConversationView('collaborating')
+              setWorkspaceChatTab('messages')
+              queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+              router.push('/workspace/chat')
+            }}
+            onDeclined={() => {
+              queryClient.invalidateQueries({ queryKey: conversationCollaborationKeys.pending() })
+            }}
+          />
           {showKnowledgeFloatingDrawer && <KnowledgeFloatingDrawer />}
         </div>
-      </div>
+    </div>
+  )
+
+  if (!canUseCall) return workspaceShell
+
+  return (
+    <CallCenterProvider recordsEnabled={canViewCallRecords}>
+      {workspaceShell}
     </CallCenterProvider>
   )
 }

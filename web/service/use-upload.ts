@@ -13,6 +13,7 @@ export const useUploadAvatar = () => {
 }
 
 export const useUploadChannelBotAvatar = useUploadAvatar
+export const useUploadChannelAgentDefaultAvatar = useUploadAvatar
 
 export const useUploadChannelLogo = () => {
   return useMutation({

@@ -101,3 +101,37 @@ def test_policy_limit_ranges(field: str, value: int):
 
     with pytest.raises(ValidationError):
         QueuePolicyUpsert(**payload)
+
+
+def test_policy_defaults_returning_agent_window_when_enabled():
+    policy = QueuePolicyUpsert(
+        channel="online_chat",
+        scope_type="employee_group",
+        scope_id=1,
+        assignment_strategy="round_robin",
+        config={"returning_agent_priority_enabled": True},
+    )
+
+    assert policy.config["returning_agent_priority_enabled"] is True
+    assert policy.config["returning_agent_window_hours"] == 24
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"returning_agent_priority_enabled": "yes", "returning_agent_window_hours": 24},
+        {"returning_agent_priority_enabled": True, "returning_agent_window_hours": None},
+        {"returning_agent_priority_enabled": True, "returning_agent_window_hours": 0},
+        {"returning_agent_priority_enabled": True, "returning_agent_window_hours": 721},
+        {"returning_agent_priority_enabled": True, "returning_agent_window_hours": 24.0},
+    ],
+)
+def test_policy_rejects_invalid_returning_agent_config(config: dict):
+    with pytest.raises(ValidationError):
+        QueuePolicyUpsert(
+            channel="online_chat",
+            scope_type="employee_group",
+            scope_id=1,
+            assignment_strategy="round_robin",
+            config=config,
+        )

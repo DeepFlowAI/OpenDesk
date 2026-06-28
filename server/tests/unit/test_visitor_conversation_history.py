@@ -159,7 +159,89 @@ async def test_create_from_visitor_resumes_only_same_channel_active_conversation
 
 
 @pytest.mark.asyncio
-async def test_create_from_visitor_persists_routed_group_before_reenqueue(monkeypatch):
+async def test_create_from_visitor_resumes_existing_conversation_for_blocked_visitor(monkeypatch):
+    visitor = SimpleNamespace(id=20, name="访客", external_id="visitor-1", blacklist="blocked")
+    existing = SimpleNamespace(
+        id=30,
+        tenant_id=10,
+        channel_id=5,
+        channel=SimpleNamespace(channel_type="web"),
+        visitor=visitor,
+        status="active",
+        agent_id=99,
+    )
+    check_restriction = AsyncMock(return_value={"reason": "restricted"})
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_or_create",
+        AsyncMock(return_value=(visitor, False)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_active_visitor_conversation",
+        AsyncMock(return_value=existing),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.check_visitor_restriction",
+        check_restriction,
+    )
+
+    result = await ConversationService.create_from_visitor(
+        AsyncMock(),
+        AsyncMock(),
+        tenant_id=10,
+        channel_id=5,
+        visitor_external_id="visitor-1",
+    )
+
+    assert result["conversation"] is existing
+    assert result["is_new"] is False
+    check_restriction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_from_visitor_restricts_blocked_visitor_without_active_conversation(monkeypatch):
+    visitor = SimpleNamespace(id=20, name="访客", external_id="visitor-1", blacklist="blocked")
+    availability = {"reason": "restricted", "can_start_conversation": False}
+    create_conversation = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_or_create",
+        AsyncMock(return_value=(visitor, False)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_active_visitor_conversation",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=SimpleNamespace(id=5, tenant_id=10, config={})),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.check_visitor_restriction",
+        AsyncMock(return_value=availability),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.create",
+        create_conversation,
+    )
+
+    result = await ConversationService.create_from_visitor(
+        AsyncMock(),
+        AsyncMock(),
+        tenant_id=10,
+        channel_id=5,
+        visitor_external_id="visitor-1",
+    )
+
+    assert result == {
+        "conversation": None,
+        "is_new": False,
+        "restricted": True,
+        "availability": availability,
+    }
+    create_conversation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_from_visitor_resume_queued_does_not_reroute_or_assign(monkeypatch):
     db = AsyncMock()
     r = AsyncMock()
     visitor = SimpleNamespace(id=20, name="访客", external_id="visitor-1")
@@ -172,15 +254,14 @@ async def test_create_from_visitor_persists_routed_group_before_reenqueue(monkey
         visitor_id=visitor.id,
         status="queued",
         agent_id=None,
-        group_id=None,
+        group_id=13,
     )
     enqueue_result = SimpleNamespace(position=SimpleNamespace(position_overall=1))
 
-    async def persist_group(_db, conversation, group_id):
-        conversation.group_id = group_id
-        return conversation
-
-    update_group = AsyncMock(side_effect=persist_group)
+    route = AsyncMock(return_value=(13, [21, 22], {21: 10, 22: 10}, None))
+    find_agent = AsyncMock(return_value=21)
+    assign_agent = AsyncMock()
+    update_group = AsyncMock()
     enqueue = AsyncMock(return_value=enqueue_result)
 
     monkeypatch.setattr(
@@ -193,11 +274,15 @@ async def test_create_from_visitor_persists_routed_group_before_reenqueue(monkey
     )
     monkeypatch.setattr(
         "app.services.conversation_service.RoutingService.route_conversation_with_meta",
-        AsyncMock(return_value=(13, [21, 22], {21: 10, 22: 10}, None)),
+        route,
     )
     monkeypatch.setattr(
         "app.services.conversation_service.AgentStatusService.find_available_agent",
-        AsyncMock(return_value=None),
+        find_agent,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.assign_agent",
+        assign_agent,
     )
     monkeypatch.setattr(
         "app.services.conversation_service.ConversationRepository.update_group",
@@ -221,15 +306,22 @@ async def test_create_from_visitor_persists_routed_group_before_reenqueue(monkey
         visitor_external_id="visitor-1",
     )
 
-    update_group.assert_awaited_once_with(db, existing, 13)
+    # Resuming a queued conversation must not re-route or assign an agent;
+    # assignment is left to the queue. It only ensures the queue task exists.
+    route.assert_not_awaited()
+    find_agent.assert_not_awaited()
+    assign_agent.assert_not_awaited()
+    update_group.assert_not_awaited()
     enqueue.assert_awaited_once_with(
         db,
         10,
         existing,
         source_type="visitor_waiting",
     )
-    assert existing.group_id == 13
+    assert existing.agent_id is None
+    assert existing.status == "queued"
     assert result["conversation"] is existing
+    assert result["newly_assigned"] is False
     assert result["queue_position"] == 1
 
 
@@ -275,6 +367,10 @@ async def test_create_from_visitor_persists_matched_welcome_message(monkeypatch)
         AsyncMock(return_value={"can_start_conversation": True}),
     )
     monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.check_human_service_gate",
+        AsyncMock(return_value={"can_start_conversation": True, "reason": "available"}),
+    )
+    monkeypatch.setattr(
         "app.services.conversation_service.RoutingService.route_conversation_with_meta",
         AsyncMock(return_value=(None, [11], {11: 5}, None)),
     )
@@ -284,6 +380,10 @@ async def test_create_from_visitor_persists_matched_welcome_message(monkeypatch)
     )
     monkeypatch.setattr(
         "app.services.conversation_service.AgentStatusService.increment_count",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ReceptionEventService.record",
         AsyncMock(),
     )
     monkeypatch.setattr(
@@ -317,6 +417,10 @@ async def test_create_from_visitor_persists_matched_welcome_message(monkeypatch)
     monkeypatch.setattr(
         "app.services.conversation_service.ConversationRepository.get_by_id",
         AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.initialize_for_conversation",
+        AsyncMock(),
     )
 
     result = await ConversationService.create_from_visitor(
@@ -579,6 +683,200 @@ async def test_create_welcome_message_on_agent_assignment_skips_when_welcome_exi
 
     assert result is None
     create_welcome.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_from_visitor_skips_stale_open_agent_bot_conversation(monkeypatch):
+    visitor = SimpleNamespace(id=20, name="访客", external_id="visitor-1")
+    channel = SimpleNamespace(
+        id=5,
+        tenant_id=10,
+        channel_type="web",
+        config={
+            "open_agent_enabled": True,
+            "open_agent_agent_id": 7,
+            "open_agent_agent_name": "小云智能机器人",
+        },
+    )
+    stale_conversation = SimpleNamespace(
+        id=29,
+        public_id="cv_old",
+        tenant_id=10,
+        channel_id=5,
+        visitor=visitor,
+        visitor_id=visitor.id,
+        channel=channel,
+        status="bot",
+        agent_id=None,
+        group_id=None,
+    )
+    new_conversation = SimpleNamespace(
+        id=30,
+        public_id="cv_new",
+        tenant_id=10,
+        channel_id=5,
+        visitor=visitor,
+        visitor_id=visitor.id,
+        channel=channel,
+        status="bot",
+        agent_id=None,
+        group_id=None,
+    )
+    system_msg = SimpleNamespace(
+        id=100,
+        content_type="system",
+        content="智能助手开始接待",
+        created_at=_dt(1),
+    )
+    close_if_stale = AsyncMock(return_value=True)
+    create_conversation = AsyncMock(return_value=new_conversation)
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_or_create",
+        AsyncMock(return_value=(visitor, False)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_active_visitor_conversation",
+        AsyncMock(return_value=stale_conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.open_agent_bot_timeout_service.OpenAgentBotTimeoutService.close_if_stale",
+        close_if_stale,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.check_open_agent_bot_availability",
+        AsyncMock(return_value={"can_start_conversation": True}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.generate_unique_public_id",
+        AsyncMock(return_value="cv_new"),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.generate_unique_share_code",
+        AsyncMock(return_value="CV-NEW123"),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.create",
+        create_conversation,
+    )
+    monkeypatch.setattr(
+        "app.services.open_agent_settings_service.OpenAgentSettingsService.get_agent_welcome_message",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.create",
+        AsyncMock(return_value=system_msg),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.update_last_message",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=new_conversation),
+    )
+    monkeypatch.setattr(
+        ConversationService,
+        "_sync_web_sdk_context_if_present",
+        AsyncMock(return_value=None),
+    )
+
+    result = await ConversationService.create_from_visitor(
+        AsyncMock(),
+        AsyncMock(),
+        tenant_id=10,
+        channel_id=5,
+        visitor_external_id="visitor-1",
+    )
+
+    close_if_stale.assert_awaited_once()
+    assert close_if_stale.await_args.args[1] is stale_conversation
+    create_conversation.assert_awaited_once()
+    assert result["is_new"] is True
+    assert result["conversation"] is new_conversation
+
+
+@pytest.mark.asyncio
+async def test_create_from_visitor_closes_bot_conversation_when_bot_disabled(monkeypatch):
+    db = AsyncMock()
+    r = AsyncMock()
+    visitor = SimpleNamespace(id=20, name="访客", external_id="visitor-1")
+    channel = SimpleNamespace(
+        id=5,
+        tenant_id=10,
+        channel_type="web",
+        config={"open_agent_enabled": False},
+    )
+    old_conversation = SimpleNamespace(
+        id=29,
+        public_id="cv_old",
+        tenant_id=10,
+        channel_id=5,
+        visitor=visitor,
+        visitor_id=visitor.id,
+        channel=channel,
+        status="bot",
+        agent_id=None,
+        group_id=None,
+    )
+    offline_availability = {
+        "can_start_conversation": False,
+        "reason": "no_online_agent",
+        "offline_title": "当前客服不在线",
+        "offline_message": "请稍后再试",
+    }
+    close_old = AsyncMock(return_value=old_conversation)
+    close_if_stale = AsyncMock()
+    human_service_gate = AsyncMock(return_value=offline_availability)
+    create_conversation = AsyncMock()
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_or_create",
+        AsyncMock(return_value=(visitor, False)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_active_visitor_conversation",
+        AsyncMock(return_value=old_conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.end_conversation",
+        close_old,
+    )
+    monkeypatch.setattr(
+        "app.services.open_agent_bot_timeout_service.OpenAgentBotTimeoutService.close_if_stale",
+        close_if_stale,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.check_human_service_gate",
+        human_service_gate,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.create",
+        create_conversation,
+    )
+
+    result = await ConversationService.create_from_visitor(
+        db,
+        r,
+        tenant_id=10,
+        channel_id=5,
+        visitor_external_id="visitor-1",
+    )
+
+    close_old.assert_awaited_once_with(db, old_conversation, "bot_disabled")
+    close_if_stale.assert_not_awaited()
+    human_service_gate.assert_awaited_once()
+    create_conversation.assert_not_awaited()
+    assert result["offline"] is True
+    assert result["availability"] is offline_availability
 
 
 @pytest.mark.asyncio

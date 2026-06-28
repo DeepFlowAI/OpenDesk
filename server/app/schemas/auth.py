@@ -17,6 +17,7 @@ class UserInfo(BaseModel):
 
     id: int
     username: str
+    name: str
     display_name: str | None = None
     avatar: str | None = None
     roles: list[str]

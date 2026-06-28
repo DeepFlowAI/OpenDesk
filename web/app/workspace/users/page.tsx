@@ -38,8 +38,10 @@ import { UserFormModal } from './user-form-modal'
 import { UserImportModal } from './user-import-modal'
 import { GroupBar } from '@/components/workspace/group-bar'
 import {
+  FieldValueDisplay,
   formatActorFieldValue,
   formatFileFieldValue,
+  isEntitySelectFieldType,
 } from '@/app/components/features/field-system/field-value-display'
 import { formatDatetimeForDisplay } from '@/lib/datetime-display'
 import { hasPermission } from '@/utils/permissions'
@@ -573,7 +575,7 @@ export default function WorkspaceUsersPage() {
             className={cn(
               'flex h-9 items-center gap-1.5 rounded-lg border px-3 text-sm transition-colors',
               hasColumnOverride
-                ? 'border-ring bg-info/10 text-primary'
+                ? 'border-border bg-muted text-foreground hover:bg-muted/80'
                 : 'border-border text-foreground/80 hover:bg-accent'
             )}
           >
@@ -682,13 +684,22 @@ export default function WorkspaceUsersPage() {
                   >
                     {displayColumns.map((col, idx) => {
                       const val = getCellValue(user, col, fieldLookup, locale)
+                      const raw = getRawCellValue(user, col)
                       return (
                         <td
                           key={col.field_key ?? col.field_id ?? `cell-${idx}`}
                           className="max-w-[280px] overflow-hidden px-6 py-3 text-sm text-foreground/80"
                           style={{ minWidth: getColumnMinWidth(col.field_type, col.field_key) }}
                         >
-                          <span className="block truncate">{val}</span>
+                          {isEntitySelectFieldType(col.field_type) && raw != null && raw !== '' ? (
+                            <FieldValueDisplay
+                              fieldType={col.field_type}
+                              value={raw}
+                              className="block truncate"
+                            />
+                          ) : (
+                            <span className="block truncate">{val}</span>
+                          )}
                         </td>
                       )
                     })}
@@ -814,12 +825,15 @@ function buildUsersUrl(
 
 const SYSTEM_KEYS = new Set([
   'public_id', 'name', 'nickname', 'external_id', 'avatar_color', 'channel_id', 'organization_id',
-  'email', 'phone', 'web_id', 'gender', 'level', 'address', 'remark',
+  'email', 'phone', 'web_id', 'gender', 'level', 'address', 'remark', 'blacklist',
+  'assignee', 'agent_id', 'assignee_group', 'assignee_group_id',
   'created_by', 'updated_by', 'created_at', 'updated_at',
 ])
 
 const SYSTEM_KEY_ALIAS: Record<string, string> = {
   nickname: 'name',
+  assignee: 'agent_id',
+  assignee_group: 'assignee_group_id',
 }
 
 const DATETIME_KEYS = new Set(['created_at', 'updated_at'])
@@ -889,8 +903,7 @@ function getCellValue(
   const { field_key, field_id, field_type } = col
 
   if (field_key && SYSTEM_KEYS.has(field_key)) {
-    const realKey = SYSTEM_KEY_ALIAS[field_key] ?? field_key
-    const raw = (user as Record<string, unknown>)[realKey]
+    const raw = getRawCellValue(user, col)
     if (raw == null) return ''
     if (field_key === 'created_by' || field_key === 'updated_by') return formatActorFieldValue(raw)
     if (DATETIME_KEYS.has(field_key)) return new Date(raw as string).toLocaleString()
@@ -918,11 +931,7 @@ function getCellValue(
     const customKey = field_key && !SYSTEM_KEYS.has(field_key) ? field_key : null
     const legacyIdKey = field_id != null ? String(field_id) : null
     const lookupKey = customKey ?? legacyIdKey ?? ''
-    const val = customKey && user.custom_fields[customKey] != null
-      ? user.custom_fields[customKey]
-      : legacyIdKey
-        ? user.custom_fields[legacyIdKey]
-        : null
+    const val = getRawCellValue(user, col)
     if (val == null) return ''
     if (field_type === 'file') {
       return formatFileFieldValue(val, locale === 'zh')
@@ -940,9 +949,31 @@ function getCellValue(
   return ''
 }
 
+function getRawCellValue(
+  user: User,
+  col: { field_key: string | null; field_id: number | null },
+): unknown {
+  const { field_key, field_id } = col
+  if (field_key && SYSTEM_KEYS.has(field_key)) {
+    const realKey = SYSTEM_KEY_ALIAS[field_key] ?? field_key
+    return (user as Record<string, unknown>)[realKey]
+  }
+
+  const customKey = field_key && !SYSTEM_KEYS.has(field_key) ? field_key : null
+  const legacyIdKey = field_id != null ? String(field_id) : null
+  if (customKey && user.custom_fields?.[customKey] != null) {
+    return user.custom_fields[customKey]
+  }
+  if (legacyIdKey) {
+    return user.custom_fields?.[legacyIdKey]
+  }
+  return null
+}
+
 function getColumnMinWidth(fieldType: string, fieldKey: string | null): number {
   if (fieldKey === 'created_at' || fieldKey === 'updated_at') return 160
   if (fieldKey === 'created_by' || fieldKey === 'updated_by') return 160
+  if (fieldKey === 'assignee' || fieldKey === 'assignee_group') return 160
   if (fieldKey === 'public_id') return 220
   if (fieldKey === 'email') return 180
   if (fieldKey === 'phone') return 130

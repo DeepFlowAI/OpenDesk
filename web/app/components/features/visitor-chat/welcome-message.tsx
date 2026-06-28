@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, type CSSProperties } from 'react'
+import { IconChevronRight } from '@tabler/icons-react'
 import type { ChannelConfig, OpenAgentFAQ, OpenAgentWelcomeMessageBlock } from '@/models/channel'
 import { MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
 import { buildOpenAgentWelcomeEmbedSrcDoc } from '@/lib/open-agent-welcome-message'
@@ -8,14 +9,13 @@ import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { SafeHtml } from '@/components/safe-html'
 import { cn } from '@/lib/utils'
 
-const DEFAULT_AGENT_AVATAR_SRC = '/default-avatar.jpg'
-
 type WelcomeMessageProps = {
   content: string
   config?: ChannelConfig
   showAvatar?: boolean
   avatarSrc?: string | null
   contentFormat?: 'html' | 'markdown'
+  align?: 'start' | 'end'
 }
 
 type OpenAgentWelcomeMessageProps = {
@@ -23,12 +23,14 @@ type OpenAgentWelcomeMessageProps = {
   config?: ChannelConfig
   showAvatar?: boolean
   avatarSrc?: string | null
+  align?: 'start' | 'end'
 }
 
 type OpenAgentFAQMessageProps = {
   faq: OpenAgentFAQ
   config?: ChannelConfig
   showAvatar?: boolean
+  reserveAvatarSpace?: boolean
   avatarSrc?: string | null
   faqDisabled?: boolean
   onFAQQuestionClick?: (text: string) => Promise<boolean> | boolean
@@ -57,6 +59,7 @@ export function WelcomeMessage({
   showAvatar = false,
   avatarSrc,
   contentFormat = 'html',
+  align = 'start',
 }: WelcomeMessageProps) {
   const bubbleClassName = cn(
     'min-h-[42px] max-w-[75%] min-w-0 whitespace-pre-wrap break-words break-all px-3 py-2 text-sm leading-6',
@@ -65,10 +68,10 @@ export function WelcomeMessage({
   )
 
   return (
-    <div className="flex flex-row items-end gap-2 px-5">
-      {showAvatar && (
+    <div className={cn('flex items-end gap-2 px-5', align === 'end' ? 'flex-row-reverse' : 'flex-row')}>
+      {showAvatar && avatarSrc && (
         <img
-          src={avatarSrc || DEFAULT_AGENT_AVATAR_SRC}
+          src={avatarSrc}
           alt=""
           className="h-9 w-9 shrink-0 rounded-full object-cover"
         />
@@ -93,12 +96,13 @@ export function OpenAgentWelcomeMessage({
   config,
   showAvatar = false,
   avatarSrc,
+  align = 'start',
 }: OpenAgentWelcomeMessageProps) {
   return (
-    <div className="flex flex-row items-end gap-2 px-5">
-      {showAvatar && (
+    <div className={cn('flex items-end gap-2 px-5', align === 'end' ? 'flex-row-reverse' : 'flex-row')}>
+      {showAvatar && avatarSrc && (
         <img
-          src={avatarSrc || DEFAULT_AGENT_AVATAR_SRC}
+          src={avatarSrc}
           alt=""
           className="h-9 w-9 shrink-0 rounded-full object-cover"
         />
@@ -139,6 +143,7 @@ export function OpenAgentFAQMessage({
   faq,
   config,
   showAvatar = false,
+  reserveAvatarSpace = false,
   avatarSrc,
   faqDisabled = false,
   onFAQQuestionClick,
@@ -162,12 +167,15 @@ export function OpenAgentFAQMessage({
 
   return (
     <div className="flex flex-row items-end gap-2 px-5">
-      {showAvatar && (
+      {showAvatar && avatarSrc && (
         <img
-          src={avatarSrc || DEFAULT_AGENT_AVATAR_SRC}
+          src={avatarSrc}
           alt=""
           className="h-9 w-9 shrink-0 rounded-full object-cover"
         />
+      )}
+      {!showAvatar && reserveAvatarSpace && (
+        <span aria-hidden="true" className="h-9 w-9 shrink-0" />
       )}
       <div
         className="min-h-[42px] max-w-[75%] min-w-0 break-words break-all px-4 py-3 text-sm leading-6"
@@ -207,7 +215,7 @@ export function OpenAgentFAQMessage({
               disabled={faqDisabled || Boolean(pendingQuestion)}
             >
               <span className="min-w-0 flex-1 break-words">{question.text}</span>
-              <span className="shrink-0 text-lg leading-none opacity-45">&gt;</span>
+              <IconChevronRight size={18} stroke={1.75} className="shrink-0 opacity-45" aria-hidden />
             </button>
           ))}
         </div>

@@ -11,6 +11,7 @@ import type { Organization } from '@/models/organization'
 import type { UnifiedField } from '@/models/field-definition'
 import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/field-value-editor'
 import { cn } from '@/lib/utils'
+import { getLinkedSelectTypeConfig } from '@/lib/field-linked-select-config'
 import { defaultCfValuesFromFieldDefinitions } from '@/lib/ticket-field-defaults'
 import { IconChevronDown, IconSearch, IconX } from '@tabler/icons-react'
 
@@ -35,10 +36,13 @@ type SystemFormData = {
   level: string
   address: string
   remark: string
+  blacklist: string
   organization_id: number | null
+  agent_id: number | null
+  assignee_group_id: number | null
 }
 
-type SystemTextFieldKey = Exclude<keyof SystemFormData, 'organization_id'>
+type SystemTextFieldKey = Exclude<keyof SystemFormData, 'organization_id' | 'agent_id' | 'assignee_group_id'>
 
 const GENDER_OPTIONS = [
   { value: '', zh: '请选择', en: 'Select' },
@@ -52,8 +56,22 @@ const LEVEL_OPTIONS = [
   { value: 'vip', zh: 'VIP', en: 'VIP' },
 ]
 
+const BLACKLIST_OPTIONS = [
+  { value: '', zh: '未拉黑', en: 'Not blocked' },
+  { value: 'blocked', zh: '已拉黑', en: 'Blocked' },
+]
+
 function customFieldKey(field: UnifiedField): string {
   return field.key ?? (field.id != null ? String(field.id) : '')
+}
+
+function toNullableNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
 }
 
 function getDropdownPlacement(root: HTMLElement | null, expectedHeight = 256): 'top' | 'bottom' {
@@ -92,13 +110,35 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
   const organizationEnabled = systemSettings?.organization_enabled === true
   const { data: fieldsData } = useUnifiedFields({ domain: 'user' })
 
+  const systemFields = useMemo<UnifiedField[]>(
+    () => (fieldsData?.items ?? []).filter((f) => f.source === 'system' && f.status === 'active'),
+    [fieldsData],
+  )
   const customFields = useMemo<UnifiedField[]>(
     () => (fieldsData?.items ?? []).filter((f) => f.source === 'custom' && f.status === 'active'),
     [fieldsData],
   )
+  const assigneeGroupField = useMemo(
+    () => systemFields.find((f) => f.key === 'assignee_group') ?? null,
+    [systemFields],
+  )
+  const assigneeField = useMemo(
+    () => systemFields.find((f) => f.key === 'assignee') ?? null,
+    [systemFields],
+  )
 
   const [form, setForm] = useState<SystemFormData>({
-    name: '', phone: '', email: '', gender: '', level: 'normal', address: '', remark: '', organization_id: null,
+    name: '',
+    phone: '',
+    email: '',
+    gender: '',
+    level: 'normal',
+    address: '',
+    remark: '',
+    blacklist: '',
+    organization_id: null,
+    agent_id: null,
+    assignee_group_id: null,
   })
   const [errors, setErrors] = useState<Partial<Record<string, string>>>({})
   const [cfValues, setCfValues] = useState<Record<string, CustomFieldValue>>({})
@@ -129,7 +169,10 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
         level: user.level ?? 'normal',
         address: user.address ?? '',
         remark: user.remark ?? '',
+        blacklist: user.blacklist ?? '',
         organization_id: user.organization_id ?? null,
+        agent_id: user.agent_id ?? null,
+        assignee_group_id: user.assignee_group_id ?? null,
       })
       if (user.custom_fields) {
         setCfValues({ ...user.custom_fields })
@@ -150,6 +193,23 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
   const setOrganization = useCallback((organizationId: number | null) => {
     setForm((prev) => ({ ...prev, organization_id: organizationId }))
   }, [])
+
+  const setAssigneeGroup = useCallback((groupId: number | null) => {
+    setForm((prev) => ({ ...prev, assignee_group_id: groupId }))
+  }, [])
+
+  const setAssignee = useCallback((agentId: number | null) => {
+    setForm((prev) => ({ ...prev, agent_id: agentId }))
+  }, [])
+
+  const resolveSystemFieldValue = useCallback(
+    (field: UnifiedField) => {
+      if (field.key === 'assignee') return form.agent_id
+      if (field.key === 'assignee_group') return form.assignee_group_id
+      return null
+    },
+    [form.agent_id, form.assignee_group_id],
+  )
 
   const setCfField = useCallback((fieldId: string, value: CustomFieldValue) => {
     setCfValues((prev) => ({ ...prev, [fieldId]: value }))
@@ -191,8 +251,15 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
         if (form.level !== (user.level ?? 'normal')) payload.level = form.level || 'normal'
         if (form.address !== (user.address ?? '')) payload.address = form.address || null
         if (form.remark !== (user.remark ?? '')) payload.remark = form.remark || null
+        if (form.blacklist !== (user.blacklist ?? '')) payload.blacklist = form.blacklist || null
         if (form.organization_id !== (user.organization_id ?? null)) {
           payload.organization_id = form.organization_id
+        }
+        if (form.assignee_group_id !== (user.assignee_group_id ?? null)) {
+          payload.assignee_group_id = form.assignee_group_id
+        }
+        if (form.agent_id !== (user.agent_id ?? null)) {
+          payload.agent_id = form.agent_id
         }
 
         const origCf = user.custom_fields ?? {}
@@ -216,7 +283,10 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
           level: form.level || 'normal',
           ...(form.address ? { address: form.address } : {}),
           ...(form.remark ? { remark: form.remark } : {}),
+          ...(form.blacklist ? { blacklist: form.blacklist } : {}),
           ...(form.organization_id != null ? { organization_id: form.organization_id } : {}),
+          ...(form.assignee_group_id != null ? { assignee_group_id: form.assignee_group_id } : {}),
+          ...(form.agent_id != null ? { agent_id: form.agent_id } : {}),
           ...(Object.keys(cfPayload).length > 0 ? { custom_fields: cfPayload } : {}),
         }
         await createMutation.mutateAsync(payload)
@@ -333,12 +403,52 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
               />
             </FieldRow>
 
+            <FieldRow label={isZh ? '黑名单' : 'Blacklist'}>
+              <select
+                value={form.blacklist}
+                onChange={(e) => setField('blacklist', e.target.value)}
+                className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              >
+                {BLACKLIST_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {isZh ? opt.zh : opt.en}
+                  </option>
+                ))}
+              </select>
+            </FieldRow>
+
             {organizationEnabled && (
               <FieldRow label={isZh ? '组织' : 'Organization'}>
                 <OrganizationSelect
                   value={form.organization_id}
                   onChange={setOrganization}
                   isZh={isZh}
+                />
+              </FieldRow>
+            )}
+
+            {assigneeGroupField && (
+              <FieldRow label={isZh ? '负责组' : 'Assignee Group'} helpText={assigneeGroupField.help_text}>
+                <UnifiedFieldValueEditor
+                  field={assigneeGroupField}
+                  value={form.assignee_group_id}
+                  typeConfig={getLinkedSelectTypeConfig(assigneeGroupField, systemFields, resolveSystemFieldValue)}
+                  onChange={(value) => setAssigneeGroup(toNullableNumber(value))}
+                  placeholder={isZh ? '搜索负责组…' : 'Search groups...'}
+                  dropdownPlacement="top"
+                />
+              </FieldRow>
+            )}
+
+            {assigneeField && (
+              <FieldRow label={isZh ? '负责人' : 'Assignee'} helpText={assigneeField.help_text}>
+                <UnifiedFieldValueEditor
+                  field={assigneeField}
+                  value={form.agent_id}
+                  typeConfig={getLinkedSelectTypeConfig(assigneeField, systemFields, resolveSystemFieldValue)}
+                  onChange={(value) => setAssignee(toNullableNumber(value))}
+                  placeholder={isZh ? '搜索员工…' : 'Search employees...'}
+                  dropdownPlacement="top"
                 />
               </FieldRow>
             )}
@@ -353,11 +463,13 @@ export function UserFormModal({ mode, user, onClose, onSuccess }: UserFormModalP
               <div className="flex flex-col gap-4">
                 {customFields.map((field) => {
                   const key = customFieldKey(field)
+                  const resolveFieldValue = (targetField: UnifiedField) => cfValues[customFieldKey(targetField)] ?? null
                   return (
                     <CustomFieldInput
                       key={field.id ?? key}
                       field={field}
                       value={cfValues[key] ?? null}
+                      typeConfig={getLinkedSelectTypeConfig(field, customFields, resolveFieldValue)}
                       onChange={(v) => setCfField(key, v)}
                       isZh={isZh}
                     />
@@ -575,11 +687,13 @@ function OrganizationSelect({
 function CustomFieldInput({
   field,
   value,
+  typeConfig,
   onChange,
   isZh,
 }: {
   field: UnifiedField
   value: CustomFieldValue
+  typeConfig: Record<string, unknown>
   onChange: (v: CustomFieldValue) => void
   isZh: boolean
 }) {
@@ -590,8 +704,10 @@ function CustomFieldInput({
       <UnifiedFieldValueEditor
         field={field}
         value={value}
+        typeConfig={typeConfig}
         onChange={(v) => onChange(v as CustomFieldValue)}
         placeholder={placeholder}
+        dropdownPlacement="top"
       />
     </FieldRow>
   )

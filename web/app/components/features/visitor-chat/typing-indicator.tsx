@@ -1,7 +1,5 @@
 'use client'
 
-const DEFAULT_AGENT_AVATAR_SRC = '/default-avatar.jpg'
-
 type TypingIndicatorProps = {
   agentBubbleBg?: string
   agentBubbleTextColor?: string
@@ -34,9 +32,9 @@ export function TypingIndicator({
 
   return (
     <div className="flex items-end gap-2 px-5 py-1">
-      {showAvatar && (
+      {showAvatar && agentAvatar && (
         <img
-          src={agentAvatar || DEFAULT_AGENT_AVATAR_SRC}
+          src={agentAvatar}
           alt={agentName || ''}
           className="h-9 w-9 shrink-0 rounded-full object-cover"
         />
