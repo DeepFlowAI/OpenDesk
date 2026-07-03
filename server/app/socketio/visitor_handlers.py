@@ -14,13 +14,22 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi.encoders import jsonable_encoder
+# Use Socket.IO's own ConnectionRefusedError, not the builtin OSError of the same
+# name: only this class propagates the rejection reason to the client. Raising the
+# builtin makes python-socketio send a generic "Connection refused by server",
+# which the client can't recognize as an auth failure — so it never stops its
+# reconnect loop.
+from socketio.exceptions import ConnectionRefusedError
 
 from app.db.redis import redis_client
 from app.db.session import AsyncSessionLocal
 from app.core.exceptions import BusinessError, UnauthorizedError
+from app.core.security import decode_visitor_session_token
 from app.libs.realtime.base import BaseRealtimeTransport
+from app.repositories.conversation_repository import ConversationRepository
 from app.services.channel_service import ChannelService
 from app.services.conversation_service import ConversationService
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_realtime_service import ConversationRealtimeService
 from app.services.open_agent_conversation_service import OpenAgentConversationService
 from app.schemas.satisfaction_survey_record import SatisfactionSubmissionPayload
@@ -40,15 +49,31 @@ NAMESPACE = "/visitor"
 _rejection_tracker = ConnectRejectionTracker()
 
 
-def _log_rejected_connect(environ: dict, reason: str) -> None:
+def _log_rejected_connect(environ: dict, reason: str, token: str | None = None) -> None:
     ip = client_ip_from_environ(environ) or "unknown"
     count, storm = _rejection_tracker.record(ip)
-    if storm:
-        logger.error(
-            "Socket auth reconnect storm on %s: %d rejected connects from %s "
-            "within the last minute (reason=%s)",
-            NAMESPACE, count, ip, reason,
-        )
+    if not storm:
+        return
+
+    # Best-effort classify the rejection so the storm log carries which channel
+    # is affected and why: a decodable token that still fails validation points
+    # at a channel mismatch / disabled channel, while an undecodable one is an
+    # expired or tampered token.
+    channel_id: object | None = None
+    detail = reason
+    if token:
+        payload = decode_visitor_session_token(token)
+        if payload is None:
+            detail = "expired_or_bad_token"
+        else:
+            channel_id = payload.get("channel_id")
+            detail = "channel_mismatch_or_disabled"
+
+    logger.error(
+        "Socket auth reconnect storm on %s: %d rejected connects from %s "
+        "within the last minute (reason=%s channel_id=%s)",
+        NAMESPACE, count, ip, detail, channel_id,
+    )
 
 
 _VISITOR_START_LOCK_TTL_SECONDS = 10
@@ -100,6 +125,11 @@ def _open_desk_messages_from_sse_events(events: list[bytes]) -> list[dict]:
     return messages
 
 
+def _handoff_should_submit_tool_result(result: dict) -> bool:
+    """Queue-full and leave-message handoffs use dedicated visitor UX, not bot fallback."""
+    return not (result.get("queue_full") or result.get("leave_message"))
+
+
 def _handoff_unavailable_socket_response(result: dict) -> dict | None:
     """Map bot handoff route failures to visitor leave-message / queue-full UX."""
     if result.get("leave_message"):
@@ -116,6 +146,8 @@ def _handoff_unavailable_socket_response(result: dict) -> dict | None:
             "ok": False,
             "error": "QUEUE_FULL",
             "reason": availability.get("reason") or result.get("reason") or "queue_full",
+            "queue_type": result.get("queue_type"),
+            "queue_id": result.get("queue_id"),
             "queue_full_message": availability.get("queue_full_message"),
             "queue_full_show_leave_message_button": availability.get(
                 "queue_full_show_leave_message_button",
@@ -188,7 +220,7 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             async with AsyncSessionLocal() as db:
                 context = await ChannelService.validate_visitor_session_token(db, token)
         except UnauthorizedError:
-            _log_rejected_connect(environ, "invalid visitor session")
+            _log_rejected_connect(environ, "invalid visitor session", token=token)
             raise ConnectionRefusedError("Invalid visitor session")
 
         visitor_ip = client_ip_from_environ(environ)
@@ -334,6 +366,8 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 "ok": False,
                 "error": "QUEUE_FULL",
                 "reason": availability["reason"],
+                "queue_type": result.get("queue_type"),
+                "queue_id": result.get("queue_id"),
                 "queue_full_message": availability.get("queue_full_message"),
                 "queue_full_show_leave_message_button": availability.get(
                     "queue_full_show_leave_message_button",
@@ -371,6 +405,8 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
 
         conv_room = f"conv:{conv.id}"
         await rt.join_room(sid, conv_room, namespace=NAMESPACE)
+        async with AsyncSessionLocal() as db:
+            display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
 
         conv_payload = {
             "conversation_public_id": conv.public_id,
@@ -383,7 +419,7 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             } if conv.visitor else None,
             "agent": {
                 "id": conv.agent.id,
-                "name": ConversationService.visitor_agent_display_name(conv.agent),
+                "name": ConversationService.agent_display_name(conv.agent, display_mode),
                 "avatar": conv.agent.avatar,
             } if conv.agent else None,
         }
@@ -393,11 +429,25 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
         should_notify = conv.agent_id and (result["is_new"] or result.get("newly_assigned"))
         if should_notify:
             agent_room = f"agent:{tenant_id}:{conv.agent_id}"
+            # A freshly assigned conversation is a pending item: raise the unread
+            # badge so the agent sees it on any page. Bump before new_conversation
+            # so the receiver's REST fetch already reflects the +1.
+            new_unread: int | None = None
+            try:
+                async with AsyncSessionLocal() as db:
+                    new_unread = await ConversationRepository.increment_unread(db, conv.id)
+            except Exception:
+                logger.exception("Failed to increment unread for new conversation %s", conv.id)
             await rt.emit("new_conversation", {
                 "conversation_id": conv.id,
                 "visitor": conv_payload.get("visitor"),
                 "channel": {"id": conv.channel_id} if conv.channel_id else None,
             }, room=agent_room, namespace="/chat")
+            if new_unread is not None:
+                await rt.emit("conversation_updated", {
+                    "conversation_id": conv.id,
+                    "unread_count": new_unread,
+                }, room=agent_room, namespace="/chat")
             await ConversationRealtimeService.emit_conversation_list_updated(
                 int(tenant_id),
                 action="assigned",
@@ -665,7 +715,12 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 tool_call_id=data.get("tool_call_id"),
             )
             tool_call_id = data.get("tool_call_id")
-            if data.get("handoff_trigger") == "bot_confirmed" and isinstance(tool_call_id, str) and tool_call_id:
+            if (
+                data.get("handoff_trigger") == "bot_confirmed"
+                and isinstance(tool_call_id, str)
+                and tool_call_id
+                and _handoff_should_submit_tool_result(result)
+            ):
                 status, message = OpenAgentConversationService._handoff_tool_result_from_route_result(result)
                 logger.info(
                     "visitor_handoff_tool_result_submit tenant_id=%s conversation_public_id=%s "
@@ -705,6 +760,8 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 logger.exception("Failed to submit OpenAgent handoff tool result")
 
         conv = result["conversation"]
+        async with AsyncSessionLocal() as db:
+            display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, int(tenant_id))
         message_payloads = result.get("messages") or []
         if not message_payloads and result.get("message"):
             message_payloads = [result["message"]]
@@ -725,6 +782,17 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
 
         if result.get("ok") and conv.agent_id:
             agent_room = f"agent:{tenant_id}:{conv.agent_id}"
+            # Bot→human handoff assigns the conversation to a human agent; raise
+            # the unread badge so they notice it on any page. Bump first and sync
+            # the in-memory count so the downstream conversation_updated emits
+            # (and the receiver's REST fetch) all carry the +1.
+            new_unread: int | None = None
+            try:
+                async with AsyncSessionLocal() as db:
+                    new_unread = await ConversationRepository.increment_unread(db, conv.id)
+                conv.unread_count = new_unread
+            except Exception:
+                logger.exception("Failed to increment unread for handoff conversation %s", conv.id)
             conv_payload = {
                 "conversation_id": conv.id,
                 "visitor": {
@@ -736,6 +804,11 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 "channel": {"id": conv.channel_id} if conv.channel_id else None,
             }
             await rt.emit("new_conversation", conv_payload, room=agent_room, namespace="/chat")
+            if new_unread is not None:
+                await rt.emit("conversation_updated", {
+                    "conversation_id": conv.id,
+                    "unread_count": new_unread,
+                }, room=agent_room, namespace="/chat")
             await ConversationRealtimeService.emit_conversation_list_updated(
                 int(tenant_id),
                 action="assigned",
@@ -771,7 +844,7 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 "conversation_public_id": conv.public_id,
                 "agent": {
                     "id": conv.agent.id,
-                    "name": ConversationService.visitor_agent_display_name(conv.agent),
+                    "name": ConversationService.agent_display_name(conv.agent, display_mode),
                     "avatar": conv.agent.avatar,
                 } if conv.agent else None,
             }, room=f"conv:{conv.id}", namespace=NAMESPACE)
@@ -797,7 +870,7 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             "message": msg_payload,
             "agent": {
                 "id": conv.agent.id,
-                "name": ConversationService.visitor_agent_display_name(conv.agent),
+                "name": ConversationService.agent_display_name(conv.agent, display_mode),
                 "avatar": conv.agent.avatar,
             } if conv.agent else None,
             **({"queue_position": result["queue_position"]} if result.get("queue_position") is not None else {}),

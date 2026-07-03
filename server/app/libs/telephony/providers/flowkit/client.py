@@ -263,8 +263,75 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
             params["duration_ms"] = duration_ms
         await self._rpc("call.dtmf", params)
 
-    async def call_bridge(self, call_id: str, other_call_id: str) -> None:
-        await self._rpc("call.bridge", {"call_id": call_id, "other_call_id": other_call_id})
+    async def call_bridge(
+        self, call_id: str, other_call_id: str, transcribe: bool = True
+    ) -> None:
+        params: dict[str, Any] = {"call_id": call_id, "other_call_id": other_call_id}
+        # Omit when True to stay backward-compatible with kernels that default
+        # to transcribing; only send the flag to explicitly disable ASR.
+        if not transcribe:
+            params["transcribe"] = False
+        await self._rpc("call.bridge", params)
+
+    async def call_connect_external_agent(
+        self,
+        call_id: str,
+        *,
+        provider: str,
+        ws_url: str,
+        token: str,
+        audio_in_rate: int,
+        audio_out_rate: int,
+        traceparent: str | None = None,
+        trace_call_id: str | None = None,
+    ) -> None:
+        params: dict[str, Any] = {
+            "call_id": call_id,
+            "provider": provider,
+            "ws_url": ws_url,
+            "token": token,
+            "audio_in_rate": audio_in_rate,
+            "audio_out_rate": audio_out_rate,
+        }
+        if traceparent:
+            params["traceparent"] = traceparent
+        if trace_call_id:
+            params["trace_call_id"] = trace_call_id
+        await self._rpc("call.connect_external_agent", params)
+
+    async def call_converse_external_agent(
+        self,
+        call_id: str,
+        *,
+        provider: str,
+        turn_url: str,
+        token: str,
+        greeting: str | None = None,
+        voice_spk_id: str | None = None,
+        traceparent: str | None = None,
+        trace_call_id: str | None = None,
+    ) -> None:
+        """Start a v2 text-turn conversation on the call leg.
+
+        flowkit owns ASR/TTS/barge-in and POSTs each transcribed utterance to
+        ``turn_url`` (Bearer ``token``), speaking back the reply; transfer_human
+        / hang_up surface as the same external_agent handoff/ended events.
+        """
+        params: dict[str, Any] = {
+            "call_id": call_id,
+            "provider": provider,
+            "turn_url": turn_url,
+            "token": token,
+        }
+        if greeting:
+            params["greeting"] = greeting
+        if voice_spk_id:
+            params["voice_spk_id"] = voice_spk_id
+        if traceparent:
+            params["traceparent"] = traceparent
+        if trace_call_id:
+            params["trace_call_id"] = trace_call_id
+        await self._rpc("call.converse_external_agent", params)
 
     async def call_unbridge(self, call_id: str, other_call_id: str) -> None:
         await self._rpc("call.unbridge", {"call_id": call_id, "other_call_id": other_call_id})

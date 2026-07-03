@@ -3,8 +3,11 @@
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { QueueMetricGroup, QueueReportMetrics } from '@/models/session-report'
+import type { MetricDistribution } from '@/models/session-report-overall'
+import { SatisfactionDistributionCharts } from './overall/satisfaction-distribution-charts'
 import {
   formatQueueMetricValue,
+  QUEUE_METRIC_GROUPS,
   queueGroupLabelKey,
   queueMetricFormat,
   queueMetricLabelKey,
@@ -13,14 +16,21 @@ import {
 
 type Props = {
   metrics?: QueueReportMetrics
+  distributions?: MetricDistribution[]
   loading?: boolean
 }
 
-export function QueueOverviewCards({ metrics, loading }: Props) {
+export function QueueOverviewCards({ metrics, distributions = [], loading }: Props) {
   return (
-    <div className="space-y-5">
-      {(['queue_access', 'human_messages', 'service_efficiency'] as QueueMetricGroup[]).map((group) => (
-        <MetricGroup key={group} group={group} metrics={metrics} loading={loading} />
+    <div className="space-y-3">
+      {QUEUE_METRIC_GROUPS.map((group) => (
+        <MetricGroup
+          key={group}
+          group={group}
+          metrics={metrics}
+          distributions={distributions.filter((item) => item.group === group)}
+          loading={loading}
+        />
       ))}
     </div>
   )
@@ -29,19 +39,21 @@ export function QueueOverviewCards({ metrics, loading }: Props) {
 function MetricGroup({
   group,
   metrics,
+  distributions,
   loading,
 }: {
   group: QueueMetricGroup
   metrics?: QueueReportMetrics
+  distributions: MetricDistribution[]
   loading?: boolean
 }) {
   const { locale } = useLocaleStore()
   return (
     <div>
-      <h3 className="mb-3 text-sm font-semibold text-muted-foreground">
+      <h3 className="mb-1.5 text-xs font-medium text-muted-foreground">
         {t(queueGroupLabelKey[group], locale)}
       </h3>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
         {queueOverviewGroups[group].map((key) => (
           <Card
             key={key}
@@ -51,6 +63,9 @@ function MetricGroup({
           />
         ))}
       </div>
+      {group === 'satisfaction' ? (
+        <SatisfactionDistributionCharts distributions={distributions} loading={loading} />
+      ) : null}
     </div>
   )
 }
@@ -65,12 +80,14 @@ function Card({
   loading?: boolean
 }) {
   return (
-    <div className="flex h-24 flex-1 flex-col justify-center gap-2 rounded-[10px] border border-border bg-background px-5 py-4">
-      <span className="text-sm text-muted-foreground">{label}</span>
+    <div className="flex min-h-[52px] flex-col justify-center gap-0.5 rounded-lg border border-border bg-background px-3 py-2">
+      <span className="truncate text-xs leading-tight text-muted-foreground" title={label}>
+        {label}
+      </span>
       {loading ? (
-        <span className="h-8 w-16 animate-pulse rounded bg-muted" aria-busy="true" />
+        <span className="h-5 w-12 animate-pulse rounded bg-muted" aria-busy="true" />
       ) : (
-        <span className="text-[28px] font-semibold leading-none tracking-tight text-foreground">
+        <span className="truncate text-lg font-semibold leading-tight tracking-tight text-foreground">
           {value}
         </span>
       )}

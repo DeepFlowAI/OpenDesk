@@ -14,6 +14,20 @@ from app.schemas.employee import VALID_ROLES
 
 
 class EmployeeRepository:
+    @staticmethod
+    async def get_sso_admin(db: AsyncSession, tenant_id: int) -> Employee | None:
+        """Find the enabled tenant super admin for SSO login."""
+        result = await db.execute(
+            select(Employee)
+            .where(
+                Employee.tenant_id == tenant_id,
+                Employee.is_active.is_(True),
+                Employee.is_super_admin.is_(True),
+            )
+            .order_by(Employee.id.asc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     @staticmethod
     async def get_by_username_or_email(
@@ -29,10 +43,13 @@ class EmployeeRepository:
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def update_last_login(db: AsyncSession, emp: Employee) -> None:
-        """Update last_login_at timestamp."""
+    async def update_login_session(db: AsyncSession, emp: Employee, session_id: str) -> Employee:
+        """Update last_login_at and the current login session marker."""
         emp.last_login_at = datetime.now(timezone.utc)
+        emp.current_session_id = session_id
         await db.commit()
+        await db.refresh(emp)
+        return emp
 
     @staticmethod
     async def update_password(db: AsyncSession, emp: Employee, password_hash: str) -> None:
@@ -53,6 +70,24 @@ class EmployeeRepository:
         result = await db.execute(
             select(Employee).where(Employee.id.in_(employee_ids))
         )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def list_active_filter_options(
+        db: AsyncSession,
+        tenant_id: int,
+        employee_ids: list[int] | None = None,
+    ) -> list[Employee]:
+        """Return active employees for lightweight selector options."""
+        if employee_ids is not None and not employee_ids:
+            return []
+        query = select(Employee).where(
+            Employee.tenant_id == tenant_id,
+            Employee.is_active.is_(True),
+        )
+        if employee_ids is not None:
+            query = query.where(Employee.id.in_(employee_ids))
+        result = await db.execute(query.order_by(Employee.id.asc()))
         return list(result.scalars().all())
 
     @staticmethod

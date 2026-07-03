@@ -23,6 +23,7 @@ from app.schemas.permission import EffectivePrincipal
 from app.schemas.satisfaction_survey_config import SatisfactionSurveyConfigPayload
 from app.schemas.satisfaction_survey_record import SatisfactionSubmissionPayload, SatisfactionSubmissionTypePayload
 from app.services.conversation_service import ConversationService
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.data_scope_service import DataScopeService
 
 logger = logging.getLogger(__name__)
@@ -376,8 +377,9 @@ class SatisfactionSurveyRecordService:
             }
 
         actor = await EmployeeRepository.get_by_id(db, int(user["user_id"]))
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
         actor_name = (
-            ConversationService.visitor_agent_display_name(actor)
+            ConversationService.agent_display_name(actor, display_mode)
             if actor
             else str(user.get("display_name") or user.get("name") or user.get("username") or "Agent")
         )

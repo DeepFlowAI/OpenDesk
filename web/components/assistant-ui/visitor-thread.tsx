@@ -20,6 +20,7 @@ import {
   QUEUE_ENTERED_SYSTEM_MESSAGE,
 } from '@/lib/visitor-queue-notice'
 import {
+  HandoffQueueFullCard,
   HumanHandoffEventMessage,
   collectConfirmedHandoffToolCallIds,
   isOpenAgentHandoffEventMessage,
@@ -435,6 +436,9 @@ type VisitorThreadProps = {
   isEmbed?: boolean
   showHeader?: boolean
   onEmbedClose?: () => void
+  composerFocusRequest?: number
+  messageSoundEnabled?: boolean
+  onMessageSoundEnabledChange?: (enabled: boolean) => void
 }
 
 export function VisitorThread({
@@ -443,6 +447,9 @@ export function VisitorThread({
   isEmbed = false,
   showHeader = true,
   onEmbedClose,
+  composerFocusRequest = 0,
+  messageSoundEnabled,
+  onMessageSoundEnabledChange,
 }: VisitorThreadProps) {
   const {
     channel,
@@ -472,6 +479,8 @@ export function VisitorThread({
     queueFullMessage,
     queueFullShowLeaveMessageButton,
     queueFullLeaveMessageButtonLabel,
+    queueLeaveMessageLoading,
+    handoffQueueFullInline,
     startConversationError,
     currentQueueCount,
     pendingHumanHandoff,
@@ -485,6 +494,8 @@ export function VisitorThread({
     onUnreadReplyVisible,
     onRestartConversation,
     onQueueFullLeaveMessage,
+    onQueueLeaveMessage,
+    onHandoffQueueFullContinueBot,
     onAssistSendMessage,
     onRequestHumanHandoff,
     onDismissHumanHandoff,
@@ -548,6 +559,26 @@ export function VisitorThread({
     [messages],
   )
   const conversationEnded = ended || conversationStatus === 'closed'
+  const showQueueLeaveMessageButton = isQueued
+    && !offlineMode
+    && !conversationEnded
+    && Boolean(conversationPublicId)
+    && config.queue_show_leave_message_button
+  const queueLeaveMessageButtonLabel = config.queue_leave_message_button_label
+    || (locale === 'zh' ? '留言' : 'Leave a message')
+  const queueLeaveMessageButton = showQueueLeaveMessageButton ? (
+    <div className="px-5 pb-1">
+      <button
+        type="button"
+        onClick={() => void onQueueLeaveMessage()}
+        disabled={queueLeaveMessageLoading}
+        className="inline-flex min-h-7 items-center gap-1.5 rounded-full bg-primary px-3 py-1 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-60"
+      >
+        {queueLeaveMessageLoading && <IconLoader2 size={13} className="animate-spin" />}
+        {queueLeaveMessageButtonLabel}
+      </button>
+    </div>
+  ) : null
   const showOpenAgentWelcomeMessage = !offlineMode
     && !conversationEnded
     && config.open_agent_enabled
@@ -683,6 +714,9 @@ export function VisitorThread({
           isMobile={isMobile}
           isEmbed={isEmbed}
           onEmbedClose={onEmbedClose}
+          locale={locale}
+          messageSoundEnabled={messageSoundEnabled}
+          onMessageSoundEnabledChange={onMessageSoundEnabledChange}
         />
       )}
 
@@ -845,11 +879,14 @@ export function VisitorThread({
         ) : (
           <>
             {isQueued && !hasQueueEnteredMessage && (
-              <QueueStatusNotice
-                locale={locale}
-                html={config.queue_message}
-                currentQueueCount={currentQueueCount}
-              />
+              <>
+                <QueueStatusNotice
+                  locale={locale}
+                  html={config.queue_message}
+                  currentQueueCount={currentQueueCount}
+                />
+                {queueLeaveMessageButton}
+              </>
             )}
 
             {/* ── Initial leave-message prompt ── */}
@@ -979,11 +1016,14 @@ export function VisitorThread({
                           <>
                             <SystemMessage content={displaySystemMessageContent(original.content, original.metadata, locale)} />
                             {isQueued && isQueueEnteredSystemMessage && (
-                              <QueueStatusNotice
-                                locale={locale}
-                                html={config.queue_message}
-                                currentQueueCount={currentQueueCount}
-                              />
+                              <>
+                                <QueueStatusNotice
+                                  locale={locale}
+                                  html={config.queue_message}
+                                  currentQueueCount={currentQueueCount}
+                                />
+                                {queueLeaveMessageButton}
+                              </>
                             )}
                           </>
                         )
@@ -1005,6 +1045,19 @@ export function VisitorThread({
                   )
                 }}
               </ThreadPrimitive.Messages>
+            )}
+
+            {/* ── Bot handoff queue-full card (leave message / keep chatting) ── */}
+            {handoffQueueFullInline && (
+              <HandoffQueueFullCard
+                locale={locale}
+                message={queueFullMessage}
+                showLeaveMessageButton={queueFullShowLeaveMessageButton}
+                leaveMessageButtonLabel={queueFullLeaveMessageButtonLabel}
+                sendButtonBgColor={config.send_button_bg_color}
+                onLeaveMessage={onQueueFullLeaveMessage}
+                onContinueBot={onHandoffQueueFullContinueBot}
+              />
             )}
 
             {/* ── Typing indicator ── */}
@@ -1086,6 +1139,7 @@ export function VisitorThread({
             disabled={false}
             isMobile={isMobile}
             isEmbed={isEmbed}
+            focusRequest={composerFocusRequest}
             insertRequest={composerInsertRequest}
             showSatisfactionButton={showComposerSatisfactionButton}
             satisfactionLoading={satisfactionLoading}

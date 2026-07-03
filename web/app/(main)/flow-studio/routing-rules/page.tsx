@@ -57,6 +57,27 @@ function DeleteModal({
   )
 }
 
+function TargetCell({ row }: { row: InboundRoutingRuleListItem }) {
+  const { locale } = useLocaleStore()
+  const isVoiceSpeed = row.target_type === 'voicespeed_agent'
+  const name = isVoiceSpeed ? row.voicespeed_agent_name : row.target_flow_name
+  const unavailable = !name
+  return (
+    <div className="flex min-w-0 items-center gap-1.5">
+      <span
+        className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${
+          isVoiceSpeed ? 'bg-cyan-50 text-cyan-700' : 'bg-blue-50 text-blue-700'
+        }`}
+      >
+        {isVoiceSpeed ? t('rr.target.tag.voiceSpeed', locale) : t('rr.target.tag.voiceFlow', locale)}
+      </span>
+      <span className={`min-w-0 truncate text-sm ${unavailable ? 'text-amber-600' : 'text-foreground'}`}>
+        {unavailable ? t('rr.target.unavailable', locale) : name}
+      </span>
+    </div>
+  )
+}
+
 export default function RoutingRulesListPage() {
   const router = useRouter()
   const { locale } = useLocaleStore()
@@ -161,7 +182,7 @@ export default function RoutingRulesListPage() {
               <div className="w-6 shrink-0" />
               <div className="w-20 shrink-0">{t('rr.col.priority', locale)}</div>
               <div className="min-w-0 flex-1">{t('rr.col.name', locale)}</div>
-              <div className="w-[200px] shrink-0">{t('rr.col.flow', locale)}</div>
+              <div className="w-[200px] shrink-0">{t('rr.col.target', locale)}</div>
               <div className="w-[100px] shrink-0">{t('rr.col.enabled', locale)}</div>
               <div className="w-[90px] shrink-0 text-center">{t('rr.col.actions', locale)}</div>
             </div>
@@ -182,8 +203,8 @@ export default function RoutingRulesListPage() {
                 </div>
                 <div className="w-20 shrink-0 text-sm text-foreground">{row.priority}</div>
                 <div className="min-w-0 flex-1 truncate text-sm text-foreground">{row.name}</div>
-                <div className="w-[200px] shrink-0 truncate text-sm text-foreground">
-                  {row.target_flow_name || '—'}
+                <div className="w-[200px] shrink-0">
+                  <TargetCell row={row} />
                 </div>
                 <div className="w-[100px] shrink-0 text-sm text-muted-foreground">
                   {row.enabled ? t('rr.status.enabled', locale) : t('rr.status.disabled', locale)}

@@ -1,3 +1,5 @@
+import type { MetricDistribution } from './session-report-overall'
+
 export type TrendType = 'half_hour' | 'hour' | 'day' | 'week' | 'month'
 
 export type MetricKey =
@@ -78,9 +80,9 @@ export type EmployeesListResponse = {
   as_of: string
 }
 
-export type QueueType = 'employee_group' | 'employee'
+export type QueueType = 'employee_group'
 export type QueueStatus = 'active' | 'inactive' | 'deleted'
-export type QueueMetricGroup = 'queue_access' | 'human_messages' | 'service_efficiency'
+export type QueueMetricGroup = 'queue_access' | 'human_messages' | 'service_efficiency' | 'satisfaction'
 export type QueueMetricFormat = 'integer' | 'duration_seconds' | 'percent'
 export type QueueMetricLevel = 'primary' | 'auxiliary'
 
@@ -107,6 +109,11 @@ export type QueueReportMetrics = {
   avg_first_human_response_seconds: number | null
   avg_agent_response_seconds: number | null
   avg_human_session_duration_seconds: number | null
+  satisfaction_invitation_count: number
+  satisfaction_submission_count: number
+  satisfaction_participation_rate: number | null
+  satisfaction_submission_rate: number | null
+  product_satisfaction_count: number
 }
 
 export type QueueOverviewRow = {
@@ -128,13 +135,14 @@ export type QueueListResponse = {
 export type QueueDetailResponse = {
   queue: QueueBrief
   metrics: QueueReportMetrics
+  distributions: MetricDistribution[]
   as_of: string
 }
 
 export type QueueMetricKey = keyof QueueReportMetrics
 
 export type QueueTrendDescriptor = {
-  key: QueueMetricKey
+  key: string
   value: number | null
   format: QueueMetricFormat
   level: QueueMetricLevel
@@ -142,7 +150,7 @@ export type QueueTrendDescriptor = {
 }
 
 export type QueueTrendMetricValue = {
-  key: QueueMetricKey
+  key: string
   value: number | null
   format: QueueMetricFormat
 }

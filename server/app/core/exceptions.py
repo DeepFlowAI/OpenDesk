@@ -35,6 +35,11 @@ class UnauthorizedError(BusinessError):
         super().__init__(message, status_code=401, code="UNAUTHORIZED")
 
 
+class SessionReplacedError(UnauthorizedError):
+    def __init__(self, message: str = "Session replaced"):
+        BusinessError.__init__(self, message, status_code=401, code="SESSION_REPLACED")
+
+
 class ForbiddenError(BusinessError):
     def __init__(self, message: str = "Forbidden"):
         super().__init__(message, status_code=403, code="FORBIDDEN")
@@ -74,3 +79,22 @@ def register_exception_handlers(app: FastAPI) -> None:
         if exc.details is not None:
             body["details"] = exc.details
         return JSONResponse(status_code=exc.status_code, content=body)
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        # Unhandled exceptions would otherwise only be printed by uvicorn's own
+        # stdout handler, which does not propagate to the root logger (and thus
+        # never reaches the remote log backend). Log the full traceback through
+        # the app logger so every 500 is captured with its trace_id.
+        logger.error(
+            "Unhandled server error: method=%s path=%s",
+            request.method,
+            request.url.path,
+            exc_info=exc,
+        )
+        body = {
+            "code": "INTERNAL_SERVER_ERROR",
+            "message": "Internal server error",
+            "status": 500,
+        }
+        return JSONResponse(status_code=500, content=body)

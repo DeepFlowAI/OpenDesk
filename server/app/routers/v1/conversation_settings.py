@@ -19,6 +19,10 @@ from app.schemas.conversation_read_status import (
     ConversationReadStatusResponse,
     ConversationReadStatusTargetResponse,
 )
+from app.schemas.conversation_agent_display_setting import (
+    ConversationAgentDisplaySettingPayload,
+    ConversationAgentDisplaySettingResponse,
+)
 from app.schemas.conversation_announcement_rule import (
     ConversationAnnouncementRuleCreate,
     ConversationAnnouncementRuleEnabledPatch,
@@ -26,6 +30,14 @@ from app.schemas.conversation_announcement_rule import (
     ConversationAnnouncementRuleReorder,
     ConversationAnnouncementRuleResponse,
     ConversationAnnouncementRuleUpdate,
+)
+from app.schemas.queue_no_show_setting import (
+    QueueNoShowSettingPayload,
+    QueueNoShowSettingResponse,
+)
+from app.schemas.knowledge_input_suggestion_setting import (
+    KnowledgeInputSuggestionSettingPayload,
+    KnowledgeInputSuggestionSettingResponse,
 )
 from app.schemas.visitor_timeout_close import (
     VisitorTimeoutClosePayload,
@@ -46,10 +58,13 @@ from app.schemas.satisfaction_survey_config import (
     SatisfactionSurveyVersionDetail,
     SatisfactionSurveyVersionListResponse,
 )
+from app.services.queue_no_show_setting_service import QueueNoShowSettingService
+from app.services.knowledge_input_suggestion_setting_service import KnowledgeInputSuggestionSettingService
 from app.services.satisfaction_survey_config_service import SatisfactionSurveyConfigService
 from app.services.emoji_setting_service import EmojiSettingService
 from app.services.conversation_announcement_rule_service import ConversationAnnouncementRuleService
 from app.services.conversation_read_status_service import ConversationReadStatusService
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_user_stat_service import ConversationUserStatService
 from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 from app.services.welcome_message_rule_service import WelcomeMessageRuleService
@@ -58,8 +73,11 @@ router = APIRouter(prefix="/conversation-settings", tags=["ConversationSettings"
 EMOJI_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 USER_STAT_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 VISITOR_TIMEOUT_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
+QUEUE_NO_SHOW_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
+KNOWLEDGE_INPUT_SUGGESTION_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 ANNOUNCEMENT_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 READ_STATUS_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
+AGENT_DISPLAY_NAME_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 
 
 @router.get(
@@ -170,6 +188,33 @@ async def get_agent_read_status_settings(
 
 
 @router.get(
+    "/agent-display-name",
+    response_model=ConversationAgentDisplaySettingResponse,
+    dependencies=[Depends(require_all_permissions(AGENT_DISPLAY_NAME_ADMIN_PERMISSIONS))],
+)
+async def get_agent_display_name_settings(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get agent display-name settings."""
+    return await ConversationAgentDisplaySettingService.get_current(db, current_user["tenant_id"])
+
+
+@router.put(
+    "/agent-display-name",
+    response_model=ConversationAgentDisplaySettingResponse,
+    dependencies=[Depends(require_all_permissions(AGENT_DISPLAY_NAME_ADMIN_PERMISSIONS))],
+)
+async def save_agent_display_name_settings(
+    body: ConversationAgentDisplaySettingPayload,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save agent display-name settings."""
+    return await ConversationAgentDisplaySettingService.save(db, current_user["tenant_id"], current_user, body)
+
+
+@router.get(
     "/visitor-timeout-close",
     response_model=VisitorTimeoutCloseResponse,
     dependencies=[Depends(require_all_permissions(VISITOR_TIMEOUT_ADMIN_PERMISSIONS))],
@@ -194,6 +239,73 @@ async def save_visitor_timeout_close_settings(
 ):
     """Save visitor timeout auto-close settings."""
     return await VisitorTimeoutCloseService.save(db, current_user["tenant_id"], current_user, body)
+
+
+@router.get(
+    "/queue-no-show",
+    response_model=QueueNoShowSettingResponse,
+    dependencies=[Depends(require_all_permissions(QUEUE_NO_SHOW_ADMIN_PERMISSIONS))],
+)
+async def get_queue_no_show_settings(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get queue no-show cancel settings or a default draft."""
+    return await QueueNoShowSettingService.get_current(db, current_user["tenant_id"])
+
+
+@router.put(
+    "/queue-no-show",
+    response_model=QueueNoShowSettingResponse,
+    dependencies=[Depends(require_all_permissions(QUEUE_NO_SHOW_ADMIN_PERMISSIONS))],
+)
+async def save_queue_no_show_settings(
+    body: QueueNoShowSettingPayload,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save queue no-show cancel settings."""
+    return await QueueNoShowSettingService.save(db, current_user["tenant_id"], current_user, body)
+
+
+@router.get(
+    "/knowledge-input-suggestions",
+    response_model=KnowledgeInputSuggestionSettingResponse,
+    dependencies=[Depends(require_all_permissions(KNOWLEDGE_INPUT_SUGGESTION_ADMIN_PERMISSIONS))],
+)
+async def get_knowledge_input_suggestion_settings(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get knowledge input suggestion settings or a default draft."""
+    return await KnowledgeInputSuggestionSettingService.get_current(db, current_user["tenant_id"])
+
+
+@router.put(
+    "/knowledge-input-suggestions",
+    response_model=KnowledgeInputSuggestionSettingResponse,
+    dependencies=[Depends(require_all_permissions(KNOWLEDGE_INPUT_SUGGESTION_ADMIN_PERMISSIONS))],
+)
+async def save_knowledge_input_suggestion_settings(
+    body: KnowledgeInputSuggestionSettingPayload,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save knowledge input suggestion settings."""
+    return await KnowledgeInputSuggestionSettingService.save(db, current_user["tenant_id"], current_user, body)
+
+
+@router.get(
+    "/knowledge-input-suggestions/agent",
+    response_model=KnowledgeInputSuggestionSettingResponse,
+    dependencies=[Depends(require_permission("chat.workspace.use"))],
+)
+async def get_agent_knowledge_input_suggestion_settings(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get agent-side knowledge input suggestion settings."""
+    return await KnowledgeInputSuggestionSettingService.get_runtime_config(db, current_user["tenant_id"])
 
 
 @router.get("/satisfaction", response_model=SatisfactionSurveyConfigResponse)

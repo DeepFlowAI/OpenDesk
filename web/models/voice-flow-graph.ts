@@ -11,6 +11,7 @@ export type NodeType =
   | 'collect'
   | 'condition'
   | 'assign_queue'
+  | 'voicespeed'
   | 'hangup'
 
 // ───────────── Prompt (TTS or audio) ─────────────
@@ -95,6 +96,15 @@ export type AssignQueueData = {
 
 export type HangupData = { pre_play: Prompt | null }
 
+// VoiceSpeed node — only the agent id + a display-name snapshot are stored;
+// voice/model/prompt all live inside VoiceSpeed and are referenced by agent_id.
+export type VoiceSpeedData = {
+  agent_id: string
+  agent_name: string
+  unavailable_prompt_text: string
+  connect_failed_prompt_text: string
+}
+
 // ───────────── Node + Edge + Graph ─────────────
 
 export type NodePosition = { x: number; y: number }
@@ -111,6 +121,7 @@ export type PlayNode = NodeBase<'play', PlayData>
 export type CollectNode = NodeBase<'collect', CollectData>
 export type ConditionNode = NodeBase<'condition', ConditionData>
 export type AssignQueueNode = NodeBase<'assign_queue', AssignQueueData>
+export type VoiceSpeedNode = NodeBase<'voicespeed', VoiceSpeedData>
 export type HangupNode = NodeBase<'hangup', HangupData>
 
 export type FlowNode =
@@ -119,6 +130,7 @@ export type FlowNode =
   | CollectNode
   | ConditionNode
   | AssignQueueNode
+  | VoiceSpeedNode
   | HangupNode
 
 export type FlowEdge = {
@@ -184,6 +196,15 @@ export function defaultAssignQueueData(): AssignQueueData {
   }
 }
 
+export function defaultVoiceSpeedData(): VoiceSpeedData {
+  return {
+    agent_id: '',
+    agent_name: '',
+    unavailable_prompt_text: '当前智能语音服务不可用，请稍后再拨。',
+    connect_failed_prompt_text: '暂时无法接入智能语音服务，请稍后再拨。',
+  }
+}
+
 export function defaultGroup(): ConditionGroup {
   return {
     id: `g_${Math.random().toString(36).slice(2, 8)}`,
@@ -205,6 +226,8 @@ export function defaultDataFor(type: NodeType): FlowNode['data'] {
       return { groups: [defaultGroup()] }
     case 'assign_queue':
       return defaultAssignQueueData()
+    case 'voicespeed':
+      return defaultVoiceSpeedData()
     case 'hangup':
       return { pre_play: null }
   }
@@ -216,6 +239,7 @@ export const NODE_COLOR: Record<NodeType, string> = {
   collect: '#F59E0B',
   condition: '#8B5CF6',
   assign_queue: '#10B981',
+  voicespeed: '#06B6D4',
   hangup: '#EF4444',
 }
 

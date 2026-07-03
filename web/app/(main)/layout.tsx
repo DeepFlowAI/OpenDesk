@@ -53,6 +53,7 @@ const ADMIN_NAV_ICONS: Record<AdminNavIconKey, ComponentType<{ size?: number; cl
   flowStudio: IconGitBranch,
   phoneNumbers: IconPhone,
   callSummary: IconFilePhone,
+  callSettings: IconSettings,
   conversationSettings: IconMessageCircleCog,
   channels: IconMessageCircle,
   sessionRouting: IconGitBranch,

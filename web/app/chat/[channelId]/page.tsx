@@ -9,10 +9,13 @@ import {
   fetchOfflineMessages,
   fetchUnreadOfflineReplies,
   fetchVisitorConversationHistory,
+  leaveQueuedConversationMessage,
   markConversationCustomerRead,
   syncConversationContext,
   useChannelPublic,
   type ChannelPublicConfig,
+  type OfflineMessageSource,
+  type OfflineMessageQueueType,
   type PublicMessage,
 } from '@/service/use-visitor-chat'
 import { telemetry } from '@/service/telemetry'
@@ -39,6 +42,14 @@ import type {
 import type { ChannelConfig } from '@/models/channel'
 import { cn } from '@/lib/utils'
 import { isVisitorQueueEnteredMessage } from '@/lib/visitor-queue-notice'
+import {
+  bindVisitorMessageAlertUnlock,
+  playVisitorMessageAlert,
+  readVisitorMessageAlertEnabled,
+  setVisitorMessageAlertEnabled,
+  stopVisitorMessageAlert,
+  unlockVisitorMessageAlert,
+} from '@/lib/visitor-message-alert'
 
 const HISTORY_PAGE_SIZE = 10
 const HISTORY_CLIENT_LIMIT = 200
@@ -53,6 +64,20 @@ type VisitorCredential = {
   visitorSessionToken?: string
   visitorSessionExpiresAt?: number
   visitorPayloadKey?: string
+}
+
+type OfflineMessageQueueTarget = {
+  queueType: OfflineMessageQueueType
+  queueId: number
+}
+
+function queueTargetFromPayload(payload: {
+  queue_type?: string
+  queue_id?: number | null
+}): OfflineMessageQueueTarget | null {
+  return payload.queue_type === 'employee_group' && typeof payload.queue_id === 'number'
+    ? { queueType: payload.queue_type, queueId: payload.queue_id }
+    : null
 }
 
 type EmbedVisitorPayload = {
@@ -439,6 +464,8 @@ const defaultConfig: ChannelConfig = {
   restricted_service_message: '抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。',
   queue_message: '您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。客服接入后会立即回复您。',
   queue_full_message: '当前排队人数较多，暂时无法进入排队。您可以稍后再试，或点击留言，我们上线后会尽快联系您。',
+  queue_show_leave_message_button: false,
+  queue_leave_message_button_label: '留言',
   queue_full_show_leave_message_button: true,
   queue_full_leave_message_button_label: '留言',
   open_agent_enabled: false,
@@ -470,6 +497,8 @@ function VisitorChatBootShell({
   isMobile,
   isEmbed,
   onEmbedClose,
+  messageSoundEnabled,
+  onMessageSoundEnabledChange,
 }: {
   channel: ChannelPublicConfig
   config: ChannelConfig
@@ -477,6 +506,8 @@ function VisitorChatBootShell({
   isMobile: boolean
   isEmbed: boolean
   onEmbedClose: () => void
+  messageSoundEnabled: boolean
+  onMessageSoundEnabledChange: (enabled: boolean) => void
 }) {
   const placeholder =
     config.input_placeholder ||
@@ -489,6 +520,9 @@ function VisitorChatBootShell({
         isMobile={isMobile}
         isEmbed={isEmbed}
         onEmbedClose={onEmbedClose}
+        locale={locale}
+        messageSoundEnabled={messageSoundEnabled}
+        onMessageSoundEnabledChange={onMessageSoundEnabledChange}
       />
       <div
         className="flex flex-1 items-center justify-center"
@@ -543,8 +577,11 @@ export default function VisitorChatPage() {
   const [visitorExternalId, setVisitorExternalId] = useState<string | null>(null)
   const [visitorSessionToken, setVisitorSessionToken] = useState<string | null>(null)
   const [offlineMessagePublicId, setOfflineMessagePublicId] = useState<string | null>(null)
+  const [offlineMessageSource, setOfflineMessageSource] = useState<OfflineMessageSource | null>(null)
+  const [offlineMessageQueueTarget, setOfflineMessageQueueTarget] = useState<OfflineMessageQueueTarget | null>(null)
   const [leaveMessageMode, setLeaveMessageMode] = useState(false)
   const [leaveMessagePrompt, setLeaveMessagePrompt] = useState('')
+  const [queueLeaveMessageLoading, setQueueLeaveMessageLoading] = useState(false)
   const lastSyncedContextTokenRef = useRef<string | null>(null)
   // Bounds automatic re-mint attempts after a visitor session auth failure, so a
   // token the server keeps rejecting (e.g. a disabled channel) can't loop.
@@ -563,6 +600,7 @@ export default function VisitorChatPage() {
     authFailed,
     conversationPublicId,
     messages,
+    messageAlertNonce,
     hasMore,
     satisfactionInvitation,
     pendingHumanHandoff,
@@ -608,8 +646,12 @@ export default function VisitorChatPage() {
   const [startConversationError, setStartConversationError] = useState<string | null>(null)
   const [queueFullShowLeaveMessageButton, setQueueFullShowLeaveMessageButton] = useState(true)
   const [queueFullLeaveMessageButtonLabel, setQueueFullLeaveMessageButtonLabel] = useState('')
+  // When a bot→human handoff overflows the queue, surface an inline confirm-style
+  // card (leave message / keep chatting) instead of the full-screen overflow card.
+  const [handoffQueueFullInline, setHandoffQueueFullInline] = useState(false)
   const [currentQueueCount, setCurrentQueueCount] = useState<number | null>(null)
   const [conversationInitializing, setConversationInitializing] = useState(true)
+  const [messageSoundEnabled, setMessageSoundEnabled] = useState(true)
   const [embedReadyPosted, setEmbedReadyPosted] = useState(false)
   const [embedInitPayload, setEmbedInitPayload] = useState<EmbedInitPayload | null>(
     () => embedInitRequired ? null : standaloneInitPayload,
@@ -617,6 +659,7 @@ export default function VisitorChatPage() {
   const [embedActivated, setEmbedActivated] = useState(
     () => !embedActivationRequired,
   )
+  const [embedComposerFocusRequest, setEmbedComposerFocusRequest] = useState(0)
   const startedRef = useRef(false)
   const customerReadInFlightRef = useRef<Set<string>>(new Set())
   const lastCustomerReadMessageRef = useRef<string | null>(null)
@@ -624,17 +667,44 @@ export default function VisitorChatPage() {
   const readReceiptInFlightKeysRef = useRef<Set<string>>(new Set())
   const readReceiptRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const conversationPublicIdRef = useRef<string | null>(null)
+  const handledMessageAlertNonceRef = useRef<number | null>(null)
   // Offline UI is driven purely by the server's start_conversation response so
   // that a visitor with an unfinished conversation can always re-enter it,
   // regardless of whether any agent is currently online. The channel-level
   // availability hint is kept only as a fallback copy for the offline screen.
   const isLeaveMessage = leaveMessageMode && !conversationPublicId
-  const queueFull = !!queueFullMessage && !isLeaveMessage && !startConversationError
-  const isOffline = !!socketOfflineMessage && !conversationPublicId && !isLeaveMessage && !queueFull && !startConversationError
+  const queueFull = !!queueFullMessage && !isLeaveMessage && !startConversationError && !handoffQueueFullInline
+  const isOffline = !!socketOfflineMessage && !conversationPublicId && !isLeaveMessage && !queueFull && !handoffQueueFullInline && !startConversationError
 
   useEffect(() => {
     conversationPublicIdRef.current = conversationPublicId
   }, [conversationPublicId])
+
+  useEffect(() => {
+    setMessageSoundEnabled(readVisitorMessageAlertEnabled())
+    return bindVisitorMessageAlertUnlock()
+  }, [])
+
+  useEffect(() => {
+    if (handledMessageAlertNonceRef.current === null) {
+      handledMessageAlertNonceRef.current = messageAlertNonce
+      return
+    }
+    if (handledMessageAlertNonceRef.current === messageAlertNonce) return
+
+    handledMessageAlertNonceRef.current = messageAlertNonce
+    if (messageSoundEnabled) playVisitorMessageAlert()
+  }, [messageAlertNonce, messageSoundEnabled])
+
+  const handleMessageSoundEnabledChange = useCallback((enabled: boolean) => {
+    setMessageSoundEnabled(enabled)
+    setVisitorMessageAlertEnabled(enabled)
+    if (enabled) {
+      unlockVisitorMessageAlert()
+    } else {
+      stopVisitorMessageAlert()
+    }
+  }, [])
 
   const trackEvent = useCallback((
     name: string,
@@ -667,6 +737,7 @@ export default function VisitorChatPage() {
     setEmbedReadyPosted(false)
     setEmbedActivated(!embedActivationRequired)
     setEmbedInitPayload(embedInitRequired ? null : standaloneInitPayload)
+    setEmbedComposerFocusRequest(0)
   }, [channelKey, embedActivationRequired, embedInstanceId, embedInitRequired, standaloneInitPayload])
 
   useEffect(() => {
@@ -693,8 +764,12 @@ export default function VisitorChatPage() {
       } else {
         setEmbedInitPayload((current) => current ?? nextPayload)
       }
-      if (data.type === 'open' || data.active === true || data.preload !== true) {
+      const shouldActivate = data.type === 'open' || data.active === true || data.preload !== true
+      if (shouldActivate) {
         setEmbedActivated(true)
+      }
+      if (data.type === 'open' || (data.type === 'init' && data.active === true)) {
+        setEmbedComposerFocusRequest((value) => value + 1)
       }
     }
 
@@ -755,6 +830,8 @@ export default function VisitorChatPage() {
     setVisitorSessionToken(null)
     setConversationPublicId(null)
     setOfflineMessagePublicId(null)
+    setOfflineMessageSource(null)
+    setOfflineMessageQueueTarget(null)
     setLeaveMessageMode(false)
     setLeaveMessagePrompt('')
     setMessages([])
@@ -964,6 +1041,8 @@ export default function VisitorChatPage() {
           queue_full_message?: string
           queue_full_show_leave_message_button?: boolean
           queue_full_leave_message_button_label?: string
+          queue_type?: string
+          queue_id?: number | null
         }) => {
           if (res.ok && res.conversation) {
             trackEvent('conversation_start_succeeded', {
@@ -999,6 +1078,8 @@ export default function VisitorChatPage() {
             setQueueFullLeaveMessageButtonLabel('')
             setStartConversationError(null)
             setOfflineMessagePublicId(null)
+            setOfflineMessageSource(null)
+            setOfflineMessageQueueTarget(null)
             setLeaveMessageMode(false)
             setLeaveMessagePrompt('')
             setConversationPublicId(res.conversation.conversation_public_id)
@@ -1067,6 +1148,8 @@ export default function VisitorChatPage() {
             })
             setConversationPublicId(null)
             setOfflineMessagePublicId(null)
+            setOfflineMessageSource(null)
+            setOfflineMessageQueueTarget(null)
             setLeaveMessageMode(false)
             setLeaveMessagePrompt('')
             setQueueFullMessage('')
@@ -1099,6 +1182,8 @@ export default function VisitorChatPage() {
             })
             setConversationPublicId(null)
             setOfflineMessagePublicId(null)
+            setOfflineMessageSource(null)
+            setOfflineMessageQueueTarget(null)
             setLeaveMessageMode(false)
             setLeaveMessagePrompt('')
             setQueueFullMessage('')
@@ -1125,6 +1210,8 @@ export default function VisitorChatPage() {
             setQueueFullShowLeaveMessageButton(true)
             setQueueFullLeaveMessageButtonLabel('')
             setCurrentQueueCount(null)
+            setOfflineMessageSource(null)
+            setOfflineMessageQueueTarget(null)
             setLeaveMessageMode(true)
             setSatisfactionInvitation(null)
             setSatisfactionCanInitiate(false)
@@ -1135,6 +1222,8 @@ export default function VisitorChatPage() {
               const data = await fetchCurrentOfflineMessage({ visitorSessionToken, limit: 50 })
               if (data?.conversation_public_id) {
                 setOfflineMessagePublicId(null)
+                setOfflineMessageSource(null)
+                setOfflineMessageQueueTarget(null)
                 setLeaveMessageMode(false)
                 setConversationPublicId(data.conversation_public_id)
                 setConversationStatus('active')
@@ -1160,6 +1249,8 @@ export default function VisitorChatPage() {
                 props: { source: 'start_conversation' },
               })
               setOfflineMessagePublicId(null)
+              setOfflineMessageSource(null)
+              setOfflineMessageQueueTarget(null)
               setLeaveMessageMode(false)
               setMessages([])
               setHasMore(false)
@@ -1173,6 +1264,8 @@ export default function VisitorChatPage() {
             })
             setConversationPublicId(null)
             setOfflineMessagePublicId(null)
+            setOfflineMessageSource(null)
+            setOfflineMessageQueueTarget(null)
             setLeaveMessageMode(false)
             setMessages([])
             setHasMore(false)
@@ -1201,6 +1294,8 @@ export default function VisitorChatPage() {
             })
             setConversationPublicId(null)
             setOfflineMessagePublicId(null)
+            setOfflineMessageSource(null)
+            setOfflineMessageQueueTarget(queueTargetFromPayload(res))
             setLeaveMessageMode(false)
             setLeaveMessagePrompt(res.leave_message_prompt || channel?.config.leave_message_prompt || '')
             setMessages([])
@@ -1219,6 +1314,7 @@ export default function VisitorChatPage() {
               || channel?.config.queue_full_leave_message_button_label
               || '',
             )
+            setHandoffQueueFullInline(false)
           }
           window.clearTimeout(timer)
           setConversationInitializing(false)
@@ -1542,6 +1638,12 @@ export default function VisitorChatPage() {
     setSatisfactionCanInitiate(false)
   }, [])
 
+  const handleOfflineMessageCreated = useCallback((offlineMessagePublicId: string) => {
+    setOfflineMessagePublicId(offlineMessagePublicId)
+    setOfflineMessageSource(null)
+    setOfflineMessageQueueTarget(null)
+  }, [])
+
   const handleRestartConversation = useCallback(async () => {
     if (!socket || !connected || !visitorSessionToken) {
       await startConversation()
@@ -1557,6 +1659,8 @@ export default function VisitorChatPage() {
     setHistoryError(false)
     setHistoryLimitReached(false)
     setConversationPublicId(null)
+    setOfflineMessageSource(null)
+    setOfflineMessageQueueTarget(null)
     setMessages([])
     setHasMore(false)
     setSatisfactionInvitation(null)
@@ -1588,11 +1692,13 @@ export default function VisitorChatPage() {
     setQueueFullMessage('')
     setQueueFullShowLeaveMessageButton(true)
     setQueueFullLeaveMessageButtonLabel('')
+    setHandoffQueueFullInline(false)
     setCurrentQueueCount(null)
     setSocketOfflineTitle('')
     setSocketOfflineMessage('')
     setConversationPublicId(null)
     setOfflineMessagePublicId(null)
+    setOfflineMessageSource('queue_full')
     setLeaveMessageMode(true)
     setLeaveMessagePrompt((current) => current || channel?.config.leave_message_prompt || '')
     setMessages([])
@@ -1601,15 +1707,76 @@ export default function VisitorChatPage() {
     setConversationStatus(null)
   }, [channel?.config.leave_message_prompt, setConversationPublicId, setHasMore, setMessages])
 
+  const handleQueueLeaveMessage = useCallback(async () => {
+    if (!conversationPublicId || !visitorSessionToken || queueLeaveMessageLoading) return
+    setQueueLeaveMessageLoading(true)
+    try {
+      const result = await leaveQueuedConversationMessage({
+        conversationPublicId,
+        visitorSessionToken,
+      })
+      setQueueFullMessage('')
+      setQueueFullShowLeaveMessageButton(true)
+      setQueueFullLeaveMessageButtonLabel('')
+      setHandoffQueueFullInline(false)
+      setCurrentQueueCount(null)
+      setSocketOfflineTitle('')
+      setSocketOfflineMessage('')
+      setConversationPublicId(null)
+      setOfflineMessagePublicId(null)
+      setOfflineMessageSource(result.source)
+      setOfflineMessageQueueTarget({
+        queueType: result.queue_type,
+        queueId: result.queue_id,
+      })
+      setLeaveMessageMode(true)
+      setLeaveMessagePrompt(result.leave_message_prompt || channel?.config.leave_message_prompt || '')
+      setMessages([])
+      setHasMore(false)
+      setEnded(false)
+      setConversationStatus(null)
+    } catch {
+      window.alert(locale === 'zh'
+        ? '暂时无法进入留言，请稍后再试'
+        : 'Unable to switch to leave a message. Please try again.')
+    } finally {
+      setQueueLeaveMessageLoading(false)
+    }
+  }, [
+    channel?.config.leave_message_prompt,
+    conversationPublicId,
+    locale,
+    queueLeaveMessageLoading,
+    setConversationPublicId,
+    setHasMore,
+    setMessages,
+    visitorSessionToken,
+  ])
+
+  // Visitor declined the leave-message option on queue overflow and stays with
+  // the bot. Clear the overflow card and keep the existing bot conversation.
+  const handleHandoffQueueFullContinueBot = useCallback(() => {
+    setQueueFullMessage('')
+    setQueueFullShowLeaveMessageButton(true)
+    setQueueFullLeaveMessageButtonLabel('')
+    setHandoffQueueFullInline(false)
+    setOfflineMessageSource(null)
+    setOfflineMessageQueueTarget(null)
+    setCurrentQueueCount(null)
+  }, [])
+
   const handleHandoffLeaveMessage = useCallback((prompt?: string) => {
     setQueueFullMessage('')
     setQueueFullShowLeaveMessageButton(true)
     setQueueFullLeaveMessageButtonLabel('')
+    setHandoffQueueFullInline(false)
     setCurrentQueueCount(null)
     setSocketOfflineTitle('')
     setSocketOfflineMessage('')
     setConversationPublicId(null)
     setOfflineMessagePublicId(null)
+    setOfflineMessageSource(null)
+    setOfflineMessageQueueTarget(null)
     setLeaveMessageMode(true)
     setLeaveMessagePrompt(prompt || channel?.config.leave_message_prompt || '')
     setMessages([])
@@ -1630,10 +1797,14 @@ export default function VisitorChatPage() {
     queue_full_show_leave_message_button?: boolean
     queue_full_leave_message_button_label?: string
     leave_message_prompt?: string
-  }) => {
+    queue_type?: string
+    queue_id?: number | null
+  }, inline = false) => {
     setSocketOfflineTitle('')
     setSocketOfflineMessage('')
     setCurrentQueueCount(null)
+    setOfflineMessageSource(null)
+    setOfflineMessageQueueTarget(queueTargetFromPayload(payload))
     setLeaveMessageMode(false)
     setLeaveMessagePrompt(payload.leave_message_prompt || channel?.config.leave_message_prompt || '')
     setQueueFullMessage(payload.queue_full_message || channel?.config.queue_full_message || '')
@@ -1643,6 +1814,7 @@ export default function VisitorChatPage() {
       || channel?.config.queue_full_leave_message_button_label
       || '',
     )
+    setHandoffQueueFullInline(inline)
     setPendingHumanHandoff(null)
   }, [
     channel?.config.leave_message_prompt,
@@ -1808,6 +1980,8 @@ export default function VisitorChatPage() {
         return
       }
       setOfflineMessagePublicId(null)
+      setOfflineMessageSource(null)
+      setOfflineMessageQueueTarget(null)
       setLeaveMessageMode(false)
       setLeaveMessagePrompt('')
       setSocketOfflineTitle('')
@@ -1815,6 +1989,7 @@ export default function VisitorChatPage() {
       setQueueFullMessage('')
       setQueueFullShowLeaveMessageButton(true)
       setQueueFullLeaveMessageButtonLabel('')
+      setHandoffQueueFullInline(false)
       setCurrentQueueCount(null)
       setConversationPublicId(data.conversation_public_id)
       setConversationStatus(data.status || 'active')
@@ -2051,6 +2226,8 @@ export default function VisitorChatPage() {
               isMobile={isMobile}
               isEmbed={isEmbed}
               onEmbedClose={handleEmbedClose}
+              messageSoundEnabled={messageSoundEnabled}
+              onMessageSoundEnabledChange={handleMessageSoundEnabledChange}
             />
           ) : (
             <div className="flex flex-1 items-center justify-center">
@@ -2106,10 +2283,14 @@ export default function VisitorChatPage() {
           conversationPublicId={conversationPublicId}
           offlineMode={isLeaveMessage}
           offlineMessagePublicId={offlineMessagePublicId}
+          offlineMessageSource={offlineMessageSource}
+          offlineMessageQueueTarget={offlineMessageQueueTarget}
           queueFull={queueFull}
           queueFullMessage={queueFullMessage}
           queueFullShowLeaveMessageButton={queueFullShowLeaveMessageButton}
           queueFullLeaveMessageButtonLabel={queueFullLeaveMessageButtonLabel}
+          queueLeaveMessageLoading={queueLeaveMessageLoading}
+          handoffQueueFullInline={handoffQueueFullInline}
           startConversationError={startConversationError}
           currentQueueCount={currentQueueCount}
           visitorSessionToken={visitorSessionToken}
@@ -2140,11 +2321,13 @@ export default function VisitorChatPage() {
           onTyping={handleTyping}
           onRestartConversation={handleRestartConversation}
           onQueueFullLeaveMessage={handleQueueFullLeaveMessage}
+          onQueueLeaveMessage={handleQueueLeaveMessage}
+          onHandoffQueueFullContinueBot={handleHandoffQueueFullContinueBot}
           onHandoffLeaveMessage={handleHandoffLeaveMessage}
           onHandoffQueueFull={handleHandoffQueueFull}
           onConversationStatusChange={setConversationStatus}
           onCurrentQueueCountChange={setCurrentQueueCount}
-          onOfflineMessageCreated={setOfflineMessagePublicId}
+          onOfflineMessageCreated={handleOfflineMessageCreated}
           onSatisfactionInitiate={handleSatisfactionInitiate}
           onSatisfactionSubmitted={handleSatisfactionSubmitted}
         >
@@ -2155,6 +2338,9 @@ export default function VisitorChatPage() {
                 isMobile={isMobile}
                 isEmbed={isEmbed}
                 onEmbedClose={handleEmbedClose}
+                locale={locale}
+                messageSoundEnabled={messageSoundEnabled}
+                onMessageSoundEnabledChange={handleMessageSoundEnabledChange}
               />
               <div className="flex min-h-0 flex-1">
                 <div className="flex min-h-0 min-w-[480px] flex-1 flex-col overflow-hidden">
@@ -2164,6 +2350,7 @@ export default function VisitorChatPage() {
                     isEmbed={isEmbed}
                     showHeader={false}
                     onEmbedClose={handleEmbedClose}
+                    composerFocusRequest={embedComposerFocusRequest}
                   />
                 </div>
                 <VisitorAssistPanel />
@@ -2184,10 +2371,14 @@ export default function VisitorChatPage() {
             conversationPublicId={conversationPublicId}
             offlineMode={isLeaveMessage}
             offlineMessagePublicId={offlineMessagePublicId}
+            offlineMessageSource={offlineMessageSource}
+            offlineMessageQueueTarget={offlineMessageQueueTarget}
             queueFull={queueFull}
             queueFullMessage={queueFullMessage}
             queueFullShowLeaveMessageButton={queueFullShowLeaveMessageButton}
             queueFullLeaveMessageButtonLabel={queueFullLeaveMessageButtonLabel}
+            queueLeaveMessageLoading={queueLeaveMessageLoading}
+            handoffQueueFullInline={handoffQueueFullInline}
             startConversationError={startConversationError}
             currentQueueCount={currentQueueCount}
             visitorSessionToken={visitorSessionToken}
@@ -2218,11 +2409,13 @@ export default function VisitorChatPage() {
             onTyping={handleTyping}
             onRestartConversation={handleRestartConversation}
             onQueueFullLeaveMessage={handleQueueFullLeaveMessage}
+            onQueueLeaveMessage={handleQueueLeaveMessage}
+            onHandoffQueueFullContinueBot={handleHandoffQueueFullContinueBot}
             onHandoffLeaveMessage={handleHandoffLeaveMessage}
             onHandoffQueueFull={handleHandoffQueueFull}
             onConversationStatusChange={setConversationStatus}
             onCurrentQueueCountChange={setCurrentQueueCount}
-            onOfflineMessageCreated={setOfflineMessagePublicId}
+            onOfflineMessageCreated={handleOfflineMessageCreated}
             onSatisfactionInitiate={handleSatisfactionInitiate}
             onSatisfactionSubmitted={handleSatisfactionSubmitted}
           >
@@ -2231,6 +2424,9 @@ export default function VisitorChatPage() {
               offlineMessage={isOffline ? offlineMessage : undefined}
               isEmbed={isEmbed}
               onEmbedClose={handleEmbedClose}
+              composerFocusRequest={embedComposerFocusRequest}
+              messageSoundEnabled={messageSoundEnabled}
+              onMessageSoundEnabledChange={handleMessageSoundEnabledChange}
             />
           </VisitorChatRuntimeProvider>
         </div>

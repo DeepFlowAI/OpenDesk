@@ -22,7 +22,7 @@ function todayIsoDate(): string {
 }
 
 const VALID_TRENDS: TrendType[] = ['half_hour', 'hour', 'day', 'week', 'month']
-const VALID_QUEUE_TYPES: QueueType[] = ['employee_group', 'employee']
+const VALID_QUEUE_TYPES: QueueType[] = ['employee_group']
 
 export default function QueueDetailPage() {
   const params = useParams<{ queueType: string; queueId: string }>()
@@ -112,7 +112,11 @@ export default function QueueDetailPage() {
             {t('ws.records.sessionReports.common.loading', locale)}
           </div>
         )}
-        <QueueOverviewCards metrics={data?.metrics} loading={isLoading} />
+        <QueueOverviewCards
+          metrics={data?.metrics}
+          distributions={data?.distributions ?? []}
+          loading={isLoading}
+        />
         <QueueTrend
           start={start}
           end={end}
@@ -120,6 +124,7 @@ export default function QueueDetailPage() {
           group={trendGroup}
           queueType={queueType}
           queueId={queueId}
+          distributions={data?.distributions ?? []}
           onTrendChange={(t) => updateParams({ trend: t })}
           onGroupChange={setTrendGroup}
           onLoadingChange={setTrendLoading}

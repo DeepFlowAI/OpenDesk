@@ -1771,6 +1771,8 @@ class OpenAgentConversationService:
             fields["leave_message_prompt"] = availability.get("leave_message_prompt")
         if result.get("queue_full"):
             fields["queue_full"] = True
+            fields["queue_type"] = result.get("queue_type")
+            fields["queue_id"] = result.get("queue_id")
             fields["queue_full_message"] = availability.get("queue_full_message")
             fields["queue_full_show_leave_message_button"] = availability.get(
                 "queue_full_show_leave_message_button",
@@ -1882,14 +1884,16 @@ class OpenAgentConversationService:
         )
         events.extend(OpenAgentConversationService._handoff_route_result_events(route_result))
         routed_conversation = route_result.get("conversation") or conversation
-        status, message = OpenAgentConversationService._handoff_tool_result_from_route_result(route_result)
-        tool_result_request = {
-            "conversation": routed_conversation,
-            "conversation_id": routed_conversation.id,
-            "tool_call_id": tool_call_id,
-            "status": status,
-            "message": message,
-        }
+        tool_result_request = None
+        if not (route_result.get("queue_full") or route_result.get("leave_message")):
+            status, message = OpenAgentConversationService._handoff_tool_result_from_route_result(route_result)
+            tool_result_request = {
+                "conversation": routed_conversation,
+                "conversation_id": routed_conversation.id,
+                "tool_call_id": tool_call_id,
+                "status": status,
+                "message": message,
+            }
         return routed_conversation, events, handoff_triggered, tool_result_request
 
     @staticmethod

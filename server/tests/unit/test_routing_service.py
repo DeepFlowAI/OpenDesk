@@ -209,7 +209,8 @@ async def test_sequential_overflow_returns_none_when_no_candidate_can_enqueue(mo
 
     selected, block_reason = await RoutingService._select_candidate_for_rule(AsyncMock(), None, 7, rule)
 
-    assert selected is None
+    assert selected is not None
+    assert selected.queue_id == 1
     assert block_reason == "queue_limit"
 
 

@@ -105,6 +105,14 @@ class Settings(BaseSettings):
     # extensions registered via the ``app.extensions`` loader. The default
     # single-tenant build does not read this value.
     TENANT_API_KEY: str = Field(default="change-me-tenant-api-key")
+    TENANT_PLATFORM_SSO_SECRET: str = Field(
+        default="",
+        description="HS256 secret used to verify Tenant Platform SSO tokens. Falls back to TENANT_API_KEY when empty.",
+    )
+    TENANT_PLATFORM_SSO_AUDIENCES: str = Field(
+        default="opendesk,opendesk-test",
+        description="Comma-separated accepted JWT audiences for Tenant Platform SSO.",
+    )
 
     # Knowledge recommendation embeddings
     KNOWLEDGE_EMBEDDING_PROVIDER: str = Field(default="aliyun")

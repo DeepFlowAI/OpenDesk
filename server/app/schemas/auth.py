@@ -12,6 +12,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class SsoLoginRequest(BaseModel):
+    token: str
+
+
 class UserInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

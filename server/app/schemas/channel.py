@@ -24,6 +24,7 @@ DEFAULT_QUEUE_MESSAGE = (
     "客服接入后会立即回复您。"
 )
 DEFAULT_QUEUE_FULL_MESSAGE = "当前排队人数较多，暂时无法进入排队。您可以稍后再试，或点击留言，我们上线后会尽快联系您。"
+DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL = "留言"
 DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL = "留言"
 DEFAULT_OPEN_AGENT_BOT_STRATEGY = "always"
 DEFAULT_OPEN_AGENT_INPUT_PLACEHOLDER = "输入消息..."
@@ -133,6 +134,8 @@ class ChannelConfig(BaseModel):
     restricted_service_message: str = DEFAULT_RESTRICTED_SERVICE_MESSAGE
     queue_message: str = DEFAULT_QUEUE_MESSAGE
     queue_full_message: str = DEFAULT_QUEUE_FULL_MESSAGE
+    queue_show_leave_message_button: bool = False
+    queue_leave_message_button_label: str = DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL
     queue_full_show_leave_message_button: bool = True
     queue_full_leave_message_button_label: str = DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL
     open_agent_enabled: bool = False
@@ -409,6 +412,13 @@ class ChannelConfig(BaseModel):
             raise ValueError("Queue full message must be at most 5000 characters")
         return v
 
+    @field_validator("queue_leave_message_button_label", mode="before")
+    @classmethod
+    def normalize_queue_leave_message_button_label(cls, v: str | None) -> str:
+        if v is None:
+            return DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL
+        return v.strip()
+
     @field_validator("queue_full_leave_message_button_label", mode="before")
     @classmethod
     def normalize_queue_full_leave_message_button_label(cls, v: str | None) -> str:
@@ -417,7 +427,12 @@ class ChannelConfig(BaseModel):
         return v.strip()
 
     @model_validator(mode="after")
-    def validate_queue_full_button_config(self) -> "ChannelConfig":
+    def validate_queue_leave_message_button_config(self) -> "ChannelConfig":
+        if self.queue_show_leave_message_button:
+            if not self.queue_leave_message_button_label:
+                raise ValueError("Queue leave-message button label is required")
+            if len(self.queue_leave_message_button_label) > 16:
+                raise ValueError("Queue leave-message button label must be at most 16 characters")
         if not self.queue_full_show_leave_message_button:
             return self
         if not self.queue_full_leave_message_button_label:
@@ -438,6 +453,8 @@ class ChannelAvailability(BaseModel):
     restricted_service_message: str = DEFAULT_RESTRICTED_SERVICE_MESSAGE
     queue_message: str = DEFAULT_QUEUE_MESSAGE
     queue_full_message: str = DEFAULT_QUEUE_FULL_MESSAGE
+    queue_show_leave_message_button: bool = False
+    queue_leave_message_button_label: str = DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL
     queue_full_show_leave_message_button: bool = True
     queue_full_leave_message_button_label: str = DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL
     current_queue_count: int | None = None

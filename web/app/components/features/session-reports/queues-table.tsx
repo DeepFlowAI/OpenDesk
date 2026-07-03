@@ -122,7 +122,6 @@ export function QueuesTable({ start, end, carriedSearch, onExportStateChange }: 
         >
           <option value="all">{t('ws.records.sessionReports.queues.type.all', locale)}</option>
           <option value="employee_group">{t(queueTypeLabelKey.employee_group, locale)}</option>
-          <option value="employee">{t(queueTypeLabelKey.employee, locale)}</option>
         </select>
       </div>
 
@@ -198,11 +197,6 @@ export function QueuesTable({ start, end, carriedSearch, onExportStateChange }: 
                 >
                   <div className="flex w-[260px] min-w-0 items-center gap-2">
                     <span className="truncate font-semibold text-foreground">{row.queue.name}</span>
-                    {row.queue.queue_type === 'employee' && (
-                      <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                        {t('ws.records.queue.personalQueue', locale)}
-                      </span>
-                    )}
                   </div>
                   <div className="w-[100px] text-center">
                     <QueueTypeTag type={row.queue.queue_type} />

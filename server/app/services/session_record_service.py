@@ -13,6 +13,7 @@ from app.repositories.session_record_repository import SessionRecordRepository
 from app.repositories.satisfaction_survey_record_repository import SatisfactionSurveyRecordRepository
 from app.repositories.ticket_repository import TicketRepository
 from app.schemas.permission import EffectivePrincipal
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.data_scope_service import DataScopeService, RESOURCE_SESSION_RECORD
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
@@ -131,6 +132,35 @@ class SessionRecordService:
         }
 
     @staticmethod
+    async def get_agent_filter_options(
+        db: AsyncSession,
+        tenant_id: int,
+        principal: EffectivePrincipal,
+    ) -> dict:
+        scope = DataScopeService.get_scope(principal, RESOURCE_SESSION_RECORD)
+        employee_ids: list[int] | None = None
+        if scope == "group":
+            peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+            employee_ids = sorted(set(peer_ids) | {principal.user_id})
+        elif scope == "self":
+            employee_ids = [principal.user_id]
+
+        employees = await EmployeeRepository.list_active_filter_options(
+            db,
+            tenant_id,
+            employee_ids,
+        )
+        return {
+            "items": [
+                {
+                    "id": employee.id,
+                    "name": employee.name or employee.display_name or employee.username,
+                }
+                for employee in employees
+            ]
+        }
+
+    @staticmethod
     def _ticket_briefs(tickets) -> list[dict]:
         return [
             {
@@ -237,10 +267,18 @@ class SessionRecordService:
             peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
             DataScopeService.assert_conversation_in_scope(principal, item, peer_ids)
         segments = await ReceptionSegmentRepository.list_for_conversation(db, conversation_id)
+        generation_status = getattr(item, "reception_generation_status", None)
+        if (
+            generation_status is None
+            and item.status == "closed"
+            and SessionRecordService._session_type(item) == "bot"
+            and not segments
+        ):
+            generation_status = "generated"
         return {
             "conversation_id": conversation_id,
             "conversation_status": item.status,
-            "generation_status": getattr(item, "reception_generation_status", None),
+            "generation_status": generation_status,
             "segments": [
                 {
                     "seq_no": segment.seq_no,
@@ -295,6 +333,7 @@ class SessionRecordService:
             if msg.sender_type == "agent" and msg.sender_id is not None
         })
         agents = {agent.id: agent for agent in await EmployeeRepository.get_by_ids(db, agent_ids)}
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, item.tenant_id)
 
         from app.services.conversation_service import ConversationService
         for msg in messages:
@@ -316,7 +355,11 @@ class SessionRecordService:
                 entry["sender_name"] = item.visitor.name
             elif msg.sender_type == "agent" and item.agent:
                 agent = agents.get(msg.sender_id) if msg.sender_id is not None else item.agent
-                entry["sender_name"] = (agent.display_name or agent.name) if agent else (item.agent.display_name or item.agent.name)
+                entry["sender_name"] = (
+                    ConversationAgentDisplaySettingService.resolve_agent_name(agent, display_mode)
+                    if agent
+                    else ConversationAgentDisplaySettingService.resolve_agent_name(item.agent, display_mode)
+                )
                 entry["sender_avatar"] = agent.avatar if agent and hasattr(agent, "avatar") else None
             elif msg.sender_type == "bot":
                 entry["sender_name"] = SessionRecordService._bot_sender_name(item, metadata)

@@ -2,6 +2,7 @@
 
 import type { CSSProperties } from 'react'
 import type { ChannelConfig } from '@/models/channel'
+import { SafeHtml } from '@/components/safe-html'
 
 export type HandoffEventType =
   | 'confirm_requested'
@@ -175,6 +176,64 @@ function HumanHandoffConfirmCard({
           onClick={onDismiss}
         >
           {locale === 'zh' ? '继续咨询智能助手' : 'Keep chatting'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+type HandoffQueueFullCardProps = {
+  locale: string
+  message: string
+  showLeaveMessageButton: boolean
+  leaveMessageButtonLabel: string
+  sendButtonBgColor?: string | null
+  onLeaveMessage: () => void
+  onContinueBot: () => void
+}
+
+export function HandoffQueueFullCard({
+  locale,
+  message,
+  showLeaveMessageButton,
+  leaveMessageButtonLabel,
+  sendButtonBgColor,
+  onLeaveMessage,
+  onContinueBot,
+}: HandoffQueueFullCardProps) {
+  const cardStyle = {
+    '--opendesk-send-button-bg': sendButtonBgColor || 'var(--color-primary)',
+  } as CSSProperties
+  const continueLabel = locale === 'zh' ? '继续咨询智能助手' : 'Keep chatting'
+  const leaveLabel = leaveMessageButtonLabel || (locale === 'zh' ? '留言' : 'Leave a message')
+
+  return (
+    <div
+      className="mx-5 mt-2 rounded-xl border border-border bg-card p-3 text-sm shadow-sm"
+      style={cardStyle}
+    >
+      {message && (
+        <SafeHtml
+          className="prose prose-sm mb-3 max-w-none leading-5 text-foreground"
+          html={message}
+        />
+      )}
+      <div className={showLeaveMessageButton ? 'grid grid-cols-2 gap-2' : 'grid grid-cols-1 gap-2'}>
+        {showLeaveMessageButton && (
+          <button
+            type="button"
+            className="h-10 rounded-md bg-[var(--opendesk-send-button-bg)] px-3 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
+            onClick={onLeaveMessage}
+          >
+            {leaveLabel}
+          </button>
+        )}
+        <button
+          type="button"
+          className="h-10 rounded-md border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:bg-muted"
+          onClick={onContinueBot}
+        >
+          {continueLabel}
         </button>
       </div>
     </div>

@@ -156,6 +156,8 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
   const activeTab = controlledActiveTab ?? internalActiveTab
   const visitorDetailRef = record.visitor?.public_id || (record.visitor?.id ? String(record.visitor.id) : '')
   const isWebChannel = record.channel?.channel_type?.toLowerCase() === 'web'
+  const showReceptionTab = record.session_type !== 'bot'
+  const resolvedActiveTab = activeTab === 'reception' && !showReceptionTab ? 'basic' : activeTab
 
   const handleSummaryDirtyChange = (dirty: boolean) => {
     setSummaryDirty(dirty)
@@ -180,27 +182,29 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
         <button
           type="button"
           onClick={() => switchTab('basic')}
-          className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', activeTab === 'basic' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
+          className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', resolvedActiveTab === 'basic' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
         >
           {t('ws.summary.tab.basic', locale)}
         </button>
         <button
           type="button"
           onClick={() => switchTab('summary')}
-          className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', activeTab === 'summary' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
+          className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', resolvedActiveTab === 'summary' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
         >
           {t('ws.summary.tab.summary', locale)}
         </button>
-        <button
-          type="button"
-          onClick={() => switchTab('reception')}
-          className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', activeTab === 'reception' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
-        >
-          {t('ws.records.sessions.reception.tab', locale)}
-        </button>
+        {showReceptionTab && (
+          <button
+            type="button"
+            onClick={() => switchTab('reception')}
+            className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', resolvedActiveTab === 'reception' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
+          >
+            {t('ws.records.sessions.reception.tab', locale)}
+          </button>
+        )}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {activeTab === 'basic' ? (
+        {resolvedActiveTab === 'basic' ? (
           <>
             <div className="mb-6">
               <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -296,9 +300,9 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
 
             <SatisfactionRecordPanel recordId={record.id} />
           </>
-        ) : activeTab === 'summary' ? (
+        ) : resolvedActiveTab === 'summary' ? (
           <SessionSummaryFields conversationId={record.id} onDirtyChange={handleSummaryDirtyChange} />
-        ) : activeTab === 'reception' ? (
+        ) : resolvedActiveTab === 'reception' ? (
           <ReceptionTrajectoryPanel recordId={record.id} />
         ) : null}
       </div>

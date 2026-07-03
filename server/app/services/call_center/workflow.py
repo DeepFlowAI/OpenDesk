@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,12 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# How many just-arrived events to stash per call while no waiter is registered.
+# Bounded so a misbehaving kernel can't grow this without limit; in practice at
+# most one or two events land in the gap between an executor's side effect and
+# its WaitForEvent.
+_PENDING_EVENT_BUFFER = 16
 
 
 class VoiceFlowWorkflow:
@@ -82,6 +89,11 @@ class VoiceFlowWorkflow:
         self._current_node_id: str | None = self._find_start_node_id()
         self._waiting: tuple[str, Callable[..., Awaitable[NextStep]]] | None = None
         self._timeout_task: asyncio.Task | None = None
+        # Events that arrived for this call while no waiter was registered (the
+        # window between an executor performing its side effect — e.g. the
+        # connect-external-agent RPC — and it returning a WaitForEvent). The
+        # next WaitForEvent consumes a matching one instead of losing it.
+        self._pending_events: deque[tuple[str, dict]] = deque(maxlen=_PENDING_EVENT_BUFFER)
 
     def _find_start_node_id(self) -> str | None:
         for n in self.graph["nodes"]:
@@ -103,12 +115,17 @@ class VoiceFlowWorkflow:
         """
 
         if self._waiting is None:
+            # No waiter yet: an executor is mid-side-effect and about to
+            # register its WaitForEvent. Stash the event so the upcoming wait
+            # can consume it — losing a terminal event here (handoff / failed /
+            # ended / bridged) silently breaks transfer-to-human.
+            self._pending_events.append((method, data))
             logger.info(
-                "workflow: dropping %s call_id=%s (not waiting)",
-                method, self.call_id,
+                "workflow: buffering %s call_id=%s (no waiter yet, pending=%d)",
+                method, self.call_id, len(self._pending_events),
             )
             return
-        wanted, callback = self._waiting
+        wanted, _callback = self._waiting
         wanted_methods = wanted if isinstance(wanted, tuple) else (wanted,)
         if method not in wanted_methods:
             logger.info(
@@ -116,6 +133,19 @@ class VoiceFlowWorkflow:
                 method, self.call_id, wanted_methods,
             )
             return
+        await self._deliver(method, data)
+
+    async def _deliver(self, method: str, data: dict) -> None:
+        """Run the registered wait callback for a matched event and advance.
+
+        Shared by `handle_event` (live event) and the buffer drain in
+        `_apply_step` (an event that arrived before the wait was registered).
+        Assumes `self._waiting` is set and `method` matches it.
+        """
+
+        if self._waiting is None:
+            return
+        _wanted, callback = self._waiting
         logger.info(
             "workflow: handling %s call_id=%s data=%s",
             method, self.call_id,
@@ -139,6 +169,17 @@ class VoiceFlowWorkflow:
         stopped = await self._apply_step(step)
         if not stopped:
             await self._run_until_yield()
+
+    def _take_buffered(self, method: str | tuple[str, ...]) -> tuple[str, dict] | None:
+        """Pop the first buffered event matching `method` (str or tuple), or None."""
+
+        wanted = method if isinstance(method, tuple) else (method,)
+        for i, (m, _data) in enumerate(self._pending_events):
+            if m in wanted:
+                item = self._pending_events[i]
+                del self._pending_events[i]
+                return item
+        return None
 
     def _cancel_timeout(self) -> None:
         if self._timeout_task is not None and not self._timeout_task.done():
@@ -201,8 +242,22 @@ class VoiceFlowWorkflow:
         if isinstance(step, WaitForEvent):
             # Store the method as-is (str or tuple) so handle_event can match.
             self._waiting = (step.method, step.on_event) if step.on_event else None
-            # Arm a timeout if the executor requested one.
             self._cancel_timeout()
+            # An event matching this wait may have arrived before we registered
+            # (race between the executor's side effect and this WaitForEvent).
+            # Consume it now instead of parking — and instead of arming a
+            # timeout that the buffered event has already pre-empted.
+            if self._waiting is not None:
+                buffered = self._take_buffered(step.method)
+                if buffered is not None:
+                    b_method, b_data = buffered
+                    logger.info(
+                        "workflow: consuming buffered %s call_id=%s",
+                        b_method, self.call_id,
+                    )
+                    await self._deliver(b_method, b_data)
+                    return True
+            # Arm a timeout if the executor requested one.
             if step.timeout_ms and step.on_timeout and self._current_node_id:
                 self._timeout_task = asyncio.create_task(
                     self._fire_timeout(
@@ -242,3 +297,19 @@ class VoiceFlowWorkflow:
         if emp_id is None:
             return None
         return {"tenant_id": self.tenant_id, "employee_id": int(emp_id)}
+
+    def pending_offer_info(self) -> dict | None:
+        """
+        Returns `{offer_id, employee_id}` while an `assign_queue` offer is
+        ringing an agent's browser and the agent has not yet accepted. None
+        once the offer is resolved (accepted → bridged, or rejected/timed out).
+
+        The orchestrator uses this on `call.hangup` to withdraw the offer when
+        the caller hangs up mid-ring, so the agent stops ringing and is freed.
+        """
+
+        offer_id = self.ctx.variables.get("sys._pending_offer_id")
+        emp_id = self.ctx.variables.get("sys._pending_offer_employee_id")
+        if not offer_id or emp_id is None:
+            return None
+        return {"offer_id": str(offer_id), "employee_id": int(emp_id)}

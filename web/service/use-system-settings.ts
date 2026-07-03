@@ -4,6 +4,7 @@ import type {
   SystemSettings,
   UpdateSystemSettingsPayload,
   UpdateOrganizationSettingsPayload,
+  UpdateCallTranscriptionPayload,
 } from '@/models/system-settings'
 
 const NS = 'system-settings'
@@ -37,6 +38,18 @@ export const useUpdateOrganizationSettings = () => {
       put<SystemSettings>('v1/system-settings/organization', { json: data }),
     onSuccess: (data) => {
       qc.setQueryData(systemSettingsKeys.detail(), data)
+    },
+  })
+}
+
+export const useUpdateCallTranscription = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: UpdateCallTranscriptionPayload) =>
+      put<SystemSettings>('v1/system-settings/call-transcription', { json: data }),
+    onSuccess: (data) => {
+      qc.setQueryData(systemSettingsKeys.detail(), data)
+      qc.invalidateQueries({ queryKey: systemSettingsKeys.detail() })
     },
   })
 }

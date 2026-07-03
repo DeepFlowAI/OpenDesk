@@ -8,6 +8,7 @@ from app.db.deps import get_db, get_current_user
 from app.schemas.system_settings import (
     SystemSettingsUpdate,
     OrganizationSettingsUpdate,
+    CallTranscriptionSettingsUpdate,
     SystemSettingsResponse,
 )
 from app.services.system_settings_service import SystemSettingsService
@@ -45,3 +46,14 @@ async def update_organization_settings(
     """Toggle organization feature for the current tenant."""
     tenant_id = current_user["tenant_id"]
     return await SystemSettingsService.update_organization_settings(db, tenant_id, body)
+
+
+@router.put("/call-transcription", response_model=SystemSettingsResponse)
+async def update_call_transcription_settings(
+    body: CallTranscriptionSettingsUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Toggle agent-workstation live transcription for the current tenant."""
+    tenant_id = current_user["tenant_id"]
+    return await SystemSettingsService.update_call_transcription(db, tenant_id, body.enabled)

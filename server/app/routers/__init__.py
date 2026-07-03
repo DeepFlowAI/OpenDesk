@@ -8,6 +8,7 @@ def register_routers(app: FastAPI) -> None:
         auth,
         system_settings,
         open_agent_settings,
+        voice_speed,
         service_hours,
         api_keys,
         open_api,
@@ -31,6 +32,7 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(system_settings.router, prefix="/api/v1")
     app.include_router(open_agent_settings.router, prefix="/api/v1")
+    app.include_router(voice_speed.router, prefix="/api/v1")
     app.include_router(service_hours.router, prefix="/api/v1")
     app.include_router(api_keys.router, prefix="/api/v1")
     app.include_router(open_api.router, prefix="/api/v1")

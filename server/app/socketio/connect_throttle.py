@@ -1,9 +1,9 @@
 """Helpers for rejected Socket.IO connect attempts.
 
-A single client whose token has expired will, by default, let the Socket.IO
-client reconnect forever. Each rejected attempt is individually harmless, so it
-used to be logged at WARNING/INFO — which means a stuck tab buries the logs in
-routine-looking noise and never trips an error alert.
+A single client whose token has expired (or was replaced) will, by default, let
+the Socket.IO client reconnect forever. Each rejected attempt is individually
+harmless, so it used to be logged at WARNING/INFO — which means a stuck tab
+buries the logs in routine-looking noise and never trips an error alert.
 
 `ConnectRejectionTracker` turns that volume into a signal: routine rejections
 stay quiet (DEBUG at the call site), but once one source crosses a threshold

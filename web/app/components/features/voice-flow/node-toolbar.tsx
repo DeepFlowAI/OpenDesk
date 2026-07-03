@@ -5,6 +5,7 @@ import {
   IconGitBranch,
   IconUserCheck,
   IconPhoneOff,
+  IconRobot,
 } from '@tabler/icons-react'
 import type { NodeType } from '@/models/voice-flow-graph'
 import { NODE_COLOR } from '@/models/voice-flow-graph'
@@ -16,6 +17,7 @@ const ITEMS: { type: NodeType; label: string; icon: React.ReactNode }[] = [
   { type: 'collect', label: '收集输入', icon: <IconKeyboard size={16} /> },
   { type: 'condition', label: '信息判定', icon: <IconGitBranch size={16} /> },
   { type: 'assign_queue', label: '分配队列', icon: <IconUserCheck size={16} /> },
+  { type: 'voicespeed', label: 'VoiceSpeed', icon: <IconRobot size={16} /> },
   { type: 'hangup', label: '挂断', icon: <IconPhoneOff size={16} /> },
 ]
 

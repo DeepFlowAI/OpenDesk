@@ -16,6 +16,15 @@ export type SessionRecordAgent = {
   avatar: string | null
 }
 
+export type SessionRecordAgentFilterOption = {
+  id: number
+  name: string
+}
+
+export type SessionRecordAgentFilterOptionsResponse = {
+  items: SessionRecordAgentFilterOption[]
+}
+
 export type SessionRecordChannel = {
   id: number
   name: string
@@ -144,6 +153,11 @@ export type SessionRecordMessage = {
   content_type: 'text' | 'rich_text' | 'image' | 'file' | 'system' | 'welcome' | 'bot_welcome' | 'satisfaction_event' | 'internal_note'
   content: string
   metadata?: Record<string, unknown>
+  is_recalled?: boolean
+  recalled_at?: string | null
+  recalled_by_type?: string | null
+  recalled_by_id?: number | null
+  recalled_by_name?: string | null
   created_at: string
   event_type?: string
   satisfaction_record_id?: number

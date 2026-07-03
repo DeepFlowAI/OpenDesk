@@ -89,6 +89,8 @@ export type ChannelConfig = {
   restricted_service_message: string
   queue_message: string
   queue_full_message: string
+  queue_show_leave_message_button: boolean
+  queue_leave_message_button_label: string
   queue_full_show_leave_message_button: boolean
   queue_full_leave_message_button_label: string
   open_agent_enabled: boolean
@@ -124,6 +126,8 @@ export type ChannelAvailability = {
   restricted_service_message: string
   queue_message: string
   queue_full_message: string
+  queue_show_leave_message_button: boolean
+  queue_leave_message_button_label: string
   queue_full_show_leave_message_button: boolean
   queue_full_leave_message_button_label: string
   current_queue_count: number | null

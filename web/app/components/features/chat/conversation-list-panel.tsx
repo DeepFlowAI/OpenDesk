@@ -4,7 +4,12 @@ import { useState, useRef, useEffect, useMemo, type ReactNode } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { IconChevronDown, IconLoader2, IconLock, IconPinned, IconRefresh, IconSearch } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
-import { avatarBackgroundForName, singleAvatarLetter } from '@/lib/avatar-fallback'
+import {
+  VISITOR_AVATAR_BACKGROUND,
+  VISITOR_AVATAR_FOREGROUND,
+  avatarBackgroundForName,
+  singleAvatarLetter,
+} from '@/lib/avatar-fallback'
 import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
 import { conversationKeys, setVisitorWebStatusQueryData, useUpdateAgentStatus, useVisitorWebStatus } from '@/service/use-conversations'
@@ -135,8 +140,11 @@ function VisitorConversationAvatar({
   return (
     <div className="relative h-10 w-10 shrink-0">
       <div
-        className="flex h-10 w-10 items-center justify-center rounded-full text-base font-medium text-white"
-        style={{ backgroundColor: conversation.visitor?.avatar_color || '#4A8C5C' }}
+        className="flex h-10 w-10 items-center justify-center rounded-full text-base font-medium"
+        style={{
+          backgroundColor: VISITOR_AVATAR_BACKGROUND,
+          color: VISITOR_AVATAR_FOREGROUND,
+        }}
       >
         {(conversation.visitor?.name || '访').charAt(0)}
       </div>
@@ -400,12 +408,16 @@ export function ConversationListPanel({
               type="button"
               onClick={() => onTabChange('offline')}
               className={cn(
-                'h-8 rounded-md px-2 text-[13px] font-medium transition-colors',
+                'relative h-8 rounded-md px-2 text-[13px] font-medium transition-colors',
                 activeTab === 'offline' ? 'bg-white text-[#1a1a1a] shadow-sm' : 'text-[#737373] hover:text-[#1a1a1a]',
               )}
             >
               {locale === 'zh' ? '留言' : 'Offline'}
-              {offlineTotal ? <span className="ml-1 text-[11px] text-[#999999]">{offlineTotal}</span> : null}
+              {offlineTotal ? (
+                <span className="absolute right-1 top-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white">
+                  {offlineTotal > 99 ? '99+' : offlineTotal}
+                </span>
+              ) : null}
             </button>
           ) : null}
           {canQueueTab ? (
@@ -415,12 +427,16 @@ export function ConversationListPanel({
               type="button"
               onClick={() => onTabChange('queue')}
               className={cn(
-                'h-8 rounded-md px-2 text-[13px] font-medium transition-colors',
+                'relative h-8 rounded-md px-2 text-[13px] font-medium transition-colors',
                 activeTab === 'queue' ? 'bg-white text-[#1a1a1a] shadow-sm' : 'text-[#737373] hover:text-[#1a1a1a]',
               )}
             >
               {t('ws.chat.tabQueue', locale)}
-              {queueTotal ? <span className="ml-1 text-[11px] text-[#999999]">{queueTotal > 99 ? '99+' : queueTotal}</span> : null}
+              {queueTotal ? (
+                <span className="absolute right-1 top-0.5 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-amber-500 px-1 text-[10px] font-semibold leading-none text-white">
+                  {queueTotal > 99 ? '99+' : queueTotal}
+                </span>
+              ) : null}
             </button>
           ) : null}
         </div>

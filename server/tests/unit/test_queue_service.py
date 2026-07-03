@@ -4,8 +4,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.services import conversation_service as cs
 from app.schemas.queue import QueueAdminAssignRequest, QueueDispatchRequest
 from app.services import queue_service as qs
+from app.services.conversation_service import ConversationService
 from app.services.queue_service import QueueTaskService
 from app.services.queue_strategy import QueueCandidate
 
@@ -137,6 +139,80 @@ def _install_dispatch_mocks(monkeypatch, tasks: list, provider: _OnlineProvider)
 
 def _dispatch_request(channel: str = "online_chat") -> QueueDispatchRequest:
     return QueueDispatchRequest(channel=channel, queue_type="employee_group", queue_id=7)
+
+
+@pytest.mark.asyncio
+async def test_leave_queued_conversation_message_cancels_queue_task(monkeypatch):
+    db = SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
+    task = _task(task_ref_id="100")
+    conversation = SimpleNamespace(
+        id=100,
+        public_id="cv_test",
+        tenant_id=1,
+        channel_id=2,
+        visitor=SimpleNamespace(external_id="visitor-1"),
+        channel=SimpleNamespace(config={
+            "queue_show_leave_message_button": True,
+            "queue_leave_message_button_label": "留言",
+            "leave_message_prompt": "请留言",
+        }),
+        group_id=7,
+        agent_id=None,
+        status="queued",
+    )
+    visitor_context = {
+        "tenant_id": 1,
+        "channel_id": 2,
+        "visitor_external_id": "visitor-1",
+    }
+
+    async def mark_terminal(_db, task_arg, status, *, now, reason=None):
+        task_arg.status = status
+        task_arg.canceled_at = now
+        task_arg.last_error = reason
+        return task_arg
+
+    async def end_conversation(_db, conversation_arg, ended_by):
+        conversation_arg.status = "closed"
+        conversation_arg.ended_by = ended_by
+        return conversation_arg
+
+    monkeypatch.setattr(cs.ConversationRepository, "get_by_public_id", AsyncMock(return_value=conversation))
+    monkeypatch.setattr(
+        cs.QueueTaskRepository,
+        "get_active_conversation_task_for_update",
+        AsyncMock(return_value=task),
+    )
+    monkeypatch.setattr(cs.QueueTaskRepository, "mark_terminal", AsyncMock(side_effect=mark_terminal))
+    monkeypatch.setattr(QueueTaskService, "_record_event", AsyncMock())
+    monkeypatch.setattr(QueueTaskService, "_materialize_conversation_summary", AsyncMock())
+    monkeypatch.setattr(QueueTaskService, "_emit_queue_change", AsyncMock())
+    monkeypatch.setattr(cs.ConversationRepository, "end_conversation", AsyncMock(side_effect=end_conversation))
+    monkeypatch.setattr(
+        ConversationService,
+        "_emit_visitor_queue_leave_message_conversation_ended",
+        AsyncMock(),
+    )
+
+    result = await ConversationService.leave_queued_conversation_message_for_session(
+        db,
+        "cv_test",
+        visitor_context,
+    )
+
+    assert result == {
+        "ok": True,
+        "source": "queue_waiting",
+        "queue_type": "employee_group",
+        "queue_id": 7,
+        "leave_message_prompt": "请留言",
+    }
+    assert task.status == "canceled"
+    assert task.last_error == "visitor_queue_leave_message"
+    assert conversation.status == "closed"
+    assert conversation.ended_by == "visitor_queue_leave_message"
+    db.commit.assert_awaited_once()
+    QueueTaskService._emit_queue_change.assert_awaited_once_with(task, "canceled")
 
 
 @pytest.mark.asyncio
@@ -379,6 +455,58 @@ async def test_dispatch_falls_back_when_returning_agent_is_not_available(monkeyp
     args, kwargs = QueueTaskService._record_event.await_args
     assert args[2] == "auto_assigned"
     assert kwargs.get("reason") is None
+
+
+@pytest.mark.asyncio
+async def test_select_immediate_online_chat_agent_prioritizes_returning_visitor(monkeypatch):
+    db = SimpleNamespace()
+    r = SimpleNamespace()
+    provider = _OnlineProvider(
+        loads={1: 0, 2: 0, 3: 0},
+        capacities={1: 3, 2: 3, 3: 3},
+    )
+    set_last_agent = AsyncMock()
+    find_returning_agent = AsyncMock(return_value=3)
+
+    monkeypatch.setattr(qs.QueueResourceProviderFactory, "create", lambda _channel: provider)
+    monkeypatch.setattr(
+        qs.QueuePolicyResolver,
+        "resolve",
+        AsyncMock(
+            return_value={
+                "assignment_strategy": "round_robin",
+                "config": {
+                    "returning_agent_priority_enabled": True,
+                    "returning_agent_window_hours": 24,
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        qs.QueueRoundRobinRepository,
+        "get_state",
+        AsyncMock(return_value=SimpleNamespace(last_agent_id=1)),
+    )
+    monkeypatch.setattr(qs.QueueRoundRobinRepository, "set_last_agent", set_last_agent)
+    monkeypatch.setattr(
+        qs.QueueReturningAgentRepository,
+        "find_recent_online_chat_agent_for_visitor",
+        find_returning_agent,
+    )
+
+    agent_id = await QueueTaskService.select_immediate_online_chat_agent(
+        db,
+        r,
+        1,
+        queue_type="employee_group",
+        queue_id=7,
+        visitor_id=20,
+    )
+
+    assert agent_id == 3
+    find_returning_agent.assert_awaited_once()
+    assert find_returning_agent.await_args.kwargs["visitor_id"] == 20
+    set_last_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

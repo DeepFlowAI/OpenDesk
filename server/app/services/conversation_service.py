@@ -14,11 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import ValidationError as PydanticValidationError
 import redis.asyncio as aioredis
 
-from app.core.exceptions import NotFoundError, BusinessError, ValidationError, ForbiddenError, UnauthorizedError
+from app.core.exceptions import ConflictError, NotFoundError, BusinessError, ValidationError, ForbiddenError, UnauthorizedError
 from app.enums import (
     ConversationStatus,
     MessageSenderType,
     MessageContentType,
+    QueueType,
+    QueueTaskStatus,
     ReceptionEventReason,
     ReceptionEventType,
 )
@@ -29,6 +31,7 @@ from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.message_repository import MessageRepository
 from app.repositories.offline_message_repository import OfflineMessageRepository
+from app.repositories.queue_repository import QueueTaskRepository
 from app.repositories.visitor_timeout_close_repository import VisitorTimeoutCloseStateRepository
 from app.schemas.channel import ChannelConfig
 from app.schemas.open_agent_settings import OpenAgentWelcomeMessage
@@ -40,6 +43,7 @@ from app.services.conversation_collaboration_service import (
     COLLABORATION_MESSAGE_SEND_PERMISSION,
     ConversationCollaborationService,
 )
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.data_scope_service import DataScopeService, RESOURCE_PEER_CONVERSATION
 from app.services.reception_event_service import ReceptionEventService
 from app.services.routing_service import RoutingService
@@ -93,6 +97,13 @@ QUEUE_ENTERED_SYSTEM_MESSAGE = "已进入人工客服队列"
 AGENT_ASSIGNED_SYSTEM_MESSAGE = "客服已接入会话"
 AGENT_ASSIGNED_EVENT_TYPE = "agent_assigned"
 BOT_DISABLED_ENDED_BY = "bot_disabled"
+# A human handoff that ends up routing the visitor to leave a message (or is
+# blocked by a full queue) closes the bot conversation, so a lingering bot
+# session can't keep occupying the visitor's single active conversation slot.
+HANDOFF_LEAVE_MESSAGE_ENDED_BY = "handoff_leave_message"
+HANDOFF_QUEUE_FULL_ENDED_BY = "handoff_queue_full"
+VISITOR_QUEUE_LEAVE_MESSAGE_ENDED_BY = "visitor_queue_leave_message"
+QUEUE_WAITING_LEAVE_MESSAGE_SOURCE = "queue_waiting"
 
 
 class ConversationService:
@@ -101,6 +112,7 @@ class ConversationService:
         config: ChannelConfig,
         *,
         availability: dict | None = None,
+        group_id: int | None = None,
     ) -> dict:
         from app.services.channel_service import ChannelService
 
@@ -121,6 +133,13 @@ class ConversationService:
             "conversation": None,
             "is_new": False,
             "queue_full": True,
+            # Carry the queue that overflowed so a follow-up leave message attaches
+            # to that exact queue instead of being re-routed.
+            **(
+                {"queue_type": QueueType.EMPLOYEE_GROUP.value, "queue_id": group_id}
+                if group_id is not None
+                else {}
+            ),
             "availability": payload,
         }
 
@@ -170,6 +189,97 @@ class ConversationService:
             ),
         }
         return {key: value for key, value in data.items() if value is not None}
+
+    @staticmethod
+    async def _emit_visitor_queue_leave_message_conversation_ended(conversation) -> None:
+        try:
+            from app.libs.realtime import get_realtime_transport
+            from app.services.conversation_realtime_service import ConversationRealtimeService
+
+            rt = get_realtime_transport()
+            payload = {
+                "conversation_id": conversation.id,
+                "conversation_public_id": conversation.public_id,
+                "ended_by": VISITOR_QUEUE_LEAVE_MESSAGE_ENDED_BY,
+            }
+            conv_room = f"conv:{conversation.id}"
+            await rt.emit("conversation_ended", payload, room=conv_room, namespace="/chat")
+            await rt.emit("conversation_ended", payload, room=conv_room, namespace="/visitor")
+            await ConversationRealtimeService.emit_conversation_list_updated(
+                conversation.tenant_id,
+                action="ended",
+                conversation_id=conversation.id,
+                rt=rt,
+            )
+        except Exception:
+            logger.exception("Failed to emit queue leave-message end for conversation %s", conversation.id)
+
+    @staticmethod
+    async def leave_queued_conversation_message_for_session(
+        db: AsyncSession,
+        conversation_public_id: str,
+        visitor_context: dict,
+    ) -> dict:
+        conversation = await ConversationRepository.get_by_public_id(db, conversation_public_id)
+        if (
+            not conversation
+            or conversation.tenant_id != visitor_context["tenant_id"]
+            or conversation.channel_id != visitor_context["channel_id"]
+            or not conversation.visitor
+            or conversation.visitor.external_id != visitor_context["visitor_external_id"]
+        ):
+            raise NotFoundError("Conversation not found")
+
+        config = ChannelConfig.model_validate(conversation.channel.config if conversation.channel else {})
+        if not config.queue_show_leave_message_button:
+            raise BusinessError("Leave message is not enabled while queuing")
+        if conversation.status != ConversationStatus.QUEUED.value or conversation.agent_id is not None:
+            raise ConflictError("Conversation is no longer queued")
+        if conversation.group_id is None:
+            raise ConflictError("Conversation has no queue target")
+
+        task = await QueueTaskRepository.get_active_conversation_task_for_update(
+            db,
+            conversation.tenant_id,
+            conversation.id,
+        )
+        if not task:
+            raise ConflictError("Queue task is not active")
+
+        from app.services.queue_service import QueueTaskService
+
+        await QueueTaskRepository.mark_terminal(
+            db,
+            task,
+            QueueTaskStatus.CANCELED.value,
+            now=datetime.now(timezone.utc),
+            reason=VISITOR_QUEUE_LEAVE_MESSAGE_ENDED_BY,
+        )
+        await QueueTaskService._record_event(
+            db,
+            task,
+            "canceled",
+            reason=VISITOR_QUEUE_LEAVE_MESSAGE_ENDED_BY,
+        )
+        await QueueTaskService._materialize_conversation_summary(db, task)
+        await ConversationRepository.end_conversation(
+            db,
+            conversation,
+            VISITOR_QUEUE_LEAVE_MESSAGE_ENDED_BY,
+        )
+        await db.commit()
+        await db.refresh(task)
+        await db.refresh(conversation)
+        await QueueTaskService._emit_queue_change(task, "canceled")
+        await ConversationService._emit_visitor_queue_leave_message_conversation_ended(conversation)
+
+        return {
+            "ok": True,
+            "source": QUEUE_WAITING_LEAVE_MESSAGE_SOURCE,
+            "queue_type": QueueType.EMPLOYEE_GROUP.value,
+            "queue_id": conversation.group_id,
+            "leave_message_prompt": config.leave_message_prompt,
+        }
 
     @staticmethod
     def _is_web_channel(channel: object) -> bool:
@@ -323,9 +433,11 @@ class ConversationService:
     @staticmethod
     def visitor_agent_display_name(agent) -> str | None:
         """Public-facing agent label for Web SDK visitors: nickname, then legal name."""
-        if agent is None:
-            return None
-        return getattr(agent, "nickname", None) or getattr(agent, "name", None) or None
+        return ConversationAgentDisplaySettingService.resolve_agent_name(agent, "nickname")
+
+    @staticmethod
+    def agent_display_name(agent, display_mode: str | None = None) -> str | None:
+        return ConversationAgentDisplaySettingService.resolve_agent_name(agent, display_mode)
 
     @staticmethod
     def _metadata_sender_name(sender_type: str, metadata: dict | None) -> str | None:
@@ -600,7 +712,8 @@ class ConversationService:
         if msg.sender_type == MessageSenderType.AGENT.value and msg.sender_id is not None:
             agent = await EmployeeRepository.get_by_id(db, msg.sender_id)
             if agent:
-                return agent.display_name or agent.name
+                display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, conversation.tenant_id)
+                return ConversationService.agent_display_name(agent, display_mode)
         if msg.sender_type == MessageSenderType.VISITOR.value:
             return getattr(getattr(conversation, "visitor", None), "name", None)
         if msg.sender_type == MessageSenderType.BOT.value:
@@ -744,6 +857,9 @@ class ConversationService:
         if not welcome_msg:
             return None
 
+        from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
+
+        await VisitorTimeoutCloseService.reset_on_outbound_message(db, conversation, welcome_msg)
         preview = ConversationService.build_message_preview(
             welcome_msg.content_type,
             welcome_msg.content,
@@ -930,7 +1046,9 @@ class ConversationService:
                     config = ChannelConfig.model_validate(
                         raw_channel_config if isinstance(raw_channel_config, dict) else {}
                     )
-                    return ConversationService._queue_full_response(config)
+                    return ConversationService._queue_full_response(
+                        config, group_id=existing.group_id
+                    )
                 if (
                     enqueue_result is None
                     and existing.group_id is None
@@ -1078,16 +1196,30 @@ class ConversationService:
                 db, tenant_id, channel_id, r, visitor_id=user.id
             )
         )
+        if route_block_reason == "queue_limit":
+            return ConversationService._queue_full_response(
+                config,
+                group_id=group_id,
+            )
 
         agent_id = None
-        if group_member_ids:
+        if group_id is not None:
+            from app.services.queue_service import QueueTaskService
+
+            agent_id = await QueueTaskService.select_immediate_online_chat_agent(
+                db,
+                r,
+                tenant_id,
+                queue_type=QueueType.EMPLOYEE_GROUP.value,
+                queue_id=group_id,
+                visitor_id=user.id,
+            )
+        if agent_id is None and group_member_ids:
             agent_id = await AgentStatusService.find_available_agent(
                 r, tenant_id, group_member_ids, max_concurrent_map
             )
 
         if agent_id is None and group_id is None:
-            if route_block_reason == "queue_limit":
-                return ConversationService._queue_full_response(config)
             return ConversationService._no_assignable_queue_response(is_new=False)
 
         now = datetime.now(timezone.utc)
@@ -1167,7 +1299,9 @@ class ConversationService:
                 if exc.code != "QUEUE_LIMIT_REACHED":
                     raise
                 await db.rollback()
-                return ConversationService._queue_full_response(config, availability=availability)
+                return ConversationService._queue_full_response(
+                    config, availability=availability, group_id=group_id
+                )
             if enqueue_result is None:
                 await db.rollback()
                 return ConversationService._no_assignable_queue_response(is_new=False)
@@ -1926,7 +2060,7 @@ class ConversationService:
             )
             from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 
-            await VisitorTimeoutCloseService.ensure_for_agent_message(db, conv)
+            await VisitorTimeoutCloseService.reset_on_outbound_message(db, conv, msg)
         elif sender_type == MessageSenderType.VISITOR.value:
             from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 
@@ -2168,6 +2302,7 @@ class ConversationService:
             conversation.id,
             before_id=before_id,
             limit=limit,
+            tenant_id=visitor_context["tenant_id"],
             include_internal=False,
             visitor_facing=True,
         )
@@ -2427,10 +2562,10 @@ class ConversationService:
                         "open_agent_handoff_state": "failed",
                         "open_agent_handoff_payload": handoff_data,
                     })
-                    conversation = await ConversationRepository.update_status(
+                    conversation = await ConversationRepository.end_conversation(
                         db,
                         conversation,
-                        ConversationStatus.BOT.value,
+                        HANDOFF_QUEUE_FULL_ENDED_BY,
                     )
                     conversation = await ConversationRepository.get_by_id(db, conversation.id)
                     queue_full_result = ConversationService._queue_full_response(config)
@@ -2442,6 +2577,8 @@ class ConversationService:
                         "agent": None,
                         "reason": "queue_full",
                         "queue_full": True,
+                        "queue_type": QueueType.EMPLOYEE_GROUP.value,
+                        "queue_id": group_id,
                         "availability": queue_full_result["availability"],
                     }
 
@@ -2481,7 +2618,7 @@ class ConversationService:
                     conversation,
                     state="failed",
                     payload=handoff_data,
-                    status=ConversationStatus.BOT.value,
+                    status=ConversationStatus.CLOSED.value,
                     allowed_previous_states=("requested", "pending"),
                 )
                 if not failed_marked:
@@ -2506,6 +2643,12 @@ class ConversationService:
                         "reason": "handoff_in_progress",
                     }
                 conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                if conversation and conversation.status == ConversationStatus.CLOSED.value:
+                    conversation = await ConversationRepository.end_conversation(
+                        db,
+                        conversation,
+                        HANDOFF_LEAVE_MESSAGE_ENDED_BY,
+                    )
                 return {
                     "ok": False,
                     "conversation": conversation,
@@ -2516,6 +2659,48 @@ class ConversationService:
                     "leave_message": True,
                     "availability": target,
                 }
+
+            if reason == "no_available_agent" and not target.get("group_id"):
+                from app.services.routing_service import RoutingService
+
+                blocked_group_id, _, _, route_block_reason = await RoutingService.route_conversation_with_meta(
+                    db,
+                    conversation.tenant_id,
+                    conversation.channel_id,
+                    r,
+                    visitor_id=conversation.visitor_id,
+                )
+                if route_block_reason == "queue_limit":
+                    channel = await ChannelRepository.get_by_id(db, conversation.channel_id)
+                    config = ChannelConfig.model_validate(
+                        channel.config if channel and isinstance(channel.config, dict) else {}
+                    )
+                    conversation = await ConversationRepository.update_open_agent_state(db, conversation, {
+                        "open_agent_handoff_state": "failed",
+                        "open_agent_handoff_payload": handoff_data,
+                    })
+                    conversation = await ConversationRepository.end_conversation(
+                        db,
+                        conversation,
+                        HANDOFF_QUEUE_FULL_ENDED_BY,
+                    )
+                    conversation = await ConversationRepository.get_by_id(db, conversation.id)
+                    queue_full_result = ConversationService._queue_full_response(
+                        config,
+                        group_id=blocked_group_id,
+                    )
+                    return {
+                        "ok": False,
+                        "conversation": conversation,
+                        "message": emitted_messages[-1] if emitted_messages else None,
+                        "messages": emitted_messages,
+                        "agent": None,
+                        "reason": "queue_full",
+                        "queue_full": True,
+                        "queue_type": queue_full_result.get("queue_type"),
+                        "queue_id": queue_full_result.get("queue_id"),
+                        "availability": queue_full_result["availability"],
+                    }
 
             content = (
                 "当前人工客服不在线，您可以继续向智能助手咨询"
@@ -2769,6 +2954,11 @@ class ConversationService:
         })
         agents = await EmployeeRepository.get_by_ids(db, agent_ids)
         agent_map = {agent.id: agent for agent in agents}
+        display_mode = (
+            await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
+            if tenant_id is not None
+            else None
+        )
 
         items = []
         for msg in messages:
@@ -2778,11 +2968,7 @@ class ConversationService:
             if msg.sender_type == MessageSenderType.AGENT.value and msg.sender_id is not None:
                 agent = agent_map.get(msg.sender_id)
                 if agent:
-                    sender_name = (
-                        ConversationService.visitor_agent_display_name(agent)
-                        if visitor_facing
-                        else (agent.display_name or agent.name)
-                    )
+                    sender_name = ConversationService.agent_display_name(agent, display_mode)
                     sender_avatar = agent.avatar
             elif msg.sender_type == MessageSenderType.BOT.value:
                 sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
@@ -2897,6 +3083,7 @@ class ConversationService:
 
         agents = await EmployeeRepository.get_by_ids(db, list(agent_ids))
         agent_map = {agent.id: agent for agent in agents}
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, channel.tenant_id)
 
         items = []
         consumed_messages = 0
@@ -2918,7 +3105,7 @@ class ConversationService:
                 ):
                     agent = agent_map.get(msg.sender_id)
                     if agent:
-                        sender_name = ConversationService.visitor_agent_display_name(agent)
+                        sender_name = ConversationService.agent_display_name(agent, display_mode)
                         sender_avatar = agent.avatar
                 elif msg.sender_type == MessageSenderType.VISITOR.value:
                     sender_name = visitor.name
@@ -2936,7 +3123,7 @@ class ConversationService:
             agent_name = None
             agent_avatar = None
             if conversation.agent:
-                agent_name = ConversationService.visitor_agent_display_name(conversation.agent)
+                agent_name = ConversationService.agent_display_name(conversation.agent, display_mode)
                 agent_avatar = conversation.agent.avatar
 
             items.append({
@@ -3020,6 +3207,7 @@ class ConversationService:
 
         agents = await EmployeeRepository.get_by_ids(db, list(agent_ids))
         agent_map = {agent.id: agent for agent in agents}
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, visitor_context["tenant_id"])
 
         items = []
         consumed_messages = 0
@@ -3041,7 +3229,7 @@ class ConversationService:
                 ):
                     agent = agent_map.get(msg.sender_id)
                     if agent:
-                        sender_name = ConversationService.visitor_agent_display_name(agent)
+                        sender_name = ConversationService.agent_display_name(agent, display_mode)
                         sender_avatar = agent.avatar
                 elif msg.sender_type == MessageSenderType.VISITOR.value:
                     sender_name = visitor.name
@@ -3059,7 +3247,7 @@ class ConversationService:
             agent_name = None
             agent_avatar = None
             if conversation.agent:
-                agent_name = ConversationService.visitor_agent_display_name(conversation.agent)
+                agent_name = ConversationService.agent_display_name(conversation.agent, display_mode)
                 agent_avatar = conversation.agent.avatar
 
             items.append({
@@ -3117,6 +3305,7 @@ class ConversationService:
 
         agents = await EmployeeRepository.get_by_ids(db, list(agent_ids))
         agent_map = {agent.id: agent for agent in agents}
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, visitor_context["tenant_id"])
 
         items = []
         consumed_messages = 0
@@ -3143,7 +3332,7 @@ class ConversationService:
                 ):
                     agent = agent_map.get(msg.sender_id)
                     if agent:
-                        sender_name = ConversationService.visitor_agent_display_name(agent)
+                        sender_name = ConversationService.agent_display_name(agent, display_mode)
                         sender_avatar = agent.avatar
                 elif msg.sender_type == MessageSenderType.VISITOR.value and visitor:
                     sender_name = visitor.name
@@ -3161,7 +3350,7 @@ class ConversationService:
             agent_name = None
             agent_avatar = None
             if conversation.agent:
-                agent_name = ConversationService.visitor_agent_display_name(conversation.agent)
+                agent_name = ConversationService.agent_display_name(conversation.agent, display_mode)
                 agent_avatar = conversation.agent.avatar
 
             items.append({
@@ -3282,6 +3471,8 @@ class ConversationService:
         agents = await EmployeeRepository.get_by_ids(db, list(agent_ids))
         agent_map = {agent.id: agent for agent in agents}
 
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
+
         items = []
         consumed_messages = 0
         for conversation in conversations:
@@ -3301,7 +3492,7 @@ class ConversationService:
                 ):
                     agent = agent_map.get(msg.sender_id)
                     if agent:
-                        sender_name = agent.display_name or agent.name
+                        sender_name = ConversationService.agent_display_name(agent, display_mode)
                         sender_avatar = agent.avatar
                 elif msg.sender_type == MessageSenderType.VISITOR.value:
                     sender_name = current.visitor.name
@@ -3328,7 +3519,7 @@ class ConversationService:
             if conversation.agent:
                 agent = {
                     "id": conversation.agent.id,
-                    "display_name": conversation.agent.display_name,
+                    "display_name": ConversationService.agent_display_name(conversation.agent, display_mode),
                     "name": conversation.agent.name,
                     "avatar": conversation.agent.avatar,
                 }
@@ -3399,6 +3590,7 @@ class ConversationService:
                 agent_ids.add(message.sender_id)
         agents = await EmployeeRepository.get_by_ids(db, list(agent_ids))
         agent_map = {agent.id: agent for agent in agents}
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
 
         items = []
         for message, conversation in rows:
@@ -3407,7 +3599,7 @@ class ConversationService:
             if message.sender_type == MessageSenderType.AGENT.value and message.sender_id is not None:
                 agent = agent_map.get(message.sender_id)
                 if agent:
-                    sender_name = agent.display_name or agent.name
+                    sender_name = ConversationService.agent_display_name(agent, display_mode)
                     sender_avatar = agent.avatar
             elif message.sender_type == MessageSenderType.VISITOR.value:
                 sender_name = conversation.visitor.name if conversation.visitor else current.visitor.name

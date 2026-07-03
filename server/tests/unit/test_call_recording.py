@@ -70,7 +70,34 @@ async def test_save_recording_by_root_call_id():
 
 
 @pytest.mark.asyncio
-async def test_save_recording_skips_ai_after_bridged():
+async def test_save_recording_skips_bridged_after_ai():
+    # The single-leg "ai" recording spans the whole call and is canonical; a
+    # later bridge recording must not replace it.
+    db = AsyncMock()
+    row = _make_row(
+        recording_url="https://bucket.oss.example/ai.wav",
+        extra_metadata={"recording": {"phase": "ai", "partial": False}},
+    )
+    with patch(
+        "app.services.call_record_service.CallRecordRepository.find_by_media_call_id",
+        new=AsyncMock(return_value=row),
+    ), patch(
+        "app.services.call_record_service.CallRecordRepository.update",
+        new=AsyncMock(),
+    ) as mock_update:
+        saved = await CallRecordService.save_recording(
+            db,
+            call_id="root-1",
+            url="https://bucket.oss.example/bridge.wav",
+            phase="bridged",
+        )
+    assert saved is False
+    mock_update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_save_recording_ai_replaces_bridged():
+    # If a bridge recording landed first, the full "ai" recording replaces it.
     db = AsyncMock()
     row = _make_row(
         recording_url="https://bucket.oss.example/bridge.wav",
@@ -89,8 +116,8 @@ async def test_save_recording_skips_ai_after_bridged():
             url="https://bucket.oss.example/ai.wav",
             phase="ai",
         )
-    assert saved is False
-    mock_update.assert_not_called()
+    assert saved is True
+    mock_update.assert_called_once()
 
 
 @pytest.mark.asyncio

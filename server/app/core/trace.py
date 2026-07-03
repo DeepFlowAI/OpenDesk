@@ -26,6 +26,7 @@ from contextvars import ContextVar
 
 _trace_id_var: ContextVar[str] = ContextVar("trace_id", default="-")
 _request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+_call_id_var: ContextVar[str] = ContextVar("call_id", default="-")
 
 
 def set_trace_id(trace_id: str | None = None) -> str:
@@ -45,6 +46,58 @@ def set_trace_id(trace_id: str | None = None) -> str:
 def get_trace_id() -> str:
     """Get trace_id from the current async context."""
     return _trace_id_var.get()
+
+
+def parse_traceparent(traceparent: str | None) -> str | None:
+    """Extract the 32-hex trace_id from a W3C ``traceparent`` header.
+
+    Format: ``<version>-<trace_id>-<parent_id>-<flags>``. Returns ``None`` when
+    the header is missing or malformed so callers can fall back to generating a
+    fresh trace_id.
+    """
+    if not traceparent:
+        return None
+    parts = traceparent.split("-")
+    if len(parts) < 4:
+        return None
+    trace_id = parts[1]
+    if len(trace_id) != 32 or trace_id == "0" * 32:
+        return None
+    try:
+        int(trace_id, 16)
+    except ValueError:
+        return None
+    return trace_id
+
+
+def build_traceparent(trace_id: str, *, sampled: bool = True) -> str:
+    """Build a W3C ``traceparent`` header carrying ``trace_id``.
+
+    Used when an inbound call arrives without a (valid) ``traceparent`` so we
+    can still propagate our freshly-minted trace_id to downstream services
+    (telephony kernel RPCs, the VoiceSpeed realtime mint) and keep one trace_id
+    across the whole call.
+    """
+    span_id = uuid.uuid4().hex[:16]
+    flags = "01" if sampled else "00"
+    return f"00-{trace_id}-{span_id}-{flags}"
+
+
+def set_call_id(call_id: str | None) -> str:
+    """Bind a call-center ``call_id`` to the current async context.
+
+    Injected into every log record by ``TraceFilter`` (as the ``call_id`` log
+    attribute) so all logs for one phone call can be queried by business key in
+    addition to ``trace_id``.
+    """
+    cid = "-" if not call_id else str(call_id)
+    _call_id_var.set(cid)
+    return cid
+
+
+def get_call_id() -> str:
+    """Get the call-center call_id from the current async context."""
+    return _call_id_var.get()
 
 
 def get_trace_id_int() -> int | None:
@@ -97,4 +150,5 @@ class TraceFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.trace_id = _trace_id_var.get()  # type: ignore[attr-defined]
         record.request_id = _request_id_var.get()  # type: ignore[attr-defined]
+        record.call_id = _call_id_var.get()  # type: ignore[attr-defined]
         return True

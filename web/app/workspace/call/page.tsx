@@ -30,6 +30,10 @@ import {
 import { toast } from 'sonner'
 
 import { DialBar } from '@/app/components/features/call-center/dial-bar'
+import {
+  CallTranscriptHistory,
+  CallTranscriptPanel,
+} from '@/app/components/features/call-center/call-transcript-panel'
 import { CallUserInfoPanel } from '@/app/components/features/call-center/call-user-info-panel'
 import {
   callRecordCustomerNumber,
@@ -469,6 +473,9 @@ export default function CallWorkspacePage() {
                     <Dd>{incoming?.call_id ? <code className="font-mono text-xs">{incoming.call_id}</code> : '—'}</Dd>
                   </dl>
                 )}
+                {!selectedRecord && incoming?.call_id && (phase === 'on_call' || phase === 'wrap_up') && (
+                  <CallTranscriptPanel callId={incoming.call_id} live={phase === 'on_call'} />
+                )}
               </section>
 
               <section className="rounded-xl border border-border bg-white p-5">
@@ -668,6 +675,7 @@ function HistoryDetail({ recordId }: { recordId: number }) {
         <Dt>通话 ID</Dt>
         <Dd><code className="font-mono text-xs">{record.call_id}</code></Dd>
       </dl>
+      <CallTranscriptHistory recordId={record.id} />
     </div>
   )
 }

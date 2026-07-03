@@ -384,13 +384,13 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
     () => ({
       ...userStyles,
       root: {
-        '--yarl__color_backdrop': 'rgba(0, 0, 0, 0.36)',
+        '--yarl__color_backdrop': 'rgba(0, 0, 0, 0.55)',
         '--yarl__color_button': 'rgba(255, 255, 255, 0.72)',
         '--yarl__color_button_active': '#ffffff',
         '--yarl__color_button_disabled': 'rgba(255, 255, 255, 0.28)',
         '--yarl__button_filter': 'none',
         '--yarl__slide_icon_loading_color': 'rgba(255, 255, 255, 0.48)',
-        '--yarl__thumbnails_container_background_color': 'rgba(0, 0, 0, 0.28)',
+        '--yarl__thumbnails_container_background_color': 'rgba(0, 0, 0, 0.45)',
         '--yarl__thumbnails_thumbnail_background': 'rgba(255, 255, 255, 0.12)',
         '--yarl__thumbnails_thumbnail_border_color': 'rgba(255, 255, 255, 0.24)',
         '--yarl__thumbnails_thumbnail_active_border_color': '#ffffff',

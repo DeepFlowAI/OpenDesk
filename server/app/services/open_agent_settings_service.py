@@ -4,12 +4,12 @@ OpenAgent settings service.
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import ValidationError as PydanticValidationError
 
-from app.core.exceptions import ValidationError
+from app.core.exceptions import ForbiddenError, ValidationError
 from app.core.secret_store import decrypt_secret, encrypt_secret
 from app.libs.open_agent import create_open_agent_client
 from app.libs.open_agent.base import BaseOpenAgentClient, OpenAgentClientError
 from app.libs.voice_speed import create_voice_speed_client
-from app.libs.voice_speed.base import BaseVoiceSpeedClient
+from app.libs.voice_speed.base import BaseVoiceSpeedClient, VoiceSpeedClientError
 from app.repositories.open_agent_settings_repository import OpenAgentSettingsRepository
 from app.schemas.open_agent_settings import (
     OpenAgentAIDisclaimer,
@@ -22,6 +22,8 @@ from app.schemas.open_agent_settings import (
     OpenAgentSettingsUpdate,
     OpenAgentVisitorRuntimeConfig,
     OpenAgentWelcomeMessage,
+    VoiceSpeedAgentListResponse,
+    VoiceSpeedAgentSummary,
     VoiceSpeedConnectionTestRequest,
     VoiceSpeedConnectionTestResponse,
     VoiceSpeedSettingsResponse,
@@ -164,6 +166,43 @@ class OpenAgentSettingsService:
         if not item or not item.voice_speed_base_url or not item.voice_speed_api_key_ciphertext:
             return None
         return item.voice_speed_base_url, decrypt_secret(item.voice_speed_api_key_ciphertext)
+
+    @staticmethod
+    async def list_voice_speed_agents(
+        db: AsyncSession,
+        tenant_id: int,
+        voice_speed_client: BaseVoiceSpeedClient | None = None,
+    ) -> VoiceSpeedAgentListResponse:
+        """List enabled VoiceSpeed agents using saved tenant credentials.
+
+        Returns ``configured=False`` when no VoiceSpeed base_url / api_key is
+        bound. The API key never leaves the server and is never returned.
+        """
+        credentials = await OpenAgentSettingsService.get_voice_speed_credentials(db, tenant_id)
+        if not credentials:
+            return VoiceSpeedAgentListResponse(configured=False, items=[])
+
+        base_url, api_key = credentials
+        client = voice_speed_client or create_voice_speed_client()
+        try:
+            result = await client.list_agents(base_url, api_key, status="enabled")
+        except VoiceSpeedClientError as exc:
+            if exc.status_code == 403:
+                raise ForbiddenError(str(exc)) from exc
+            raise ValidationError(str(exc)) from exc
+
+        return VoiceSpeedAgentListResponse(
+            configured=True,
+            items=[
+                VoiceSpeedAgentSummary(
+                    id=item.id,
+                    name=item.name,
+                    description=item.description,
+                    status=item.status,
+                )
+                for item in result.items
+            ],
+        )
 
     @staticmethod
     async def list_active_agents(

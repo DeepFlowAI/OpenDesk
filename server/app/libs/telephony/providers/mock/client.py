@@ -32,6 +32,11 @@ class MockTelephonyClient(BaseTelephonyClient):
         self.recorded: list[tuple[str, dict[str, Any]]] = []
         # Test injection slot: tests can preset webrtc.offer answer SDP / call_id
         self.webrtc_offer_response: dict = {"call_id": "mock-webrtc-call", "sdp": "v=0\r\n"}
+        # Test injection slots for simulating FlowKit RPC errors (e.g. -32002
+        # "call not found" when a leg is already gone). `bridge_error` is raised
+        # by call_bridge; `hangup_errors` maps a call_id → exception for call_hangup.
+        self.bridge_error: Exception | None = None
+        self.hangup_errors: dict[str, Exception] = {}
         self.call_list_response: list[dict] = []
         self.originate_response: dict = {
             "call_id": "mock-out-call",
@@ -81,6 +86,9 @@ class MockTelephonyClient(BaseTelephonyClient):
 
     async def call_hangup(self, call_id: str, reason: str | None = None) -> None:
         self.recorded.append(("call.hangup", {"call_id": call_id, "reason": reason}))
+        err = self.hangup_errors.get(call_id)
+        if err is not None:
+            raise err
 
     async def call_say(
         self, call_id: str, text: str, *, voice: str | None = None, barge_in: bool | None = None,
@@ -103,8 +111,69 @@ class MockTelephonyClient(BaseTelephonyClient):
     ) -> None:
         self.recorded.append(("call.dtmf", {"call_id": call_id, "digits": digits, "duration_ms": duration_ms}))
 
-    async def call_bridge(self, call_id: str, other_call_id: str) -> None:
-        self.recorded.append(("call.bridge", {"call_id": call_id, "other_call_id": other_call_id}))
+    async def call_bridge(
+        self, call_id: str, other_call_id: str, transcribe: bool = True
+    ) -> None:
+        self.recorded.append((
+            "call.bridge",
+            {"call_id": call_id, "other_call_id": other_call_id, "transcribe": transcribe},
+        ))
+        if self.bridge_error is not None:
+            raise self.bridge_error
+
+    async def call_connect_external_agent(
+        self,
+        call_id: str,
+        *,
+        provider: str,
+        ws_url: str,
+        token: str,
+        audio_in_rate: int,
+        audio_out_rate: int,
+        traceparent: str | None = None,
+        trace_call_id: str | None = None,
+    ) -> None:
+        self.recorded.append((
+            "call.connect_external_agent",
+            {
+                "call_id": call_id,
+                "provider": provider,
+                "ws_url": ws_url,
+                "token": token,
+                "audio_in_rate": audio_in_rate,
+                "audio_out_rate": audio_out_rate,
+                "traceparent": traceparent,
+                "trace_call_id": trace_call_id,
+            },
+        ))
+
+    async def call_converse_external_agent(
+        self,
+        call_id: str,
+        *,
+        provider: str,
+        turn_url: str,
+        token: str,
+        greeting: str | None = None,
+        voice_spk_id: str | None = None,
+        traceparent: str | None = None,
+        trace_call_id: str | None = None,
+    ) -> None:
+        self.recorded.append((
+            "call.converse_external_agent",
+            {
+                "call_id": call_id,
+                "provider": provider,
+                "turn_url": turn_url,
+                "token": token,
+                "greeting": greeting,
+                "voice_spk_id": voice_spk_id,
+                "traceparent": traceparent,
+                "trace_call_id": trace_call_id,
+            },
+        ))
+        if self.bridge_error is not None:
+            raise self.bridge_error
 
     async def call_unbridge(self, call_id: str, other_call_id: str) -> None:
         self.recorded.append(("call.unbridge", {"call_id": call_id, "other_call_id": other_call_id}))

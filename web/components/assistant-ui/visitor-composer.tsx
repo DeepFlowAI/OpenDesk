@@ -115,6 +115,7 @@ type VisitorComposerProps = {
   disabled: boolean
   isMobile: boolean
   isEmbed?: boolean
+  focusRequest?: number
   insertRequest?: VisitorComposerInsertRequest | null
   showSatisfactionButton?: boolean
   satisfactionLoading?: boolean
@@ -132,6 +133,7 @@ export function VisitorComposer({
   disabled,
   isMobile,
   isEmbed = false,
+  focusRequest = 0,
   insertRequest,
   showSatisfactionButton = false,
   satisfactionLoading = false,
@@ -165,6 +167,22 @@ export function VisitorComposer({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastInsertIdRef = useRef<number | null>(null)
+
+  const focusTextarea = useCallback((selectionIndex?: number) => {
+    window.requestAnimationFrame(() => {
+      const textarea =
+        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
+        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
+      if (!textarea || textarea.disabled) return
+      textarea.focus({ preventScroll: true })
+      const len = selectionIndex ?? textarea.value.length
+      try {
+        textarea.setSelectionRange(len, len)
+      } catch {
+        // Some hosts leave selection APIs unavailable; focus alone is enough.
+      }
+    })
+  }, [])
 
   // Enter-to-send should only fall back to newline on real touch devices
   // (phone/tablet soft keyboards), not on narrow desktop windows. Viewport
@@ -211,6 +229,11 @@ export function VisitorComposer({
   }, [composer, onTyping])
 
   useEffect(() => {
+    if (!focusRequest || disabled) return
+    focusTextarea()
+  }, [disabled, focusRequest, focusTextarea])
+
+  useEffect(() => {
     const previewUrl = pastedAttachment?.previewUrl
     if (!previewUrl) return
     return () => URL.revokeObjectURL(previewUrl)
@@ -224,20 +247,8 @@ export function VisitorComposer({
     const becameQuoted = quotedId !== null && prevQuotedIdRef.current !== quotedId
     prevQuotedIdRef.current = quotedId
     if (!becameQuoted || disabled || offlineMode) return
-    window.requestAnimationFrame(() => {
-      const textarea =
-        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
-        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
-      if (!textarea || textarea.disabled) return
-      textarea.focus({ preventScroll: true })
-      const len = textarea.value.length
-      try {
-        textarea.setSelectionRange(len, len)
-      } catch {
-        // Some hosts leave selection APIs unavailable; focus alone is enough.
-      }
-    })
-  }, [disabled, offlineMode, quotedMessage])
+    focusTextarea()
+  }, [disabled, focusTextarea, offlineMode, quotedMessage])
 
   useEffect(() => {
     if (!insertRequest || disabled || lastInsertIdRef.current === insertRequest.id) return
@@ -257,18 +268,8 @@ export function VisitorComposer({
 
     composer.setText(insertRequest.text)
     restoreQuote()
-    const textarea =
-      rootRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
-      rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
-    window.requestAnimationFrame(() => {
-      textarea?.focus({ preventScroll: true })
-      try {
-        textarea?.setSelectionRange(insertRequest.text.length, insertRequest.text.length)
-      } catch {
-        // Ignore host selection limitations.
-      }
-    })
-  }, [composer, disabled, insertRequest, locale, onClearQuote, onQuoteMessage])
+    focusTextarea(insertRequest.text.length)
+  }, [composer, disabled, focusTextarea, insertRequest, locale, onClearQuote, onQuoteMessage])
 
   const handleImageSelect = useCallback(() => {
     fileInputRef.current?.click()
@@ -442,7 +443,9 @@ export function VisitorComposer({
           maxRows={MAX_ROWS}
           onChange={handleTypingDebounce}
           onPaste={handlePaste}
-          className="w-full resize-none border-0 bg-transparent px-3 pt-2.5 pb-1 text-sm text-foreground outline-none placeholder:text-[#9CA3AF] disabled:cursor-not-allowed disabled:opacity-50 sm:px-4 sm:pt-3"
+          // iOS Safari auto-zooms the page when a focused input's font-size is
+          // below 16px; force 16px on touch devices to prevent that zoom.
+          className="w-full resize-none border-0 bg-transparent px-3 pt-2.5 pb-1 text-sm text-foreground outline-none placeholder:text-[#9CA3AF] disabled:cursor-not-allowed disabled:opacity-50 pointer-coarse:text-base sm:px-4 sm:pt-3"
           style={{ lineHeight: `${LINE_HEIGHT}px` }}
         />
 
@@ -571,6 +574,7 @@ export function VisitorComposer({
                 </Button>
                 <Button
                   type="button"
+                  autoFocus
                   onClick={() => void handlePastedAttachmentSend()}
                   disabled={uploading}
                   className="bg-[var(--opendesk-send-button-bg)] text-primary-foreground hover:opacity-90"

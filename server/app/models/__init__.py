@@ -15,17 +15,20 @@ from app.models.audio_asset import AudioAsset  # noqa: F401
 from app.models.voice_flow_system_variable import VoiceFlowSystemVariable  # noqa: F401
 from app.models.agent_status import AgentStatus  # noqa: F401
 from app.models.call_record import CallRecord  # noqa: F401
+from app.models.call_transcript_segment import CallTranscriptSegment  # noqa: F401
 from app.models.agent_webrtc_session import AgentWebRTCSession  # noqa: F401
 from app.models.inbound_routing_rule import InboundRoutingRule  # noqa: F401
 from app.models.sip_trunk import SipTrunk  # noqa: F401
 from app.models.phone_number import PhoneNumber  # noqa: F401
 from app.models.phone_number_tenant_meta import PhoneNumberTenantMeta  # noqa: F401
+from app.models.verify_file import VerifyFile  # noqa: F401
 from app.models.session_routing_rule import SessionRoutingRule  # noqa: F401
 from app.models.welcome_message_rule import WelcomeMessageRule  # noqa: F401
 from app.models.conversation_announcement_rule import ConversationAnnouncementRule  # noqa: F401
 from app.models.satisfaction_survey_config import SatisfactionSurveyConfig, SatisfactionSurveyConfigVersion  # noqa: F401
 from app.models.emoji_setting import EmojiSetting  # noqa: F401
 from app.models.conversation_read_status_setting import ConversationReadStatusSetting  # noqa: F401
+from app.models.conversation_agent_display_setting import ConversationAgentDisplaySetting  # noqa: F401
 from app.models.conversation_user_stat_setting import ConversationUserStatSetting  # noqa: F401
 from app.models.visitor_timeout_close import VisitorTimeoutCloseSetting, VisitorTimeoutCloseState  # noqa: F401
 from app.models.satisfaction_survey_record import SatisfactionSurveyRecord  # noqa: F401
@@ -66,3 +69,5 @@ from app.models.user_view import UserView  # noqa: F401
 from app.models.ticket_view import TicketView  # noqa: F401
 from app.models.organization_view import OrganizationView  # noqa: F401
 from app.models.queue import QueueTask, QueuePolicy, QueueRoundRobinState, QueueAssignmentEvent, QueueOutboxEvent  # noqa: F401
+from app.models.queue_no_show_setting import QueueNoShowSetting  # noqa: F401
+from app.models.knowledge_input_suggestion_setting import KnowledgeInputSuggestionSetting  # noqa: F401

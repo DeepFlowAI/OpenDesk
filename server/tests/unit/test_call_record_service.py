@@ -179,6 +179,61 @@ async def test_mark_answered_does_not_record_queue_duration_metadata(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_mark_completed_clamps_overflowing_talk_duration(monkeypatch):
+    # A CDR left un-closed for decades computes a duration beyond int4 range;
+    # completion must clamp instead of raising "value out of int32 range".
+    far_past = datetime(1990, 1, 1, tzinfo=timezone.utc)
+    row = SimpleNamespace(call_id="c", answered_at=far_past, started_at=far_past)
+    updates = []
+
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.get_by_call_id",
+        AsyncMock(return_value=row),
+    )
+
+    async def fake_update(_db, _row, patch):
+        updates.append(patch)
+        return _row
+
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.update",
+        fake_update,
+    )
+
+    await CallRecordService.mark_completed(AsyncMock(), 1, "c")
+
+    patch = updates[0]
+    assert patch["state"] == "completed"
+    assert patch["talk_duration_ms"] == 2_147_483_647
+
+
+@pytest.mark.asyncio
+async def test_mark_completed_clamps_ring_duration_when_unanswered(monkeypatch):
+    far_past = datetime(1990, 1, 1, tzinfo=timezone.utc)
+    row = SimpleNamespace(call_id="c", answered_at=None, started_at=far_past)
+    updates = []
+
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.get_by_call_id",
+        AsyncMock(return_value=row),
+    )
+
+    async def fake_update(_db, _row, patch):
+        updates.append(patch)
+        return _row
+
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.update",
+        fake_update,
+    )
+
+    await CallRecordService.mark_completed(AsyncMock(), 1, "c")
+
+    patch = updates[0]
+    assert patch["ring_duration_ms"] == 2_147_483_647
+
+
+@pytest.mark.asyncio
 async def test_get_by_id_uses_call_record_queue_metadata(monkeypatch):
     row = SimpleNamespace(
         id=7,

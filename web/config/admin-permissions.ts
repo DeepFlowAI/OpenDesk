@@ -6,6 +6,7 @@ export type AdminNavIconKey =
   | 'flowStudio'
   | 'phoneNumbers'
   | 'callSummary'
+  | 'callSettings'
   | 'conversationSettings'
   | 'channels'
   | 'sessionRouting'
@@ -59,6 +60,7 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
       { labelKey: 'nav.flowStudio', href: '/flow-studio', iconKey: 'flowStudio', permission: 'call.admin.flow.manage' },
       { labelKey: 'nav.phoneNumbers', href: '/call-center/phone-numbers', iconKey: 'phoneNumbers', permission: 'call.admin.number.manage' },
       { labelKey: 'nav.callSummary', href: '/call-summary', iconKey: 'callSummary', permission: 'call.admin.summary_config.manage' },
+      { labelKey: 'nav.callSettings', href: '/call-center/settings', iconKey: 'callSettings', permission: 'call.admin.number.manage' },
     ],
   },
   {
@@ -108,6 +110,7 @@ export const ADMIN_ROUTE_RULES: AdminRouteRule[] = [
   { prefix: '/queue-settings', permissions: ['org.queue.manage'] },
   { prefix: '/flow-studio', permissions: ['call.admin.flow.manage'] },
   { prefix: '/call-center/phone-numbers', permissions: ['call.admin.number.manage'] },
+  { prefix: '/call-center/settings', permissions: ['call.admin.number.manage'] },
   { prefix: '/call-summary', permissions: ['call.admin.summary_config.manage'] },
   { prefix: '/online-service/conversation-settings', permissions: ['chat.admin.settings.manage'] },
   { prefix: '/channels', permissions: ['chat.admin.channel.manage'] },

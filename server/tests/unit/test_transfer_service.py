@@ -318,6 +318,7 @@ class _TransferPatches:
         })
         self.status_inc = AsyncMock()
         self.status_dec = AsyncMock()
+        self.restart_timeout = AsyncMock()
         # Two calls happen in transfer_conversation: receiver first, then
         # initiator. Default to no history for both unless overridden.
         self.history_mock = AsyncMock(
@@ -349,6 +350,11 @@ class _TransferPatches:
             patch.object(ts.AgentStatusService, "get_status", new=self.status_get),
             patch.object(ts.AgentStatusService, "increment_count", new=self.status_inc),
             patch.object(ts.AgentStatusService, "decrement_count", new=self.status_dec),
+            patch.object(
+                ts.VisitorTimeoutCloseService,
+                "restart_on_transfer",
+                new=self.restart_timeout,
+            ),
             patch.object(ts, "get_realtime_transport", new=self.get_rt),
             patch.object(ts.ReceptionEventService, "record", new=AsyncMock(return_value=None)),
         ]
@@ -405,6 +411,12 @@ class TestTransferConversation:
         # 2) Redis side effects
         assert p.status_dec.await_count == 1
         assert p.status_inc.await_count == 1
+        p.restart_timeout.assert_awaited_once()
+        restart_args = p.restart_timeout.await_args
+        assert restart_args.args[0] is fake_db
+        assert restart_args.args[1] is conversation
+        assert restart_args.kwargs["commit"] is False
+        assert isinstance(restart_args.kwargs["anchor_at"], datetime)
 
         # 3) Realtime broadcast: 3 new_message + 2 conversation_transferred + 1 list invalidation
         assert p.rt.emit.await_count == 6
@@ -454,6 +466,33 @@ class TestTransferConversation:
         # realtime payload to prevent drift between the two surfaces).
         json.dumps(result)
         assert isinstance(result["started_at"], str)
+
+    @pytest.mark.asyncio
+    async def test_reassign_update_bumps_unread_for_receiver(self, fake_db, fake_redis):
+        """The transfer is a pending item for the receiver, so the atomic
+        reassign UPDATE must also increment the unread counter."""
+        conversation = _make_conversation(agent_id=11)
+        target = _make_employee(id=22, name="Bob", display_name="Bob 客服")
+        initiator = _make_employee(id=11, name="Alice", display_name="Alice 客服")
+
+        with _TransferPatches(
+            conversation, target, initiator,
+            target_status=AgentOnlineStatus.ONLINE.value,
+        ):
+            await TransferService.transfer_conversation(
+                db=fake_db,
+                r=fake_redis,
+                conversation_id=conversation.id,
+                target_agent_id=target.id,
+                current_user_id=11,
+                tenant_id=7,
+            )
+
+        update_stmt = fake_db.execute.await_args_list[0].args[0]
+        rendered = str(update_stmt)
+        assert "unread_count" in rendered
+        # Atomic self-referential increment rather than a read-modify-write.
+        assert "unread_count + " in rendered.replace("conversations.", "")
 
     @pytest.mark.asyncio
     async def test_admin_initiator_appears_as_message_author(self, fake_db, fake_redis):

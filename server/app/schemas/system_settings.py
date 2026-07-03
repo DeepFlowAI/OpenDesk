@@ -32,9 +32,14 @@ class OrganizationSettingsUpdate(BaseModel):
     organization_enabled: bool
 
 
+class CallTranscriptionSettingsUpdate(BaseModel):
+    enabled: bool
+
+
 class SystemSettingsResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     default_language: str
     default_timezone: str
     organization_enabled: bool = False
+    bridge_asr_enabled: bool = False

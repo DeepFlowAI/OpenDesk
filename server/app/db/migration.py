@@ -18,6 +18,12 @@ def run_migrations() -> None:
         text=True,
     )
     if result.returncode != 0:
-        logger.error("Migration failed: %s", result.stderr)
+        logger.error(
+            "Migration failed with exit code %s\nstdout:\n%s\nstderr:\n%s",
+            result.returncode,
+            result.stdout,
+            result.stderr,
+        )
+        raise RuntimeError("Database migration failed")
     else:
         logger.info("Migrations complete.")

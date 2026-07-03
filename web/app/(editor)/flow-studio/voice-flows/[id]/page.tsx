@@ -35,7 +35,8 @@ import { PropertyPanel } from '@/app/components/features/voice-flow/property-pan
 import { FlowInfoPopover } from '@/app/components/features/voice-flow/flow-info-popover'
 import { VariablesModal } from '@/app/components/features/voice-flow/variables-modal'
 import { VersionsDrawer } from '@/app/components/features/voice-flow/versions-drawer'
-import { defaultDataFor, type NodeType } from '@/models/voice-flow-graph'
+import { nodeOptionLabel } from '@/app/components/features/voice-flow/nodes'
+import { NODE_COLOR, defaultDataFor, genEdgeId, type NodeType } from '@/models/voice-flow-graph'
 import { useUpdateVoiceFlow, useVoiceFlow } from '@/service/use-voice-flows'
 import {
   formatIssueHeadline,
@@ -116,6 +117,28 @@ function EditorBody({ id }: { id: number }) {
     const n = makeNewNode(type)
     setNodes((prev) => [...prev, n])
     setSelectedId(n.id)
+  }
+
+  // Set/replace/clear the single edge from a node's named outlet — keeps the
+  // property-panel outlet dropdown and the canvas connection in sync.
+  const connectOutlet = (sourceId: string, handle: string, targetId: string | null) => {
+    setEdges((prev) => {
+      const filtered = prev.filter(
+        (e) => !(e.source === sourceId && (e.sourceHandle ?? 'next') === handle),
+      )
+      if (!targetId) return filtered
+      return [
+        ...filtered,
+        {
+          id: genEdgeId(),
+          source: sourceId,
+          target: targetId,
+          sourceHandle: handle,
+          type: 'smoothstep',
+          style: { stroke: NODE_COLOR.voicespeed, strokeWidth: 2 },
+        },
+      ]
+    })
   }
 
   const addNodeAt = (type: NodeType, position: { x: number; y: number }) => {
@@ -262,8 +285,10 @@ function EditorBody({ id }: { id: number }) {
           <PropertyPanel
             selected={selected}
             updateNode={updateNode}
-            allNodes={nodes.map((n) => ({ id: n.id, type: n.type ?? '', label: `${n.type} #${n.id}` }))}
+            allNodes={nodes.map((n) => ({ id: n.id, type: n.type ?? '', label: nodeOptionLabel(n.type, n.data) }))}
             graphVariables={flowVariables.map((v) => v.name)}
+            edges={edges}
+            onConnectOutlet={connectOutlet}
           />
         </aside>
       </div>

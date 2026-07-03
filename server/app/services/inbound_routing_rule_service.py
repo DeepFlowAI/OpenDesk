@@ -40,6 +40,40 @@ class InboundRoutingRuleService:
             raise ValidationError("Target voice flow is invalid, disabled, or deleted")
 
     @staticmethod
+    async def _validate_target(
+        db: AsyncSession,
+        tenant_id: int,
+        data: InboundRoutingRuleCreate | InboundRoutingRuleUpdate,
+    ) -> None:
+        if data.target_type == "voice_flow":
+            if data.target_voice_flow_id is None:
+                raise ValidationError("target_voice_flow_id is required when target_type is voice_flow")
+            await InboundRoutingRuleService._ensure_target_flow(db, tenant_id, data.target_voice_flow_id)
+        elif data.target_type == "voicespeed_agent":
+            if not data.voicespeed_agent_id:
+                raise ValidationError("voicespeed_agent_id is required when target_type is voicespeed_agent")
+            if data.transfer_target is None:
+                raise ValidationError("transfer_target is required when target_type is voicespeed_agent")
+
+    @staticmethod
+    def _target_payload(data: InboundRoutingRuleCreate | InboundRoutingRuleUpdate) -> dict:
+        if data.target_type == "voicespeed_agent":
+            return {
+                "target_type": "voicespeed_agent",
+                "target_voice_flow_id": None,
+                "voicespeed_agent_id": data.voicespeed_agent_id,
+                "voicespeed_agent_name": data.voicespeed_agent_name,
+                "transfer_target": data.transfer_target.model_dump() if data.transfer_target else None,
+            }
+        return {
+            "target_type": "voice_flow",
+            "target_voice_flow_id": data.target_voice_flow_id,
+            "voicespeed_agent_id": None,
+            "voicespeed_agent_name": None,
+            "transfer_target": None,
+        }
+
+    @staticmethod
     def _rule_to_response(rule, flow_name: str | None) -> dict:
         return {
             "id": rule.id,
@@ -47,8 +81,12 @@ class InboundRoutingRuleService:
             "name": rule.name,
             "enabled": rule.enabled,
             "conditions": list(rule.conditions) if rule.conditions else [],
+            "target_type": rule.target_type,
             "target_voice_flow_id": rule.target_voice_flow_id,
             "target_flow_name": flow_name or "",
+            "voicespeed_agent_id": rule.voicespeed_agent_id,
+            "voicespeed_agent_name": rule.voicespeed_agent_name,
+            "transfer_target": rule.transfer_target,
             "created_at": rule.created_at,
             "updated_at": rule.updated_at,
         }
@@ -60,8 +98,11 @@ class InboundRoutingRuleService:
             "priority": rule.priority,
             "name": rule.name,
             "enabled": rule.enabled,
+            "target_type": rule.target_type,
             "target_voice_flow_id": rule.target_voice_flow_id,
             "target_flow_name": flow_name or "",
+            "voicespeed_agent_id": rule.voicespeed_agent_id,
+            "voicespeed_agent_name": rule.voicespeed_agent_name,
             "created_at": rule.created_at,
             "updated_at": rule.updated_at,
         }
@@ -95,7 +136,7 @@ class InboundRoutingRuleService:
 
     @staticmethod
     async def create(db: AsyncSession, tenant_id: int, data: InboundRoutingRuleCreate) -> dict:
-        await InboundRoutingRuleService._ensure_target_flow(db, tenant_id, data.target_voice_flow_id)
+        await InboundRoutingRuleService._validate_target(db, tenant_id, data)
         conds = await InboundRoutingRuleService._validate_conditions(
             db, tenant_id, data.conditions
         )
@@ -106,7 +147,7 @@ class InboundRoutingRuleService:
             "name": data.name,
             "enabled": data.enabled,
             "conditions": conds,
-            "target_voice_flow_id": data.target_voice_flow_id,
+            **InboundRoutingRuleService._target_payload(data),
         }
         rule = await InboundRoutingRuleRepository.create(db, payload)
         return await InboundRoutingRuleService.get_by_id(db, rule.id, tenant_id)
@@ -119,7 +160,7 @@ class InboundRoutingRuleService:
         if not row:
             raise NotFoundError("Routing rule not found")
         rule, _ = row
-        await InboundRoutingRuleService._ensure_target_flow(db, tenant_id, data.target_voice_flow_id)
+        await InboundRoutingRuleService._validate_target(db, tenant_id, data)
         conds = await InboundRoutingRuleService._validate_conditions(
             db, tenant_id, data.conditions
         )
@@ -130,7 +171,7 @@ class InboundRoutingRuleService:
                 "name": data.name,
                 "enabled": data.enabled,
                 "conditions": conds,
-                "target_voice_flow_id": data.target_voice_flow_id,
+                **InboundRoutingRuleService._target_payload(data),
             },
         )
         return await InboundRoutingRuleService.get_by_id(db, rule_id, tenant_id)

@@ -380,3 +380,28 @@ class OfflineMessageRepository:
             ],
         )
         return offline_message
+
+    @staticmethod
+    async def mark_archived(
+        db: AsyncSession,
+        offline_message: OfflineMessage,
+        *,
+        handled_by_id: int,
+        handled_at: datetime,
+    ) -> OfflineMessage:
+        offline_message.status = "archived"
+        offline_message.handled_by_id = handled_by_id
+        offline_message.handled_at = handled_at
+        await db.commit()
+        await db.refresh(
+            offline_message,
+            attribute_names=[
+                "visitor",
+                "channel",
+                "target_group",
+                "conversation",
+                "handled_by",
+                "messages",
+            ],
+        )
+        return offline_message

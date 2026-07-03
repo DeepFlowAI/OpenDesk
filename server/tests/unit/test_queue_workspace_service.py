@@ -337,6 +337,8 @@ async def test_assign_self_and_send_assigns_then_sends_text(monkeypatch):
     assign_to_agent = AsyncMock(return_value=assignment)
     send_message = AsyncMock(return_value=message)
     emit_message = AsyncMock()
+    mark_read = AsyncMock(return_value=[])
+    rt = SimpleNamespace(emit=AsyncMock())
     monkeypatch.setattr(QueueWorkspaceService, "_assign_to_agent", assign_to_agent)
     monkeypatch.setattr(
         "app.services.queue_workspace_service.ConversationRepository.get_by_id",
@@ -345,6 +347,14 @@ async def test_assign_self_and_send_assigns_then_sends_text(monkeypatch):
     monkeypatch.setattr(
         "app.services.queue_workspace_service.ConversationService.send_message",
         send_message,
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationService.mark_read",
+        mark_read,
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.get_realtime_transport",
+        lambda: rt,
     )
     monkeypatch.setattr(QueueWorkspaceService, "_emit_sent_message_events", emit_message)
     db = object()
@@ -374,6 +384,13 @@ async def test_assign_self_and_send_assigns_then_sends_text(monkeypatch):
     assert kwargs["content"] == "您好，我来处理"
     assert kwargs["principal"] is principal
     emit_message.assert_awaited_once_with(assigned_conversation, message, principal.user_id)
+    # Proactively entering + replying must clear the assignment's unread +1.
+    mark_read.assert_awaited_once_with(db, assigned_conversation.id)
+    cleared_events = [
+        call for call in rt.emit.await_args_list
+        if call.args[0] == "conversation_updated" and call.args[1].get("unread_count") == 0
+    ]
+    assert len(cleared_events) == 1
     assert result.message_sent is True
     assert result.message.content == "您好，我来处理"
     assert result.message.sender_name == "Alice"
@@ -489,6 +506,10 @@ async def test_emit_assignment_events_sends_welcome_message_to_visitor(monkeypat
         AsyncMock(return_value=welcome_msg),
     )
     monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationRepository.increment_unread",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
         "app.services.queue_workspace_service.ConversationRealtimeService.emit_conversation_list_updated",
         emit_list_updated,
     )
@@ -498,6 +519,12 @@ async def test_emit_assignment_events_sends_welcome_message_to_visitor(monkeypat
     emitted_events = [call.args[0] for call in rt.emit.await_args_list]
     assert "conversation_assigned" in emitted_events
     assert emitted_events.count("new_message") == 2
+    # Assignment bumps the unread badge and broadcasts the fresh count.
+    assert conversation.unread_count == 1
+    assert any(
+        call.args[0] == "conversation_updated" and call.args[1].get("unread_count") == 1
+        for call in rt.emit.await_args_list
+    )
     visitor_new_message = rt.emit.await_args_list[emitted_events.index("new_message")]
     assert visitor_new_message.kwargs["namespace"] == "/visitor"
     assert visitor_new_message.args[1]["content_type"] == "welcome"
@@ -532,6 +559,10 @@ async def test_emit_assignment_events_sends_agent_assigned_event_to_visitor(monk
     monkeypatch.setattr(
         "app.services.queue_workspace_service.MessageRepository.get_welcome_message",
         AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationRepository.increment_unread",
+        AsyncMock(return_value=1),
     )
     monkeypatch.setattr(
         "app.services.queue_workspace_service.ConversationRealtimeService.emit_conversation_list_updated",
@@ -620,6 +651,10 @@ async def test_emit_assignment_events_emits_internal_note_to_agents_only(monkeyp
     monkeypatch.setattr(
         "app.services.queue_workspace_service.MessageRepository.get_welcome_message",
         AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationRepository.increment_unread",
+        AsyncMock(return_value=1),
     )
     monkeypatch.setattr(
         "app.services.queue_workspace_service.ConversationRealtimeService.emit_conversation_list_updated",

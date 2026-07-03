@@ -514,6 +514,12 @@ class AssignQueueExecutor(BaseNodeExecutor):
         else:
             await self._say(ctx, data.get("queue_prompt_text") or "正在为您转接，请稍候。")
 
+        # Record the in-flight offer so the orchestrator can withdraw it (stop
+        # the agent's browser ringing + free the agent) if the caller hangs up
+        # before the agent accepts. Cleared once a decision arrives below.
+        ctx.variables["sys._pending_offer_id"] = offer_id
+        ctx.variables["sys._pending_offer_employee_id"] = pick["employee_id"]
+
         log.info(
             "assign_queue: offered to agent=%s offer_id=%s timeout=%ss call_id=%s",
             pick["employee_id"], offer_id, timeout_s, ctx.call_id,
@@ -542,6 +548,11 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 prompt_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await prompt_task
+            # Offer lifecycle is over (accepted / rejected / timed out / caller
+            # hung up). Drop the pending markers so a later call.hangup doesn't
+            # try to withdraw an offer that's already resolved.
+            ctx.variables.pop("sys._pending_offer_id", None)
+            ctx.variables.pop("sys._pending_offer_employee_id", None)
 
         if not decision or not decision.get("accept"):
             log.info(
@@ -584,17 +595,110 @@ class AssignQueueExecutor(BaseNodeExecutor):
         ctx.variables.pop("sys.assign_queue_status", None)
         ctx.variables.pop("sys.assign_queue_limit_reason", None)
 
-        log.info(
-            "assign_queue: bridging sip=%s ↔ webrtc=%s",
-            ctx.call_id, webrtc_call_id,
+        return await self._bridge_to_agent(
+            ctx,
+            webrtc_call_id=webrtc_call_id,
+            employee_id=pick["employee_id"],
+            redis=redis,
         )
-        await ctx.telephony.call_stop(ctx.call_id)
-        await ctx.telephony.call_bridge(ctx.call_id, webrtc_call_id)
+
+    async def _bridge_to_agent(
+        self,
+        ctx: ExecutionContext,
+        *,
+        webrtc_call_id: str,
+        employee_id: int,
+        redis: Any,
+    ) -> NextStep:
+        """Bridge the caller's SIP leg to the agent's WebRTC leg.
+
+        Handles the race where the caller hangs up between accepting the offer
+        and the bridge: FlowKit then rejects `call.bridge` with -32002 ("call
+        not found"). We abort cleanly — tear down the agent's own WebRTC leg,
+        finalize the CDR and reset the agent's status — so the agent isn't left
+        bridged to a dead leg and stuck on 忙碌.
+        """
+
+        import logging
+
+        from app.libs.telephony.base import TelephonyRPCError
+
+        from app.services.system_settings_service import SystemSettingsService
+
+        log = logging.getLogger(__name__)
+        # Read the tenant's live-transcription toggle on a short, self-contained
+        # session BEFORE the bridge so we never hold a DB session across the RPC.
+        transcribe = await SystemSettingsService.is_bridge_asr_enabled_managed(ctx.tenant_id)
+        log.info(
+            "assign_queue: bridging sip=%s ↔ webrtc=%s transcribe=%s",
+            ctx.call_id, webrtc_call_id, transcribe,
+        )
+        try:
+            await ctx.telephony.call_stop(ctx.call_id)
+            await ctx.telephony.call_bridge(ctx.call_id, webrtc_call_id, transcribe=transcribe)
+        except TelephonyRPCError as exc:
+            if exc.code == -32002:
+                log.warning(
+                    "assign_queue: bridge target gone (caller hung up) call_id=%s "
+                    "— aborting and freeing agent=%s",
+                    ctx.call_id, employee_id,
+                )
+                await self._abort_bridge(
+                    ctx,
+                    employee_id=employee_id,
+                    webrtc_call_id=webrtc_call_id,
+                    redis=redis,
+                    reason="caller_gone",
+                )
+                return End("bridge_aborted")
+            raise
 
         async def _on_bridged(ctx_: ExecutionContext, node_: dict, _ev: dict) -> NextStep:
             return End("bridged")
 
         return WaitForEvent(method="call.bridged", on_event=_on_bridged)
+
+    async def _abort_bridge(
+        self,
+        ctx: ExecutionContext,
+        *,
+        employee_id: int,
+        webrtc_call_id: str,
+        redis: Any,
+        reason: str,
+    ) -> None:
+        import logging
+
+        from app.libs.telephony.base import TelephonyRPCError
+        from app.services.cc_agent_resource_service import CcAgentResourceService
+
+        log = logging.getLogger(__name__)
+        # Tear down the agent's own WebRTC leg so their browser call ends.
+        if webrtc_call_id:
+            try:
+                await ctx.telephony.call_hangup(webrtc_call_id, reason=reason)
+            except TelephonyRPCError as exc:
+                if exc.code != -32002:
+                    log.warning(
+                        "assign_queue: abort hangup of agent leg %s failed code=%s",
+                        webrtc_call_id, exc.code,
+                    )
+            except Exception:  # noqa: BLE001
+                log.warning("assign_queue: abort hangup of agent leg raised", exc_info=True)
+
+        orchestrator = ctx.variables.get("__orchestrator__")
+        if orchestrator is not None:
+            await orchestrator.finalize_agent_call(
+                tenant_id=ctx.tenant_id,
+                employee_id=employee_id,
+                call_id=ctx.call_id,
+                reason=reason,
+                mark_cdr_completed=True,
+            )
+        elif redis is not None:
+            await CcAgentResourceService.release(
+                redis, ctx.tenant_id, employee_id, reason=reason,
+            )
 
     @classmethod
     def _set_failure_status(
@@ -635,6 +739,212 @@ class AssignQueueExecutor(BaseNodeExecutor):
             await asyncio.sleep(interval)
 
 
+class VoiceSpeedExecutor(BaseNodeExecutor):
+    """
+    Hand the live call to an external VoiceSpeed agent.
+
+    On enter we (a) open a SHORT db session only to read+decrypt the tenant's
+    VoiceSpeed credentials and close it, (b) ask the media kernel to run the
+    conversation on the call leg — the kernel does ASR/TTS/barge-in and POSTs
+    each transcribed utterance to the agent's turn endpoint — then (c) wait,
+    holding NO db session, for the kernel's external-agent control events. The
+    agent's `handoff` (transfer-to-human) is routed out the node's `handoff`
+    outlet; it is honored only once (idempotent, per design 3.3). Failure/
+    normal-end terminate the call.
+    """
+
+    _EVENTS = (
+        "call.external_agent.connected",
+        "call.external_agent.handoff",
+        "call.external_agent.failed",
+        "call.external_agent.ended",
+    )
+    _DEFAULT_UNAVAILABLE = "当前智能语音服务不可用，请稍后再拨。"
+    _DEFAULT_CONNECT_FAILED = "暂时无法接入智能语音服务，请稍后再拨。"
+    _DEFAULT_GREETING = "您好，请问有什么可以帮您？"
+
+    async def execute(self, ctx: ExecutionContext, node: dict) -> NextStep:
+        import logging
+
+        log = logging.getLogger(__name__)
+        data = node.get("data") or {}
+        agent_id = str(data.get("agent_id") or "").strip()
+
+        # (a) Short session: read + decrypt VoiceSpeed credentials, then close.
+        # Nothing is held during the network I/O that follows.
+        from app.db.session import AsyncSessionLocal
+        from app.services.open_agent_settings_service import OpenAgentSettingsService
+
+        credentials: tuple[str, str] | None = None
+        if agent_id:
+            async with AsyncSessionLocal() as db:
+                credentials = await OpenAgentSettingsService.get_voice_speed_credentials(
+                    db, ctx.tenant_id,
+                )
+
+        # (b) Availability check — a missing agent id or unconfigured tenant is
+        # "clearly unavailable"; play the prompt and end without bridging.
+        if not agent_id or credentials is None:
+            log.info(
+                "voicespeed: unavailable agent_id=%r configured=%s call_id=%s",
+                agent_id, credentials is not None, ctx.call_id,
+            )
+            return await self._terminate(
+                ctx,
+                data.get("unavailable_prompt_text") or self._DEFAULT_UNAVAILABLE,
+                reason="voicespeed_unavailable",
+            )
+
+        base_url, api_key = credentials
+
+        # (c) Build the agent's text-turn URL and ask the media kernel to run the
+        #     conversation on the call leg. In v2 (flowkit-中枢架构) the kernel owns
+        #     ASR/TTS/barge-in and POSTs each transcribed utterance to the turn
+        #     endpoint — there is NO realtime token to mint, NO audio bridged out
+        #     of the kernel, and NO db session held during the call.
+        from app.libs.voice_speed import create_voice_speed_client
+
+        turn_url = create_voice_speed_client().build_turn_url(base_url, agent_id)
+        greeting = (data.get("greeting_text") or "").strip() or self._DEFAULT_GREETING
+        try:
+            await ctx.telephony.call_converse_external_agent(
+                ctx.call_id,
+                provider="voicespeed",
+                turn_url=turn_url,
+                token=api_key,
+                greeting=greeting,
+                traceparent=ctx.variables.get("sys._traceparent"),
+                trace_call_id=ctx.variables.get("sys._trace_call_id") or ctx.call_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "voicespeed: converse_external_agent failed call_id=%s", ctx.call_id,
+                exc_info=True,
+            )
+            return await self._terminate(
+                ctx,
+                data.get("connect_failed_prompt_text") or self._DEFAULT_CONNECT_FAILED,
+                reason="voicespeed_connect_failed",
+            )
+
+        # (d) Conversation is running in the kernel — wait holding NO db session.
+        return self._wait()
+
+    def _wait(self) -> NextStep:
+        return WaitForEvent(method=self._EVENTS, on_event=self._on_agent_event)
+
+    async def _on_agent_event(
+        self, ctx: ExecutionContext, node: dict, ev: dict,
+    ) -> NextStep:
+        import logging
+
+        log = logging.getLogger(__name__)
+        method = ev.get("_event_method", "")
+        data = node.get("data") or {}
+        if method == "call.external_agent.handoff":
+            return await self._handle_handoff(ctx, node, ev)
+        if method == "call.external_agent.failed":
+            log.info(
+                "voicespeed: bridge failed call_id=%s code=%s message=%s",
+                ctx.call_id, ev.get("code"), ev.get("message"),
+            )
+            return await self._terminate(
+                ctx,
+                data.get("connect_failed_prompt_text") or self._DEFAULT_CONNECT_FAILED,
+                reason="voicespeed_connect_failed",
+            )
+        if method == "call.external_agent.ended":
+            log.info(
+                "voicespeed: bridge ended call_id=%s reason=%s",
+                ctx.call_id, ev.get("reason"),
+            )
+            return await self._terminate(ctx, None, reason="voicespeed_ended")
+        # connected — bridge is up; keep waiting for a terminal/handoff event.
+        log.info("voicespeed: bridge connected call_id=%s", ctx.call_id)
+        return self._wait()
+
+    async def _handle_handoff(
+        self, ctx: ExecutionContext, node: dict, ev: dict,
+    ) -> NextStep:
+        import logging
+
+        log = logging.getLogger(__name__)
+        # Idempotent: only the first handoff is acted on. Duplicates — or any
+        # handoff after the call has already bridged to an agent — are ignored
+        # (per design 3.3). The kernel keeps streaming, so we keep waiting.
+        if ctx.variables.get("sys._handoff_handled") or ctx.variables.get("sys._bridged_agent_id") is not None:
+            log.info("call.handoff.duplicate call_id=%s", ctx.call_id)
+            return self._wait()
+        ctx.variables["sys._handoff_handled"] = True
+        payload = ev.get("payload") or {}
+        # suggested_target / urgency are recorded only; they never override the
+        # admin-configured human target (design 0.2 / 3.4.2).
+        ctx.variables["sys._handoff_payload"] = payload
+        log.info(
+            "voicespeed: handoff accepted call_id=%s payload_keys=%s",
+            ctx.call_id, sorted(payload.keys()),
+        )
+        target = edge_target(ctx, node["id"], "handoff")
+        if target:
+            return Goto(target)
+        log.info("voicespeed: handoff with no outlet — ending call_id=%s", ctx.call_id)
+        return await self._terminate(ctx, None, reason="voicespeed_handoff_no_outlet")
+
+    async def _terminate(
+        self, ctx: ExecutionContext, text: str | None, *, reason: str,
+    ) -> NextStep:
+        if text:
+            await self._say(ctx, text)
+        try:
+            await ctx.telephony.call_hangup(ctx.call_id, reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
+        return End(reason)
+
+    @staticmethod
+    async def _say(ctx: ExecutionContext, text: str) -> None:
+        try:
+            await ctx.telephony.call_say(ctx.call_id, text)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def build_voicespeed_direct_graph(
+    *,
+    agent_id: str,
+    agent_name: str | None,
+    transfer_target: dict | None,
+) -> dict:
+    """Synthetic flow for a routing rule that points straight at a VoiceSpeed
+    agent (no editor flow). The call is already answered by the orchestrator;
+    this graph just bridges to the agent and, on transfer-to-human, routes into
+    the rule's single `transfer_target` by reusing the assign_queue executor.
+    """
+    transfer = transfer_target or {}
+    queue_targets = [transfer] if transfer.get("queue_type") and transfer.get("queue_id") else []
+    return {
+        "version": 1,
+        "nodes": [
+            {"id": "start", "type": "start", "data": {}, "position": {"x": 0, "y": 0}},
+            {
+                "id": "voicespeed", "type": "voicespeed", "position": {"x": 1, "y": 0},
+                "data": {"agent_id": agent_id, "agent_name": agent_name or ""},
+            },
+            {
+                "id": "assign_queue", "type": "assign_queue", "position": {"x": 2, "y": 0},
+                "data": {"queue_targets": queue_targets, "timeout_seconds": 60},
+            },
+            {"id": "hangup", "type": "hangup", "position": {"x": 3, "y": 0}, "data": {"pre_play": None}},
+        ],
+        "edges": [
+            {"id": "e_start", "source": "start", "target": "voicespeed", "source_handle": "next"},
+            {"id": "e_handoff", "source": "voicespeed", "target": "assign_queue", "source_handle": "handoff"},
+            {"id": "e_timeout", "source": "assign_queue", "target": "hangup", "source_handle": "timeout"},
+        ],
+        "variables": [],
+    }
+
+
 class HangupExecutor(BaseNodeExecutor):
 
     async def execute(self, ctx: ExecutionContext, node: dict) -> NextStep:
@@ -661,6 +971,7 @@ NODE_EXECUTORS: dict[str, BaseNodeExecutor] = {
     "collect": CollectExecutor(),
     "condition": ConditionExecutor(),
     "assign_queue": AssignQueueExecutor(),
+    "voicespeed": VoiceSpeedExecutor(),
     "hangup": HangupExecutor(),
 }
 

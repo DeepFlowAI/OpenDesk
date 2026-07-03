@@ -14,7 +14,13 @@ from app.libs.open_agent.base import (
     OpenAgentAgentSummary,
     OpenAgentConnectionResult,
 )
-from app.libs.voice_speed.base import VoiceSpeedConnectionResult
+from app.core.exceptions import ForbiddenError
+from app.libs.voice_speed.base import (
+    VoiceSpeedAgentListResult,
+    VoiceSpeedAgentSummary,
+    VoiceSpeedClientError,
+    VoiceSpeedConnectionResult,
+)
 from app.repositories.open_agent_settings_repository import OpenAgentSettingsRepository
 from app.schemas.open_agent_settings import (
     OpenAgentConnectionTestRequest,
@@ -104,13 +110,22 @@ class FakeOpenAgentClient:
 
 
 class FakeVoiceSpeedClient:
-    def __init__(self, ok: bool = True):
+    def __init__(self, ok: bool = True, agents=None, list_error: Exception | None = None):
         self.ok = ok
         self.calls: list[tuple[str, str]] = []
+        self.agent_calls: list[tuple[str, str, str]] = []
+        self._agents = agents
+        self._list_error = list_error
 
     async def test_connection(self, base_url: str, api_key: str) -> VoiceSpeedConnectionResult:
         self.calls.append((base_url, api_key))
         return VoiceSpeedConnectionResult(self.ok, "VoiceSpeed 连接成功" if self.ok else "Denied")
+
+    async def list_agents(self, base_url: str, api_key: str, status: str = "enabled") -> VoiceSpeedAgentListResult:
+        self.agent_calls.append((base_url, api_key, status))
+        if self._list_error is not None:
+            raise self._list_error
+        return VoiceSpeedAgentListResult(items=self._agents or [])
 
 
 @pytest.mark.asyncio
@@ -294,6 +309,96 @@ async def test_list_active_agents_requires_saved_credentials(monkeypatch):
 
     with pytest.raises(ValidationError):
         await OpenAgentSettingsService.list_active_agents(object(), 1)
+
+
+@pytest.mark.asyncio
+async def test_list_voice_speed_agents_returns_safe_fields(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url=None,
+        api_key_ciphertext=None,
+        voice_speed_base_url="https://vs.example.com",
+        voice_speed_api_key_ciphertext=encrypt_secret("vs-key"),
+    )
+    client = FakeVoiceSpeedClient(
+        agents=[
+            VoiceSpeedAgentSummary(id="7", name="Sales", description="d", status="enabled"),
+        ]
+    )
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    response = await OpenAgentSettingsService.list_voice_speed_agents(
+        object(), 1, voice_speed_client=client
+    )
+
+    assert response.configured is True
+    assert [(a.id, a.name, a.description, a.status) for a in response.items] == [
+        ("7", "Sales", "d", "enabled")
+    ]
+    assert client.agent_calls == [("https://vs.example.com", "vs-key", "enabled")]
+
+
+@pytest.mark.asyncio
+async def test_list_voice_speed_agents_not_configured(monkeypatch):
+    async def fake_get(_db, _tenant_id):
+        return None
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    response = await OpenAgentSettingsService.list_voice_speed_agents(object(), 1)
+    assert response.configured is False
+    assert response.items == []
+
+
+@pytest.mark.asyncio
+async def test_list_voice_speed_agents_empty_list(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url=None,
+        api_key_ciphertext=None,
+        voice_speed_base_url="https://vs.example.com",
+        voice_speed_api_key_ciphertext=encrypt_secret("vs-key"),
+    )
+    client = FakeVoiceSpeedClient(agents=[])
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    response = await OpenAgentSettingsService.list_voice_speed_agents(
+        object(), 1, voice_speed_client=client
+    )
+    assert response.configured is True
+    assert response.items == []
+
+
+@pytest.mark.asyncio
+async def test_list_voice_speed_agents_forbidden_on_missing_scope(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url=None,
+        api_key_ciphertext=None,
+        voice_speed_base_url="https://vs.example.com",
+        voice_speed_api_key_ciphertext=encrypt_secret("vs-key"),
+    )
+    client = FakeVoiceSpeedClient(
+        list_error=VoiceSpeedClientError("missing config scope", status_code=403)
+    )
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    with pytest.raises(ForbiddenError):
+        await OpenAgentSettingsService.list_voice_speed_agents(
+            object(), 1, voice_speed_client=client
+        )
 
 
 @pytest.mark.asyncio

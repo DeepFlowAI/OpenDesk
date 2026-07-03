@@ -1,6 +1,6 @@
 /* Semi-transparent dark overlay for image preview (YARL uses .yarl__container as the backdrop) */
 .od-image-preview-lightbox .yarl__container {
-  background-color: rgba(0, 0, 0, 0.36);
+  background-color: rgba(0, 0, 0, 0.55);
 }
 
 .od-image-preview-lightbox .yarl__slide {
@@ -9,11 +9,19 @@
 }
 
 .od-image-preview-lightbox .yarl__thumbnails_container {
-  background-color: rgba(0, 0, 0, 0.28);
+  background-color: rgba(0, 0, 0, 0.45);
 }
 
 @media (max-width: 640px) {
   .od-image-preview-lightbox .yarl__slide {
     padding: 64px 20px 20px;
   }
+}
+
+/* YARL sets -webkit-touch-callout: none on images, which suppresses the native
+   context menu (Copy Image / Save Image). Restore it for clipboard copy. */
+.od-image-preview-lightbox .yarl__slide_image {
+  -webkit-touch-callout: default;
+  -webkit-user-select: auto;
+  user-select: auto;
 }

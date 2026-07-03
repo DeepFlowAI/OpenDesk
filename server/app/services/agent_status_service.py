@@ -198,6 +198,12 @@ class AgentStatusService:
         )
 
     @staticmethod
+    async def get_connection_sid(r: aioredis.Redis, tenant_id: int, user_id: int) -> str | None:
+        """Return the currently tracked Socket.IO sid for an agent."""
+        sid = await r.hget(AgentStatusService._key(tenant_id, user_id), _CONNECTION_SID_FIELD)
+        return sid if isinstance(sid, str) else None
+
+    @staticmethod
     async def schedule_disconnect(
         r: aioredis.Redis,
         tenant_id: int,

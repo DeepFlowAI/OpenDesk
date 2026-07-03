@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import delete
 
-from app.enums import QueueTaskStatus
+from app.enums import QueueTaskStatus, QueueTaskType
 from app.models.conversation import Conversation
 from app.models.conversation_queue_summary import ConversationQueueSummary
 from app.models.call_record import CallRecord
@@ -121,6 +121,24 @@ class QueueTaskRepository:
                 QueueTask.task_ref_id == task_ref_id,
                 QueueTask.status.in_(ACTIVE_TASK_STATUSES),
             )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_active_conversation_task_for_update(
+        db: AsyncSession,
+        tenant_id: int,
+        conversation_id: int,
+    ) -> QueueTask | None:
+        result = await db.execute(
+            select(QueueTask)
+            .where(
+                QueueTask.tenant_id == tenant_id,
+                QueueTask.task_type == QueueTaskType.CONVERSATION.value,
+                QueueTask.task_ref_id == str(conversation_id),
+                QueueTask.status.in_(ACTIVE_TASK_STATUSES),
+            )
+            .with_for_update()
         )
         return result.scalar_one_or_none()
 
@@ -436,6 +454,34 @@ class QueueCandidateRepository:
 
 class QueueReturningAgentRepository:
     @staticmethod
+    async def find_recent_online_chat_agent_for_visitor(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        visitor_id: int,
+        cutoff: datetime,
+        exclude_conversation_id: int | None = None,
+    ) -> int | None:
+        history_at = func.coalesce(
+            Conversation.ended_at,
+            Conversation.last_message_at,
+            Conversation.started_at,
+            Conversation.created_at,
+        )
+        query = select(Conversation.agent_id).where(
+            Conversation.tenant_id == tenant_id,
+            Conversation.visitor_id == visitor_id,
+            Conversation.agent_id.is_not(None),
+            history_at >= cutoff,
+        )
+        if exclude_conversation_id is not None:
+            query = query.where(Conversation.id != exclude_conversation_id)
+        result = await db.execute(
+            query.order_by(history_at.desc(), Conversation.id.desc()).limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
     async def find_recent_online_chat_agent(
         db: AsyncSession,
         tenant_id: int,
@@ -447,25 +493,13 @@ class QueueReturningAgentRepository:
         if current is None or current.tenant_id != tenant_id or current.visitor_id is None:
             return None
 
-        history_at = func.coalesce(
-            Conversation.ended_at,
-            Conversation.last_message_at,
-            Conversation.started_at,
-            Conversation.created_at,
+        return await QueueReturningAgentRepository.find_recent_online_chat_agent_for_visitor(
+            db,
+            tenant_id,
+            visitor_id=current.visitor_id,
+            cutoff=cutoff,
+            exclude_conversation_id=current.id,
         )
-        result = await db.execute(
-            select(Conversation.agent_id)
-            .where(
-                Conversation.tenant_id == tenant_id,
-                Conversation.visitor_id == current.visitor_id,
-                Conversation.id != current.id,
-                Conversation.agent_id.is_not(None),
-                history_at >= cutoff,
-            )
-            .order_by(history_at.desc(), Conversation.id.desc())
-            .limit(1)
-        )
-        return result.scalar_one_or_none()
 
     @staticmethod
     async def find_recent_call_center_agent(

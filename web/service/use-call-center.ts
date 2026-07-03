@@ -5,6 +5,7 @@ import type {
   AgentStatusUpdate,
   CallRecordDetail,
   CallRecordListResponse,
+  CallTranscriptResponse,
   CallUserAssociationResponse,
   WebRTCSession,
 } from '@/models/call-center'
@@ -17,6 +18,7 @@ const keys = {
   recordsRoot: () => [NS, 'records'] as const,
   records: (params: Record<string, unknown>) => [NS, 'records', params] as const,
   record: (id: number | null | undefined) => [NS, 'records', id ?? null] as const,
+  transcript: (id: number | null | undefined) => [NS, 'records', id ?? null, 'transcript'] as const,
 }
 
 export const useMyAgentStatus = () =>
@@ -171,6 +173,14 @@ export const useCallRecord = (id: number | null | undefined) =>
   useQuery({
     queryKey: keys.record(id),
     queryFn: () => get<CallRecordDetail>(`v1/call-center/call-records/${id}`),
+    enabled: typeof id === 'number',
+  })
+
+export const useCallTranscript = (id: number | null | undefined) =>
+  useQuery({
+    queryKey: keys.transcript(id),
+    queryFn: () =>
+      get<CallTranscriptResponse>(`v1/call-center/call-records/${id}/transcript`),
     enabled: typeof id === 'number',
   })
 

@@ -705,6 +705,26 @@ class ConversationRepository:
         await db.commit()
 
     @staticmethod
+    async def increment_unread(
+        db: AsyncSession, conversation_id: int, delta: int = 1
+    ) -> int:
+        """Atomically bump a conversation's agent-facing unread counter.
+
+        Returns the post-increment value so callers can broadcast the fresh
+        count without a follow-up read. The single UPDATE avoids the read-modify
+        -write race a Python-side increment would introduce.
+        """
+        result = await db.execute(
+            update(Conversation)
+            .where(Conversation.id == conversation_id)
+            .values(unread_count=Conversation.unread_count + delta)
+            .returning(Conversation.unread_count)
+        )
+        await db.commit()
+        new_value = result.scalar_one_or_none()
+        return int(new_value) if new_value is not None else 0
+
+    @staticmethod
     async def reset_unread(db: AsyncSession, conversation_id: int) -> None:
         await db.execute(
             update(Conversation)
@@ -792,6 +812,30 @@ class ConversationRepository:
                 visitor_id,
             )
         return conversations[0] if conversations else None
+
+    @staticmethod
+    async def count_active_visitor_conversations(
+        db: AsyncSession,
+        tenant_id: int,
+        visitor_id: int,
+        channel_id: int,
+    ) -> int:
+        result = await db.execute(
+            select(func.count())
+            .select_from(Conversation)
+            .where(
+                Conversation.tenant_id == tenant_id,
+                Conversation.visitor_id == visitor_id,
+                Conversation.channel_id == channel_id,
+                Conversation.status.in_([
+                    ConversationStatus.ACTIVE.value,
+                    ConversationStatus.QUEUED.value,
+                    ConversationStatus.BOT.value,
+                    ConversationStatus.HANDOFF_PENDING.value,
+                ]),
+            )
+        )
+        return int(result.scalar_one() or 0)
 
     @staticmethod
     async def list_stale_open_agent_bot_conversations(

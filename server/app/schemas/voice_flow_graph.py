@@ -182,6 +182,19 @@ class HangupData(BaseModel):
     pre_play: Prompt | None = None
 
 
+class VoiceSpeedData(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Only the agent id + a display-name snapshot are stored; voice/model/prompt
+    # all live inside VoiceSpeed and are referenced solely by agent_id.
+    agent_id: str = Field("", max_length=128)
+    agent_name: str = ""
+    # Fixed opening line the kernel speaks when the call enters this node, before
+    # the caller says anything (v2 flowkit-中枢架构).
+    greeting_text: str = Field("您好，请问有什么可以帮您？", min_length=1, max_length=300)
+    unavailable_prompt_text: str = Field("当前智能语音服务不可用，请稍后再拨。", min_length=1, max_length=300)
+    connect_failed_prompt_text: str = Field("暂时无法接入智能语音服务，请稍后再拨。", min_length=1, max_length=300)
+
+
 # ─────────────────────────── Node + Edge + Graph ───────────────────────────
 
 class NodePosition(BaseModel):
@@ -225,8 +238,13 @@ class HangupNode(_NodeBase):
     data: HangupData = Field(default_factory=HangupData)
 
 
+class VoiceSpeedNode(_NodeBase):
+    type: Literal["voicespeed"]
+    data: VoiceSpeedData
+
+
 Node = Annotated[
-    Union[StartNode, PlayNode, CollectNode, ConditionNode, AssignQueueNode, HangupNode],
+    Union[StartNode, PlayNode, CollectNode, ConditionNode, AssignQueueNode, HangupNode, VoiceSpeedNode],
     Field(discriminator="type"),
 ]
 

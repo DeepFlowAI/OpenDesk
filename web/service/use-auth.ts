@@ -12,6 +12,12 @@ export const useLogin = () =>
       post<LoginResponse>('v1/auth/login', { json: data }),
   })
 
+export const useSsoLogin = () =>
+  useMutation({
+    mutationFn: (token: string) =>
+      post<LoginResponse>('v1/auth/sso', { json: { token } }),
+  })
+
 export const useCurrentUser = (enabled = true) =>
   useQuery({
     queryKey: authKeys.currentUser,

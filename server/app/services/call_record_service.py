@@ -24,6 +24,18 @@ from app.services.call_user_association_service import CallUserAssociationServic
 logger = logging.getLogger(__name__)
 CALL_QUEUE_SUMMARY_METADATA_KEY = "queue_summary"
 
+# Duration columns are PostgreSQL int4. A CDR left un-closed for a very long
+# time (e.g. a stale row swept up by a manual cleanup) can compute a duration
+# beyond int4 range, which asyncpg rejects with "value out of int32 range" and
+# aborts the write. Clamp into [0, int32-max] so completion never crashes.
+_INT32_MAX = 2_147_483_647
+
+
+def _clamp_duration_ms(value: int) -> int:
+    if value < 0:
+        return 0
+    return min(value, _INT32_MAX)
+
 
 class CallRecordService:
 
@@ -117,7 +129,9 @@ class CallRecordService:
         if agent_id is not None:
             patch["agent_id"] = agent_id
         if row.started_at:
-            patch["ring_duration_ms"] = int((ts - row.started_at).total_seconds() * 1000)
+            patch["ring_duration_ms"] = _clamp_duration_ms(
+                int((ts - row.started_at).total_seconds() * 1000)
+            )
         await CallRecordRepository.update(db, row, patch)
 
     @staticmethod
@@ -135,9 +149,13 @@ class CallRecordService:
         ts = datetime.now(timezone.utc)
         patch: dict = {"state": end_state, "ended_at": ts, "hangup_reason": hangup_reason}
         if row.answered_at:
-            patch["talk_duration_ms"] = int((ts - row.answered_at).total_seconds() * 1000)
+            patch["talk_duration_ms"] = _clamp_duration_ms(
+                int((ts - row.answered_at).total_seconds() * 1000)
+            )
         elif row.started_at and "ring_duration_ms" not in patch:
-            patch["ring_duration_ms"] = int((ts - row.started_at).total_seconds() * 1000)
+            patch["ring_duration_ms"] = _clamp_duration_ms(
+                int((ts - row.started_at).total_seconds() * 1000)
+            )
         await CallRecordRepository.update(db, row, patch)
 
     @staticmethod
@@ -183,8 +201,10 @@ class CallRecordService:
     ) -> bool:
         """Persist telephony kernel recording URL onto the CDR.
 
-        Returns True when a row was updated. Bridge recordings (phase=bridged)
-        replace earlier single-leg (phase=ai) URLs; the reverse is ignored.
+        Returns True when a row was updated. The single-leg ``ai`` recording now
+        spans the WHOLE call (voice-agent phase + human phase) and is canonical;
+        a later ``bridged`` recording must not replace it. A bridge recording is
+        still stored as a fallback when no ``ai`` recording arrived.
         """
 
         row = await CallRecordRepository.find_by_media_call_id(db, call_id)
@@ -192,7 +212,7 @@ class CallRecordService:
             return False
 
         existing = (row.extra_metadata or {}).get("recording") or {}
-        if row.recording_url and existing.get("phase") == "bridged" and phase != "bridged":
+        if row.recording_url and existing.get("phase") == "ai" and phase == "bridged":
             return False
 
         metadata = dict(row.extra_metadata or {})

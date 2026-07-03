@@ -295,12 +295,22 @@ export function CallCenterProvider({
     }
     try {
       await setStatusMutation.mutateAsync({ status: newStatus })
+      // Manually choosing a status ends the post-call wrap-up, so the status
+      // pill (which is pinned to "整理中"/after_call_work while phase === 'wrap_up')
+      // and the wrap-up panel reflect the new status immediately instead of
+      // staying on "整理中" until the page is refreshed.
+      if (phase === 'wrap_up') {
+        setIncoming(null)
+        setCallStart(null)
+        setPhase('idle')
+        refetchCallRecords()
+      }
       if (newStatus === 'ready') toast.success('已就绪 — 等待来电')
       else if (newStatus === 'offline') toast.success('已离线')
     } catch {
       toast.error('状态切换失败')
     }
-  }, [leg, setStatusMutation])
+  }, [leg, setStatusMutation, phase, refetchCallRecords])
 
   const accept = useCallback(async () => {
     if (!incoming) return

@@ -1,5 +1,11 @@
 import ky, { HTTPError } from 'ky'
 import { logAuthEvent } from '@/utils/auth-log'
+import {
+  clearStoredAuth,
+  isSessionReplacedCode,
+  readApiErrorCode,
+  redirectToSessionReplacedLogin,
+} from '@/utils/session-replacement'
 
 // API base URL must be supplied via NEXT_PUBLIC_API_URL (see web/.env.example).
 // We intentionally avoid a hard-coded localhost fallback so production builds
@@ -11,6 +17,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? ''
  * - `success`: a fresh token was issued.
  * - `auth_error`: the server rejected the credentials (401/403) — the session
  *   is genuinely invalid and the user must re-authenticate.
+ * - `session_replaced`: a newer login replaced this session.
  * - `transient_error`: a network/server-side hiccup (timeout, 5xx, 429) — the
  *   existing session may still be valid, so callers should retry rather than
  *   force a logout.
@@ -19,6 +26,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? ''
 export type RefreshOutcome =
   | { status: 'success'; token: string }
   | { status: 'auth_error' }
+  | { status: 'session_replaced' }
   | { status: 'transient_error' }
   | { status: 'no_token' }
 
@@ -47,6 +55,7 @@ export async function refreshAccessToken(): Promise<RefreshOutcome> {
     } catch (err) {
       if (err instanceof HTTPError) {
         const status = err.response.status
+        const code = await readApiErrorCode(err.response)
         let serverMessage = ''
         try {
           const body = (await err.response.json()) as { message?: string }
@@ -58,6 +67,9 @@ export async function refreshAccessToken(): Promise<RefreshOutcome> {
           status,
           reason: serverMessage || 'http_error',
         })
+        if ((status === 401 || status === 403) && isSessionReplacedCode(code)) {
+          return { status: 'session_replaced' }
+        }
         // Only 401/403 mean the credentials are truly invalid; any other
         // status (5xx, 429, ...) is treated as a retryable transient failure.
         if (status === 401 || status === 403) return { status: 'auth_error' }
@@ -86,13 +98,22 @@ const client = ky.create({
     afterResponse: [
       async (request, _options, response) => {
         if (response.status !== 401) return
+        const code = await readApiErrorCode(response)
+        if (isSessionReplacedCode(code)) {
+          await logAuthEvent('session_cleared', {
+            trigger: 'session_replaced',
+            path: request.url,
+          }, { immediate: true })
+          redirectToSessionReplacedLogin()
+          return
+        }
         // Don't retry the refresh endpoint itself
         if (request.url.includes('/auth/refresh')) {
           await logAuthEvent('session_cleared', {
             trigger: 'refresh_endpoint_401',
             path: request.url,
           }, { immediate: true })
-          localStorage.removeItem('auth_token')
+          clearStoredAuth()
           window.location.href = '/login'
           return
         }
@@ -107,12 +128,20 @@ const client = ky.create({
         // to the caller, but keep the session so a temporary hiccup doesn't
         // kick the user out.
         if (outcome.status === 'transient_error') return
+        if (outcome.status === 'session_replaced') {
+          await logAuthEvent('session_cleared', {
+            trigger: 'refresh_session_replaced',
+            path: request.url,
+          }, { immediate: true })
+          redirectToSessionReplacedLogin()
+          return
+        }
         // auth_error / no_token: credentials are invalid → force re-login.
         await logAuthEvent('session_cleared', {
           trigger: 'refresh_after_api_401',
           path: request.url,
         }, { immediate: true })
-        localStorage.removeItem('auth_token')
+        clearStoredAuth()
         window.location.href = '/login'
         return
       },

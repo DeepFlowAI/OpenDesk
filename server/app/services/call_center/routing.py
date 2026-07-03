@@ -22,7 +22,13 @@ async def match_routing_rule(
     from_number: str | None,
     to_number: str | None,
     now: datetime | None = None,
-) -> tuple[InboundRoutingRule, VoiceFlow] | None:
+) -> tuple[InboundRoutingRule, VoiceFlow | None] | None:
+    """Return the first matching rule and its target.
+
+    For `target_type == "voicespeed_agent"` the flow is `None` (the call is
+    bridged directly to the agent). For `voice_flow` rules the matched
+    `VoiceFlow` is returned; rules whose flow is missing/disabled are skipped.
+    """
     now = now or datetime.now(timezone.utc)
 
     q = (
@@ -69,19 +75,22 @@ async def match_routing_rule(
 
     # Try each rule in priority order
     for rule in rules:
-        if _rule_matches(rule, from_number, to_number, sched_cache):
-            flow = (
-                await db.execute(
-                    select(VoiceFlow).where(
-                        VoiceFlow.id == rule.target_voice_flow_id,
-                        VoiceFlow.tenant_id == tenant_id,
-                        VoiceFlow.deleted_at.is_(None),
-                        VoiceFlow.enabled.is_(True),
-                    )
+        if not _rule_matches(rule, from_number, to_number, sched_cache):
+            continue
+        if rule.target_type == "voicespeed_agent":
+            return (rule, None)
+        flow = (
+            await db.execute(
+                select(VoiceFlow).where(
+                    VoiceFlow.id == rule.target_voice_flow_id,
+                    VoiceFlow.tenant_id == tenant_id,
+                    VoiceFlow.deleted_at.is_(None),
+                    VoiceFlow.enabled.is_(True),
                 )
-            ).scalar_one_or_none()
-            if flow:
-                return (rule, flow)
+            )
+        ).scalar_one_or_none()
+        if flow:
+            return (rule, flow)
     return None
 
 

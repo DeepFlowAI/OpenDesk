@@ -20,6 +20,13 @@ from __future__ import annotations
 import logging
 
 from app.configs.settings import settings
+from app.core.trace import (
+    build_traceparent,
+    get_trace_id,
+    parse_traceparent,
+    set_call_id,
+    set_trace_id,
+)
 from app.db.session import AsyncSessionLocal
 from app.libs.realtime import get_realtime_transport
 from app.libs.telephony import (
@@ -32,9 +39,11 @@ from app.libs.telephony.providers.flowkit.telecom_client import (
 )
 from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
 from app.services.call_center.catalog_sync import CatalogSyncService
+from app.services.call_center.nodes import build_voicespeed_direct_graph
 from app.services.call_center.routing import match_routing_rule
 from app.services.call_center.workflow import VoiceFlowWorkflow
 from app.services.call_record_service import CallRecordService
+from app.services.call_transcript_service import CallTranscriptService
 from app.services.cc_agent_resource_service import CcAgentResourceService
 from app.services.cc_agent_status_service import CcAgentStatusService
 
@@ -78,10 +87,21 @@ class CallCenterOrchestrator:
         # dial. Consumed by _on_outbound_answered to fire call.bridge so
         # audio flows the instant the carrier picks up. Cleared in _on_hangup.
         self._outbound_webrtc_pairs: dict[str, str] = {}
+        # Per-call trace context: call_id → (trace_id, trace_call_id). Lets any
+        # async handler that did NOT go through _route_event (hangup, recording,
+        # outbound lifecycle, agent-side finalize) re-bind the call's trace_id
+        # before emitting logs, so every log for one call shares one trace_id.
+        # Outlives the workflow (recording.completed can arrive after hangup);
+        # cleaned up on a delay after hangup.
+        self._call_traces: dict[str, tuple[str, str]] = {}
 
     # Time we keep an ended call_id around so late /dial-webrtc/offer
     # requests can be answered with 410 Gone instead of a confusing 404.
     _OUTBOUND_CLEANUP_DELAY_SEC = 60
+
+    # Time we keep a call's trace context after hangup so late events
+    # (notably call.recording.completed) can still bind the call's trace_id.
+    _TRACE_CLEANUP_DELAY_SEC = 300
 
     # ────────────────── Pending-offer registry ──────────────────
 
@@ -116,6 +136,21 @@ class CallCenterOrchestrator:
         self.telephony.on_event("call.play_end", self._route_event)
         self.telephony.on_event("call.speech_end", self._route_event)
         self.telephony.on_event("call.bridged", self._route_event)
+        # Mirror live ASR/TTS text to the bridged agent's browser for the
+        # real-time transcript display. These run alongside the routing above
+        # and never persist anything.
+        self.telephony.on_event("call.speech_partial", self._on_transcript_event)
+        self.telephony.on_event("call.speech_end", self._on_transcript_event)
+        self.telephony.on_event("call.user_text", self._on_transcript_event)
+        self.telephony.on_event("call.assistant_text", self._on_transcript_event)
+        # Dual-leg transcript of a bridged (human↔human) call — carries an
+        # explicit speaker and is anchored on the user-leg call_id.
+        self.telephony.on_event("call.bridge_transcript", self._on_transcript_event)
+        # External realtime-agent (VoiceSpeed) bridge lifecycle.
+        self.telephony.on_event("call.external_agent.connected", self._route_event)
+        self.telephony.on_event("call.external_agent.handoff", self._route_event)
+        self.telephony.on_event("call.external_agent.failed", self._route_event)
+        self.telephony.on_event("call.external_agent.ended", self._route_event)
         self.telephony.on_event("call.hangup", self._on_hangup)
         self.telephony.on_event("call.recording.completed", self._on_recording_completed)
         # Outbound originate emits these three; we forward them to the
@@ -270,6 +305,22 @@ class CallCenterOrchestrator:
             )
             return
 
+        # Continue the W3C trace started by the kernel on the real phone entry
+        # so all OpenDesk logs/spans for this call share one trace_id; also bind
+        # the business call_id for log queries. When the kernel didn't send a
+        # (valid) traceparent, set_trace_id mints a fresh 32-hex trace_id — we
+        # then synthesize a traceparent from it so the SAME trace_id propagates
+        # downstream (kernel RPCs + VoiceSpeed mint), never an empty trace.
+        traceparent = data.get("traceparent")
+        trace_id = set_trace_id(parse_traceparent(traceparent))
+        if parse_traceparent(traceparent) is None:
+            traceparent = build_traceparent(trace_id)
+        trace_call_id = data.get("root_call_id") or call_id
+        set_call_id(trace_call_id)
+        self._register_call_trace(call_id, trace_id, trace_call_id)
+        if trace_call_id != call_id:
+            self._register_call_trace(trace_call_id, trace_id, trace_call_id)
+
         tenant_id = await self._resolve_tenant_id()
         if tenant_id is None:
             logger.warning("Inbound call %s: no tenant resolved; hanging up", call_id)
@@ -288,12 +339,26 @@ class CallCenterOrchestrator:
                 await self.telephony.call_hangup(call_id, reason="no_route")
                 return
             rule, flow = matched
-            _ = rule
-            version = flow.current_version
-            if version is None:
-                await self.telephony.call_hangup(call_id, reason="no_flow_version")
-                return
-            graph = dict(version.graph_json)
+
+            if rule.target_type == "voicespeed_agent":
+                graph = build_voicespeed_direct_graph(
+                    agent_id=rule.voicespeed_agent_id or "",
+                    agent_name=rule.voicespeed_agent_name,
+                    transfer_target=rule.transfer_target,
+                )
+                voice_flow_id = None
+                voice_flow_version_id = None
+            else:
+                if flow is None:
+                    await self.telephony.call_hangup(call_id, reason="no_route")
+                    return
+                version = flow.current_version
+                if version is None:
+                    await self.telephony.call_hangup(call_id, reason="no_flow_version")
+                    return
+                graph = dict(version.graph_json)
+                voice_flow_id = flow.id
+                voice_flow_version_id = version.id
 
             await CallRecordService.create_for_incoming(
                 db,
@@ -303,8 +368,8 @@ class CallCenterOrchestrator:
                 root_call_id=data.get("root_call_id"),
                 from_number=from_number or None,
                 to_number=to_number or None,
-                voice_flow_id=flow.id,
-                voice_flow_version_id=version.id,
+                voice_flow_id=voice_flow_id,
+                voice_flow_version_id=voice_flow_version_id,
             )
 
         workflow = VoiceFlowWorkflow(
@@ -316,6 +381,9 @@ class CallCenterOrchestrator:
             initial_variables={
                 "sys.caller_number": from_number or "",
                 "sys.called_number": to_number or "",
+                "sys._traceparent": traceparent,
+                "sys._trace_id": trace_id,
+                "sys._trace_call_id": trace_call_id,
             },
         )
         self._workflows[call_id] = workflow
@@ -327,12 +395,114 @@ class CallCenterOrchestrator:
             logger.exception("Workflow start failed call_id=%s", call_id)
             await self.telephony.call_hangup(call_id, reason="workflow_error")
 
+    def _register_call_trace(
+        self, call_id: str | None, trace_id: str, trace_call_id: str
+    ) -> None:
+        if call_id:
+            self._call_traces[call_id] = (trace_id, trace_call_id)
+
+    def bind_call_trace(self, call_id: str | None) -> None:
+        """Re-bind a call's trace_id + call_id into the contextvars.
+
+        Kernel events arrive on fresh asyncio tasks that do NOT inherit the
+        contextvars set in `_on_incoming`, so every handler that does not go
+        through `_route_event` must call this before logging — otherwise its
+        logs carry an empty trace_id and can't be correlated with the rest of
+        the call. Looks the call up in the live workflow first, then the
+        per-call trace map (which outlives the workflow).
+        """
+
+        trace_id: str | None = None
+        trace_call_id: str | None = None
+        wf = self._workflows.get(call_id) if call_id else None
+        wf_ctx = getattr(wf, "ctx", None)
+        if wf_ctx is not None:
+            trace_id = wf_ctx.variables.get("sys._trace_id")
+            trace_call_id = wf_ctx.variables.get("sys._trace_call_id")
+        if not trace_id and call_id in self._call_traces:
+            trace_id, trace_call_id = self._call_traces[call_id]
+        if trace_id:
+            set_trace_id(trace_id)
+        set_call_id(trace_call_id or call_id)
+
     async def _route_event(self, event: CallEvent) -> None:
         call_id = event.data.get("call_id")
         wf = self._workflows.get(call_id) if call_id else None
         if wf is None:
             return
+        # Re-establish this call's trace context — kernel events arrive on fresh
+        # asyncio tasks that don't inherit the contextvars set in _on_incoming.
+        self.bind_call_trace(call_id)
         await wf.handle_event(event.method, event.data)
+
+    # Kernel event → (transcript role, is-final). Partials stream into the
+    # in-progress bubble; finals close it.
+    _TRANSCRIPT_EVENT_ROLES: dict[str, tuple[str, bool]] = {
+        "call.speech_partial": ("user", False),
+        "call.speech_end": ("user", True),
+        "call.user_text": ("user", True),
+        "call.assistant_text": ("agent", True),
+    }
+
+    async def _on_transcript_event(self, event: CallEvent) -> None:
+        """Relay live ASR/TTS text to the bridged agent's browser.
+
+        Pure passthrough for the real-time transcript UI — nothing is stored.
+        Stays a silent no-op until the call is bridged to an agent, so text
+        only flows once an agent has actually joined the call.
+        """
+
+        call_id = event.data.get("call_id")
+        if not call_id:
+            return
+        self.bind_call_trace(call_id)
+        wf = self._workflows.get(call_id)
+        if wf is None:
+            return
+        agent = wf.bridged_agent_info()
+        if agent is None:
+            return
+        text = (event.data.get("text") or "").strip()
+        if not text:
+            return
+        if event.method == "call.bridge_transcript":
+            role = "agent" if event.data.get("speaker") == "agent" else "user"
+            final = bool(event.data.get("final"))
+        else:
+            role, final = self._TRANSCRIPT_EVENT_ROLES.get(event.method, ("user", True))
+        try:
+            rt = get_realtime_transport()
+            room = f"agent:{agent['tenant_id']}:{agent['employee_id']}"
+            await rt.emit(
+                "cc.transcript",
+                {
+                    "call_id": call_id,
+                    "role": role,
+                    "text": text,
+                    "final": final,
+                    "seq": event.data.get("seq"),
+                },
+                room=room,
+                namespace="/chat",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cc.transcript push failed call_id=%s", call_id)
+
+        # Persist finalized lines so the transcript survives a refresh and is
+        # viewable from call history. Partials are transient and not stored.
+        if final:
+            try:
+                async with AsyncSessionLocal() as db:
+                    await CallTranscriptService.append(
+                        db,
+                        tenant_id=agent["tenant_id"],
+                        call_id=call_id,
+                        role=role,
+                        text=text,
+                        seq=event.data.get("seq"),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("transcript persist failed call_id=%s", call_id)
 
     async def _on_webrtc_ice(self, event: CallEvent) -> None:
         """
@@ -345,6 +515,7 @@ class CallCenterOrchestrator:
         candidate = event.data.get("candidate")
         if not call_id or candidate is None:
             return
+        self.bind_call_trace(call_id)
         try:
             async with AsyncSessionLocal() as db:
                 info = await AgentWebRTCSessionService.get_employee_for_call_id(db, call_id)
@@ -369,6 +540,12 @@ class CallCenterOrchestrator:
         call_id = event.data.get("call_id")
         if not call_id:
             return
+        self.bind_call_trace(call_id)
+        # Keep the trace mapping alive briefly so a trailing
+        # call.recording.completed can still bind this call's trace_id, then
+        # drop it to bound memory.
+        import asyncio as _aio_trace
+        _aio_trace.create_task(self._delayed_trace_cleanup(call_id))
 
         # Outbound originator path: if this call_id was an agent-initiated
         # outbound, notify the agent's browser. We MARK the entry as ended
@@ -399,9 +576,23 @@ class CallCenterOrchestrator:
 
         wf = self._workflows.pop(call_id, None)
         bridged_agent: dict | None = None
+        pending_offer: dict | None = None
         if wf is not None:
             bridged_agent = wf.bridged_agent_info()
+            pending_offer = wf.pending_offer_info()
             await wf.on_call_hangup(event.data)
+
+        # Caller hung up while an assign_queue offer was still ringing an agent
+        # (offer not yet accepted). Withdraw it so the agent's browser stops
+        # ringing and the reserved agent is freed immediately instead of waiting
+        # out the full offer timeout.
+        if wf is not None and pending_offer and not bridged_agent:
+            await self._withdraw_pending_offer(
+                tenant_id=wf.tenant_id,
+                call_id=call_id,
+                pending_offer=pending_offer,
+                reason=event.data.get("reason") or "caller_hangup",
+            )
 
         try:
             async with AsyncSessionLocal() as db:
@@ -480,6 +671,189 @@ class CallCenterOrchestrator:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to finalize CDR / status for call_id=%s", call_id)
 
+    async def _withdraw_pending_offer(
+        self,
+        *,
+        tenant_id: int,
+        call_id: str,
+        pending_offer: dict,
+        reason: str,
+    ) -> None:
+        """Cancel an offer that was still ringing when the caller hung up.
+
+        Resolves the workflow's pending decision (so the assign_queue executor
+        stops awaiting), releases the reserved agent's Redis resource, and pings
+        the agent's browser via Socket.IO so the incoming-call UI stops ringing.
+        Holds no DB session — Redis + Socket.IO only.
+        """
+
+        employee_id = int(pending_offer["employee_id"])
+        offer_id = str(pending_offer["offer_id"])
+        # Wake the assign_queue executor so it exits its node promptly instead
+        # of blocking until the offer timeout fires.
+        self.resolve_offer(offer_id, {"accept": False, "reason": reason})
+        redis = _get_redis_client()
+        if redis is not None:
+            try:
+                await CcAgentResourceService.release(
+                    redis,
+                    tenant_id,
+                    employee_id,
+                    reason=reason,
+                    expected_offer_id=offer_id,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "withdraw offer: release failed agent=%s/%s", tenant_id, employee_id,
+                )
+        await self.notify_agent_call_ended(
+            tenant_id=tenant_id,
+            employee_id=employee_id,
+            call_id=call_id,
+            reason=reason,
+        )
+
+    async def finalize_agent_call(
+        self,
+        *,
+        tenant_id: int,
+        employee_id: int,
+        call_id: str,
+        reason: str | None,
+        mark_cdr_completed: bool = False,
+    ) -> None:
+        """Reset an agent back out of the in-call state and notify their browser.
+
+        Used by terminal paths that are NOT driven by a customer `call.hangup`
+        event (bridge aborted because the caller was already gone; agent-
+        initiated hangup of an already-ended call). Opens its own short DB
+        session for the writes and holds none across the Socket.IO emit.
+        """
+
+        self.bind_call_trace(call_id)
+        redis = _get_redis_client()
+        try:
+            async with AsyncSessionLocal() as db:
+                if mark_cdr_completed:
+                    from sqlalchemy import select
+                    from app.models.call_record import CallRecord
+                    row = (
+                        await db.execute(
+                            select(CallRecord).where(CallRecord.call_id == call_id)
+                        )
+                    ).scalar_one_or_none()
+                    if row is not None:
+                        await CallRecordService.mark_completed(
+                            db, row.tenant_id, call_id, hangup_reason=reason,
+                        )
+                if redis is not None:
+                    await CcAgentResourceService.mark_after_call_work(
+                        redis,
+                        tenant_id,
+                        employee_id,
+                        call_id=call_id,
+                        reason=reason or "call_hangup",
+                    )
+                await CcAgentStatusService.sync_pg_status(
+                    db, tenant_id, employee_id, "after_call_work", None,
+                )
+                await AgentWebRTCSessionService.set_busy(
+                    db, tenant_id, employee_id, busy=False,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "finalize_agent_call failed agent=%s/%s call_id=%s",
+                tenant_id, employee_id, call_id,
+            )
+        await self.notify_agent_call_ended(
+            tenant_id=tenant_id,
+            employee_id=employee_id,
+            call_id=call_id,
+            reason=reason,
+        )
+
+    async def hangup_agent_current_call(
+        self,
+        *,
+        tenant_id: int,
+        employee_id: int,
+    ) -> dict:
+        """Hang up whatever call the current agent is on, robustly.
+
+        Tears down the agent's OWN WebRTC leg (so the browser call always ends)
+        in addition to the customer SIP leg. If the customer leg is already gone
+        (FlowKit -32002 "call not found"), that's treated as already-ended and we
+        reset the agent's status directly — no customer `call.hangup` event will
+        arrive to drive the usual cleanup, so without this the agent stays stuck
+        on 忙碌. Short DB session for the lookup is closed before the RPCs.
+        """
+
+        from sqlalchemy import desc, select
+        from app.libs.telephony.base import TelephonyRPCError
+        from app.models.call_record import CallRecord
+
+        async with AsyncSessionLocal() as db:
+            row = (
+                await db.execute(
+                    select(CallRecord)
+                    .where(
+                        CallRecord.tenant_id == tenant_id,
+                        CallRecord.agent_id == employee_id,
+                        CallRecord.state.in_(("ringing", "queued", "in_progress")),
+                    )
+                    .order_by(desc(CallRecord.started_at))
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return {"ok": False, "error": "no_active_call"}
+            target_call_id = row.root_call_id or row.call_id
+            record_id = row.id
+            session = await AgentWebRTCSessionService.get_active(db, tenant_id, employee_id)
+            webrtc_call_id = session["webrtc_call_id"] if session else None
+
+        self.bind_call_trace(target_call_id)
+        logger.info(
+            "Agent %s requested hangup; target SIP call_id=%s (record id=%s)",
+            employee_id, target_call_id, record_id,
+        )
+
+        # Always tear down the agent's own WebRTC leg so the browser call ends,
+        # even when the customer SIP leg is already gone.
+        if webrtc_call_id:
+            try:
+                await self.telephony.call_hangup(webrtc_call_id, reason="agent_hangup")
+            except TelephonyRPCError as exc:
+                if exc.code != -32002:
+                    logger.warning(
+                        "agent hangup: agent leg %s hangup rejected code=%s",
+                        webrtc_call_id, exc.code,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("agent hangup: agent leg hangup raised", exc_info=True)
+
+        customer_gone = False
+        try:
+            await self.telephony.call_hangup(target_call_id, reason="agent_hangup")
+        except TelephonyRPCError as exc:
+            if exc.code == -32002:
+                customer_gone = True
+            else:
+                logger.warning("agent hangup: call.hangup rejected code=%s", exc.code)
+                return {"ok": False, "error": "rpc_error", "code": exc.code}
+
+        if customer_gone:
+            # No customer call.hangup event will arrive — reset the agent here.
+            await self.finalize_agent_call(
+                tenant_id=tenant_id,
+                employee_id=employee_id,
+                call_id=target_call_id,
+                reason="agent_hangup",
+                mark_cdr_completed=True,
+            )
+            return {"ok": True, "note": "already_ended", "call_id": target_call_id}
+        return {"ok": True, "call_id": target_call_id}
+
     async def _on_recording_completed(self, event: CallEvent) -> None:
         """Persist telephony kernel recording URL onto the CDR."""
 
@@ -491,6 +865,7 @@ class CallCenterOrchestrator:
                 "call.recording.completed missing call_id/oss_url: %s", data,
             )
             return
+        self.bind_call_trace(call_id)
         try:
             async with AsyncSessionLocal() as db:
                 saved = await CallRecordService.save_recording(
@@ -539,6 +914,11 @@ class CallCenterOrchestrator:
         back to that agent's browser. Cleared by _on_hangup."""
 
         self._outbound_originators[call_id] = (tenant_id, employee_id, outbound_did)
+        # Capture the dialing request's trace so outbound kernel events
+        # (which arrive on fresh tasks) can re-bind the same trace_id.
+        trace_id = get_trace_id()
+        if trace_id and trace_id != "-":
+            self._register_call_trace(call_id, trace_id, call_id)
 
     def outbound_ended_reason(self, call_id: str) -> tuple[str | None, int | None] | None:
         """If the outbound SIP leg has already ended, return its (reason,
@@ -551,6 +931,17 @@ class CallCenterOrchestrator:
         await _aio.sleep(self._OUTBOUND_CLEANUP_DELAY_SEC)
         self._outbound_originators.pop(call_id, None)
         self._outbound_ended.pop(call_id, None)
+
+    async def _delayed_trace_cleanup(self, call_id: str) -> None:
+        import asyncio as _aio
+        entry = self._call_traces.get(call_id)
+        await _aio.sleep(self._TRACE_CLEANUP_DELAY_SEC)
+        self._call_traces.pop(call_id, None)
+        # Also drop the root/media key that maps to the same trace, if any.
+        if entry is not None:
+            _trace_id, trace_call_id = entry
+            if trace_call_id and trace_call_id != call_id:
+                self._call_traces.pop(trace_call_id, None)
 
     async def cancel_outbound(self, call_id: str) -> None:
         """Best-effort hangup of an in-flight outbound SIP leg.
@@ -589,6 +980,7 @@ class CallCenterOrchestrator:
         info = self._peek_outbound_originator(call_id)
         if info is None:
             return  # not an agent-initiated outbound, ignore
+        self.bind_call_trace(call_id)
         tenant_id, employee_id, _did = info
         await self.notify_agent_outbound_event(
             tenant_id=tenant_id, employee_id=employee_id,
@@ -601,6 +993,7 @@ class CallCenterOrchestrator:
         info = self._peek_outbound_originator(call_id)
         if info is None:
             return
+        self.bind_call_trace(call_id)
         tenant_id, employee_id, _did = info
 
         redis = _get_redis_client()
@@ -633,8 +1026,13 @@ class CallCenterOrchestrator:
         # answered event regardless so the UI advances.
         webrtc_call_id = self._pop_outbound_webrtc(call_id)
         if webrtc_call_id:
+            # Read the tenant's live-transcription toggle on a short session that
+            # closes before the bridge RPC (no DB session held across I/O).
+            from app.services.system_settings_service import SystemSettingsService
+
+            transcribe = await SystemSettingsService.is_bridge_asr_enabled_managed(tenant_id)
             try:
-                await self.telephony.call_bridge(call_id, webrtc_call_id)
+                await self.telephony.call_bridge(call_id, webrtc_call_id, transcribe=transcribe)
                 logger.info(
                     "outbound auto-bridge: sip=%s webrtc=%s", call_id, webrtc_call_id,
                 )

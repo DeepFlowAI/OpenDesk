@@ -3,7 +3,9 @@ import { get, post } from './base'
 import { agentKeys, conversationKeys } from '@/service/use-conversations'
 import type {
   OfflineMessage,
+  OfflineMessageArchiveResponse,
   OfflineMessageCountResponse,
+  OfflineMessageConvertAndSendResponse,
   OfflineMessageConvertResponse,
   OfflineMessageDetail,
   OfflineMessageListResponse,
@@ -11,7 +13,7 @@ import type {
 
 const NS = 'offline-messages'
 
-export type OfflineMessageListStatus = 'pending' | 'converted' | 'all'
+export type OfflineMessageListStatus = 'pending' | 'converted' | 'archived' | 'all'
 
 export const offlineMessageKeys = {
   all: [NS] as const,
@@ -84,9 +86,16 @@ export const useOfflineMessageCount = (params?: {
 
 export const useOfflineMessage = (id: number | null) =>
   useQuery({
-    queryKey: id ? offlineMessageKeys.detail(id) : [...offlineMessageKeys.all, 'detail', null],
-    queryFn: () => get<OfflineMessageDetail>(`v1/offline-messages/${id}`),
-    enabled: !!id,
+    queryKey: typeof id === 'number'
+      ? offlineMessageKeys.detail(id)
+      : [...offlineMessageKeys.all, 'detail', null],
+    queryFn: () => {
+      if (typeof id !== 'number') {
+        throw new Error('Offline message id is required')
+      }
+      return get<OfflineMessageDetail>(`v1/offline-messages/${id}`)
+    },
+    enabled: typeof id === 'number',
   })
 
 export const useCreateConversationFromOfflineMessage = () => {
@@ -104,6 +113,20 @@ export const useCreateConversationFromOfflineMessage = () => {
   })
 }
 
+export const useArchiveOfflineMessage = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) =>
+      post<OfflineMessageArchiveResponse>(`v1/offline-messages/${id}/archive`),
+    onSuccess: (_data, id) => {
+      removePendingOfflineMessageFromListCache(qc, id)
+      qc.invalidateQueries({ queryKey: offlineMessageKeys.lists() })
+      qc.invalidateQueries({ queryKey: offlineMessageKeys.counts() })
+      qc.invalidateQueries({ queryKey: offlineMessageKeys.detail(id) })
+    },
+  })
+}
+
 export const useAssignOfflineMessageToSelf = () => {
   const qc = useQueryClient()
   return useMutation({
@@ -114,6 +137,24 @@ export const useAssignOfflineMessageToSelf = () => {
     onSuccess: (_data, { id }) => {
       removePendingOfflineMessageFromListCache(qc, id)
       qc.invalidateQueries({ queryKey: offlineMessageKeys.lists() })
+      qc.invalidateQueries({ queryKey: offlineMessageKeys.detail(id) })
+      qc.invalidateQueries({ queryKey: conversationKeys.lists() })
+      qc.invalidateQueries({ queryKey: agentKeys.stats })
+    },
+  })
+}
+
+export const useAssignAndSendOfflineMessageToSelf = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, content }: { id: number; content: string }) =>
+      post<OfflineMessageConvertAndSendResponse>(`v1/offline-messages/${id}/assign-self/send`, {
+        json: { content },
+      }),
+    onSuccess: (_data, { id }) => {
+      removePendingOfflineMessageFromListCache(qc, id)
+      qc.invalidateQueries({ queryKey: offlineMessageKeys.lists() })
+      qc.invalidateQueries({ queryKey: offlineMessageKeys.counts() })
       qc.invalidateQueries({ queryKey: offlineMessageKeys.detail(id) })
       qc.invalidateQueries({ queryKey: conversationKeys.lists() })
       qc.invalidateQueries({ queryKey: agentKeys.stats })

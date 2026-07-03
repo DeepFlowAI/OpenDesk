@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import date
 from io import BytesIO
+import json
 import zipfile
 
 import pytest
@@ -53,6 +54,7 @@ async def seed_queue_report_data():
         _TENANT_PK = tenant.scalar_one()
 
         await db.execute(text("DELETE FROM conversations WHERE tenant_id = :tid"), {"tid": _TENANT_PK})
+        await db.execute(text("DELETE FROM satisfaction_survey_configs WHERE tenant_id = :tid"), {"tid": _TENANT_PK})
         await db.execute(text("DELETE FROM employee_groups WHERE tenant_id = :tid"), {"tid": _TENANT_PK})
         await db.execute(text("DELETE FROM employees WHERE tenant_id = :tid"), {"tid": _TENANT_PK})
         await db.commit()
@@ -164,6 +166,105 @@ async def seed_queue_report_data():
             "beta": _AGENT_B_ID,
             "anchor": date.fromisoformat(_ANCHOR_DATE_STR),
         })
+
+        service_settings = {
+            "enabled": True,
+            "section_title": "服务满意度",
+            "popup_title": "请评价本次服务",
+            "rating_mode": "stars",
+            "show_resolution": True,
+            "rating_options": [
+                {"key": "service-good", "enabled": True, "name": "满意", "score": 10},
+                {"key": "service-bad", "enabled": True, "name": "不满意", "score": 2},
+            ],
+        }
+        product_settings = {
+            "enabled": True,
+            "section_title": "产品满意度",
+            "popup_title": "请评价本次产品体验",
+            "rating_mode": "stars",
+            "rating_options": [
+                {"key": "product-good", "enabled": True, "name": "好用", "score": 10},
+            ],
+        }
+        snapshot = {
+            "name": "队列满意度",
+            "enabled": True,
+            "triggers": {"agent_invite": True, "user_initiated": True, "session_end_invite": True},
+            "service": service_settings,
+            "product": product_settings,
+        }
+        cfg = await db.execute(text("""
+            INSERT INTO satisfaction_survey_configs
+              (tenant_id, name, enabled, current_version, triggers, service_settings, product_settings)
+            VALUES
+              (:tid, '队列满意度', true, 2, CAST(:triggers AS jsonb), CAST(:service AS jsonb), CAST(:product AS jsonb))
+            RETURNING id
+        """), {
+            "tid": _TENANT_PK,
+            "triggers": json.dumps(snapshot["triggers"]),
+            "service": json.dumps(service_settings),
+            "product": json.dumps(product_settings),
+        })
+        config_id = cfg.scalar_one()
+        await db.execute(text("""
+            INSERT INTO satisfaction_survey_config_versions
+              (tenant_id, config_id, version, snapshot, published_at)
+            VALUES
+              (:tid, :config_id, 2, CAST(:snapshot AS jsonb),
+               ((:anchor)::date + TIME '09:00')::timestamp AT TIME ZONE 'Asia/Shanghai')
+        """), {
+            "tid": _TENANT_PK,
+            "config_id": config_id,
+            "snapshot": json.dumps(snapshot),
+            "anchor": date.fromisoformat(_ANCHOR_DATE_STR),
+        })
+
+        service_good = {
+            "type": "service",
+            "rating_mode": "stars",
+            "option_key": "service-good",
+            "option_name": "满意",
+            "labels": [],
+            "remark": "",
+            "resolved": True,
+            "submitted_at": f"{_ANCHOR_DATE_STR}T10:25:00+08:00",
+        }
+        product_good = {
+            "type": "product",
+            "rating_mode": "stars",
+            "option_key": "product-good",
+            "option_name": "好用",
+            "labels": [],
+            "remark": "",
+            "submitted_at": f"{_ANCHOR_DATE_STR}T10:25:00+08:00",
+        }
+        await db.execute(text("""
+            INSERT INTO satisfaction_survey_records
+              (tenant_id, conversation_id, visitor_id, config_version, config_snapshot,
+               invitation_source, invited_at, status, survey_types,
+               service_result, product_result, submitted_at)
+            VALUES
+              (:tid, :c1, :vid, 2, CAST(:snapshot AS jsonb),
+               'agent', ((:anchor)::date + TIME '10:20')::timestamp AT TIME ZONE 'Asia/Shanghai',
+               'submitted', '["service","product"]'::jsonb,
+               CAST(:service_good AS jsonb), CAST(:product_good AS jsonb),
+               ((:anchor)::date + TIME '10:25')::timestamp AT TIME ZONE 'Asia/Shanghai'),
+              (:tid, :c2, :vid, 2, CAST(:snapshot AS jsonb),
+               'agent', ((:anchor)::date + TIME '11:20')::timestamp AT TIME ZONE 'Asia/Shanghai',
+               'submitted', '["service"]'::jsonb,
+               CAST(:service_good AS jsonb), NULL,
+               ((:anchor)::date + TIME '11:25')::timestamp AT TIME ZONE 'Asia/Shanghai')
+        """), {
+            "tid": _TENANT_PK,
+            "vid": visitor_id,
+            "c1": c1,
+            "c2": c2,
+            "snapshot": json.dumps(snapshot),
+            "service_good": json.dumps(service_good),
+            "product_good": json.dumps(product_good),
+            "anchor": date.fromisoformat(_ANCHOR_DATE_STR),
+        })
         await db.commit()
 
         _TOKEN = create_access_token(
@@ -184,6 +285,14 @@ def _worksheet_text(content: bytes, sheet: int) -> str:
         return archive.read(f"xl/worksheets/sheet{sheet}.xml").decode("utf-8")
 
 
+def _distributions_by_key(distributions: list[dict]) -> dict[str, dict]:
+    return {item["key"]: item for item in distributions}
+
+
+def _slice_values(distribution: dict) -> dict[str, int]:
+    return {item["key"]: item["value"] for item in distribution["slices"]}
+
+
 class TestQueueReportsAPI:
     @pytest.mark.asyncio
     async def test_list_queues_returns_current_and_metric_rows(self, client: AsyncClient):
@@ -194,7 +303,8 @@ class TestQueueReportsAPI:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["total"] == 3
+        assert data["total"] == 1
+        assert all(item["queue"]["queue_type"] == "employee_group" for item in data["items"])
 
         group = next(item for item in data["items"] if item["queue"]["queue_type"] == "employee_group")
         assert group["queue"]["name"] == "Support Group"
@@ -204,6 +314,16 @@ class TestQueueReportsAPI:
         assert group["metrics"]["queue_assign_rate"] == pytest.approx(0.5)
         assert group["metrics"]["avg_queue_duration_seconds"] == pytest.approx(90.0)
         assert group["metrics"]["final_session_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_list_queues_rejects_personal_queue_filter(self, client: AsyncClient):
+        resp = await client.get(
+            "/api/v1/reports/sessions/queues",
+            params={"start": _ANCHOR_DATE_STR, "end": _ANCHOR_DATE_STR, "queue_type": "employee"},
+            headers=_auth(),
+        )
+        assert resp.status_code == 400
+        assert "Unsupported queue type" in resp.text
 
     @pytest.mark.asyncio
     async def test_queue_detail_returns_overview_metrics(self, client: AsyncClient):
@@ -220,6 +340,38 @@ class TestQueueReportsAPI:
         assert data["metrics"]["effective_session_count"] == 1
         assert data["metrics"]["avg_first_human_response_seconds"] == 30
         assert data["metrics"]["avg_agent_response_seconds"] == 20
+        assert data["metrics"]["satisfaction_invitation_count"] == 1
+        assert data["metrics"]["satisfaction_submission_count"] == 1
+        assert data["metrics"]["satisfaction_participation_rate"] == pytest.approx(1)
+        assert data["metrics"]["satisfaction_submission_rate"] == pytest.approx(1)
+        assert data["metrics"]["product_satisfaction_count"] == 1
+        distributions = _distributions_by_key(data["distributions"])
+        assert set(distributions) == {
+            "satisfaction_resolution",
+            "service_satisfaction_rating",
+            "product_satisfaction_rating",
+        }
+        assert _slice_values(distributions["satisfaction_resolution"]) == {
+            "resolved": 1,
+            "unresolved": 0,
+        }
+        assert _slice_values(distributions["service_satisfaction_rating"]) == {
+            "service-good": 1,
+            "service-bad": 0,
+        }
+        assert _slice_values(distributions["product_satisfaction_rating"]) == {
+            "product-good": 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_personal_queue_detail_is_not_available(self, client: AsyncClient):
+        resp = await client.get(
+            f"/api/v1/reports/sessions/queues/employee/{_AGENT_B_ID}",
+            params={"start": _ANCHOR_DATE_STR, "end": _ANCHOR_DATE_STR},
+            headers=_auth(),
+        )
+        assert resp.status_code == 400
+        assert "Unsupported queue type" in resp.text
 
     @pytest.mark.asyncio
     async def test_queue_trend_groups_by_conversation_start_hour(self, client: AsyncClient):
@@ -242,6 +394,47 @@ class TestQueueReportsAPI:
         assert values_11["unassigned_queue_session_count"] == 1
 
     @pytest.mark.asyncio
+    async def test_queue_trend_returns_satisfaction_group(self, client: AsyncClient):
+        resp = await client.get(
+            f"/api/v1/reports/sessions/queues/employee_group/{_GROUP_ID}/trend",
+            params={"start": _ANCHOR_DATE_STR, "end": _ANCHOR_DATE_STR, "trend": "hour", "group": "satisfaction"},
+            headers=_auth(),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["group"] == "satisfaction"
+        assert [metric["key"] for metric in data["metrics"]] == [
+            "satisfaction_invitation_count",
+            "satisfaction_submission_count",
+            "product_satisfaction_count",
+            "satisfaction_resolution:resolved",
+            "satisfaction_resolution:unresolved",
+            "service_satisfaction_rating:service-good",
+            "service_satisfaction_rating:service-bad",
+            "product_satisfaction_rating:product-good",
+        ]
+        hour_10 = next(bucket for bucket in data["buckets"] if bucket["label"] == "10")
+        hour_11 = next(bucket for bucket in data["buckets"] if bucket["label"] == "11")
+        values_10 = {metric["key"]: metric["value"] for metric in hour_10["metrics"]}
+        values_11 = {metric["key"]: metric["value"] for metric in hour_11["metrics"]}
+        assert values_10["satisfaction_invitation_count"] == 1
+        assert values_10["satisfaction_submission_count"] == 1
+        assert values_10["product_satisfaction_count"] == 1
+        assert values_10["satisfaction_resolution:resolved"] == 1
+        assert values_10["satisfaction_resolution:unresolved"] == 0
+        assert values_10["service_satisfaction_rating:service-good"] == 1
+        assert values_10["service_satisfaction_rating:service-bad"] == 0
+        assert values_10["product_satisfaction_rating:product-good"] == 1
+        assert values_11["satisfaction_invitation_count"] == 0
+        assert values_11["satisfaction_submission_count"] == 0
+        assert values_11["product_satisfaction_count"] == 0
+        assert values_11["satisfaction_resolution:resolved"] == 0
+        assert values_11["satisfaction_resolution:unresolved"] == 0
+        assert values_11["service_satisfaction_rating:service-good"] == 0
+        assert values_11["service_satisfaction_rating:service-bad"] == 0
+        assert values_11["product_satisfaction_rating:product-good"] == 0
+
+    @pytest.mark.asyncio
     async def test_queue_list_export_returns_xlsx(self, client: AsyncClient):
         resp = await client.get(
             "/api/v1/reports/sessions/queues/export",
@@ -253,6 +446,7 @@ class TestQueueReportsAPI:
         sheet = _worksheet_text(resp.content, 1)
         assert "队列指标列表" in sheet
         assert "Support Group" in sheet
+        assert "Queue Beta" not in sheet
 
     @pytest.mark.asyncio
     async def test_queue_detail_export_returns_xlsx(self, client: AsyncClient):
@@ -265,13 +459,16 @@ class TestQueueReportsAPI:
                 "queue_type": "employee_group",
                 "queue_id": _GROUP_ID,
                 "trend": "hour",
-                "group": "queue_access",
+                "group": "satisfaction",
             },
             headers=_auth(),
         )
         assert resp.status_code == 200
         assert "排队接入" in _worksheet_text(resp.content, 1)
-        assert "趋势明细" in _worksheet_text(resp.content, 2)
+        trend_sheet = _worksheet_text(resp.content, 2)
+        assert "趋势明细" in trend_sheet
+        assert "解决情况" in trend_sheet
+        assert "服务满意度" in trend_sheet
 
     @pytest.mark.asyncio
     async def test_queue_reports_require_auth(self, client: AsyncClient):

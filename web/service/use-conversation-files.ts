@@ -4,6 +4,8 @@ import type {
   ConversationFileUploadResponse,
 } from '@/models/conversation-file'
 import type {
+  OfflineMessageSource,
+  OfflineMessageQueueType,
   PublicOfflineMessageSendResponse,
   VisitorEnvironmentPayload,
 } from '@/service/use-visitor-chat'
@@ -50,9 +52,21 @@ export async function sendVisitorOfflineMessageFile(params: {
   visitorSessionToken: string
   file: File
   visitorEnvironment?: VisitorEnvironmentPayload | null
+  source?: OfflineMessageSource | null
+  queueType?: OfflineMessageQueueType | null
+  queueId?: number | null
 }): Promise<PublicOfflineMessageSendResponse> {
   const formData = new FormData()
   formData.append('file', params.file)
+  if (params.source) {
+    formData.append('source', params.source)
+  }
+  if (params.queueType) {
+    formData.append('queue_type', params.queueType)
+  }
+  if (params.queueId) {
+    formData.append('queue_id', String(params.queueId))
+  }
   if (params.visitorEnvironment?.system) {
     formData.append('system', params.visitorEnvironment.system)
   }

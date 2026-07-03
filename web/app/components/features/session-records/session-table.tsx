@@ -5,8 +5,7 @@ import { IconSearch, IconLoader2, IconCalendar, IconChevronDown, IconChevronRigh
 import { cn } from '@/lib/utils'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import { useSessionRecords } from '@/service/use-session-records'
-import { useEmployees } from '@/service/use-employees'
+import { useSessionRecordAgentOptions, useSessionRecords } from '@/service/use-session-records'
 import { useSatisfactionFilterOptions } from '@/service/use-satisfaction-survey'
 import { useAuthStore } from '@/context/auth-store'
 import { getDataScope } from '@/utils/permissions'
@@ -558,7 +557,6 @@ export function SessionTable({ onSelectRecord }: Props) {
   const { user } = useAuthStore()
   const sessionScope = getDataScope(user, 'session_record')
   const canFilterByAgent = sessionScope === 'all' || sessionScope === 'group'
-  const userGroupIds = useMemo(() => new Set(user?.group_ids ?? []), [user?.group_ids])
   const tenantId = user?.tenant_id ?? null
 
   // Column visibility/order — persisted per tenant in localStorage.
@@ -658,19 +656,8 @@ export function SessionTable({ onSelectRecord }: Props) {
     draftProductOption,
     draftProductLabel,
   ].filter(Boolean).length
-  const { data: employeesData } = useEmployees(
-    { per_page: 200, status: 'active' },
-    { enabled: canFilterByAgent }
-  )
-  const agentOptions = useMemo(() => {
-    const items = employeesData?.items ?? []
-    if (sessionScope !== 'group') return items
-    return items.filter((emp) => {
-      const groupIds = emp.group_ids ?? []
-      if (emp.id === user?.id) return true
-      return groupIds.some((groupId) => userGroupIds.has(groupId))
-    })
-  }, [employeesData?.items, sessionScope, user?.id, userGroupIds])
+  const { data: agentOptionsData } = useSessionRecordAgentOptions(canFilterByAgent)
+  const agentOptions = agentOptionsData?.items ?? []
 
   const handleSearch = useCallback(() => {
     setFilters({
@@ -782,7 +769,7 @@ export function SessionTable({ onSelectRecord }: Props) {
               className="h-9 min-w-[160px] rounded-md border border-border bg-background px-2.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
             >
               <option value="">{t('ws.records.sessions.filter.allAgents', locale)}</option>
-              {agentOptions.map((emp: { id: number; name: string }) => (
+              {agentOptions.map((emp) => (
                 <option key={emp.id} value={emp.id}>
                   {emp.name}
                 </option>

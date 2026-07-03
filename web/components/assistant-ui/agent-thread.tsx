@@ -19,12 +19,19 @@ import {
   IconPinned,
   IconUserPlus,
 } from '@tabler/icons-react'
+import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
+import { getBoundedFixedMenuPosition } from '@/lib/floating-menu-position'
+import {
+  copyImageUrlToClipboard,
+  copyPlainTextToClipboard,
+  getSelectionTextWithin,
+  htmlToPlainText,
+} from '@/lib/clipboard'
 import { useAuthStore } from '@/context/auth-store'
 import { useChatStore } from '@/context/chat-store'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import { EndConversationModal } from '@/app/components/features/chat/end-conversation-modal'
 import { TransferConversationModal } from '@/app/components/features/chat/transfer-conversation-modal'
 import { InviteCollaboratorModal } from '@/app/components/features/chat/invite-collaborator-modal'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
@@ -39,6 +46,7 @@ import {
   getVisibleOpenAgentToolBlocks,
 } from '@/app/components/features/chat/open-agent-trace-blocks'
 import { conversationKeys, setVisitorWebStatusQueryData, useVisitorWebStatus } from '@/service/use-conversations'
+import { getConversationFileUrl } from '@/service/use-conversation-files'
 import { get } from '@/service/base'
 import { AssistantMarkdownText, MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
@@ -64,6 +72,7 @@ import type {
   VisitorWebStatusResponse,
   WorkspaceConversationHistoryItem,
 } from '@/models/conversation'
+import type { ConversationFilePayload } from '@/models/conversation-file'
 import type { Socket } from 'socket.io-client'
 
 // ─── Timestamp formatting ────────────────────────────────────────
@@ -102,6 +111,9 @@ function isReadStatusContentType(contentType: string | undefined): boolean {
 }
 
 const MESSAGE_RECALL_WINDOW_MS = 2 * 60 * 1000
+const MESSAGE_ACTION_MENU_WIDTH = 112
+const MESSAGE_ACTION_MENU_VERTICAL_PADDING = 8
+const MESSAGE_ACTION_MENU_ITEM_HEIGHT = 32
 
 function isRecallableContentType(contentType: string | undefined): boolean {
   return contentType === 'text'
@@ -273,7 +285,7 @@ function AgentMessageBubble({
 }: {
   message: MessageState
   socket: Socket | null
-  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id'>) => void
+  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id' | 'conversationId'>) => void
 }) {
   const {
     conversation,
@@ -286,6 +298,9 @@ function AgentMessageBubble({
   } = useAgentChatConfig()
   const meta = message.metadata?.custom as AgentMessageMeta | undefined
   const [messageMenu, setMessageMenu] = useState<{ x: number; y: number } | null>(null)
+  // Captures the highlighted text at right-click time, since clicking the menu
+  // item would otherwise clear the browser selection before we can read it.
+  const selectedTextRef = useRef<string>('')
   const conversationMessages = useChatStore((state) => state.messages.get(conversation.id) || EMPTY_MESSAGES)
   const isAgent = meta?.senderType === 'agent'
   const isBot = meta?.senderType === 'bot'
@@ -368,6 +383,12 @@ function AgentMessageBubble({
       closed: isClosed,
       webChannel: String(conversation.channel?.channel_type || '').toLowerCase() === 'web',
     })
+  const canCopyCurrentMessage =
+    !isRecalled
+    && (
+      attachmentContentType === 'image'
+      || ((meta?.contentType === 'text' || meta?.contentType === 'rich_text') && hasMessageText)
+    )
   const quote = messageQuoteFromMetadata(meta?.metadata)
   const quotedOriginal = quote
     ? conversationMessages.find((item) => item.id === quote.message_id) ?? null
@@ -438,16 +459,66 @@ function AgentMessageBubble({
   }, [messageMenu])
 
   const handleContextMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
-    if (!canRecallMessage && !canQuoteCurrentMessage) return
+    if (!canRecallMessage && !canQuoteCurrentMessage && !canCopyCurrentMessage) return
     event.preventDefault()
-    setMessageMenu({ x: event.clientX, y: event.clientY })
-  }, [canQuoteCurrentMessage, canRecallMessage])
+    selectedTextRef.current = getSelectionTextWithin(event.currentTarget)
+    const itemCount =
+      Number(canCopyCurrentMessage) + Number(canQuoteCurrentMessage) + Number(canRecallMessage)
+    setMessageMenu(getBoundedFixedMenuPosition(
+      { x: event.clientX, y: event.clientY },
+      {
+        width: MESSAGE_ACTION_MENU_WIDTH,
+        height: MESSAGE_ACTION_MENU_VERTICAL_PADDING + MESSAGE_ACTION_MENU_ITEM_HEIGHT * itemCount,
+      },
+    ))
+  }, [canCopyCurrentMessage, canQuoteCurrentMessage, canRecallMessage])
 
   const handleQuote = useCallback(() => {
     setMessageMenu(null)
     if (!canQuoteCurrentMessage) return
     onQuoteMessage(originalMessage)
   }, [canQuoteCurrentMessage, onQuoteMessage, originalMessage])
+
+  const handleCopy = useCallback(async () => {
+    setMessageMenu(null)
+    if (!canCopyCurrentMessage) return
+    const selectedText = selectedTextRef.current
+    selectedTextRef.current = ''
+    let ok = false
+    if (selectedText.trim()) {
+      ok = await copyPlainTextToClipboard(selectedText)
+    } else if (attachmentContentType === 'image') {
+      let imageUrl = content
+      try {
+        const payload = JSON.parse(content) as ConversationFilePayload
+        if (payload?.file_id) {
+          const res = await getConversationFileUrl({
+            conversationId: meta?.conversationId ?? conversation.id,
+            fileId: payload.file_id,
+            downloadName: payload.name,
+          })
+          imageUrl = res.url
+        }
+      } catch {
+        // content is a direct image URL rather than a file payload
+      }
+      ok = await copyImageUrlToClipboard(imageUrl)
+    } else if (isRichText) {
+      ok = await copyPlainTextToClipboard(htmlToPlainText(content))
+    } else {
+      ok = await copyPlainTextToClipboard(content)
+    }
+    if (ok) toast.success(t('ws.chat.copy.success', cfgLocale))
+    else toast.error(t('ws.chat.copy.failed', cfgLocale))
+  }, [
+    attachmentContentType,
+    canCopyCurrentMessage,
+    cfgLocale,
+    content,
+    conversation.id,
+    isRichText,
+    meta?.conversationId,
+  ])
 
   const handleRecall = useCallback(() => {
     setMessageMenu(null)
@@ -568,6 +639,15 @@ function AgentMessageBubble({
           style={{ left: messageMenu.x, top: messageMenu.y }}
           onClick={(event) => event.stopPropagation()}
         >
+          {canCopyCurrentMessage && (
+            <button
+              type="button"
+              className="flex w-full items-center rounded px-3 py-1.5 text-left text-foreground hover:bg-muted"
+              onClick={() => { void handleCopy() }}
+            >
+              {t('ws.chat.copy.action', cfgLocale)}
+            </button>
+          )}
           {canQuoteCurrentMessage && (
             <button
               type="button"
@@ -1154,7 +1234,7 @@ function VisitorWebStatusBadge({
 type AgentThreadProps = {
   socket: Socket | null
   composerInsertRequest?: ComposerInsertRequest | null
-  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id'>) => void
+  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id' | 'conversationId'>) => void
   composerInputHeight?: number
   onComposerInputHeightCommit?: (height: number) => void
   messageSearchOpen?: boolean
@@ -1215,7 +1295,6 @@ export function AgentThread({
   const { locale } = useLocaleStore()
   const currentUserId = useAuthStore((state) => state.user?.id)
   const currentMessages = useChatStore((state) => state.messages.get(conversation.id) || EMPTY_MESSAGES)
-  const [showEndModal, setShowEndModal] = useState(false)
   const [showTransferModal, setShowTransferModal] = useState(false)
   const [showInviteModal, setShowInviteModal] = useState(false)
   const [highlightedMessageId, setHighlightedMessageId] = useState<number | null>(null)
@@ -1523,7 +1602,7 @@ export function AgentThread({
           )}
           {canEndConversation && (
             <button
-              onClick={() => setShowEndModal(true)}
+              onClick={onEndConversation}
               className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-[#E8E8E8] text-[#666666] transition-colors hover:bg-[#DDDDDD]"
               title={t('ws.chat.endConversation', locale)}
               type="button"
@@ -1654,7 +1733,8 @@ export function AgentThread({
 
       {/* ── Composer ── */}
       <AgentComposer
-        disabled={isClosed}
+        disabled={isClosed && !canStartNewConversation}
+        disabledReason={startNewConversationDisabledReason}
         socket={socket}
         insertRequest={composerInsertRequest}
         inputHeight={composerInputHeight}
@@ -1662,15 +1742,6 @@ export function AgentThread({
         messageSearchOpen={messageSearchOpen}
         onOpenMessageSearch={onOpenMessageSearch}
       />
-
-      {/* ── End conversation modal ── */}
-      {showEndModal && (
-        <EndConversationModal
-          conversation={conversation}
-          onClose={() => setShowEndModal(false)}
-          socket={socket}
-        />
-      )}
 
       {/* ── Transfer conversation modal ── */}
       {canTransfer && (

@@ -16,6 +16,7 @@ class Employee(Base, TimestampMixin):
         UniqueConstraint("tenant_id", "username", name="uq_employees_tenant_username"),
         Index("ix_employees_tenant_email", "tenant_id", "email"),
         Index("ix_employees_tenant_job_number", "tenant_id", "job_number"),
+        Index("ix_employees_tenant_current_session", "tenant_id", "current_session_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -27,6 +28,7 @@ class Employee(Base, TimestampMixin):
     roles: Mapped[list] = mapped_column(JSON, nullable=False, server_default='["agent"]')
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    current_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     name: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
     nickname: Mapped[str | None] = mapped_column(String(64), nullable=True)

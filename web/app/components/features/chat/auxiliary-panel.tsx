@@ -304,7 +304,7 @@ export function AuxiliaryPanel({
                 useDisabledReason={knowledgeUseReason}
                 canSend={Boolean(conversation && !conversationClosed && connected)}
                 sendDisabledReason={knowledgeSendReason}
-                showRecommendations
+                showRecommendations={Boolean(conversation)}
                 onUse={handleKnowledgeUse}
                 onSend={handleKnowledgeSend}
               />

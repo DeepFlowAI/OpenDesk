@@ -134,6 +134,20 @@ class VoiceSpeedConnectionTestResponse(BaseModel):
     message: str
 
 
+class VoiceSpeedAgentSummary(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    status: str
+
+
+class VoiceSpeedAgentListResponse(BaseModel):
+    # `configured` is False when the tenant has no VoiceSpeed base_url / api_key
+    # bound yet, so the UI can show a "not configured" state instead of an error.
+    configured: bool = True
+    items: list[VoiceSpeedAgentSummary] = []
+
+
 class OpenAgentAgentSummary(BaseModel):
     id: int
     name: str

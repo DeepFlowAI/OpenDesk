@@ -24,6 +24,7 @@ import {
   useConversations,
   conversationKeys,
   patchConversationListCache,
+  prependConversationToListCache,
 } from '@/service/use-conversations'
 import { GlobalCallBar } from '@/app/components/features/call-center/global-call-bar'
 import { NetworkMonitor } from '@/app/components/features/network-monitor'
@@ -45,6 +46,7 @@ import {
 import type { Conversation, Message } from '@/models/conversation'
 import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 import { logAuthEvent } from '@/utils/auth-log'
+import { redirectToSessionReplacedLogin } from '@/utils/session-replacement'
 import { useWorkspaceNotificationAlert } from '@/hooks/use-workspace-notification-alert'
 import { CollaborationInvitationDialog } from '@/app/components/features/chat/collaboration-invitation-dialog'
 import {
@@ -118,7 +120,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   const { data: convData } = useConversations({ enabled: syncChatNotifications })
   const pendingCollaborationInvitationsQuery = usePendingCollaborationInvitations(syncCollaborationInvitations)
   const pendingCollaborationInvitation = pendingCollaborationInvitationsQuery.data?.items[0] ?? null
-  const { socket, connected, connecting, authFailed, connect } = useSocketStore()
+  const { socket, connected, connecting, authFailed, sessionReplaced, connect } = useSocketStore()
   const {
     conversations,
     setConversations,
@@ -163,9 +165,12 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     if (authFailed) {
       void logAuthEvent('session_cleared', { trigger: 'socket_auth_failed' }, { immediate: true }).then(() => {
         useAuthStore.getState().clearAuth()
+        if (sessionReplaced) {
+          redirectToSessionReplacedLogin()
+        }
       })
     }
-  }, [authFailed])
+  }, [authFailed, sessionReplaced])
 
   useEffect(() => {
     if (syncChatSocket && token && !connected && !connecting && !authFailed) {
@@ -260,10 +265,14 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
       })
         .then((r) => r.json())
         .then((conv: Conversation) => {
+          // Only enqueue + light the unread badge. Auto-selecting here would
+          // mark the conversation read and drop the badge the agent needs to
+          // notice a new assignment from another page.
           addConversation(conv)
-          if (useChatStore.getState().selectedConversationId == null) {
-            selectConversation(conv.id)
-          }
+          // Keep the HTTP list cache in sync so navigating to the chat page
+          // (which replaces the store from this cache) does not drop the new
+          // conversation before the next poll.
+          prependConversationToListCache(queryClient, conv)
         })
         .catch(() => {
           queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
@@ -326,13 +335,17 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
         playSessionAlert()
         if (data.conversation) {
           addConversation(data.conversation)
+          prependConversationToListCache(queryClient, data.conversation)
         } else {
           const apiBase = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001/api/'
           fetch(`${apiBase}v1/conversations/${data.conversation_id}`, {
             headers: { Authorization: `Bearer ${token}` },
           })
             .then((r) => r.json())
-            .then((conv: Conversation) => addConversation(conv))
+            .then((conv: Conversation) => {
+              addConversation(conv)
+              prependConversationToListCache(queryClient, conv)
+            })
             .catch(() => {
               queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
             })

@@ -17,6 +17,7 @@ from app.schemas.channel import (
     DEFAULT_OFFLINE_MESSAGE,
     DEFAULT_OFFLINE_TITLE,
     DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
+    DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL,
     DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL,
     DEFAULT_QUEUE_FULL_MESSAGE,
     DEFAULT_QUEUE_MESSAGE,
@@ -61,6 +62,8 @@ def test_channel_config_uses_default_offline_message():
     assert config.restricted_service_message == DEFAULT_RESTRICTED_SERVICE_MESSAGE
     assert config.queue_message == DEFAULT_QUEUE_MESSAGE
     assert config.queue_full_message == DEFAULT_QUEUE_FULL_MESSAGE
+    assert config.queue_show_leave_message_button is False
+    assert config.queue_leave_message_button_label == DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL
     assert config.queue_full_show_leave_message_button is True
     assert config.queue_full_leave_message_button_label == DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL
     assert config.use_agent_avatar is False
@@ -124,7 +127,11 @@ def test_channel_config_rejects_empty_restricted_service_message():
 
 def test_availability_payload_includes_restricted_copy():
     payload = ChannelService._availability_payload(
-        ChannelConfig(restricted_service_message="暂时无法提供在线咨询"),
+        ChannelConfig(
+            restricted_service_message="暂时无法提供在线咨询",
+            queue_show_leave_message_button=True,
+            queue_leave_message_button_label="稍后留言",
+        ),
         can_start_conversation=False,
         reason="restricted",
         checked_at=datetime.now(timezone.utc),
@@ -133,9 +140,29 @@ def test_availability_payload_includes_restricted_copy():
     assert payload["reason"] == "restricted"
     assert payload["restricted_service_title"] == DEFAULT_RESTRICTED_SERVICE_TITLE
     assert payload["restricted_service_message"] == "暂时无法提供在线咨询"
+    assert payload["queue_show_leave_message_button"] is True
+    assert payload["queue_leave_message_button_label"] == "稍后留言"
 
 
 def test_channel_config_validates_queue_full_leave_message_button_label():
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(
+            queue_show_leave_message_button=True,
+            queue_leave_message_button_label="  ",
+        )
+
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(
+            queue_show_leave_message_button=True,
+            queue_leave_message_button_label="x" * 17,
+        )
+
+    config = ChannelConfig(
+        queue_show_leave_message_button=False,
+        queue_leave_message_button_label="",
+    )
+    assert config.queue_show_leave_message_button is False
+
     with pytest.raises(PydanticValidationError):
         ChannelConfig(queue_full_leave_message_button_label="  ")
 
@@ -440,6 +467,11 @@ async def test_public_config_returns_open_agent_welcome_message(monkeypatch):
         "ConversationAnnouncementRuleService.match_public_announcement",
         AsyncMock(return_value=None),
     )
+    monkeypatch.setattr(
+        "app.services.conversation_read_status_service."
+        "ConversationReadStatusService.get_public_config",
+        AsyncMock(return_value={"agent_workspace_enabled": True, "web_sdk_enabled": True}),
+    )
 
     result = await ChannelService.get_public_config_with_availability_by_key(
         AsyncMock(),
@@ -502,6 +534,70 @@ async def test_human_service_gate_returns_leave_message_strategy(monkeypatch):
     assert result["outside_service_hours_strategy"] == "leave_message"
     assert result["leave_message_prompt"] == "请留言"
     assert ConversationService._availability_is_leave_message(result) is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_human_handoff_target_uses_queue_returning_agent_for_group(monkeypatch):
+    db = AsyncMock()
+    r = AsyncMock()
+    channel = SimpleNamespace(id=10, tenant_id=7, config={})
+    group = SimpleNamespace(
+        id=8,
+        tenant_id=7,
+        members=[
+            SimpleNamespace(
+                employee_id=21,
+                employee=SimpleNamespace(is_active=True, max_concurrent=5),
+            ),
+            SimpleNamespace(
+                employee_id=22,
+                employee=SimpleNamespace(is_active=True, max_concurrent=5),
+            ),
+        ],
+    )
+    select_agent = AsyncMock(return_value=22)
+    fallback_find_agent = AsyncMock(return_value=21)
+
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.check_human_service_gate",
+        AsyncMock(return_value={"can_start_conversation": True, "reason": "available"}),
+    )
+    monkeypatch.setattr(
+        "app.repositories.employee_group_repository.EmployeeGroupRepository.get_by_id",
+        AsyncMock(return_value=group),
+    )
+    monkeypatch.setattr(
+        "app.services.queue_service.QueueTaskService.select_immediate_online_chat_agent",
+        select_agent,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.AgentStatusService.find_available_agent",
+        fallback_find_agent,
+    )
+
+    result = await ChannelService.resolve_human_handoff_target(
+        db,
+        r,
+        10,
+        handoff_payload={"handoff": {"agent_group_id": 8}},
+        visitor_id=20,
+    )
+
+    select_agent.assert_awaited_once_with(
+        db,
+        r,
+        7,
+        queue_type="employee_group",
+        queue_id=8,
+        visitor_id=20,
+    )
+    fallback_find_agent.assert_not_awaited()
+    assert result["agent_id"] == 22
+    assert result["group_id"] == 8
 
 
 def test_no_available_agent_is_not_leave_message():

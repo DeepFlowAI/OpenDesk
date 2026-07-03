@@ -146,6 +146,21 @@ class CallRecordDetail(BaseModel):
     metadata: dict = {}
 
 
+class CallTranscriptSegmentSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    role: str
+    text: str
+    seq: int | None = None
+    created_at: datetime
+
+
+class CallTranscriptResponse(BaseModel):
+    call_id: str | None = None
+    segments: list[CallTranscriptSegmentSchema] = Field(default_factory=list)
+
+
 class CallUserAssociationResponse(BaseModel):
     record_id: int
     call_id: str

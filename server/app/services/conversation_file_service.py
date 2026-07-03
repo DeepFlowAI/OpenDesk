@@ -39,6 +39,16 @@ IMAGE_MAGIC_NUMBERS = {
     "image/gif": (b"GIF87a", b"GIF89a"),
     "image/webp": (b"RIFF",),
 }
+IMAGE_MIME_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+GENERIC_UPLOAD_CONTENT_TYPES = {
+    "application/octet-stream",
+    "binary/octet-stream",
+}
 
 
 class ConversationFileService:
@@ -67,6 +77,18 @@ class ConversationFileService:
         return re.sub(r'[\r\n"]+', "_", filename)[:255] or "download"
 
     @staticmethod
+    def _detect_image_mime_type(data: bytes) -> str | None:
+        if data.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            return "image/webp"
+        return None
+
+    @staticmethod
     def _validate_magic_number(content_type: str, data: bytes) -> None:
         if content_type == "image/webp":
             if not (data.startswith(b"RIFF") and data[8:12] == b"WEBP"):
@@ -77,6 +99,29 @@ class ConversationFileService:
             return
         if not any(data.startswith(signature) for signature in signatures):
             raise ValidationError("File content does not match MIME type")
+
+    @staticmethod
+    def _normalize_upload_metadata(content_type: str | None, ext: str, data: bytes) -> tuple[str, str]:
+        declared_content_type = (
+            (content_type or "application/octet-stream")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
+        )
+        if not declared_content_type:
+            declared_content_type = "application/octet-stream"
+
+        detected_image_type = ConversationFileService._detect_image_mime_type(data)
+        if declared_content_type in IMAGE_MAGIC_NUMBERS:
+            if not detected_image_type:
+                raise ValidationError("File content does not match MIME type")
+            return detected_image_type, IMAGE_MIME_EXTENSIONS[detected_image_type]
+
+        if detected_image_type and declared_content_type in GENERIC_UPLOAD_CONTENT_TYPES:
+            return detected_image_type, IMAGE_MIME_EXTENSIONS[detected_image_type]
+
+        safe_ext = ext if ext and ext not in BLOCKED_CONVERSATION_FILE_EXTENSIONS else "bin"
+        return declared_content_type, safe_ext
 
     @staticmethod
     async def _get_conversation_for_visitor(
@@ -146,13 +191,15 @@ class ConversationFileService:
         if len(data) > MAX_CONVERSATION_FILE_SIZE:
             raise ValidationError("File size exceeds 100MB limit")
 
-        safe_ext = ext if ext and ext not in BLOCKED_CONVERSATION_FILE_EXTENSIONS else "bin"
+        content_type, safe_ext = ConversationFileService._normalize_upload_metadata(
+            file.content_type,
+            ext,
+            data,
+        )
         date_prefix = datetime.now(timezone.utc).strftime("%Y%m%d")
         key = f"conversation-files/{tenant_id}/{conversation_id}/{date_prefix}/{uuid.uuid4().hex}.{safe_ext}"
 
         storage = create_storage_client()
-        content_type = file.content_type or "application/octet-stream"
-        ConversationFileService._validate_magic_number(content_type, data)
         await storage.upload(key, data, content_type=content_type)
         access_url = await storage.get_temporary_url(
             key,

@@ -440,6 +440,31 @@ async def test_get_reception_trajectory_maps_snapshots(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_reception_trajectory_treats_pure_bot_without_segments_as_generated(monkeypatch):
+    conversation = _conversation(
+        open_agent_agent_id=12,
+        status="closed",
+        reception_generation_status=None,
+    )
+
+    monkeypatch.setattr(
+        "app.services.session_record_service.SessionRecordRepository.get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.session_record_service.ReceptionSegmentRepository.list_for_conversation",
+        AsyncMock(return_value=[]),
+    )
+
+    result = await SessionRecordService.get_reception_trajectory(
+        AsyncMock(), conversation_id=1, tenant_id=1
+    )
+
+    assert result["generation_status"] == "generated"
+    assert result["segments"] == []
+
+
+@pytest.mark.asyncio
 async def test_get_reception_trajectory_not_found(monkeypatch):
     from app.core.exceptions import NotFoundError
 

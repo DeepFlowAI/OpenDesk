@@ -5,12 +5,14 @@ import {
   useRef,
   useCallback,
   useState,
+  useMemo,
   type ChangeEvent,
   type ClipboardEvent as ReactClipboardEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { ComposerPrimitive, useComposerRuntime } from '@assistant-ui/react'
+import { toast } from 'sonner'
 import { useAgentChatConfig } from './agent-chat-runtime'
 import { EmojiPicker } from './emoji-picker'
 import { RichTextComposer } from './rich-text-composer'
@@ -26,10 +28,16 @@ import {
   richTextToPlainText,
 } from '@/lib/rich-text-message'
 import { useLocaleStore } from '@/context/locale-store'
+import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
+import { hasPermission } from '@/utils/permissions'
+import { useKnowledgeDocuments } from '@/service/use-knowledge'
+import { useAgentKnowledgeInputSuggestionSetting } from '@/service/use-knowledge-input-suggestion-setting'
+import { knowledgeHtmlToMessageText } from '@/app/components/features/knowledge/knowledge-utils'
 import { MessageQuotePreview } from '@/app/components/features/chat/message-quote'
 import type { Socket } from 'socket.io-client'
 import type { Message } from '@/models/conversation'
+import type { KnowledgeDocument } from '@/models/knowledge'
 
 function focusComposerTextareaIn(root: ParentNode | null) {
   const ta =
@@ -57,6 +65,7 @@ function focusComposerTextarea(e: ReactPointerEvent<HTMLElement>) {
 
 type AgentComposerProps = {
   disabled: boolean
+  disabledReason?: string | null
   socket: Socket | null
   insertRequest?: ComposerInsertRequest | null
   inputHeight?: number
@@ -67,6 +76,7 @@ type AgentComposerProps = {
 
 export type ComposerInsertRequest = {
   id: number
+  conversationId: number
   text: string
   contentType?: 'text' | 'rich_text'
   quotedMessage?: Message | null
@@ -79,6 +89,11 @@ const COMPOSER_INPUT_MAX_HEIGHT = 168
 type PastedAttachmentPreview = {
   file: File
   previewUrl: string | null
+}
+
+type SuggestionPrefix = {
+  text: string
+  replaceEnd: number
 }
 
 type NavigatorWithUserAgentData = Navigator & {
@@ -124,6 +139,67 @@ function supportsClipboardFileAttachmentPaste(): boolean {
   const nav = navigator as NavigatorWithUserAgentData
   const platform = (nav.userAgentData?.platform || nav.platform || '').toLowerCase()
   return platform.includes('win')
+}
+
+function useDebouncedValue(value: string): string {
+  const [debounced, setDebounced] = useState(value)
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), 300)
+    return () => window.clearTimeout(timer)
+  }, [value])
+
+  return debounced
+}
+
+function isCjkChar(char: string): boolean {
+  return /[\u3400-\u9fff\uf900-\ufaff]/u.test(char)
+}
+
+function isLatinWordChar(char: string): boolean {
+  return /[A-Za-z0-9]/.test(char)
+}
+
+function extractSuggestionPrefix(input: string, triggerLength: number): SuggestionPrefix | null {
+  if (!input.trimStart()) return null
+
+  let units = 0
+  let index = 0
+  let replaceEnd = 0
+  const maxUnits = Math.max(1, Math.min(10, triggerLength))
+
+  while (index < input.length) {
+    const char = input[index]
+    if (/\s/.test(char)) {
+      index += 1
+      continue
+    }
+
+    if (isCjkChar(char)) {
+      units += 1
+      if (units > maxUnits) return null
+      index += 1
+      replaceEnd = index
+      continue
+    }
+
+    if (isLatinWordChar(char)) {
+      units += 1
+      if (units > maxUnits) return null
+      while (index < input.length && isLatinWordChar(input[index])) {
+        index += 1
+      }
+      replaceEnd = index
+      continue
+    }
+
+    index += 1
+  }
+
+  if (units <= 0 || replaceEnd <= 0) return null
+
+  const text = input.slice(0, replaceEnd).trim()
+  return text ? { text, replaceEnd } : null
 }
 
 function isClipboardFilePasteAllowed(file: File, allowNonImageFiles: boolean): boolean {
@@ -175,6 +251,7 @@ function formatAttachmentSize(size: number): string {
 
 export function AgentComposer({
   disabled,
+  disabledReason,
   socket,
   insertRequest,
   inputHeight: storedInputHeight,
@@ -183,6 +260,7 @@ export function AgentComposer({
   onOpenMessageSearch,
 }: AgentComposerProps) {
   const { locale } = useLocaleStore()
+  const currentUser = useAuthStore((state) => state.user)
   const composer = useComposerRuntime()
   const {
     conversation,
@@ -199,6 +277,7 @@ export function AgentComposer({
     canSendPublicReply,
     canCreateInternalNote,
     composerReadOnlyReason,
+    resolveConversationForSend,
     quotedMessage,
     onQuoteMessage,
     onClearQuote,
@@ -208,6 +287,8 @@ export function AgentComposer({
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastInsertIdRef = useRef<number | null>(null)
   const appliedStoredInputHeightRef = useRef<number | undefined>(undefined)
+  const activeConversationIdRef = useRef(conversation.id)
+  const composerDraftsRef = useRef<Map<number, string>>(new Map())
   const [uploading, setUploading] = useState(false)
   const [sentToast, setSentToast] = useState(false)
   const [inputHeight, setInputHeight] = useState(COMPOSER_INPUT_DEFAULT_HEIGHT)
@@ -218,6 +299,11 @@ export function AgentComposer({
   const [richTextResetKey, setRichTextResetKey] = useState(0)
   const [richTextUploading, setRichTextUploading] = useState(false)
   const [richTextSending, setRichTextSending] = useState(false)
+  const [composerText, setComposerText] = useState('')
+  // -1 means no suggestion is actively selected: pressing Enter sends the
+  // message. Arrow keys or mouse hover set a concrete index to opt in.
+  const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1)
+  const [dismissedSuggestionPrefix, setDismissedSuggestionPrefix] = useState<string | null>(null)
   const showModeSwitcher = canCreateInternalNote && canSendPublicReply
   const showInternalOnlyLabel = canCreateInternalNote && !canSendPublicReply
   const isInternalMode = composerMode === 'internal'
@@ -225,11 +311,44 @@ export function AgentComposer({
     !isInternalMode
     && canSendPublicReply
     && String(conversation.channel?.channel_type || 'web').toLowerCase() === 'web'
+  const isDeferredConversation = Boolean(resolveConversationForSend)
   const showSatisfactionInvite =
     !isInternalMode
     && canSendPublicReply
     && satisfactionState?.disabled_reason !== 'agent_invite_disabled'
   const hasModeHeader = showModeSwitcher || showInternalOnlyLabel
+  const canUseChat = hasPermission(currentUser, 'chat.workspace.use')
+  const canViewKnowledge = hasPermission(currentUser, 'knowledge.workspace.view')
+  const suggestionConfigQuery = useAgentKnowledgeInputSuggestionSetting(canUseChat)
+  const suggestionPrefix = useMemo(
+    () => extractSuggestionPrefix(composerText, suggestionConfigQuery.data?.trigger_length ?? 2),
+    [composerText, suggestionConfigQuery.data?.trigger_length],
+  )
+  const suggestionSearchText = useDebouncedValue(suggestionPrefix?.text ?? '')
+  const suggestionPopoverEligible = Boolean(
+    canViewKnowledge
+    && canSendPublicReply
+    && !disabled
+    && !composerReadOnlyReason
+    && !isInternalMode
+    && !richTextMode
+    && suggestionConfigQuery.data?.enabled
+    && suggestionPrefix
+    && dismissedSuggestionPrefix !== suggestionPrefix.text,
+  )
+  const shouldFetchSuggestions = Boolean(
+    suggestionPopoverEligible
+    && suggestionSearchText
+    && suggestionPrefix?.text === suggestionSearchText,
+  )
+  const suggestionsQuery = useKnowledgeDocuments({
+    q: suggestionSearchText,
+    display_status: 'published',
+    page: 1,
+    per_page: 5,
+  }, { enabled: shouldFetchSuggestions })
+  const suggestionDocuments = suggestionsQuery.data?.items ?? []
+  const showSuggestionPopover = suggestionPopoverEligible && Boolean(suggestionPrefix?.text)
   const messageSearchButton = onOpenMessageSearch ? (
     <button
       type="button"
@@ -251,6 +370,51 @@ export function AgentComposer({
     appliedStoredInputHeightRef.current = storedInputHeight
     setInputHeight(clampComposerInputHeight(storedInputHeight))
   }, [inputResizing, storedInputHeight])
+
+  useEffect(() => {
+    const previousConversationId = activeConversationIdRef.current
+    if (previousConversationId === conversation.id) return
+
+    const currentText = composer.getState().text
+    if (currentText.length > 0) {
+      composerDraftsRef.current.set(previousConversationId, currentText)
+    } else {
+      composerDraftsRef.current.delete(previousConversationId)
+    }
+
+    activeConversationIdRef.current = conversation.id
+    const nextText = composerDraftsRef.current.get(conversation.id) ?? ''
+    if (currentText !== nextText) composer.setText(nextText)
+    setComposerText(nextText)
+    setDismissedSuggestionPrefix(null)
+    setSelectedSuggestionIndex(-1)
+  }, [composer, conversation.id])
+
+  useEffect(() => {
+    const syncComposerText = () => {
+      const text = composer.getState().text
+      setComposerText(text)
+      const conversationId = activeConversationIdRef.current
+      if (text.length > 0) {
+        composerDraftsRef.current.set(conversationId, text)
+      } else {
+        composerDraftsRef.current.delete(conversationId)
+      }
+    }
+
+    syncComposerText()
+    return composer.subscribe(syncComposerText)
+  }, [composer])
+
+  useEffect(() => {
+    setSelectedSuggestionIndex(-1)
+  }, [suggestionSearchText, suggestionDocuments.length])
+
+  useEffect(() => {
+    if (dismissedSuggestionPrefix && suggestionPrefix?.text !== dismissedSuggestionPrefix) {
+      setDismissedSuggestionPrefix(null)
+    }
+  }, [dismissedSuggestionPrefix, suggestionPrefix?.text])
 
   useEffect(() => {
     if (isInternalMode || !showRichTextToggle) setRichTextMode(false)
@@ -288,6 +452,15 @@ export function AgentComposer({
 
   useEffect(() => {
     if (!insertRequest || disabled || lastInsertIdRef.current === insertRequest.id) return
+
+    // Insert requests are scoped to the conversation they were created for.
+    // Mark stale requests (e.g. left over after closing a conversation and
+    // switching to another one) as consumed so they never leak into the
+    // composer of a different conversation.
+    if (insertRequest.conversationId !== conversation.id) {
+      lastInsertIdRef.current = insertRequest.id
+      return
+    }
 
     lastInsertIdRef.current = insertRequest.id
     const restoreQuote = () => {
@@ -345,9 +518,11 @@ export function AgentComposer({
         // Ignore host selection limitations.
       }
     })
-  }, [composer, disabled, insertRequest, locale, onClearQuote, onQuoteMessage, richTextDraft, richTextMode, setComposerMode])
+  }, [composer, conversation.id, disabled, insertRequest, locale, onClearQuote, onQuoteMessage, richTextDraft, richTextMode, setComposerMode])
 
   const handleTypingDebounce = useCallback(() => {
+    setComposerText(composer.getState().text)
+    if (isDeferredConversation) return
     if (isInternalMode || !canSendPublicReply) return
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current)
     typingTimerRef.current = setTimeout(() => {
@@ -355,7 +530,7 @@ export function AgentComposer({
         socket.emit('typing', { conversation_id: conversation.id })
       }
     }, 300)
-  }, [socket, conversation.id, isInternalMode, canSendPublicReply])
+  }, [composer, socket, conversation.id, isInternalMode, canSendPublicReply, isDeferredConversation])
 
   // When the input transitions to empty (message sent or draft cleared), cancel
   // any pending typing emit and immediately tell the visitor to stop the "agent
@@ -372,12 +547,12 @@ export function AgentComposer({
           clearTimeout(typingTimerRef.current)
           typingTimerRef.current = null
         }
-        if (socket && conversation.id) {
+        if (socket && conversation.id && !isDeferredConversation) {
           socket.emit('typing', { conversation_id: conversation.id, stop: true })
         }
       }
     })
-  }, [composer, socket, conversation.id])
+  }, [composer, socket, conversation.id, isDeferredConversation])
 
   const handleAttachmentSelect = useCallback(() => {
     if (uploading) return
@@ -397,6 +572,14 @@ export function AgentComposer({
       e.target.value = ''
       if (!file || uploading) return
 
+      if (isDeferredConversation) {
+        setPastedAttachment({
+          file,
+          previewUrl: getPastedAttachmentPreviewUrl(file),
+        })
+        return
+      }
+
       setUploading(true)
       try {
         await onFileSend(file)
@@ -406,7 +589,7 @@ export function AgentComposer({
         setUploading(false)
       }
     },
-    [locale, onFileSend, uploading],
+    [isDeferredConversation, locale, onFileSend, uploading],
   )
 
   const handlePaste = useCallback(
@@ -511,6 +694,83 @@ export function AgentComposer({
     }
   }, [locale, onFileSend, pastedAttachment, uploading])
 
+  const handleKnowledgeSuggestionUse = useCallback(
+    (document: KnowledgeDocument) => {
+      const prefix = suggestionPrefix
+      const messageText = knowledgeHtmlToMessageText(document.content_html)
+      if (!messageText) {
+        toast.error(t('ws.knowledge.emptyContent', locale))
+        return
+      }
+      const currentText = composer.getState().text
+      const replaceEnd = prefix?.replaceEnd ?? 0
+      const nextText = replaceEnd > 0
+        ? `${messageText}${currentText.slice(replaceEnd)}`
+        : `${currentText}${currentText.trim() ? '\n\n' : ''}${messageText}`
+      const cursor = replaceEnd > 0 ? messageText.length : nextText.length
+      const textarea =
+        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
+        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
+
+      composer.setText(nextText)
+      setDismissedSuggestionPrefix(prefix?.text ?? null)
+      toast.success(t('ws.knowledge.added', locale))
+      window.requestAnimationFrame(() => {
+        textarea?.focus({ preventScroll: true })
+        try {
+          textarea?.setSelectionRange(cursor, cursor)
+        } catch {
+          // Ignore host selection limitations.
+        }
+      })
+    },
+    [composer, locale, suggestionPrefix],
+  )
+
+  const handlePlainInputKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+      if (!showSuggestionPopover) return
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        setSelectedSuggestionIndex((index) => {
+          const max = Math.max(0, suggestionDocuments.length - 1)
+          return index >= max ? 0 : index + 1
+        })
+        return
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        setSelectedSuggestionIndex((index) => {
+          const max = Math.max(0, suggestionDocuments.length - 1)
+          return index <= 0 ? max : index - 1
+        })
+        return
+      }
+      // Only capture Enter when the agent has explicitly picked a suggestion
+      // via arrow keys or mouse hover; otherwise let Enter send the message.
+      if (event.key === 'Enter' && selectedSuggestionIndex >= 0 && suggestionDocuments[selectedSuggestionIndex]) {
+        event.preventDefault()
+        handleKnowledgeSuggestionUse(suggestionDocuments[selectedSuggestionIndex])
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setDismissedSuggestionPrefix(suggestionPrefix?.text ?? null)
+        return
+      }
+      if (event.key === 'Tab') {
+        setDismissedSuggestionPrefix(suggestionPrefix?.text ?? null)
+      }
+    },
+    [
+      handleKnowledgeSuggestionUse,
+      selectedSuggestionIndex,
+      showSuggestionPopover,
+      suggestionDocuments,
+      suggestionPrefix?.text,
+    ],
+  )
+
   const resizeInputBy = useCallback((delta: number) => {
     setInputHeight((height) => {
       const nextHeight = clampComposerInputHeight(height + delta)
@@ -572,6 +832,62 @@ export function AgentComposer({
     [onInputHeightCommit, resizeInputBy],
   )
 
+  const suggestionPopover = showSuggestionPopover ? (
+    <div
+      className="absolute bottom-[calc(100%+8px)] left-0 right-0 z-30 max-h-[240px] overflow-hidden rounded-xl border border-[#E5E5E5] bg-white shadow-lg"
+      role="listbox"
+      aria-label={t('knowledgeInputSuggestion.title', locale)}
+      // Clear the hover selection when the pointer leaves the popover so Enter
+      // sends the message again unless a suggestion is re-selected.
+      onMouseLeave={() => setSelectedSuggestionIndex(-1)}
+    >
+      {suggestionsQuery.isLoading || suggestionsQuery.isFetching || (showSuggestionPopover && !shouldFetchSuggestions) ? (
+        <div className="flex flex-col gap-1.5 p-2">
+          {Array.from({ length: 3 }).map((_, index) => (
+            <div key={index} className="h-9 animate-pulse rounded-lg bg-muted" />
+          ))}
+        </div>
+      ) : suggestionsQuery.isError ? (
+        <div className="flex items-center justify-between gap-3 p-3 text-xs text-muted-foreground">
+          <span>{t('ws.knowledge.loadFailed', locale)}</span>
+          <button
+            type="button"
+            className="rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-accent"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => void suggestionsQuery.refetch()}
+          >
+            {t('ws.knowledge.retry', locale)}
+          </button>
+        </div>
+      ) : suggestionDocuments.length === 0 ? (
+        <div className="p-3 text-xs text-muted-foreground">{t('ws.knowledge.noResults', locale)}</div>
+      ) : (
+        <div className="max-h-[240px] overflow-y-auto p-1.5">
+          {suggestionDocuments.map((document, index) => {
+            const selected = index === selectedSuggestionIndex
+            return (
+              <button
+                key={document.id}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                className={cn(
+                  'flex w-full rounded-lg px-3 py-2 text-left transition-colors',
+                  selected ? 'bg-muted text-foreground' : 'text-foreground hover:bg-muted/70',
+                )}
+                onMouseEnter={() => setSelectedSuggestionIndex(index)}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => handleKnowledgeSuggestionUse(document)}
+              >
+                <span className="truncate text-sm font-medium">{document.title}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  ) : null
+
   useEffect(() => {
     if (!inputResizing) return
 
@@ -590,7 +906,7 @@ export function AgentComposer({
     return (
       <div className="shrink-0 bg-[#FAFAFA] px-6 pb-4 pt-3">
         <div className="rounded-xl border border-[#E5E5E5] bg-white px-4 py-3 text-center text-sm text-muted-foreground">
-          {t('ws.chat.historyReadOnlyHint', locale)}
+          {disabledReason || t('ws.chat.historyReadOnlyHint', locale)}
         </div>
       </div>
     )
@@ -690,6 +1006,7 @@ export function AgentComposer({
             {messageSearchButton}
           </div>
         )}
+        {suggestionPopover}
         {richTextMode ? (
           <RichTextComposer
             key={richTextResetKey}
@@ -714,6 +1031,7 @@ export function AgentComposer({
             submitMode="enter"
             rows={1}
             onChange={handleTypingDebounce}
+            onKeyDown={handlePlainInputKeyDown}
             onPaste={handlePaste}
             className={cn(
               'max-h-[168px] min-h-[22px] w-full resize-none overflow-y-auto border-0 bg-transparent p-0 text-sm leading-[22px] text-[#1a1a1a] outline-none ring-0 focus-visible:ring-0',
@@ -855,6 +1173,7 @@ export function AgentComposer({
                 </Button>
                 <Button
                   type="button"
+                  autoFocus
                   onClick={() => void handlePastedAttachmentSend()}
                   disabled={uploading}
                 >

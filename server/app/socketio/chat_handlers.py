@@ -17,6 +17,12 @@ import logging
 import uuid
 
 from fastapi.encoders import jsonable_encoder
+# Use Socket.IO's own ConnectionRefusedError, not the builtin OSError of the same
+# name: only this class propagates the rejection reason to the client. Raising the
+# builtin makes python-socketio send a generic "Connection refused by server",
+# which the client can't recognize as an auth failure — so it never stops its
+# reconnect loop.
+from socketio.exceptions import ConnectionRefusedError
 
 from app.configs.settings import settings
 from app.core.exceptions import BusinessError
@@ -26,9 +32,11 @@ from app.db.redis import redis_client
 from app.enums import MessageContentType, MessageSenderType, AgentOnlineStatus
 from app.libs.realtime.base import BaseRealtimeTransport
 from app.services.conversation_service import ConversationService
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_realtime_service import ConversationRealtimeService
 from app.services.agent_status_service import AgentStatusService
 from app.services.data_scope_service import DataScopeService, RESOURCE_PEER_CONVERSATION
+from app.services.employee_session_service import EmployeeSessionService
 from app.services.offline_message_realtime_service import OfflineMessageRealtimeService
 from app.services.permission_service import PermissionService
 from app.services.queue_realtime_service import QueueRealtimeService
@@ -44,14 +52,21 @@ NAMESPACE = "/chat"
 _rejection_tracker = ConnectRejectionTracker()
 
 
-def _log_rejected_connect(environ: dict, sid: str, reason: str) -> None:
+def _log_rejected_connect(
+    environ: dict,
+    sid: str,
+    reason: str,
+    *,
+    tenant_id: object | None = None,
+    user_id: object | None = None,
+) -> None:
     ip = client_ip_from_environ(environ) or "unknown"
     count, storm = _rejection_tracker.record(ip)
     if storm:
         logger.error(
             "Socket auth reconnect storm on %s: %d rejected connects from %s "
-            "within the last minute (reason=%s)",
-            NAMESPACE, count, ip, reason,
+            "within the last minute (reason=%s tenant_id=%s user_id=%s)",
+            NAMESPACE, count, ip, reason, tenant_id, user_id,
         )
     else:
         logger.debug("Chat connect rejected: %s, sid=%s ip=%s", reason, sid, ip)
@@ -113,6 +128,18 @@ def _normalize_subscription_items(data: dict | None, key: str, allowed: list[str
 
 
 async def _get_socket_principal(rt: BaseRealtimeTransport, sid: str):
+    session = await _get_valid_socket_session(rt, sid)
+    user_id = session.get("user_id")
+    tenant_id = session.get("tenant_id")
+
+    async with AsyncSessionLocal() as db:
+        return await PermissionService.get_current_principal(
+            db,
+            {"user_id": int(user_id), "tenant_id": int(tenant_id)},
+        )
+
+
+async def _get_valid_socket_session(rt: BaseRealtimeTransport, sid: str) -> dict:
     session = await rt.get_session(sid, namespace=NAMESPACE)
     user_id = session.get("user_id")
     tenant_id = session.get("tenant_id")
@@ -124,10 +151,15 @@ async def _get_socket_principal(rt: BaseRealtimeTransport, sid: str):
         )
 
     async with AsyncSessionLocal() as db:
-        return await PermissionService.get_current_principal(
+        await EmployeeSessionService.validate_payload(
             db,
-            {"user_id": int(user_id), "tenant_id": int(tenant_id)},
+            {
+                "user_id": int(user_id),
+                "tenant_id": int(tenant_id),
+                "session_id": session.get("session_id"),
+            },
         )
+    return session
 
 
 def _counter_room_for(principal, resource: str) -> str | None:
@@ -241,6 +273,7 @@ async def _assign_queued_conversations(
                     tenant_id,
                     agent_id,
                     QueuePullRequest(),
+                    enforce_visitor_online=True,
                 )
             except NotFoundError:
                 break
@@ -275,13 +308,34 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         user_id = payload.get("user_id") or payload.get("sub")
         tenant_id = payload.get("tenant_id")
         if not user_id or not tenant_id:
-            _log_rejected_connect(environ, sid, "missing user_id or tenant_id")
+            _log_rejected_connect(
+                environ, sid, "missing user_id or tenant_id",
+                tenant_id=tenant_id, user_id=user_id,
+            )
             raise ConnectionRefusedError("Missing user_id or tenant_id in token")
         user_id = int(user_id)
+        tenant_id = int(tenant_id)
+
+        try:
+            async with AsyncSessionLocal() as db:
+                await EmployeeSessionService.validate_payload(
+                    db,
+                    {
+                        "user_id": user_id,
+                        "tenant_id": tenant_id,
+                        "session_id": payload.get("session_id"),
+                    },
+                )
+        except BusinessError as exc:
+            _log_rejected_connect(
+                environ, sid, exc.code, tenant_id=tenant_id, user_id=user_id,
+            )
+            raise ConnectionRefusedError(exc.code) from exc
 
         await rt.save_session(sid, {
             "user_id": user_id,
             "tenant_id": tenant_id,
+            "session_id": payload.get("session_id"),
         }, namespace=NAMESPACE)
 
         # Join personal agent room for targeted events
@@ -332,7 +386,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
     @rt.on("update_status", namespace=NAMESPACE)  # type: ignore
     async def on_update_status(sid: str, data: dict):
-        session = await rt.get_session(sid, namespace=NAMESPACE)
+        try:
+            session = await _get_valid_socket_session(rt, sid)
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
         user_id = session.get("user_id")
         tenant_id = session.get("tenant_id")
         status = data.get("status")
@@ -500,7 +557,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
     @rt.on("join_conversation", namespace=NAMESPACE)  # type: ignore
     async def on_join_conversation(sid: str, data: dict):
-        session = await rt.get_session(sid, namespace=NAMESPACE)
+        try:
+            session = await _get_valid_socket_session(rt, sid)
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
         user_id = session.get("user_id")
         tenant_id = session.get("tenant_id")
         conversation_id = data.get("conversation_id")
@@ -549,7 +609,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
     @rt.on("send_message", namespace=NAMESPACE)  # type: ignore
     async def on_send_message(sid: str, data: dict):
         message_flow_id = uuid.uuid4().hex
-        session = await rt.get_session(sid, namespace=NAMESPACE)
+        try:
+            session = await _get_valid_socket_session(rt, sid)
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
         user_id = session.get("user_id")
         tenant_id = session.get("tenant_id")
         conversation_id = data.get("conversation_id")
@@ -619,6 +682,8 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                     tenant_id=tenant_id,
                     conversation_id=conversation_id,
                 )
+                display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
+                display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
         except BusinessError as exc:
             logger.warning(
                 "workspace_message_save_rejected message_flow_id=%s tenant_id=%s user_id=%s "
@@ -664,7 +729,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             "conversation_id": conversation_id,
             "sender_type": "agent",
             "sender_id": user_id,
-            "sender_name": user.display_name or user.name if user else "Agent",
+            "sender_name": ConversationService.agent_display_name(user, display_mode) if user else "Agent",
             "sender_avatar": user.avatar if user else None,
             "content_type": msg.content_type,
             "content": msg.content,
@@ -734,7 +799,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         if not is_internal_note:
             visitor_msg_payload = {
                 **msg_payload,
-                "sender_name": ConversationService.visitor_agent_display_name(user) if user else "Agent",
+                "sender_name": ConversationService.agent_display_name(user, display_mode) if user else "Agent",
             }
             # The Web SDK keys messages by conversation_public_id and only marks
             # agent messages read when this id matches the open conversation, so
@@ -774,7 +839,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
     @rt.on("recall_message", namespace=NAMESPACE)  # type: ignore
     async def on_recall_message(sid: str, data: dict):
         message_flow_id = uuid.uuid4().hex
-        session = await rt.get_session(sid, namespace=NAMESPACE)
+        try:
+            session = await _get_valid_socket_session(rt, sid)
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
         user_id = session.get("user_id")
         tenant_id = session.get("tenant_id")
         conversation_id = data.get("conversation_id")
@@ -810,6 +878,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                     tenant_id=tenant_id,
                     conversation_id=conversation_id,
                 )
+                display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
         except BusinessError as exc:
             logger.warning(
                 "workspace_message_recall_rejected message_flow_id=%s tenant_id=%s user_id=%s "
@@ -835,6 +904,12 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             )
             raise
 
+        # The message is already committed above. Everything below is realtime
+        # fan-out (broadcasting to agent/visitor rooms). It lives outside the
+        # DB try/except, so wrap it separately: any failure here must be logged
+        # under this module's scope (a raw crash would otherwise only surface in
+        # the Socket.IO framework logger, making "recalled in DB but no live
+        # update" incidents very hard to trace).
         recipient_agent_ids = {int(user_id)}
         if conv and conv.agent_id:
             recipient_agent_ids.add(int(conv.agent_id))
@@ -846,72 +921,99 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             "conversation_id": conversation_id,
             "message_id": msg.id,
         }
-        response_payload = ConversationService._message_response_payload(
-            msg,
-            conversation_id=conversation_id,
-            sender_name=sender.display_name or sender.name if sender else None,
-            sender_avatar=sender.avatar if sender else None,
-            viewer_agent_id=int(user_id),
-        )
-        for recipient_agent_id in recipient_agent_ids:
-            agent_payload = ConversationService._message_response_payload(
+        try:
+            response_payload = ConversationService._message_response_payload(
                 msg,
                 conversation_id=conversation_id,
-                sender_name=sender.display_name or sender.name if sender else None,
+                sender_name=ConversationService.agent_display_name(sender, display_mode) if sender else None,
                 sender_avatar=sender.avatar if sender else None,
-                viewer_agent_id=recipient_agent_id,
+                viewer_agent_id=int(user_id),
             )
-            if recipient_agent_id == int(user_id):
-                response_payload = agent_payload
-            agent_room = f"agent:{tenant_id}:{recipient_agent_id}"
-            await _emit_workspace_message_event(
-                rt,
-                "message_recalled",
-                jsonable_encoder(agent_payload),
-                room=agent_room,
-                namespace=NAMESPACE,
-                log_context=emit_log_context,
-            )
-            if conversation_update:
+            for recipient_agent_id in recipient_agent_ids:
+                agent_payload = ConversationService._message_response_payload(
+                    msg,
+                    conversation_id=conversation_id,
+                    sender_name=ConversationService.agent_display_name(sender, display_mode) if sender else None,
+                    sender_avatar=sender.avatar if sender else None,
+                    viewer_agent_id=recipient_agent_id,
+                )
+                if recipient_agent_id == int(user_id):
+                    response_payload = agent_payload
+                agent_room = f"agent:{tenant_id}:{recipient_agent_id}"
                 await _emit_workspace_message_event(
                     rt,
-                    "conversation_updated",
-                    jsonable_encoder({
-                        **conversation_update,
-                        "unread_count": conv.unread_count if conv else None,
-                    }),
+                    "message_recalled",
+                    jsonable_encoder(agent_payload),
                     room=agent_room,
                     namespace=NAMESPACE,
                     log_context=emit_log_context,
                 )
+                if conversation_update:
+                    await _emit_workspace_message_event(
+                        rt,
+                        "conversation_updated",
+                        jsonable_encoder({
+                            **conversation_update,
+                            "unread_count": conv.unread_count if conv else None,
+                        }),
+                        room=agent_room,
+                        namespace=NAMESPACE,
+                        log_context=emit_log_context,
+                    )
 
-        visitor_payload = ConversationService._message_response_payload(
-            msg,
-            conversation_public_id=conv.public_id,
-            sender_name=ConversationService.visitor_agent_display_name(sender) if sender else None,
-            sender_avatar=sender.avatar if sender else None,
-            visitor_facing=True,
-        )
-        await _emit_workspace_message_event(
-            rt,
-            "message_recalled",
-            jsonable_encoder(visitor_payload),
-            room=f"conv:{conversation_id}",
-            namespace="/visitor",
-            log_context=emit_log_context,
-        )
-        await ConversationRealtimeService.emit_conversation_list_updated(
+            visitor_payload = ConversationService._message_response_payload(
+                msg,
+                conversation_public_id=conv.public_id,
+                sender_name=ConversationService.agent_display_name(sender, display_mode) if sender else None,
+                sender_avatar=sender.avatar if sender else None,
+                visitor_facing=True,
+            )
+            await _emit_workspace_message_event(
+                rt,
+                "message_recalled",
+                jsonable_encoder(visitor_payload),
+                room=f"conv:{conversation_id}",
+                namespace="/visitor",
+                log_context=emit_log_context,
+            )
+            await ConversationRealtimeService.emit_conversation_list_updated(
+                tenant_id,
+                action="message",
+                conversation_id=conversation_id,
+                rt=rt,
+                message_flow_id=message_flow_id,
+            )
+        except Exception:
+            logger.exception(
+                "workspace_message_recall_broadcast_failed message_flow_id=%s tenant_id=%s user_id=%s "
+                "conversation_id=%s message_id=%s recipient_agent_ids=%s",
+                message_flow_id,
+                tenant_id,
+                user_id,
+                conversation_id,
+                msg.id,
+                ",".join(str(agent_id) for agent_id in sorted(recipient_agent_ids)),
+            )
+            raise
+
+        logger.info(
+            "workspace_message_recall_completed message_flow_id=%s tenant_id=%s user_id=%s "
+            "conversation_id=%s message_id=%s recipient_agent_ids=%s",
+            message_flow_id,
             tenant_id,
-            action="message",
-            conversation_id=conversation_id,
-            rt=rt,
-            message_flow_id=message_flow_id,
+            user_id,
+            conversation_id,
+            msg.id,
+            ",".join(str(agent_id) for agent_id in sorted(recipient_agent_ids)),
         )
         return {"ok": True, "message": jsonable_encoder(response_payload)}
 
     @rt.on("send_satisfaction_invitation", namespace=NAMESPACE)  # type: ignore
     async def on_send_satisfaction_invitation(sid: str, data: dict):
-        session = await rt.get_session(sid, namespace=NAMESPACE)
+        try:
+            session = await _get_valid_socket_session(rt, sid)
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
         user_id = session.get("user_id")
         tenant_id = session.get("tenant_id")
         conversation_id = data.get("conversation_id")
@@ -936,6 +1038,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
     @rt.on("typing", namespace=NAMESPACE)  # type: ignore
     async def on_typing(sid: str, data: dict):
+        try:
+            await _get_valid_socket_session(rt, sid)
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
         conversation_id = data.get("conversation_id")
         if conversation_id:
             conv_room = f"conv:{conversation_id}"
@@ -946,7 +1052,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
     @rt.on("end_conversation", namespace=NAMESPACE)  # type: ignore
     async def on_end_conversation(sid: str, data: dict):
-        session = await rt.get_session(sid, namespace=NAMESPACE)
+        try:
+            session = await _get_valid_socket_session(rt, sid)
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
         tenant_id = session.get("tenant_id")
         conversation_id = data.get("conversation_id")
 
@@ -988,7 +1097,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
     @rt.on("mark_read", namespace=NAMESPACE)  # type: ignore
     async def on_mark_read(sid: str, data: dict):
-        session = await rt.get_session(sid, namespace=NAMESPACE)
+        try:
+            session = await _get_valid_socket_session(rt, sid)
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
         tenant_id = session.get("tenant_id")
         user_id = session.get("user_id")
         conversation_id = data.get("conversation_id")

@@ -45,6 +45,7 @@ from app.schemas.satisfaction_survey_record import (
 )
 from app.services.conversation_file_service import ConversationFileService
 from app.services.conversation_service import ConversationService
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_user_stat_service import ConversationUserStatService
 from app.services.agent_status_service import AgentStatusService
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
@@ -406,10 +407,11 @@ async def recall_message(
     )
     from app.repositories.employee_repository import EmployeeRepository
     employee = await EmployeeRepository.get_by_id(db, principal.user_id)
+    display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, principal.tenant_id)
     return ConversationService._message_response_payload(
         msg,
         conversation_id=msg.conversation_id,
-        sender_name=employee.display_name or employee.name if employee else None,
+        sender_name=ConversationService.agent_display_name(employee, display_mode) if employee else None,
         sender_avatar=employee.avatar if employee else None,
         viewer_agent_id=principal.user_id,
     )
@@ -436,10 +438,11 @@ async def send_message(
     )
     from app.repositories.employee_repository import EmployeeRepository
     employee = await EmployeeRepository.get_by_id(db, principal.user_id)
+    display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, principal.tenant_id)
     return ConversationService._message_response_payload(
         msg,
         conversation_id=msg.conversation_id,
-        sender_name=employee.display_name or employee.name if employee else None,
+        sender_name=ConversationService.agent_display_name(employee, display_mode) if employee else None,
         sender_avatar=employee.avatar if employee else None,
         viewer_agent_id=principal.user_id,
     )

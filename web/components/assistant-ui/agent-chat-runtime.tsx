@@ -6,6 +6,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react'
@@ -28,6 +29,15 @@ import type { Socket } from 'socket.io-client'
 // ─── Config context ──────────────────────────────────────────────
 
 export type ComposerMode = 'public' | 'internal'
+
+export type ResolvedConversationForSend = {
+  conversation: Conversation
+  alreadyActive?: boolean
+}
+
+export type DeferredConversationSendResult = {
+  messageSent: boolean
+}
 
 export type AgentChatConfigValue = {
   conversation: Conversation
@@ -73,6 +83,11 @@ export type AgentChatConfigValue = {
   onSendSatisfaction: () => Promise<boolean>
   emojiConfig: EmojiTargetConfig | null
   readStatusEnabled: boolean
+  resolveConversationForSend?: () => Promise<ResolvedConversationForSend>
+  onDeferredConversationResolved?: (
+    conversation: Conversation,
+    result: DeferredConversationSendResult,
+  ) => void | Promise<void>
 }
 
 export type AgentImageMessage = {
@@ -147,6 +162,7 @@ export function AgentChatRuntimeProvider({
     chatConfig.canSendPublicReply ? 'public' : 'internal',
   )
   const [quotedMessage, setQuotedMessage] = useState<Message | null>(null)
+  const resolvedConversationRef = useRef<Conversation | null>(null)
   const messagesMap = useChatStore((s) => s.messages)
   const currentMessages = useMemo(() => messagesMap.get(convId) || [], [messagesMap, convId])
   const imageMessages = useMemo<AgentImageMessage[]>(
@@ -164,6 +180,7 @@ export function AgentChatRuntimeProvider({
 
   useEffect(() => {
     setQuotedMessage(null)
+    resolvedConversationRef.current = null
   }, [convId])
 
   const onQuoteMessage = useCallback((message: Message) => {
@@ -203,15 +220,62 @@ export function AgentChatRuntimeProvider({
     [chatConfig.locale, socket],
   )
 
+  const ensureSendConversation = useCallback(async () => {
+    if (!chatConfig.resolveConversationForSend) return conversation
+    if (resolvedConversationRef.current) return resolvedConversationRef.current
+    const resolved = await chatConfig.resolveConversationForSend()
+    resolvedConversationRef.current = resolved.conversation
+    return resolved.conversation
+  }, [chatConfig, conversation])
+
+  const notifyDeferredConversationResolved = useCallback(
+    async (sendConversation: Conversation, messageSent: boolean) => {
+      if (!chatConfig.resolveConversationForSend || !chatConfig.onDeferredConversationResolved) return
+      await chatConfig.onDeferredConversationResolved(sendConversation, { messageSent })
+    },
+    [chatConfig],
+  )
+
+  const emitDeferredAwareMessage = useCallback(
+    async (payload: {
+      conversation: Conversation
+      content: string
+      content_type: string
+      quoted_message_id?: number
+    }) => {
+      try {
+        await emitSendMessage({
+          conversation_id: payload.conversation.id,
+          content: payload.content,
+          content_type: payload.content_type,
+          ...(payload.quoted_message_id ? { quoted_message_id: payload.quoted_message_id } : {}),
+        })
+      } catch (error) {
+        await notifyDeferredConversationResolved(payload.conversation, false)
+        throw error
+      }
+      await notifyDeferredConversationResolved(payload.conversation, true)
+    },
+    [emitSendMessage, notifyDeferredConversationResolved],
+  )
+
   const onFileSend = useCallback(
     async (file: File) => {
       if (composerMode === 'internal' || !chatConfig.canSendPublicReply) return
       if (!socket || !convId) return
 
-      const uploaded = await uploadAgentConversationFile({
-        conversationId: convId,
-        file,
-      })
+      const sendConversation = await ensureSendConversation()
+
+      let uploaded: ConversationFileUploadResponse
+      try {
+        uploaded = await uploadAgentConversationFile({
+          conversationId: sendConversation.id,
+          file,
+        })
+      } catch (error) {
+        await notifyDeferredConversationResolved(sendConversation, false)
+        throw error
+      }
       const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
       const content = JSON.stringify({
         schema_version: uploaded.schema_version,
@@ -221,14 +285,23 @@ export function AgentChatRuntimeProvider({
         mime_type: uploaded.mime_type,
       })
 
-      await emitSendMessage({
-        conversation_id: convId,
+      await emitDeferredAwareMessage({
+        conversation: sendConversation,
         content,
         content_type: contentType,
         ...(quotedMessage ? { quoted_message_id: quotedMessage.id } : {}),
       })
     },
-    [convId, composerMode, chatConfig.canSendPublicReply, emitSendMessage, quotedMessage],
+    [
+      convId,
+      composerMode,
+      chatConfig.canSendPublicReply,
+      emitDeferredAwareMessage,
+      ensureSendConversation,
+      notifyDeferredConversationResolved,
+      quotedMessage,
+      socket,
+    ],
   )
 
   const onRichTextImageUpload = useCallback(
@@ -237,26 +310,36 @@ export function AgentChatRuntimeProvider({
         throw new Error('Rich text image upload is not available')
       }
       if (!convId) throw new Error('Conversation is required')
+      const sendConversation = await ensureSendConversation()
       return uploadAgentConversationFile({
-        conversationId: convId,
+        conversationId: sendConversation.id,
         file,
       })
     },
-    [convId, composerMode, chatConfig.canSendPublicReply],
+    [convId, composerMode, chatConfig.canSendPublicReply, ensureSendConversation],
   )
 
   const onRichTextSend = useCallback(
     async (html: string) => {
       if (!socket || !convId) return
       if (composerMode === 'internal' || !chatConfig.canSendPublicReply) return
-      await emitSendMessage({
-        conversation_id: convId,
+      const sendConversation = await ensureSendConversation()
+      await emitDeferredAwareMessage({
+        conversation: sendConversation,
         content: html,
         content_type: 'rich_text',
         ...(quotedMessage ? { quoted_message_id: quotedMessage.id } : {}),
       })
     },
-    [socket, convId, composerMode, chatConfig.canSendPublicReply, emitSendMessage, quotedMessage],
+    [
+      socket,
+      convId,
+      composerMode,
+      chatConfig.canSendPublicReply,
+      emitDeferredAwareMessage,
+      ensureSendConversation,
+      quotedMessage,
+    ],
   )
 
   const convertMessage = useCallback(
@@ -298,14 +381,27 @@ export function AgentChatRuntimeProvider({
       if (!socket || !convId) return
       if (composerMode === 'internal' && !chatConfig.canCreateInternalNote) return
       if (composerMode === 'public' && !chatConfig.canSendPublicReply) return
-      await emitSendMessage({
-        conversation_id: convId,
+      const sendConversation = composerMode === 'public'
+        ? await ensureSendConversation()
+        : conversation
+      await emitDeferredAwareMessage({
+        conversation: sendConversation,
         content: textPart.text,
         content_type: composerMode === 'internal' ? 'internal_note' : 'text',
         ...(composerMode === 'public' && quotedMessage ? { quoted_message_id: quotedMessage.id } : {}),
       })
     },
-    [socket, convId, composerMode, chatConfig.canCreateInternalNote, chatConfig.canSendPublicReply, emitSendMessage, quotedMessage],
+    [
+      socket,
+      convId,
+      composerMode,
+      chatConfig.canCreateInternalNote,
+      chatConfig.canSendPublicReply,
+      conversation,
+      emitDeferredAwareMessage,
+      ensureSendConversation,
+      quotedMessage,
+    ],
   )
 
   const runtime = useExternalStoreRuntime({

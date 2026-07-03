@@ -57,6 +57,17 @@ export type VisitorEnvironmentPayload = {
   browser?: string | null
 }
 
+export type OfflineMessageSource = 'queue_full' | 'queue_waiting'
+export type OfflineMessageQueueType = 'employee_group'
+
+export type LeaveQueuedConversationMessageResponse = {
+  ok: boolean
+  source: 'queue_waiting'
+  queue_type: OfflineMessageQueueType
+  queue_id: number
+  leave_message_prompt: string
+}
+
 const visitorEnvironmentJson = (environment?: VisitorEnvironmentPayload | null) => ({
   ...(environment?.system ? { system: environment.system } : {}),
   ...(environment?.browser ? { browser: environment.browser } : {}),
@@ -202,11 +213,24 @@ export const fetchOfflineMessages = (params: {
     },
   )
 
+export const leaveQueuedConversationMessage = (params: {
+  conversationPublicId: string
+  visitorSessionToken: string
+}) =>
+  publicClient
+    .post(`v1/public/conversations/${params.conversationPublicId}/queue-leave-message`, {
+      headers: withVisitorToken(params.visitorSessionToken),
+    })
+    .json<LeaveQueuedConversationMessageResponse>()
+
 export const createOfflineMessageWithMessage = (params: {
   visitorSessionToken: string
   contentType: 'text' | 'image' | 'file'
   content: string
   visitorEnvironment?: VisitorEnvironmentPayload | null
+  source?: OfflineMessageSource | null
+  queueType?: OfflineMessageQueueType | null
+  queueId?: number | null
 }) =>
   publicClient
     .post('v1/public/offline-messages/messages', {
@@ -214,6 +238,9 @@ export const createOfflineMessageWithMessage = (params: {
       json: {
         content_type: params.contentType,
         content: params.content,
+        ...(params.source ? { source: params.source } : {}),
+        ...(params.queueType ? { queue_type: params.queueType } : {}),
+        ...(params.queueId ? { queue_id: params.queueId } : {}),
         ...visitorEnvironmentJson(params.visitorEnvironment),
       },
     })
@@ -225,6 +252,9 @@ export const sendOfflineMessage = (params: {
   contentType: 'text' | 'image' | 'file'
   content: string
   visitorEnvironment?: VisitorEnvironmentPayload | null
+  source?: OfflineMessageSource | null
+  queueType?: OfflineMessageQueueType | null
+  queueId?: number | null
 }) =>
   publicClient
     .post(`v1/public/offline-messages/${params.offlineMessagePublicId}/messages`, {
@@ -232,6 +262,9 @@ export const sendOfflineMessage = (params: {
       json: {
         content_type: params.contentType,
         content: params.content,
+        ...(params.source ? { source: params.source } : {}),
+        ...(params.queueType ? { queue_type: params.queueType } : {}),
+        ...(params.queueId ? { queue_id: params.queueId } : {}),
         ...visitorEnvironmentJson(params.visitorEnvironment),
       },
     })

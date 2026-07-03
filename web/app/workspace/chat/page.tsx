@@ -63,9 +63,9 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import { getDataScope, hasPermission } from '@/utils/permissions'
-import type { Message, Conversation, AgentStats } from '@/models/conversation'
+import type { Message, Conversation, AgentStats, MessageListResponse } from '@/models/conversation'
 import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
-import type { OfflineMessageConvertResponse } from '@/models/offline-message'
+import type { OfflineMessageArchiveResponse, OfflineMessageConvertResponse } from '@/models/offline-message'
 import type { OfflineMessageListResponse } from '@/models/offline-message'
 import type { QueueAssignmentWorkspaceResponse } from '@/models/queue-workspace'
 import type { ComposerInsertRequest } from '@/components/assistant-ui/agent-composer'
@@ -130,6 +130,16 @@ function buildMessagePreview(msg: Message, locale: 'zh' | 'en'): string {
     }
   }
   return `[${msg.content_type}]`
+}
+
+function mergeMessagesById(fetchedMessages: Message[], localMessages: Message[]): Message[] {
+  const byId = new Map<number, Message>()
+  fetchedMessages.forEach((msg) => byId.set(msg.id, msg))
+  localMessages.forEach((msg) => {
+    const existing = byId.get(msg.id)
+    byId.set(msg.id, existing ? { ...existing, ...msg } : msg)
+  })
+  return [...byId.values()].sort((a, b) => a.id - b.id)
 }
 
 export default function ChatPage() {
@@ -258,6 +268,28 @@ export default function ChatPage() {
       })
     },
     [updateCurrentUserPreferences, user],
+  )
+
+  const hydrateTransferredConversationMessages = useCallback(
+    async (conversationId: number) => {
+      try {
+        const data = await queryClient.fetchQuery({
+          queryKey: [...conversationKeys.messages(conversationId), undefined],
+          queryFn: () =>
+            get<MessageListResponse>(`v1/conversations/${conversationId}/messages`, {
+              searchParams: { limit: 20 },
+            }),
+        })
+        const localMessages = useChatStore.getState().messages.get(conversationId) || []
+        useChatStore.getState().setMessages(
+          conversationId,
+          mergeMessagesById(data.items, localMessages),
+        )
+      } catch {
+        queryClient.invalidateQueries({ queryKey: conversationKeys.messages(conversationId) })
+      }
+    },
+    [queryClient],
   )
 
   useEffect(() => {
@@ -475,12 +507,10 @@ export default function ChatPage() {
             }
           }
           if (conversationScope === 'my') {
+            // Enqueue + keep the unread badge. Auto-selecting a brand-new
+            // conversation would mark it read immediately, defeating the
+            // pending-assignment reminder; the agent opens it to clear it.
             addConversation(conv)
-            const selectedId = useChatStore.getState().selectedConversationId
-            if (selectedId == null) {
-              setSelectedConversationSnapshot(conv)
-              selectConversation(conv.id)
-            }
           }
         })
         .catch(() => {})
@@ -588,7 +618,7 @@ export default function ChatPage() {
     const handleOfflineListUpdated = (data?: OfflineMessageUpdatedEvent) => {
       if (!canOfflineMessages) return
       const offlineMessageId = data?.offline_message_id
-      if (data?.action === 'converted' && typeof offlineMessageId === 'number') {
+      if ((data?.action === 'converted' || data?.action === 'archived') && typeof offlineMessageId === 'number') {
         setSelectedOfflineMessageId((current) => {
           if (current !== offlineMessageId) return current
           const pendingItems = offlineMessageItems.some((item) => item.id === offlineMessageId)
@@ -637,7 +667,10 @@ export default function ChatPage() {
             .catch(() => {})
         }
         queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
+        queryClient.invalidateQueries({ queryKey: conversationKeys.detail(data.conversation_id) })
+        queryClient.invalidateQueries({ queryKey: conversationKeys.messages(data.conversation_id) })
         queryClient.invalidateQueries({ queryKey: agentKeys.stats })
+        void hydrateTransferredConversationMessages(data.conversation_id)
       }
     }
 
@@ -839,6 +872,7 @@ export default function ChatPage() {
     isPeerTabActive,
     isQueueTabActive,
     selectedQueueTaskId,
+    hydrateTransferredConversationMessages,
   ])
 
   const listSelectedConversation = conversations.find((c) => c.id === selectedConversationId) || null
@@ -993,9 +1027,21 @@ export default function ChatPage() {
     }
   }, [auxiliaryPanelResizing])
 
-  const requestComposerInsert = useCallback((request: Omit<ComposerInsertRequest, 'id'>) => {
+  // A pending insert request only makes sense for the conversation it was
+  // created in; drop it as soon as the selection changes (or is closed) so it
+  // can never surface in another conversation's composer.
+  useEffect(() => {
+    setComposerInsertRequest(null)
+  }, [selectedConversationId])
+
+  const requestComposerInsert = useCallback((request: Omit<ComposerInsertRequest, 'id' | 'conversationId'>) => {
+    // Bind the request to the conversation it targets so it cannot be applied
+    // to another conversation's composer after switching.
+    const conversationId = useChatStore.getState().selectedConversationId
+    if (!conversationId) return
     setComposerInsertRequest((prev) => ({
       id: (prev?.id ?? 0) + 1,
+      conversationId,
       ...request,
     }))
   }, [])
@@ -1232,8 +1278,10 @@ export default function ChatPage() {
             ? t('ws.chat.visitorHasActiveConversation', locale)
             : t('ws.chat.newConversationStarted', locale),
         )
+        return conversation
       } catch {
         window.alert(t('ws.chat.startNewConversationFailed', locale))
+        throw new Error('Failed to start conversation')
       }
     },
     [
@@ -1256,19 +1304,58 @@ export default function ChatPage() {
   }, [offlineMessageItems])
 
   const handleOfflineAssigned = useCallback(
-    (response: OfflineMessageConvertResponse, offlineMessageId: number) => {
+    (
+      response: OfflineMessageConvertResponse,
+      offlineMessageId: number,
+      options?: { openConversation?: boolean; messageSent?: boolean },
+    ) => {
       queryClient.invalidateQueries({ queryKey: offlineMessageKeys.counts() })
       if (response.assigned_to_current_user) {
         addConversation(response.conversation)
-        advanceOfflineMessageSelection(offlineMessageId)
         queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
         queryClient.invalidateQueries({ queryKey: agentKeys.stats })
+        if (options?.openConversation && response.conversation) {
+          setSelectedConversationSnapshot(response.conversation)
+          selectConversation(response.conversation.id)
+          setConversationScope('my')
+          setMyConversationView('current')
+          setWorkspaceChatTab('messages')
+          setSelectedOfflineMessageId(null)
+          showWorkspaceToast(
+            options.messageSent === false
+              ? t('ws.chat.queueQuickReplyAssignedMessageFailed', locale)
+              : t('ws.chat.queueQuickReplyAssignedAndSent', locale),
+          )
+          return
+        }
+        advanceOfflineMessageSelection(offlineMessageId)
         return
       }
       advanceOfflineMessageSelection(offlineMessageId)
       void offlineMessagesQuery.refetch()
     },
-    [addConversation, advanceOfflineMessageSelection, offlineMessagesQuery, queryClient],
+    [
+      addConversation,
+      advanceOfflineMessageSelection,
+      locale,
+      offlineMessagesQuery,
+      queryClient,
+      selectConversation,
+      setConversationScope,
+      setMyConversationView,
+      setSelectedConversationSnapshot,
+      setSelectedOfflineMessageId,
+      setWorkspaceChatTab,
+      showWorkspaceToast,
+    ],
+  )
+
+  const handleOfflineArchived = useCallback(
+    (_response: OfflineMessageArchiveResponse, offlineMessageId: number) => {
+      queryClient.invalidateQueries({ queryKey: offlineMessageKeys.counts() })
+      advanceOfflineMessageSelection(offlineMessageId)
+    },
+    [advanceOfflineMessageSelection, queryClient],
   )
 
   const handleConversationPanelTabChange = useCallback((tab: ConversationPanelTab) => {
@@ -1476,9 +1563,11 @@ export default function ChatPage() {
             selectedId={selectedQueueTaskId}
             loading={queueTasksQuery.isLoading || queueTasksQuery.isFetching}
             queueFilter={queueFilter}
+            agentStatus={agentStatus || null}
             onQueueFilterChange={setQueueFilter}
             onSelect={setSelectedQueueTaskId}
             onRefresh={() => void queueTasksQuery.refetch()}
+            onAssigned={handleQueueAssigned}
           />
         )}
       />
@@ -1538,7 +1627,9 @@ export default function ChatPage() {
         <OfflineMessageDetailPanel
           selectedId={selectedOfflineMessageId}
           onAssigned={handleOfflineAssigned}
+          onArchived={handleOfflineArchived}
           agentStatus={agentStatus || null}
+          socket={socket}
           auxiliaryPanelWidth={auxiliaryPanelWidth}
           resizeHandle={auxiliaryPanelResizeHandle}
         />
@@ -1546,6 +1637,7 @@ export default function ChatPage() {
         <QueueTaskPanel
           selectedId={selectedQueueTaskId}
           agentStatus={agentStatus || null}
+          socket={socket}
           onAssigned={handleQueueAssigned}
         />
       )}

@@ -123,6 +123,72 @@ class TestSessionRecordsAPI:
         assert isinstance(data["items"], list)
 
     @pytest.mark.asyncio
+    async def test_agent_options_use_session_record_scope_without_employee_view(self, client: AsyncClient):
+        async with AsyncSessionLocal() as db:
+            tenant_pk = (await db.execute(text(
+                "SELECT id FROM tenants WHERE tenant_id = 'test-corp'"
+            ))).scalar_one()
+            hashed = hash_password("Test1234")
+            await db.execute(text("""
+                INSERT INTO employees (tenant_id, username, email, password_hash, name, display_name, roles, is_active)
+                VALUES
+                    (:tid, 'rec_filter_limited', 'rec_filter_limited@example.com', :pw, 'Filter Limited Agent', 'Filter Limited Agent', '["agent"]'::jsonb, true),
+                    (:tid, 'rec_filter_visible', 'rec_filter_visible@example.com', :pw, 'Filter Visible Agent', 'Filter Visible Agent', '["agent"]'::jsonb, true)
+                ON CONFLICT ON CONSTRAINT uq_employees_tenant_username DO UPDATE SET
+                    name = EXCLUDED.name,
+                    display_name = EXCLUDED.display_name,
+                    is_active = true
+            """), {"tid": tenant_pk, "pw": hashed})
+            role_id = (await db.execute(text("""
+                INSERT INTO roles (
+                    tenant_id, key, name, description, is_system, is_active,
+                    permissions, data_scopes
+                )
+                VALUES (
+                    :tid, 'session_record_filter_options_all', 'Session Record Filter Options All',
+                    'Session Record Filter Options All', false, true,
+                    '["chat.workspace.use","chat.session_record.view"]'::json,
+                    '{"session_record":"all"}'::json
+                )
+                ON CONFLICT ON CONSTRAINT uq_roles_tenant_key DO UPDATE SET
+                    permissions = EXCLUDED.permissions,
+                    data_scopes = EXCLUDED.data_scopes,
+                    is_active = true
+                RETURNING id
+            """), {"tid": tenant_pk})).scalar_one()
+            limited_id = (await db.execute(text("""
+                SELECT id FROM employees
+                WHERE tenant_id = :tid AND username = 'rec_filter_limited'
+            """), {"tid": tenant_pk})).scalar_one()
+            visible_id = (await db.execute(text("""
+                SELECT id FROM employees
+                WHERE tenant_id = :tid AND username = 'rec_filter_visible'
+            """), {"tid": tenant_pk})).scalar_one()
+            await db.execute(text(
+                "DELETE FROM employee_roles WHERE employee_id = :employee_id"
+            ), {"employee_id": limited_id})
+            await db.execute(text("""
+                INSERT INTO employee_roles (employee_id, role_id)
+                VALUES (:employee_id, :role_id)
+                ON CONFLICT ON CONSTRAINT uq_employee_roles_employee_role DO NOTHING
+            """), {"employee_id": limited_id, "role_id": role_id})
+            await db.commit()
+
+        token = create_access_token(
+            {"sub": str(limited_id), "tenant_id": tenant_pk, "roles": ["agent"]}
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        employees_resp = await client.get("/api/v1/employees", headers=headers)
+        assert employees_resp.status_code == 403
+
+        resp = await client.get("/api/v1/session-records/agent-options", headers=headers)
+        assert resp.status_code == 200
+        names_by_id = {item["id"]: item["name"] for item in resp.json()["items"]}
+        assert names_by_id[visible_id] == "Filter Visible Agent"
+        assert names_by_id[limited_id] == "Filter Limited Agent"
+
+    @pytest.mark.asyncio
     async def test_list_with_keyword_filter(self, client: AsyncClient):
         resp = await client.get(
             "/api/v1/session-records",

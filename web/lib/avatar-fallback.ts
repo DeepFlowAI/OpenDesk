@@ -4,6 +4,9 @@
 
 const HUES = [210, 160, 280, 32, 340, 190, 24, 262, 130, 310]
 
+export const VISITOR_AVATAR_BACKGROUND = '#E5E5E5'
+export const VISITOR_AVATAR_FOREGROUND = '#737373'
+
 /**
  * One visible character for the avatar: first CJK char or first Latin letter.
  */

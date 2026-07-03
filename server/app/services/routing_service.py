@@ -160,7 +160,12 @@ class RoutingService:
                 candidate.gate_passed,
                 candidate.has_available_agent,
             )
-            return candidate.group_id, candidate.member_ids, candidate.max_concurrent_map, None
+            return (
+                candidate.group_id,
+                candidate.member_ids,
+                candidate.max_concurrent_map,
+                block_reason,
+            )
 
         if not rules:
             logger.warning("No routing rules for tenant %d, falling back to all active agents", tenant_id)
@@ -430,6 +435,15 @@ class RoutingService:
         return candidates
 
     @staticmethod
+    def _first_gate_blocked_candidate(
+        candidates: list[RouteQueueCandidate],
+    ) -> RouteQueueCandidate | None:
+        for candidate in candidates:
+            if not candidate.gate_passed:
+                return candidate
+        return None
+
+    @staticmethod
     async def _select_candidate_for_rule(
         db: AsyncSession,
         r: aioredis.Redis | None,
@@ -480,12 +494,34 @@ class RoutingService:
                 )
                 return last_enqueueable, None
             if saw_gate_blocked:
+                blocked = RoutingService._first_gate_blocked_candidate(candidates)
+                if blocked is not None:
+                    logger.info(
+                        "route_candidate_selected tenant_id=%s rule_id=%s queue_type=%s queue_id=%s "
+                        "reason=queue_limit_blocked",
+                        tenant_id,
+                        rule.id,
+                        blocked.queue_type,
+                        blocked.queue_id,
+                    )
+                    return blocked, "queue_limit"
                 return None, "queue_limit"
             return None, "no_candidate"
 
         eligible = [candidate for candidate in candidates if candidate.gate_passed]
         if not eligible:
             if any(not candidate.gate_passed for candidate in candidates):
+                blocked = RoutingService._first_gate_blocked_candidate(candidates)
+                if blocked is not None:
+                    logger.info(
+                        "route_candidate_selected tenant_id=%s rule_id=%s queue_type=%s queue_id=%s "
+                        "reason=queue_limit_blocked",
+                        tenant_id,
+                        rule.id,
+                        blocked.queue_type,
+                        blocked.queue_id,
+                    )
+                    return blocked, "queue_limit"
                 return None, "queue_limit"
             return None, "no_candidate"
         if strategy == "shortest_tail_wait":

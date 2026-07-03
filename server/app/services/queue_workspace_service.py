@@ -44,6 +44,7 @@ from app.schemas.queue_workspace import (
     QueueWorkspaceTaskListResponse,
 )
 from app.services.agent_status_service import AgentStatusService
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_realtime_service import ConversationRealtimeService
 from app.services.conversation_service import AGENT_ASSIGNED_EVENT_TYPE, ConversationService
 from app.services.data_scope_service import DataScopeService, RESOURCE_CHAT_QUEUE
@@ -330,6 +331,25 @@ class QueueWorkspaceService:
                 principal.user_id,
             )
 
+        # Entering a queued conversation and replying in one shot is the agent
+        # actively reading it, so the assignment +1 must not linger as a badge.
+        # Clear the counter and notify the agent's room so any other page drops
+        # the red dot for this conversation.
+        await ConversationService.mark_read(db, conversation_id)
+        try:
+            rt = get_realtime_transport()
+            await rt.emit(
+                "conversation_updated",
+                {"conversation_id": conversation_id, "unread_count": 0},
+                room=f"agent:{principal.tenant_id}:{principal.user_id}",
+                namespace="/chat",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to emit unread-cleared event for assign-and-send conversation %s",
+                conversation_id,
+            )
+
         logger.info(
             "queue_task_assigned_and_sent tenant_id=%s user_id=%s queue_task_id=%s conversation_id=%s message_id=%s",
             principal.tenant_id,
@@ -338,9 +358,10 @@ class QueueWorkspaceService:
             conversation_id,
             message.id,
         )
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, principal.tenant_id)
         return QueueAssignAndSendResponse(
             **assignment.model_dump(),
-            message=QueueWorkspaceService._message_response_item(message, conversation),
+            message=QueueWorkspaceService._message_response_item(message, conversation, display_mode),
             message_sent=True,
         )
 
@@ -744,6 +765,7 @@ class QueueWorkspaceService:
         })
         agents = await EmployeeRepository.get_by_ids(db, agent_ids)
         agent_map = {agent.id: agent for agent in agents if agent.tenant_id == tenant_id}
+        display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
         items = []
         for msg in messages:
             metadata = getattr(msg, "metadata_", None) or {}
@@ -752,7 +774,7 @@ class QueueWorkspaceService:
             if msg.sender_type == "agent" and msg.sender_id is not None:
                 agent = agent_map.get(msg.sender_id)
                 if agent:
-                    sender_name = agent.display_name or agent.name
+                    sender_name = ConversationService.agent_display_name(agent, display_mode)
                     sender_avatar = agent.avatar
             elif msg.sender_type == "bot":
                 sender_name = ConversationService._metadata_sender_name(msg.sender_type, metadata)
@@ -800,6 +822,17 @@ class QueueWorkspaceService:
             rt = get_realtime_transport()
             tenant_id = conversation.tenant_id
             agent_room = f"agent:{tenant_id}:{agent_id}"
+            # Assignment itself is a pending item the agent must handle, so it
+            # raises the unread badge even on pages other than the chat view.
+            # Bump before emitting new_conversation so the receiver's REST fetch
+            # already reflects the +1, and keep the in-memory object in sync so
+            # the welcome / assigned message events carry the same count.
+            new_unread: int | None = None
+            display_mode = None
+            if db is not None:
+                new_unread = await ConversationRepository.increment_unread(db, conversation.id)
+                conversation.unread_count = new_unread
+                display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
             await rt.emit(
                 "new_conversation",
                 {
@@ -819,6 +852,16 @@ class QueueWorkspaceService:
                 room=agent_room,
                 namespace="/chat",
             )
+            if new_unread is not None:
+                await rt.emit(
+                    "conversation_updated",
+                    {
+                        "conversation_id": conversation.id,
+                        "unread_count": new_unread,
+                    },
+                    room=agent_room,
+                    namespace="/chat",
+                )
             await rt.emit(
                 "conversation_assigned",
                 {
@@ -827,7 +870,7 @@ class QueueWorkspaceService:
                     "agent": (
                         {
                             "id": conversation.agent.id,
-                            "name": ConversationService.visitor_agent_display_name(conversation.agent),
+                            "name": ConversationService.agent_display_name(conversation.agent, display_mode),
                             "avatar": conversation.agent.avatar,
                         }
                         if conversation.agent
@@ -940,11 +983,15 @@ class QueueWorkspaceService:
             logger.exception("Failed to emit queue assign-and-send message events for conversation %s", conversation.id)
 
     @staticmethod
-    def _message_response_item(message, conversation: Conversation | None) -> dict[str, Any]:
+    def _message_response_item(
+        message,
+        conversation: Conversation | None,
+        display_mode: str | None = None,
+    ) -> dict[str, Any]:
         sender_name = None
         sender_avatar = None
         if conversation is not None and message.sender_type == MessageSenderType.AGENT.value and conversation.agent:
-            sender_name = conversation.agent.display_name or conversation.agent.name
+            sender_name = ConversationService.agent_display_name(conversation.agent, display_mode)
             sender_avatar = conversation.agent.avatar
         return ConversationService._message_response_payload(
             message,

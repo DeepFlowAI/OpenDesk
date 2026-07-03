@@ -140,7 +140,61 @@ class BaseTelephonyClient(ABC):
     ) -> None: ...
 
     @abstractmethod
-    async def call_bridge(self, call_id: str, other_call_id: str) -> None: ...
+    async def call_bridge(
+        self, call_id: str, other_call_id: str, transcribe: bool = True
+    ) -> None:
+        """Bridge two call legs.
+
+        `transcribe` controls whether the media kernel runs live ASR on the
+        bridged audio. When False, the kernel is told to skip transcription
+        for this call; when True (default), transcription behaves as before.
+        """
+
+    @abstractmethod
+    async def call_connect_external_agent(
+        self,
+        call_id: str,
+        *,
+        provider: str,
+        ws_url: str,
+        token: str,
+        audio_in_rate: int,
+        audio_out_rate: int,
+        traceparent: str | None = None,
+        trace_call_id: str | None = None,
+    ) -> None:
+        """Bridge a call leg to an external realtime agent over WebSocket.
+
+        The kernel opens a WS to `ws_url` (authenticated with `token`),
+        resamples the caller's audio to `audio_in_rate` on the way out and the
+        agent's audio to the call leg on the way back, and emits
+        `call.external_agent.{connected,handoff,failed,ended}` events. Provider
+        is kept generic (no VoiceSpeed business semantics) so other realtime
+        agents can reuse this RPC.
+        """
+
+    @abstractmethod
+    async def call_converse_external_agent(
+        self,
+        call_id: str,
+        *,
+        provider: str,
+        turn_url: str,
+        token: str,
+        greeting: str | None = None,
+        voice_spk_id: str | None = None,
+        traceparent: str | None = None,
+        trace_call_id: str | None = None,
+    ) -> None:
+        """Run a text-turn conversation on a call leg (v2 flowkit-中枢架构).
+
+        Unlike `call_connect_external_agent` (which bridges raw audio), the
+        kernel owns ASR/TTS/barge-in here and POSTs each transcribed utterance to
+        `turn_url` (Bearer `token`), expecting `{reply, commands, voice_spk_id}`;
+        it speaks the reply and emits the same
+        `call.external_agent.{connected,handoff,failed,ended}` events. No audio
+        leaves the kernel.
+        """
 
     @abstractmethod
     async def call_unbridge(self, call_id: str, other_call_id: str) -> None: ...

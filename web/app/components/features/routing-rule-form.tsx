@@ -9,14 +9,27 @@ import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
-import type { RoutingCondition, RoutingConditionType } from '@/models/inbound-routing-rule'
+import type {
+  RoutingCondition,
+  RoutingConditionType,
+  RoutingTargetType,
+} from '@/models/inbound-routing-rule'
+import type { AssignQueueTarget, AssignQueueTargetType } from '@/models/voice-flow-graph'
 import { useServiceHours } from '@/service/use-service-hours'
 import { useVoiceFlowsSelect } from '@/service/use-voice-flows'
+import { useEmployeeGroups, useEmployeeSelect } from '@/service/use-employee-groups'
+import { useUnifiedFields } from '@/service/use-field-definitions'
+import { FieldDomain, FieldType } from '@/types/field-enums'
 import {
   useInboundRoutingRule,
   useCreateInboundRoutingRule,
   useUpdateInboundRoutingRule,
 } from '@/service/use-inbound-routing-rules'
+import {
+  VoiceSpeedAgentSelect,
+  isVoiceSpeedSelectBlocking,
+  type VoiceSpeedAgentSelectStatus,
+} from '@/app/components/features/voice-speed-agent-select'
 
 type RowState = RoutingCondition & { _key: string }
 
@@ -55,7 +68,18 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
 
   const [name, setName] = useState('')
   const [enabled, setEnabled] = useState(true)
+  const [targetType, setTargetType] = useState<RoutingTargetType>('voice_flow')
+  // Each target type keeps its own temp values so switching back and forth
+  // doesn't lose what the user already filled in. Only the active type is
+  // submitted on save.
   const [targetFlowId, setTargetFlowId] = useState<number | ''>('')
+  const [vsAgentId, setVsAgentId] = useState('')
+  const [vsAgentName, setVsAgentName] = useState('')
+  const [transferTarget, setTransferTarget] = useState<AssignQueueTarget>({
+    queue_type: 'employee_group',
+    queue_id: null,
+  })
+  const [vsStatus, setVsStatus] = useState<VoiceSpeedAgentSelectStatus>('loading')
   const [rows, setRows] = useState<RowState[]>([])
   const [initialized, setInitialized] = useState(false)
 
@@ -70,7 +94,11 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
     if (!rule || initialized) return
     setName(rule.name)
     setEnabled(rule.enabled)
-    setTargetFlowId(rule.target_voice_flow_id)
+    setTargetType(rule.target_type ?? 'voice_flow')
+    setTargetFlowId(rule.target_voice_flow_id ?? '')
+    setVsAgentId(rule.voicespeed_agent_id ?? '')
+    setVsAgentName(rule.voicespeed_agent_name ?? '')
+    if (rule.transfer_target) setTransferTarget(rule.transfer_target)
     setRows((rule.conditions ?? []).map((c) => ({ ...c, _key: newKey() })))
     setInitialized(true)
   }, [isNew, rule, initialized])
@@ -83,29 +111,44 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
       return
     }
     if (rule && initialized) {
+      const savedTarget =
+        rule.target_type === 'voicespeed_agent'
+          ? {
+              type: 'voicespeed_agent',
+              agent: rule.voicespeed_agent_id ?? '',
+              transfer: rule.transfer_target ?? null,
+            }
+          : { type: 'voice_flow', flow: rule.target_voice_flow_id ?? '' }
       setSavedSnapshot(
         JSON.stringify({
           name: rule.name.trim(),
           enabled: rule.enabled,
-          target: rule.target_voice_flow_id,
+          target: savedTarget,
           conditions: rule.conditions ?? [],
         })
       )
     }
   }, [isNew, rule, initialized])
 
-  const payloadForCompare = useMemo(
-    () =>
-      JSON.stringify({
-        name: name.trim(),
-        enabled,
-        target: targetFlowId === '' ? '' : Number(targetFlowId),
-        conditions: rows.map(({ _key: _, ...c }) => c),
-      }),
-    [name, enabled, targetFlowId, rows]
-  )
+  const payloadForCompare = useMemo(() => {
+    const target =
+      targetType === 'voicespeed_agent'
+        ? { type: 'voicespeed_agent', agent: vsAgentId, transfer: vsAgentId ? transferTarget : null }
+        : { type: 'voice_flow', flow: targetFlowId === '' ? '' : Number(targetFlowId) }
+    return JSON.stringify({
+      name: name.trim(),
+      enabled,
+      target,
+      conditions: rows.map(({ _key: _, ...c }) => c),
+    })
+  }, [name, enabled, targetType, targetFlowId, vsAgentId, transferTarget, rows])
 
-  const emptyNewSnapshot = '{"name":"","enabled":true,"target":"","conditions":[]}'
+  const emptyNewSnapshot = JSON.stringify({
+    name: '',
+    enabled: true,
+    target: { type: 'voice_flow', flow: '' },
+    conditions: [],
+  })
   const isDirty = isNew ? payloadForCompare !== emptyNewSnapshot : payloadForCompare !== savedSnapshot
 
   const goBack = () => {
@@ -139,12 +182,45 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
       toast.error(t('rr.form.validation.name', locale))
       return
     }
-    if (targetFlowId === '') {
-      toast.error(t('rr.form.validation.flow', locale))
-      return
-    }
     const conditions: RoutingCondition[] = rows.map(({ _key: _, ...c }) => c)
-    const body = { name: tn, enabled, conditions, target_voice_flow_id: Number(targetFlowId) }
+
+    let body: import('@/models/inbound-routing-rule').SaveInboundRoutingRulePayload
+    if (targetType === 'voice_flow') {
+      if (targetFlowId === '') {
+        toast.error(t('rr.form.validation.flow', locale))
+        return
+      }
+      body = {
+        name: tn,
+        enabled,
+        conditions,
+        target_type: 'voice_flow',
+        target_voice_flow_id: Number(targetFlowId),
+      }
+    } else {
+      if (isVoiceSpeedSelectBlocking(vsStatus)) {
+        toast.error(t('vs.agent.toast.unavailable', locale))
+        return
+      }
+      if (!vsAgentId) {
+        toast.error(t('rr.form.validation.agent', locale))
+        return
+      }
+      if (transferTarget.queue_id == null) {
+        toast.error(t('rr.form.validation.transfer', locale))
+        return
+      }
+      body = {
+        name: tn,
+        enabled,
+        conditions,
+        target_type: 'voicespeed_agent',
+        voicespeed_agent_id: vsAgentId,
+        voicespeed_agent_name: vsAgentName,
+        transfer_target: transferTarget,
+      }
+    }
+
     try {
       if (isNew) {
         await createMut.mutateAsync(body)
@@ -153,14 +229,19 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
       } else if (ruleId != null) {
         await updateMut.mutateAsync({ id: ruleId, data: body })
         toast.success(t('rr.form.saveSuccess', locale))
-        setSavedSnapshot(JSON.stringify({ name: tn, enabled, target: Number(targetFlowId), conditions }))
+        setSavedSnapshot(payloadForCompare)
       }
     } catch {
       toast.error(t('rr.form.saveFailed', locale))
     }
   }
 
-  const saveDisabled = createMut.isPending || updateMut.isPending || !isDirty || !name.trim() || targetFlowId === ''
+  const targetIncomplete =
+    targetType === 'voice_flow'
+      ? targetFlowId === ''
+      : !vsAgentId || transferTarget.queue_id == null || isVoiceSpeedSelectBlocking(vsStatus)
+  const saveDisabled =
+    createMut.isPending || updateMut.isPending || !isDirty || !name.trim() || targetIncomplete
 
   if (!isNew && loadingRule) {
     return <p className="p-8 text-sm text-muted-foreground">{t('rr.loading', locale)}</p>
@@ -318,29 +399,80 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
           </button>
         </div>
 
-        {/* Target voice flow */}
-        <div className="flex flex-col gap-2">
+        {/* Target — voice flow or VoiceSpeed agent */}
+        <div className="flex flex-col gap-3">
           <div className="flex items-center gap-0.5">
-            <span className="text-sm font-medium text-foreground/80">{t('rr.form.targetFlow', locale)}</span>
+            <span className="text-sm font-medium text-foreground/80">{t('rr.form.target', locale)}</span>
             <span className="text-sm font-medium text-destructive">*</span>
           </div>
-          <div className="relative">
-            <select
-              value={targetFlowId === '' ? '' : String(targetFlowId)}
-              onChange={(e) => setTargetFlowId(e.target.value ? Number(e.target.value) : '')}
-              className="h-10 w-full appearance-none rounded-lg border border-border bg-white px-3 pr-9 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-            >
-              <option value="" className="text-muted-foreground">
-                {t('rr.form.targetFlow.placeholder', locale)}
-              </option>
-              {(flows?.items ?? []).map((f) => (
-                <option key={f.id} value={f.id}>
-                  {f.name}
-                </option>
-              ))}
-            </select>
-            <IconChevronDown size={18} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+
+          {/* Target type segmented control */}
+          <div className="inline-flex w-fit rounded-lg border border-border p-0.5">
+            {(['voice_flow', 'voicespeed_agent'] as RoutingTargetType[]).map((tt) => (
+              <button
+                key={tt}
+                type="button"
+                onClick={() => setTargetType(tt)}
+                className={cn(
+                  'rounded-md px-4 py-1.5 text-sm font-medium transition-colors',
+                  targetType === tt
+                    ? 'bg-primary text-white'
+                    : 'text-foreground/70 hover:bg-accent'
+                )}
+              >
+                {tt === 'voice_flow'
+                  ? t('rr.form.target.voiceFlow', locale)
+                  : t('rr.form.target.voiceSpeed', locale)}
+              </button>
+            ))}
           </div>
+
+          {targetType === 'voice_flow' ? (
+            <div className="relative">
+              <select
+                value={targetFlowId === '' ? '' : String(targetFlowId)}
+                onChange={(e) => setTargetFlowId(e.target.value ? Number(e.target.value) : '')}
+                className="h-10 w-full appearance-none rounded-lg border border-border bg-white px-3 pr-9 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+              >
+                <option value="" className="text-muted-foreground">
+                  {t('rr.form.targetFlow.placeholder', locale)}
+                </option>
+                {(flows?.items ?? []).map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.name}
+                  </option>
+                ))}
+              </select>
+              <IconChevronDown size={18} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            </div>
+          ) : (
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-0.5">
+                  <span className="text-sm font-medium text-foreground/80">{t('vs.agent.label', locale)}</span>
+                  <span className="text-sm font-medium text-destructive">*</span>
+                </div>
+                <VoiceSpeedAgentSelect
+                  value={vsAgentId}
+                  agentName={vsAgentName}
+                  onChange={(id, n) => {
+                    setVsAgentId(id)
+                    setVsAgentName(n)
+                  }}
+                  onStatusChange={setVsStatus}
+                />
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-0.5">
+                  <span className="text-sm font-medium text-foreground/80">{t('rr.form.transferTarget', locale)}</span>
+                  <span className="text-sm font-medium text-destructive">*</span>
+                </div>
+                <TransferTargetPicker value={transferTarget} onChange={setTransferTarget} />
+                <p className="text-[13px] text-muted-foreground">{t('rr.form.transferTarget.hint', locale)}</p>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -357,6 +489,90 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
           router.push('/flow-studio/routing-rules')
         }}
       />
+    </div>
+  )
+}
+
+/**
+ * Single human-handoff target picker — mirrors the queue-target selector used
+ * by the assign_queue voice-flow node (user field / employee / employee group),
+ * but limited to one target as required for direct VoiceSpeed routing.
+ */
+function TransferTargetPicker({
+  value,
+  onChange,
+}: {
+  value: AssignQueueTarget
+  onChange: (next: AssignQueueTarget) => void
+}) {
+  const { locale } = useLocaleStore()
+  const { data: groups } = useEmployeeGroups({ page: 1, per_page: 200 })
+  const { data: employees } = useEmployeeSelect({ page: 1, per_page: 200 })
+  const { data: userFields } = useUnifiedFields({
+    domain: FieldDomain.USER,
+    include_metadata: false,
+  })
+  const queueFields =
+    userFields?.items.filter(
+      (field) =>
+        field.id != null &&
+        field.status === 'active' &&
+        (field.field_type === FieldType.EMPLOYEE_SELECT ||
+          field.field_type === FieldType.GROUP_SELECT)
+    ) ?? []
+
+  return (
+    <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-2">
+      <div className="relative">
+        <select
+          value={value.queue_type}
+          onChange={(e) =>
+            onChange({ queue_type: e.target.value as AssignQueueTargetType, queue_id: null })
+          }
+          className="h-10 w-full appearance-none rounded-lg border border-border bg-white px-3 pr-8 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        >
+          <option value="employee_group">{t('rr.form.transfer.type.group', locale)}</option>
+          <option value="employee">{t('rr.form.transfer.type.employee', locale)}</option>
+          <option value="user_field">{t('rr.form.transfer.type.userField', locale)}</option>
+        </select>
+        <IconChevronDown size={16} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+      </div>
+
+      <div className="relative min-w-0">
+        <select
+          value={value.queue_id ?? ''}
+          onChange={(e) =>
+            onChange({ ...value, queue_id: e.target.value ? Number(e.target.value) : null })
+          }
+          className="h-10 w-full appearance-none rounded-lg border border-border bg-white px-3 pr-8 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        >
+          <option value="">
+            {value.queue_type === 'employee'
+              ? t('rr.form.transfer.placeholder.employee', locale)
+              : value.queue_type === 'user_field'
+                ? t('rr.form.transfer.placeholder.userField', locale)
+                : t('rr.form.transfer.placeholder.group', locale)}
+          </option>
+          {value.queue_type === 'employee'
+            ? (employees?.items ?? []).map((emp) => (
+                <option key={emp.id} value={emp.id}>
+                  {emp.display_name || emp.username}
+                </option>
+              ))
+            : value.queue_type === 'user_field'
+              ? queueFields.map((field) => (
+                  <option key={field.id} value={field.id ?? ''}>
+                    {field.name}
+                  </option>
+                ))
+              : (groups?.items ?? []).map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+        </select>
+        <IconChevronDown size={16} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+      </div>
     </div>
   )
 }

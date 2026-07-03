@@ -4,7 +4,7 @@ Public API router — endpoints accessible without authentication.
 Used by the visitor-facing chat widget to fetch channel config, messages, and files.
 """
 from collections.abc import Callable, Coroutine
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from fastapi import Header
@@ -27,6 +27,7 @@ from app.schemas.message import (
     VisitorUnreadOfflineReplyResponse,
 )
 from app.schemas.offline_message import (
+    OfflineMessageSource,
     OfflineMessageCreateRequest,
     OfflineMessageSendRequest,
     PublicOfflineMessageResponse,
@@ -215,6 +216,9 @@ async def create_offline_message_public(
         metadata=payload.metadata,
         visitor_system=payload.system,
         visitor_browser=payload.browser,
+        source=payload.source,
+        queue_type=payload.queue_type,
+        queue_id=payload.queue_id,
     )
 
 
@@ -250,6 +254,9 @@ async def create_and_send_offline_message_public(
         content=body.content,
         visitor_system=body.system,
         visitor_browser=body.browser,
+        source=body.source,
+        queue_type=body.queue_type,
+        queue_id=body.queue_id,
     )
 
 
@@ -411,6 +418,20 @@ async def mark_conversation_customer_read_public(
     )
 
 
+@router.post("/conversations/{conversation_public_id}/queue-leave-message")
+async def leave_queued_conversation_message_public(
+    conversation_public_id: str,
+    db: AsyncSession = Depends(get_db),
+    visitor_context: dict = Depends(get_visitor_context),
+):
+    """Cancel a visitor-owned queued conversation and enter leave-message mode."""
+    return await ConversationService.leave_queued_conversation_message_for_session(
+        db,
+        conversation_public_id,
+        visitor_context,
+    )
+
+
 @router.post("/conversations/{conversation_public_id}/open-agent/chat")
 async def chat_open_agent_public(
     conversation_public_id: str,
@@ -533,6 +554,9 @@ async def create_and_send_offline_message_file_public(
     file: UploadFile = File(...),
     system: str | None = Form(None, max_length=64),
     browser: str | None = Form(None, max_length=128),
+    source: OfflineMessageSource | None = Form(None),
+    queue_type: Literal["employee_group"] | None = Form(None),
+    queue_id: int | None = Form(None, gt=0),
     db: AsyncSession = Depends(get_db),
     r: aioredis.Redis = Depends(get_redis),
     visitor_context: dict = Depends(get_visitor_context),
@@ -545,6 +569,9 @@ async def create_and_send_offline_message_file_public(
         file,
         visitor_system=system,
         visitor_browser=browser,
+        source=source,
+        queue_type=queue_type,
+        queue_id=queue_id,
     )
 
 

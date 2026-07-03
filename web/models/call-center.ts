@@ -101,6 +101,21 @@ export type CallRecordDetail = CallRecordListItem & {
 
 export type CallRecordListResponse = PaginatedResponse<CallRecordListItem>
 
+export type CallTranscriptRole = 'user' | 'agent'
+
+export type CallTranscriptSegment = {
+  id: number
+  role: CallTranscriptRole
+  text: string
+  seq: number | null
+  created_at: string
+}
+
+export type CallTranscriptResponse = {
+  call_id: string | null
+  segments: CallTranscriptSegment[]
+}
+
 export type CallUserAssociationResponse = {
   record_id: number
   call_id: string

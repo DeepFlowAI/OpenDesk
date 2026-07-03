@@ -22,6 +22,7 @@ from app.schemas.call_center import (
     AgentStatusUpdate,
     CallRecordDetail,
     CallRecordUserLinkRequest,
+    CallTranscriptResponse,
     CallUserAssociationResponse,
     CallRecordListResponse,
     CancelOutboundRequest,
@@ -41,6 +42,7 @@ from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
 from app.services.call_center.outbound_dial_service import OutboundDialService
 from app.services.call_center.outbound_webrtc_service import OutboundWebRTCService
 from app.services.call_record_service import CallRecordService
+from app.services.call_transcript_service import CallTranscriptService
 from app.services.call_user_association_service import CallUserAssociationService
 from app.services.cc_agent_resource_service import CcAgentResourceService
 from app.services.cc_agent_status_service import CcAgentStatusService
@@ -154,6 +156,21 @@ async def get_call_record(
     db: AsyncSession = Depends(get_db),
 ):
     return await CallRecordService.get_by_id(db, record_id, principal.tenant_id, principal)
+
+
+@router.get(
+    "/call-records/{record_id}/transcript",
+    response_model=CallTranscriptResponse,
+    dependencies=[Depends(require_permission("call.record.view"))],
+)
+async def get_call_record_transcript(
+    record_id: int,
+    principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    return await CallTranscriptService.get_for_record(
+        db, record_id, principal.tenant_id, principal
+    )
 
 
 @router.post(
@@ -348,59 +365,23 @@ async def webrtc_ice(
 )
 async def hangup_current_call(
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
     """
-    Hang up whatever call the current agent is bridged to.
+    Hang up whatever call the current agent is on.
 
-    Looks up the most recent active CDR for this agent (state in
-    {ringing, queued, in_progress}) and tells the kernel to drop the SIP
-    user leg. FlowKit's `call.hangup` notification then propagates through
-    the orchestrator: CDR is marked completed, agent_status flips to
-    after_call_work, webrtc_session goes back to online_idle, and the
-    browser receives `cc.call_hangup` for UI teardown.
+    Delegated to the orchestrator, which tears down the agent's OWN WebRTC leg
+    as well as the customer SIP leg and resets the agent's status. When the
+    customer leg is already gone the orchestrator finalizes locally (no
+    `call.hangup` event will arrive to drive cleanup), so the agent can always
+    hang up and never gets stuck on 忙碌.
     """
 
-    import logging
-    from sqlalchemy import desc, select
-    from app.models.call_record import CallRecord
-    from app.libs.telephony.base import TelephonyRPCError
+    from app.services.call_center.orchestrator import get_orchestrator
 
-    log = logging.getLogger(__name__)
-    tenant_id = current_user["tenant_id"]
-    employee_id = current_user["user_id"]
-
-    # Find the live call this agent is on.
-    q = (
-        select(CallRecord)
-        .where(
-            CallRecord.tenant_id == tenant_id,
-            CallRecord.agent_id == employee_id,
-            CallRecord.state.in_(("ringing", "queued", "in_progress")),
-        )
-        .order_by(desc(CallRecord.started_at))
-        .limit(1)
+    return await get_orchestrator().hangup_agent_current_call(
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
     )
-    row = (await db.execute(q)).scalar_one_or_none()
-    if row is None:
-        return {"ok": False, "error": "no_active_call"}
-
-    target_call_id = row.root_call_id or row.call_id
-    log.info(
-        "Agent %s requested hangup; target SIP call_id=%s (record id=%s)",
-        employee_id, target_call_id, row.id,
-    )
-    telephony = get_telephony_client()
-    try:
-        await telephony.call_hangup(target_call_id, reason="agent_hangup")
-    except TelephonyRPCError as e:
-        log.warning("call.hangup RPC rejected code=%s msg=%s", e.code, e.args)
-        # If the kernel says "call not found" the call is already torn down;
-        # treat as success so the UI can move on.
-        if e.code == -32002:
-            return {"ok": True, "note": "already_ended"}
-        return {"ok": False, "error": "rpc_error", "code": e.code}
-    return {"ok": True, "call_id": target_call_id}
 
 
 @router.post(

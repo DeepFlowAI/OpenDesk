@@ -46,6 +46,11 @@ async def get_current_user(authorization: str | None = Header(None)) -> dict:
         except (ValueError, TypeError):
             raise UnauthorizedError("Token contains invalid tenant_id, please re-login")
 
+    from app.services.employee_session_service import EmployeeSessionService
+
+    async with AsyncSessionLocal() as db:
+        await EmployeeSessionService.validate_payload(db, payload)
+
     return payload
 
 

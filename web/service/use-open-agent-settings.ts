@@ -11,6 +11,7 @@ import type {
   UpdateVoiceSpeedSettingsPayload,
   VoiceSpeedSettings,
 } from '@/models/open-agent-settings'
+import type { VoiceSpeedAgentListResponse } from '@/models/voice-speed-agent'
 
 const NS = 'open-agent-settings'
 
@@ -19,6 +20,7 @@ export const openAgentSettingsKeys = {
   detail: () => [...openAgentSettingsKeys.all, 'detail'] as const,
   agents: () => [...openAgentSettingsKeys.all, 'agents'] as const,
   voiceSpeed: () => [...openAgentSettingsKeys.all, 'voice-speed'] as const,
+  voiceSpeedAgents: () => [...openAgentSettingsKeys.all, 'voice-speed', 'agents'] as const,
 }
 
 export const useOpenAgentSettings = () =>
@@ -71,6 +73,14 @@ export const useOpenAgentAgents = (enabled = true) =>
   useQuery({
     queryKey: openAgentSettingsKeys.agents(),
     queryFn: () => get<OpenAgentAgentListResponse>('v1/open-agent-settings/agents'),
+    enabled,
+    retry: false,
+  })
+
+export const useVoiceSpeedAgents = (enabled = true) =>
+  useQuery({
+    queryKey: openAgentSettingsKeys.voiceSpeedAgents(),
+    queryFn: () => get<VoiceSpeedAgentListResponse>('v1/voice-speed/agents'),
     enabled,
     retry: false,
   })

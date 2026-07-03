@@ -29,6 +29,15 @@ class SessionRecordAgent(BaseModel):
     avatar: str | None = None
 
 
+class SessionRecordAgentFilterOption(BaseModel):
+    id: int
+    name: str
+
+
+class SessionRecordAgentFilterOptionsResponse(BaseModel):
+    items: list[SessionRecordAgentFilterOption] = Field(default_factory=list)
+
+
 class SessionRecordChannel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

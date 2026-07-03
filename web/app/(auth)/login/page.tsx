@@ -1,9 +1,9 @@
 'use client'
 
-import { useState, useEffect, useCallback, Suspense } from 'react'
+import { useState, useEffect, useCallback, useRef, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { IconHeadset, IconEye, IconEyeOff } from '@tabler/icons-react'
-import { useLogin } from '@/service/use-auth'
+import { useLogin, useSsoLogin } from '@/service/use-auth'
 import { useSystemInfo } from '@/service/use-system'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
@@ -12,6 +12,7 @@ import { getDefaultAccessiblePath } from '@/utils/permissions'
 import { loginSchema, TENANT_IDENTIFIER_REGEX } from '@/utils/validators'
 import { cn } from '@/lib/utils'
 import { LegalFooter } from '@/components/legal-footer'
+import { SESSION_REPLACED_REASON } from '@/utils/session-replacement'
 
 const LAST_TENANT_KEY = 'opendesk_last_tenant'
 
@@ -29,7 +30,9 @@ function LoginPage() {
   const { setAuth } = useAuthStore()
   const { locale, setLocale } = useLocaleStore()
   const loginMutation = useLogin()
+  const ssoLoginMutation = useSsoLogin()
   const { data: systemInfo } = useSystemInfo()
+  const ssoHandledRef = useRef(false)
   // Default to false (= show field) when info unavailable — safer for users
   // who otherwise wouldn't see what to type.
   const singleTenantMode = systemInfo?.single_tenant_mode ?? false
@@ -37,8 +40,43 @@ function LoginPage() {
   const [formData, setFormData] = useState({ tenant: '', username: '', password: '' })
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
   const [apiError, setApiError] = useState('')
+  const [showSessionReplacedAlert, setShowSessionReplacedAlert] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [touched, setTouched] = useState<Record<string, boolean>>({})
+
+  useEffect(() => {
+    setShowSessionReplacedAlert(searchParams.get('reason') === SESSION_REPLACED_REASON)
+  }, [searchParams])
+
+  useEffect(() => {
+    const ssoToken = searchParams.get('sso_token')
+    if (!ssoToken || ssoHandledRef.current) return
+    ssoHandledRef.current = true
+    setApiError('')
+    ssoLoginMutation.mutate(ssoToken, {
+      onSuccess: (data) => {
+        setAuth(data.user, data.access_token)
+        const redirect = searchParams.get('redirect')
+        const defaultPath = getDefaultAccessiblePath(data.user)
+        router.replace(redirect && redirect.startsWith('/') ? redirect : defaultPath)
+      },
+      onError: async (err: unknown) => {
+        let status = 0
+        let code = ''
+        if (err && typeof err === 'object' && 'response' in err) {
+          const response = (err as { response: Response }).response
+          status = response.status
+          try {
+            const body = await response.json()
+            code = body?.code ?? ''
+          } catch {
+            // ignore json parse error
+          }
+        }
+        setApiError(mapApiError(status, code))
+      },
+    })
+  }, [router, searchParams, setAuth, ssoLoginMutation])
 
   useEffect(() => {
     if (singleTenantMode && systemInfo) {
@@ -90,6 +128,7 @@ function LoginPage() {
   const handleChange = (field: string, value: string) => {
     setFormData((prev) => ({ ...prev, [field]: value }))
     setApiError('')
+    setShowSessionReplacedAlert(false)
     if (touched[field]) {
       validateField(field, value)
     }
@@ -195,6 +234,14 @@ function LoginPage() {
       {/* Main area */}
       <div className="flex flex-1 items-center justify-center">
         <div className="w-[400px] rounded-xl border border-border bg-white p-6">
+          {showSessionReplacedAlert && (
+            <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 p-3">
+              <p className="text-[13px] text-destructive/80">
+                {t('login.session_replaced', locale)}
+              </p>
+            </div>
+          )}
+
           {/* Title */}
           <div className="mb-3 flex flex-col gap-2">
             <h1 className="font-sans text-2xl font-bold text-foreground">

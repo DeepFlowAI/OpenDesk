@@ -39,6 +39,13 @@ VISITOR_MESSAGE_CONTENT_TYPES = {
     MessageContentType.IMAGE.value,
     MessageContentType.FILE.value,
 }
+OUTBOUND_MESSAGE_CONTENT_TYPES = {
+    MessageContentType.TEXT.value,
+    MessageContentType.RICH_TEXT.value,
+    MessageContentType.IMAGE.value,
+    MessageContentType.FILE.value,
+    MessageContentType.WELCOME.value,
+}
 
 
 class VisitorTimeoutCloseService:
@@ -199,11 +206,10 @@ class VisitorTimeoutCloseService:
             if not conversation:
                 return None
         existing = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, conversation.id)
-        if VisitorTimeoutCloseService._is_locked(existing):
+        if existing:
             return existing
         payload, version = await VisitorTimeoutCloseService._setting_or_default(db, conversation.tenant_id)
         effective_anchor_at = anchor_at or conversation.started_at or datetime.now(timezone.utc)
-        next_check_at = VisitorTimeoutCloseService._next_check_at(payload, conversation, effective_anchor_at, None)
         return await VisitorTimeoutCloseStateRepository.upsert_for_conversation(
             db,
             tenant_id=conversation.tenant_id,
@@ -212,7 +218,7 @@ class VisitorTimeoutCloseService:
             anchor_message_id=None,
             first_reminded_at=None,
             closed_at=None,
-            next_check_at=next_check_at,
+            next_check_at=None,
             config_version=version,
             commit=commit,
         )
@@ -238,6 +244,49 @@ class VisitorTimeoutCloseService:
             return existing
         payload, version = await VisitorTimeoutCloseService._setting_or_default(db, conversation.tenant_id)
         anchor_at = message.created_at or datetime.now(timezone.utc)
+        return await VisitorTimeoutCloseStateRepository.upsert_for_conversation(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            anchor_at=anchor_at,
+            anchor_message_id=message.id,
+            first_reminded_at=None,
+            closed_at=None,
+            next_check_at=None,
+            config_version=version,
+            commit=commit,
+        )
+
+    @staticmethod
+    async def reset_on_outbound_message(
+        db: AsyncSession,
+        conversation,
+        message,
+        *,
+        commit: bool = True,
+    ) -> VisitorTimeoutCloseState | None:
+        if (
+            not conversation
+            or getattr(conversation, "status", None) != ConversationStatus.ACTIVE.value
+            or not getattr(conversation, "agent_id", None)
+        ):
+            return None
+        content_type = getattr(message, "content_type", None)
+        if content_type not in OUTBOUND_MESSAGE_CONTENT_TYPES:
+            return None
+        is_agent_message = getattr(message, "sender_type", None) == MessageSenderType.AGENT.value
+        is_welcome_message = content_type == MessageContentType.WELCOME.value
+        if not is_agent_message and not is_welcome_message:
+            return None
+        if getattr(conversation, "visitor", None) is None:
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            if not conversation:
+                return None
+        existing = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, conversation.id)
+        if VisitorTimeoutCloseService._is_locked(existing):
+            return existing
+        payload, version = await VisitorTimeoutCloseService._setting_or_default(db, conversation.tenant_id)
+        anchor_at = message.created_at or datetime.now(timezone.utc)
         next_check_at = VisitorTimeoutCloseService._next_check_at(payload, conversation, anchor_at, None)
         return await VisitorTimeoutCloseStateRepository.upsert_for_conversation(
             db,
@@ -245,6 +294,39 @@ class VisitorTimeoutCloseService:
             conversation_id=conversation.id,
             anchor_at=anchor_at,
             anchor_message_id=message.id,
+            first_reminded_at=None,
+            closed_at=None,
+            next_check_at=next_check_at,
+            config_version=version,
+            commit=commit,
+        )
+
+    @staticmethod
+    async def restart_on_transfer(
+        db: AsyncSession,
+        conversation,
+        *,
+        anchor_at: datetime | None = None,
+        commit: bool = True,
+    ) -> VisitorTimeoutCloseState | None:
+        if not conversation or conversation.status != ConversationStatus.ACTIVE.value or not conversation.agent_id:
+            return None
+        if getattr(conversation, "visitor", None) is None:
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            if not conversation:
+                return None
+        existing = await VisitorTimeoutCloseStateRepository.get_by_conversation(db, conversation.id)
+        if VisitorTimeoutCloseService._is_locked(existing):
+            return existing
+        payload, version = await VisitorTimeoutCloseService._setting_or_default(db, conversation.tenant_id)
+        transfer_at = anchor_at or datetime.now(timezone.utc)
+        next_check_at = VisitorTimeoutCloseService._next_check_at(payload, conversation, transfer_at, None)
+        return await VisitorTimeoutCloseStateRepository.upsert_for_conversation(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            anchor_at=transfer_at,
+            anchor_message_id=None,
             first_reminded_at=None,
             closed_at=None,
             next_check_at=next_check_at,
@@ -411,15 +493,31 @@ class VisitorTimeoutCloseService:
             sender_type=MessageSenderType.VISITOR.value,
             content_types=VISITOR_MESSAGE_CONTENT_TYPES,
         )
-        if latest_user_message and (
-            state.anchor_message_id != latest_user_message.id
-            or latest_user_message.created_at > state.anchor_at
-        ):
-            await VisitorTimeoutCloseService.reset_on_visitor_message(db, conversation, latest_user_message)
-            return "skipped"
+        if latest_user_message and latest_user_message.created_at:
+            visitor_after_anchor = latest_user_message.created_at > state.anchor_at
+            same_anchor_newer_message = (
+                state.anchor_message_id is not None
+                and latest_user_message.created_at == state.anchor_at
+                and latest_user_message.id > state.anchor_message_id
+            )
+            if visitor_after_anchor or same_anchor_newer_message:
+                await VisitorTimeoutCloseService.reset_on_visitor_message(db, conversation, latest_user_message)
+                return "skipped"
 
         first_minutes, close_minutes = VisitorTimeoutCloseService._thresholds(payload, conversation)
         elapsed_seconds = (checked_at - state.anchor_at).total_seconds()
+        if elapsed_seconds >= first_minutes * 60 and state.first_reminded_at is None:
+            await VisitorTimeoutCloseService._send_reminder(
+                db,
+                state,
+                conversation,
+                payload,
+                version,
+                first_minutes,
+                checked_at,
+            )
+            return "reminded"
+
         if elapsed_seconds >= close_minutes * 60:
             await VisitorTimeoutCloseService._auto_close(
                 db,
@@ -432,18 +530,6 @@ class VisitorTimeoutCloseService:
                 r,
             )
             return "closed"
-
-        if elapsed_seconds >= first_minutes * 60 and state.first_reminded_at is None:
-            await VisitorTimeoutCloseService._send_reminder(
-                db,
-                state,
-                conversation,
-                payload,
-                version,
-                first_minutes,
-                checked_at,
-            )
-            return "reminded"
 
         next_check_at = VisitorTimeoutCloseService._next_check_at(
             payload,
@@ -523,12 +609,16 @@ class VisitorTimeoutCloseService:
             anchor_at=state.anchor_at,
         )
         _, close_minutes = VisitorTimeoutCloseService._thresholds(payload, conversation)
+        next_check_at = state.anchor_at + timedelta(minutes=close_minutes)
+        if next_check_at <= now:
+            reminder_gap_minutes = max(close_minutes - timeout_minutes, 1)
+            next_check_at = now + timedelta(minutes=reminder_gap_minutes)
         await VisitorTimeoutCloseStateRepository.update(
             db,
             state,
             {
                 "first_reminded_at": now,
-                "next_check_at": state.anchor_at + timedelta(minutes=close_minutes),
+                "next_check_at": next_check_at,
                 "config_version": version,
             },
         )
@@ -546,7 +636,7 @@ class VisitorTimeoutCloseService:
             state.anchor_at.isoformat(),
             now.isoformat(),
             timeout_minutes,
-            (state.anchor_at + timedelta(minutes=close_minutes)).isoformat(),
+            next_check_at.isoformat(),
             ",".join(VisitorTimeoutCloseService._visible_to(payload)),
         )
 

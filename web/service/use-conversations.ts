@@ -52,6 +52,24 @@ export const patchConversationListCache = (
   })
 }
 
+// Insert a socket-pushed conversation at the head of the cached "my" list so
+// it survives a later full-list sync. The store gets the conversation via
+// addConversation, but the HTTP list cache stays stale (its 60s freshness
+// window suppresses a refetch on navigation); without this, the next
+// setConversations call replaces the store with a snapshot that predates the
+// push and the conversation silently disappears until a manual refresh.
+export const prependConversationToListCache = (
+  qc: QueryClient,
+  conversation: Conversation,
+  scope: ConversationListScope = 'my',
+) => {
+  qc.setQueryData<ConversationListResponse>(conversationKeys.list(scope), (prev) => {
+    if (!prev) return prev
+    if (prev.items.some((item) => item.id === conversation.id)) return prev
+    return { ...prev, items: [conversation, ...prev.items], total: prev.total + 1 }
+  })
+}
+
 const visitorWebStatusTimestamp = (value: VisitorWebStatusResponse | undefined) => {
   const timestamp = Date.parse(value?.checked_at ?? '')
   return Number.isNaN(timestamp) ? 0 : timestamp

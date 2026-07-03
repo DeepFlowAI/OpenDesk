@@ -1,6 +1,6 @@
 import type { AgentBrief, ChannelBrief, Conversation, GroupBrief, Message, VisitorBrief } from '@/models/conversation'
 
-export type OfflineMessageStatus = 'pending' | 'converted'
+export type OfflineMessageStatus = 'pending' | 'converted' | 'archived'
 
 export type OfflineMessageEntry = Omit<Message, 'conversation_id' | 'conversation_public_id'> & {
   offline_message_id: number
@@ -15,6 +15,7 @@ export type OfflineMessage = {
   channel: ChannelBrief | null
   target_group: GroupBrief | null
   conversation: Conversation | null
+  handled_by: AgentBrief | null
   visitor_external_id: string
   visitor_name: string | null
   handled_by_id: number | null
@@ -50,4 +51,13 @@ export type OfflineMessageConvertResponse = {
   messages: Message[]
   assigned_to_current_user?: boolean
   assigned_agent?: AgentBrief | null
+}
+
+export type OfflineMessageArchiveResponse = {
+  offline_message: OfflineMessage
+}
+
+export type OfflineMessageConvertAndSendResponse = OfflineMessageConvertResponse & {
+  message: Message | null
+  message_sent: boolean
 }

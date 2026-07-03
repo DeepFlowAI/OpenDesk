@@ -11,7 +11,7 @@ import {
   IconPlus,
   IconTrash,
 } from '@tabler/icons-react'
-import type { Node } from '@xyflow/react'
+import type { Edge, Node } from '@xyflow/react'
 
 import { PromptInput } from './prompt-input'
 import {
@@ -28,9 +28,11 @@ import {
   type ConditionOperator,
   type HangupData,
   type PlayData,
+  type VoiceSpeedData,
   defaultAssignQueueData,
   defaultGroup,
 } from '@/models/voice-flow-graph'
+import { VoiceSpeedAgentSelect } from '@/app/components/features/voice-speed-agent-select'
 import { useEmployeeGroups, useEmployeeSelect } from '@/service/use-employee-groups'
 import { useUnifiedFields } from '@/service/use-field-definitions'
 import { useServiceHours } from '@/service/use-service-hours'
@@ -44,11 +46,15 @@ export function PropertyPanel({
   updateNode,
   allNodes,
   graphVariables,
+  edges = [],
+  onConnectOutlet,
 }: {
   selected: Node | null
   updateNode: (id: string, patch: { data?: Record<string, unknown> }) => void
   allNodes: SelectableNode[]
   graphVariables: string[]
+  edges?: Edge[]
+  onConnectOutlet?: (sourceId: string, handle: string, targetId: string | null) => void
 }) {
   if (!selected) {
     return (
@@ -98,6 +104,16 @@ export function PropertyPanel({
             setData={setData<AssignQueueData>}
           />
         )}
+        {type === 'voicespeed' && (
+          <VoiceSpeedPanel
+            nodeId={id}
+            data={selected.data as VoiceSpeedData}
+            setData={setData<VoiceSpeedData>}
+            allNodes={allNodes}
+            edges={edges}
+            onConnectOutlet={onConnectOutlet}
+          />
+        )}
         {type === 'hangup' && (
           <HangupPanel data={selected.data as HangupData} setData={setData<HangupData>} />
         )}
@@ -113,6 +129,7 @@ function typeLabel(t: string): string {
     case 'collect': return '收集输入'
     case 'condition': return '信息判定'
     case 'assign_queue': return '分配队列'
+    case 'voicespeed': return 'VoiceSpeed'
     case 'hangup': return '挂断'
     default: return t
   }
@@ -464,7 +481,15 @@ function ConditionPanel({
 
       <button
         type="button"
-        onClick={() => setData({ groups: [...data.groups, defaultGroup()] })}
+        onClick={() => {
+          // Give each new group a unique default name so saving doesn't fail
+          // the "group names must be unique" check before the user renames it.
+          const used = new Set(data.groups.map((g) => g.name))
+          let n = data.groups.length + 1
+          let name = `条件组${n}`
+          while (used.has(name)) name = `条件组${++n}`
+          setData({ groups: [...data.groups, { ...defaultGroup(), name }] })
+        }}
         className="flex w-full items-center justify-center gap-1 rounded-md border border-dashed border-border py-2 text-xs text-primary"
       >
         <IconPlus size={14} /> 添加条件组
@@ -798,6 +823,95 @@ function TextAreaField({
       />
       <div className="mt-0.5 text-right text-[11px] text-foreground/50">{value.length}/300</div>
     </div>
+  )
+}
+
+// ─────────────── voicespeed ───────────────
+
+function VoiceSpeedPanel({
+  nodeId,
+  data,
+  setData,
+  allNodes,
+  edges,
+  onConnectOutlet,
+}: {
+  nodeId: string
+  data: VoiceSpeedData
+  setData: (p: Partial<VoiceSpeedData>) => void
+  allNodes: SelectableNode[]
+  edges: Edge[]
+  onConnectOutlet?: (sourceId: string, handle: string, targetId: string | null) => void
+}) {
+  // The handoff outlet shares one source of truth with the canvas: the edge
+  // from this node's `handoff` handle. The dropdown reads/writes that edge so
+  // editing either place stays in sync.
+  const handoffEdge = edges.find(
+    (e) => e.source === nodeId && (e.sourceHandle ?? 'next') === 'handoff',
+  )
+  const handoffTarget = handoffEdge?.target ?? ''
+  const targetOptions = allNodes.filter((n) => n.id !== nodeId && n.type !== 'start')
+
+  return (
+    <>
+      <section className="space-y-3">
+        <h4 className="text-sm font-semibold text-foreground">Agent 设置</h4>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-foreground/80">
+            VoiceSpeed Agent <span className="text-destructive">*</span>
+          </label>
+          <VoiceSpeedAgentSelect
+            value={data.agent_id}
+            agentName={data.agent_name}
+            onChange={(id, name) => setData({ agent_id: id, agent_name: name })}
+          />
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <h4 className="text-sm font-semibold text-foreground">转人工设置</h4>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-foreground/80">
+            转人工出口 <span className="text-destructive">*</span>
+          </label>
+          <div className="relative">
+            <select
+              value={handoffTarget}
+              onChange={(e) => onConnectOutlet?.(nodeId, 'handoff', e.target.value || null)}
+              disabled={!onConnectOutlet}
+              className="h-9 w-full appearance-none rounded-md border border-border bg-white px-2 pr-8 text-sm disabled:opacity-50"
+            >
+              <option value="">请选择后续节点</option>
+              {targetOptions.map((n) => (
+                <option key={n.id} value={n.id}>
+                  {n.label}
+                </option>
+              ))}
+            </select>
+            <IconChevronDown size={14} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
+          </div>
+          <p className="mt-1 text-xs text-foreground/60">
+            与画布上的「转人工」出口连线为同一份数据，任一处修改自动同步。推荐连接到「分配队列」节点。
+          </p>
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <h4 className="text-sm font-semibold text-foreground">运行异常提示</h4>
+        <TextAreaField
+          label="Agent 不可用提示"
+          value={data.unavailable_prompt_text}
+          onChange={(value) => setData({ unavailable_prompt_text: value })}
+          placeholder="当前智能语音服务不可用，请稍后再拨。"
+        />
+        <TextAreaField
+          label="连接失败提示"
+          value={data.connect_failed_prompt_text}
+          onChange={(value) => setData({ connect_failed_prompt_text: value })}
+          placeholder="暂时无法接入智能语音服务，请稍后再拨。"
+        />
+      </section>
+    </>
   )
 }
 

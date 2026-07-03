@@ -1,7 +1,15 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
+import {
+  IconArchive,
   IconInbox,
   IconLoader2,
   IconMessageCircle,
@@ -27,6 +35,7 @@ import type { AgentStatus, Conversation, Message } from '@/models/conversation'
 import type { UnifiedField } from '@/models/field-definition'
 import type {
   OfflineMessage,
+  OfflineMessageArchiveResponse,
   OfflineMessageConvertResponse,
   OfflineMessageDetail,
   OfflineMessageEntry,
@@ -35,6 +44,7 @@ import type { QueueAssignableAgent } from '@/models/queue-workspace'
 import type { User } from '@/models/user'
 import {
   getNextPendingOfflineMessageId,
+  useArchiveOfflineMessage,
   useAssignOfflineMessageToAgent,
   useAssignOfflineMessageToSelf,
   useOfflineMessage,
@@ -45,15 +55,33 @@ import { useAssignableAgents } from '@/service/use-queue-workspace'
 import { useUnifiedFields } from '@/service/use-field-definitions'
 import { useUser } from '@/service/use-users'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
+import { DeferredConversationComposer } from '@/app/components/features/chat/deferred-conversation-composer'
 import { FieldValueDisplay } from '@/app/components/features/field-system/field-value-display'
 import { t } from '@/utils/i18n'
 import { isLeaveMessagePromptMessage } from '@/lib/offline-message-event'
+import type { Socket } from 'socket.io-client'
+
+type OfflineAssignedOptions = { openConversation?: boolean; messageSent?: boolean }
+
+type OfflineAssignedHandler = (
+  response: OfflineMessageConvertResponse,
+  offlineMessageId: number,
+  options?: OfflineAssignedOptions,
+) => void
+
+type OfflineArchivedHandler = (
+  response: OfflineMessageArchiveResponse,
+  offlineMessageId: number,
+) => void
 
 type Props = {
   status: OfflineMessageListStatus
-  onAssigned?: (response: OfflineMessageConvertResponse, offlineMessageId: number) => void
+  onAssigned?: OfflineAssignedHandler
+  onArchived?: OfflineArchivedHandler
   readOnly?: boolean
   agentStatus?: AgentStatus | null
+  socket?: Socket | null
+  showStatusFilter?: boolean
 }
 
 type OfflineMessageListSidebarProps = {
@@ -68,9 +96,11 @@ type OfflineMessageListSidebarProps = {
 
 type OfflineMessageDetailPanelProps = {
   selectedId: number | null
-  onAssigned?: (response: OfflineMessageConvertResponse, offlineMessageId: number) => void
+  onAssigned?: OfflineAssignedHandler
+  onArchived?: OfflineArchivedHandler
   readOnly?: boolean
   agentStatus?: AgentStatus | null
+  socket?: Socket | null
   auxiliaryPanelWidth?: number
   resizeHandle?: ReactNode
 }
@@ -85,6 +115,34 @@ const SYSTEM_KEY_ALIAS: Record<string, keyof User> = {
   nickname: 'name',
   assignee: 'agent_id',
   assignee_group: 'assignee_group_id',
+}
+
+function offlineMessageDraftConversation(detail: OfflineMessageDetail): Conversation {
+  return {
+    id: detail.conversation?.id ?? -detail.id,
+    public_id: detail.conversation?.public_id ?? detail.public_id,
+    share_code: detail.conversation?.share_code ?? '',
+    tenant_id: detail.tenant_id,
+    visitor: detail.visitor,
+    agent: null,
+    channel: detail.channel,
+    group: detail.target_group,
+    status: detail.conversation?.status ?? 'queued',
+    started_at: detail.conversation?.started_at ?? null,
+    ended_at: null,
+    ended_by: null,
+    last_message_at: detail.last_message_at,
+    last_message_preview: detail.last_message_preview,
+    visitor_system: null,
+    visitor_browser: null,
+    visitor_ip: null,
+    unread_count: 0,
+    has_history_conversations: false,
+    viewer_relation: 'own',
+    collaborated_by_current_user: false,
+    collaborators: [],
+    created_at: detail.created_at,
+  }
 }
 
 function formatTime(value: string | null | undefined, locale: string): string {
@@ -110,7 +168,21 @@ function visitorLabel(item: OfflineMessage, locale: string): string {
 
 function statusLabel(status: OfflineMessage['status'], locale: string): string {
   if (status === 'pending') return locale === 'zh' ? '待处理' : 'Pending'
+  if (status === 'archived') return locale === 'zh' ? '已归档' : 'Archived'
   return locale === 'zh' ? '已创建会话' : 'Converted'
+}
+
+function listTitle(status: OfflineMessageListStatus, locale: string): string {
+  if (status === 'pending') return locale === 'zh' ? '待处理留言' : 'Pending Messages'
+  if (status === 'converted') return locale === 'zh' ? '已创建会话留言' : 'Converted Messages'
+  if (status === 'archived') return locale === 'zh' ? '已归档留言' : 'Archived Messages'
+  return locale === 'zh' ? '全部留言' : 'All Offline Messages'
+}
+
+function statusBadgeClass(status: OfflineMessage['status']): string {
+  if (status === 'pending') return 'bg-amber-50 text-amber-700'
+  if (status === 'archived') return 'bg-muted text-muted-foreground'
+  return 'bg-emerald-50 text-emerald-700'
 }
 
 function entryToMessage(entry: OfflineMessageEntry): Message {
@@ -123,9 +195,11 @@ function entryToMessage(entry: OfflineMessageEntry): Message {
 function OfflineMessageBubble({
   entry,
   offlineMessageId,
+  visitorName,
 }: {
   entry: OfflineMessageEntry
   offlineMessageId: number
+  visitorName: string | null
 }) {
   const { locale } = useLocaleStore()
   const message = entryToMessage(entry)
@@ -133,6 +207,7 @@ function OfflineMessageBubble({
     message.content_type === 'image' ? 'image' : message.content_type === 'file' ? 'file' : null
   const isVisitor = message.sender_type === 'visitor'
   const isLeaveMessagePrompt = isLeaveMessagePromptMessage(message)
+  const senderLabel = visitorName || message.sender_name || t('ws.chat.queueVisitor', locale)
 
   return (
     <div
@@ -143,7 +218,7 @@ function OfflineMessageBubble({
     >
       {isVisitor ? (
         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#4A8C5C] text-sm font-medium text-white">
-          {(message.sender_name || '访').charAt(0)}
+          {senderLabel.charAt(0)}
         </div>
       ) : isLeaveMessagePrompt ? (
         <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#D6E6F9] text-sm font-medium text-[#4A80B5]">
@@ -156,6 +231,11 @@ function OfflineMessageBubble({
           isVisitor ? 'items-start' : isLeaveMessagePrompt ? 'items-end' : 'items-center',
         )}
       >
+        {isVisitor && (
+          <span className="mb-1 text-[11px] text-[#737373]">
+            {senderLabel}
+          </span>
+        )}
         {attachmentType ? (
           <MessageAttachment
             offlineMessageId={offlineMessageId}
@@ -199,9 +279,7 @@ export function OfflineMessageListSidebar({
         <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
           <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
             <IconInbox size={18} />
-            {status === 'pending'
-              ? locale === 'zh' ? '待处理留言' : 'Pending Messages'
-              : locale === 'zh' ? '全部留言' : 'All Offline Messages'}
+            {listTitle(status, locale)}
           </div>
           <button
             type="button"
@@ -246,9 +324,7 @@ export function OfflineMessageListSidebar({
                   <span
                     className={cn(
                       'shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium',
-                      item.status === 'pending'
-                        ? 'bg-amber-50 text-amber-700'
-                        : 'bg-emerald-50 text-emerald-700',
+                      statusBadgeClass(item.status),
                     )}
                   >
                     {statusLabel(item.status, locale)}
@@ -274,22 +350,44 @@ function displayAgentName(agent: QueueAssignableAgent): string {
   return agent.display_name || agent.name || `#${agent.id}`
 }
 
+// Backend message returned when the visitor already has an in-progress conversation.
+const ACTIVE_CONVERSATION_ERROR = 'Visitor already has an active conversation'
+const OFFLINE_MESSAGE_CONVERTED_ERROR = 'Offline message has already been converted'
+const OFFLINE_MESSAGE_ARCHIVED_ERROR = 'Offline message has already been archived'
+
+async function readBackendErrorMessage(err: unknown): Promise<string | null> {
+  if (err && typeof err === 'object' && 'response' in err) {
+    const resp = (err as { response: Response }).response
+    try {
+      const body = (await resp.clone().json()) as { message?: string }
+      return body?.message ?? null
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
 export function OfflineMessageDetailPanel({
   selectedId,
   onAssigned,
+  onArchived,
   readOnly = false,
   agentStatus = null,
+  socket = null,
   auxiliaryPanelWidth,
   resizeHandle,
 }: OfflineMessageDetailPanelProps) {
   const { locale } = useLocaleStore()
   const detailQuery = useOfflineMessage(selectedId)
+  const archiveMessage = useArchiveOfflineMessage()
   const assignSelf = useAssignOfflineMessageToSelf()
   const assignAgent = useAssignOfflineMessageToAgent()
   const detail = detailQuery.data ?? null
   const showAuxiliaryPanel = typeof auxiliaryPanelWidth === 'number'
   const [toast, setToast] = useState<string | null>(null)
   const [assignOpen, setAssignOpen] = useState(false)
+  const deferredAssignmentRef = useRef<OfflineMessageConvertResponse | null>(null)
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => () => {
@@ -302,6 +400,8 @@ export function OfflineMessageDetailPanel({
     toastTimerRef.current = setTimeout(() => setToast(null), 2500)
   }, [])
 
+  const isOffline = agentStatus?.status === 'offline'
+
   const handleAssignSelf = useCallback(async () => {
     if (!detail || detail.status !== 'pending') return
     if (agentStatus?.status === 'offline') {
@@ -312,11 +412,64 @@ export function OfflineMessageDetailPanel({
       const result = await assignSelf.mutateAsync({ id: detail.id })
       onAssigned?.(result, detail.id)
       showToast(t('ws.chat.queueAssignedToMe', locale))
-    } catch {
-      showToast(t('ws.chat.queueAssignFailed', locale))
+    } catch (err) {
+      const backendMessage = await readBackendErrorMessage(err)
+      showToast(
+        backendMessage === ACTIVE_CONVERSATION_ERROR
+          ? t('ws.chat.queueAssignActiveConversation', locale)
+          : t('ws.chat.queueAssignFailed', locale),
+      )
       void detailQuery.refetch()
     }
   }, [agentStatus?.status, assignSelf, detail, detailQuery, locale, onAssigned, showToast])
+
+  const handleArchive = useCallback(async () => {
+    if (!detail || detail.status !== 'pending') return
+    try {
+      const result = await archiveMessage.mutateAsync(detail.id)
+      onArchived?.(result, detail.id)
+      showToast(t('ws.chat.offlineArchived', locale))
+    } catch (err) {
+      const backendMessage = await readBackendErrorMessage(err)
+      showToast(
+        backendMessage === OFFLINE_MESSAGE_ARCHIVED_ERROR
+          ? t('ws.chat.offlineArchived', locale)
+          : backendMessage === OFFLINE_MESSAGE_CONVERTED_ERROR
+            ? t('ws.chat.offlineAlreadyConverted', locale)
+            : t('ws.chat.queueAssignFailed', locale),
+      )
+      void detailQuery.refetch()
+    }
+  }, [archiveMessage, detail, detailQuery, locale, onArchived, showToast])
+
+  const isProcessing =
+    archiveMessage.isPending
+    || assignSelf.isPending
+    || assignAgent.isPending
+  const deferredConversation = detail ? offlineMessageDraftConversation(detail) : null
+  const resolveConversationForSend = async () => {
+    if (!detail || detail.status !== 'pending') throw new Error('Offline message is required')
+    if (isOffline) {
+      showToast(t('ws.chat.queueQuickReplyOffline', locale))
+      throw new Error('Agent is offline')
+    }
+
+    try {
+      const response = await assignSelf.mutateAsync({ id: detail.id })
+      deferredAssignmentRef.current = response
+      return { conversation: response.conversation }
+    } catch (err) {
+      deferredAssignmentRef.current = null
+      const backendMessage = await readBackendErrorMessage(err)
+      showToast(
+        backendMessage === ACTIVE_CONVERSATION_ERROR
+          ? t('ws.chat.queueAssignActiveConversation', locale)
+          : t('ws.chat.queueQuickSendStateChanged', locale),
+      )
+      void detailQuery.refetch()
+      throw err
+    }
+  }
 
   return (
     <>
@@ -349,17 +502,30 @@ export function OfflineMessageDetailPanel({
                 <span
                   className={cn(
                     'rounded-full px-2.5 py-1 text-xs font-medium',
-                    detail.status === 'pending' ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700',
+                    statusBadgeClass(detail.status),
                   )}
                 >
                   {statusLabel(detail.status, locale)}
                 </span>
                 {!readOnly && detail.status === 'pending' && (
                   <div className="flex shrink-0 items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={isProcessing}
+                      onClick={() => void handleArchive()}
+                    >
+                      {archiveMessage.isPending ? (
+                        <IconLoader2 size={14} className="mr-1 animate-spin" />
+                      ) : (
+                        <IconArchive size={14} className="mr-1" />
+                      )}
+                      {t('ws.chat.offlineArchive', locale)}
+                    </Button>
                     {detail.can_assign_self && (
                       <Button
                         size="sm"
-                        disabled={assignSelf.isPending || detail.messages.length === 0}
+                        disabled={isProcessing || detail.messages.length === 0}
                         onClick={() => void handleAssignSelf()}
                       >
                         {assignSelf.isPending ? (
@@ -374,7 +540,7 @@ export function OfflineMessageDetailPanel({
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={detail.messages.length === 0}
+                        disabled={isProcessing || detail.messages.length === 0}
                         onClick={() => setAssignOpen(true)}
                       >
                         <IconUsers size={14} className="mr-1" />
@@ -398,11 +564,36 @@ export function OfflineMessageDetailPanel({
                       key={entry.id}
                       entry={entry}
                       offlineMessageId={detail.id}
+                      visitorName={detail.visitor?.name || detail.visitor_name || null}
                     />
                   ))}
                 </div>
               )}
             </div>
+
+            {!readOnly && detail.status === 'pending' && detail.can_assign_self && detail.messages.length > 0 && deferredConversation && (
+              <div className="shrink-0 border-t border-[#E5E5E5] bg-[#FAFAFA] pt-3">
+                <div className="mb-2 px-6 text-xs text-muted-foreground">
+                  {isOffline ? t('ws.chat.queueQuickReplyOffline', locale) : t('ws.chat.queueQuickReplyHint', locale)}
+                </div>
+                <DeferredConversationComposer
+                  conversation={deferredConversation}
+                  socket={socket}
+                  locale={locale}
+                  disabled={isProcessing || isOffline}
+                  disabledReason={isOffline ? t('ws.chat.queueQuickReplyOffline', locale) : null}
+                  resolveConversationForSend={resolveConversationForSend}
+                  onResolved={(_conversation, result) => {
+                    const assignment = deferredAssignmentRef.current
+                    if (!assignment || !detail) return
+                    onAssigned?.(assignment, detail.id, {
+                      openConversation: true,
+                      messageSent: result.messageSent,
+                    })
+                  }}
+                />
+              </div>
+            )}
 
             <OfflineMessageAssignDialog
               open={assignOpen}
@@ -424,8 +615,13 @@ export function OfflineMessageDetailPanel({
                   showToast(t('ws.chat.queueAssignedToAgent', locale, { name }))
                   setAssignOpen(false)
                   onAssigned?.(result, detail.id)
-                } catch {
-                  showToast(t('ws.chat.queueAssignFailed', locale))
+                } catch (err) {
+                  const backendMessage = await readBackendErrorMessage(err)
+                  showToast(
+                    backendMessage === ACTIVE_CONVERSATION_ERROR
+                      ? t('ws.chat.queueAssignActiveConversation', locale)
+                      : t('ws.chat.queueAssignFailed', locale),
+                  )
                   void detailQuery.refetch()
                 }
               }}
@@ -634,6 +830,15 @@ function OfflineMessageAssistPanel({
             <InfoRow label={t('ws.chat.channelName', locale)} value={detail.channel?.name || '-'} />
             <InfoRow label={t('ws.chat.agentGroup', locale)} value={detail.target_group?.name || '-'} />
             <InfoRow label={locale === 'zh' ? '处理状态' : 'Status'} value={statusLabel(detail.status, locale)} />
+            <InfoRow
+              label={locale === 'zh' ? '处理客服' : 'Handled By'}
+              value={
+                detail.handled_by?.display_name
+                || detail.handled_by?.name
+                || (detail.handled_by_id ? `#${detail.handled_by_id}` : '-')
+              }
+            />
+            <InfoRow label={locale === 'zh' ? '处理时间' : 'Handled At'} value={formatTime(detail.handled_at, locale)} />
             <InfoRow label={locale === 'zh' ? '留言时间' : 'Created At'} value={formatTime(detail.created_at, locale)} />
             <InfoRow label={locale === 'zh' ? '最近留言' : 'Last Message'} value={formatTime(detail.last_message_at, locale)} />
             <InfoRow label={locale === 'zh' ? '消息数' : 'Messages'} value={String(detail.message_count)} />
@@ -743,6 +948,39 @@ function InfoRow({ label, value }: { label: string; value: string }) {
   )
 }
 
+function OfflineStatusFilter({
+  value,
+  onChange,
+}: {
+  value: OfflineMessageListStatus
+  onChange: (status: OfflineMessageListStatus) => void
+}) {
+  const { locale } = useLocaleStore()
+  const options: OfflineMessageListStatus[] = ['all', 'pending', 'converted', 'archived']
+
+  return (
+    <div className="border-b border-border bg-[#FAFAFA] px-3 py-2">
+      <div className="grid grid-cols-2 gap-1.5">
+        {options.map((status) => (
+          <button
+            key={status}
+            type="button"
+            onClick={() => onChange(status)}
+            className={cn(
+              'rounded-md border px-2 py-1.5 text-xs font-medium transition-colors',
+              value === status
+                ? 'border-border bg-background text-foreground shadow-sm'
+                : 'border-transparent text-muted-foreground hover:bg-background hover:text-foreground',
+            )}
+          >
+            {status === 'all' ? (locale === 'zh' ? '全部' : 'All') : statusLabel(status, locale)}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function getFieldIdentity(field: UnifiedField): string {
   return field.key ?? `custom:${field.id ?? field.name}`
 }
@@ -761,8 +999,17 @@ function getFieldRawValue(user: User, field: UnifiedField): unknown {
   return null
 }
 
-export function OfflineMessagePanel({ status, onAssigned, readOnly = false, agentStatus = null }: Props) {
-  const listQuery = useOfflineMessages({ status })
+export function OfflineMessagePanel({
+  status,
+  onAssigned,
+  onArchived,
+  readOnly = false,
+  agentStatus = null,
+  socket = null,
+  showStatusFilter = false,
+}: Props) {
+  const [activeStatus, setActiveStatus] = useState<OfflineMessageListStatus>(status)
+  const listQuery = useOfflineMessages({ status: activeStatus })
   const items = listQuery.data?.items ?? []
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const skipAutoSelectRef = useRef(false)
@@ -770,6 +1017,15 @@ export function OfflineMessagePanel({ status, onAssigned, readOnly = false, agen
     () => items.some((item) => item.id === selectedId),
     [items, selectedId],
   )
+
+  useEffect(() => {
+    setActiveStatus(status)
+  }, [status])
+
+  useEffect(() => {
+    setSelectedId(null)
+    skipAutoSelectRef.current = false
+  }, [activeStatus])
 
   useEffect(() => {
     if (selectedId && selectedExists) return
@@ -790,11 +1046,27 @@ export function OfflineMessagePanel({ status, onAssigned, readOnly = false, agen
     [items, onAssigned],
   )
 
+  const handleArchived = useCallback(
+    (response: OfflineMessageArchiveResponse, offlineMessageId: number) => {
+      const nextId = getNextPendingOfflineMessageId(items, offlineMessageId)
+      skipAutoSelectRef.current = nextId == null
+      setSelectedId(nextId)
+      onArchived?.(response, offlineMessageId)
+    },
+    [items, onArchived],
+  )
+
   return (
     <div className="flex h-full min-h-0 bg-white">
       <aside className="flex w-[320px] shrink-0 flex-col border-r border-border bg-[#FAFAFA]">
+        {showStatusFilter && (
+          <OfflineStatusFilter
+            value={activeStatus}
+            onChange={setActiveStatus}
+          />
+        )}
         <OfflineMessageListSidebar
-          status={status}
+          status={activeStatus}
           items={items}
           selectedId={selectedId}
           onSelect={setSelectedId}
@@ -805,8 +1077,10 @@ export function OfflineMessagePanel({ status, onAssigned, readOnly = false, agen
       <OfflineMessageDetailPanel
         selectedId={selectedId}
         onAssigned={handleAssigned}
+        onArchived={handleArchived}
         readOnly={readOnly}
         agentStatus={agentStatus}
+        socket={socket}
       />
     </div>
   )

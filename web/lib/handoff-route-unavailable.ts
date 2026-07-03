@@ -3,6 +3,8 @@ export type HandoffRouteUnavailablePayload = {
   reason?: string
   leave_message?: boolean
   queue_full?: boolean
+  queue_type?: string
+  queue_id?: number
   leave_message_prompt?: string
   queue_full_message?: string
   queue_full_show_leave_message_button?: boolean

@@ -14,6 +14,7 @@ from app.schemas.session_record import (
     SessionRecordDetailResponse,
     SessionRecordMessageListResponse,
     ReceptionTrajectoryResponse,
+    SessionRecordAgentFilterOptionsResponse,
 )
 from app.schemas.satisfaction_survey_record import (
     SatisfactionFilterOptionsResponse,
@@ -82,6 +83,15 @@ async def get_satisfaction_filter_options(
 ):
     """Get current-version satisfaction filter options for session records."""
     return await SatisfactionSurveyRecordService.get_filter_options(db, principal.tenant_id)
+
+
+@router.get("/agent-options", response_model=SessionRecordAgentFilterOptionsResponse)
+async def get_agent_filter_options(
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+):
+    """Get agent selector options allowed by the session-record data scope."""
+    return await SessionRecordService.get_agent_filter_options(db, principal.tenant_id, principal)
 
 
 @router.get("/{record_id}", response_model=SessionRecordDetailResponse)

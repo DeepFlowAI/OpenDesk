@@ -91,6 +91,41 @@ class TestSystemSettingsAPI:
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
+    async def test_get_settings_returns_bridge_asr_default_false(self, client: AsyncClient):
+        """Live-transcription toggle defaults to False for a fresh tenant."""
+        headers = _auth_header(tenant_id=9999)
+        resp = await client.get("/api/v1/system-settings", headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["bridge_asr_enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_call_transcription_toggle_persists_and_is_returned(self, client: AsyncClient):
+        """PUT /call-transcription flips the flag and GET reflects it."""
+        headers = _auth_header(tenant_id=7)
+
+        resp = await client.put(
+            "/api/v1/system-settings/call-transcription",
+            json={"enabled": True},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["bridge_asr_enabled"] is True
+
+        resp = await client.get("/api/v1/system-settings", headers=headers)
+        assert resp.json()["bridge_asr_enabled"] is True
+
+        resp = await client.put(
+            "/api/v1/system-settings/call-transcription",
+            json={"enabled": False},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["bridge_asr_enabled"] is False
+
+        resp = await client.get("/api/v1/system-settings", headers=headers)
+        assert resp.json()["bridge_asr_enabled"] is False
+
+    @pytest.mark.asyncio
     async def test_missing_auth_returns_401(self, client: AsyncClient):
         """Request without Authorization header should fail."""
         resp = await client.get("/api/v1/system-settings")

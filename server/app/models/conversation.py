@@ -40,7 +40,7 @@ class Conversation(Base, TimestampMixin):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    ended_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    ended_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_message_preview: Mapped[str | None] = mapped_column(String(200), nullable=True)
     visitor_system: Mapped[str | None] = mapped_column(String(64), nullable=True)

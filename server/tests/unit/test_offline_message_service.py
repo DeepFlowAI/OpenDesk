@@ -1,21 +1,23 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
-from app.core.exceptions import BusinessError
+from app.core.exceptions import BusinessError, ForbiddenError
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.offline_message import OfflineMessage, OfflineMessageEntry
 from app.schemas.permission import EffectivePrincipal
 from app.services.offline_message_service import (
     DataScopeService,
+    OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY,
     OFFLINE_MESSAGE_CONVERSATION_CREATED_EVENT,
     OFFLINE_MESSAGE_CONVERSATION_CREATED_TEXT,
     OFFLINE_MESSAGE_PROMPT_EVENT,
     OfflineMessageRepository,
     OfflineMessageService,
+    QUEUE_FULL_LEAVE_MESSAGE_SOURCE,
     VISITOR_ENVIRONMENT_METADATA_KEY,
 )
 from app.services.offline_message_realtime_service import OfflineMessageRealtimeService
@@ -66,6 +68,75 @@ async def test_count_for_agent_uses_scope_predicate(monkeypatch):
         status="pending",
         scope_predicate=predicate,
     )
+
+
+@pytest.mark.asyncio
+async def test_archive_marks_pending_message_archived(monkeypatch):
+    db = SimpleNamespace(rollback=AsyncMock())
+    principal = _principal()
+    row = SimpleNamespace(
+        id=12,
+        public_id="om_test",
+        tenant_id=1,
+        status="pending",
+        visitor=SimpleNamespace(name="Visitor"),
+        channel=SimpleNamespace(id=2),
+        target_group=SimpleNamespace(id=7),
+        conversation=None,
+        handled_by=None,
+        visitor_external_id="visitor-1",
+        visitor_name="Visitor",
+        handled_by_id=None,
+        handled_at=None,
+        last_message_at=datetime(2026, 6, 17, 10, 30, tzinfo=timezone.utc),
+        last_message_preview="hello",
+        message_count=1,
+        metadata_={},
+        created_at=datetime(2026, 6, 17, 10, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 6, 17, 10, 30, tzinfo=timezone.utc),
+    )
+
+    async def mark_archived(_db, offline_message, *, handled_by_id, handled_at):
+        offline_message.status = "archived"
+        offline_message.handled_by_id = handled_by_id
+        offline_message.handled_at = handled_at
+        return offline_message
+
+    emit_updated = AsyncMock()
+    monkeypatch.setattr(OfflineMessageRepository, "get_by_id_for_update", AsyncMock(return_value=row))
+    monkeypatch.setattr(OfflineMessageRepository, "get_by_id", AsyncMock(return_value=row))
+    monkeypatch.setattr(OfflineMessageRepository, "mark_archived", AsyncMock(side_effect=mark_archived))
+    monkeypatch.setattr(OfflineMessageService, "_assert_view_access", AsyncMock())
+    monkeypatch.setattr(OfflineMessageRealtimeService, "emit_updated", emit_updated)
+
+    result = await OfflineMessageService.archive(db, principal, row.id)
+
+    assert result["offline_message"]["status"] == "archived"
+    assert row.handled_by_id == principal.user_id
+    assert row.handled_at.tzinfo is not None
+    db.rollback.assert_not_awaited()
+    OfflineMessageRepository.get_by_id.assert_awaited_once_with(db, row.id)
+    emit_updated.assert_awaited_once_with(row, action="archived")
+
+
+@pytest.mark.asyncio
+async def test_archive_rejects_already_archived_message(monkeypatch):
+    db = SimpleNamespace(rollback=AsyncMock())
+    principal = _principal()
+    row = SimpleNamespace(id=12, tenant_id=1, status="archived", target_group_id=7)
+    emit_updated = AsyncMock()
+
+    monkeypatch.setattr(OfflineMessageRepository, "get_by_id_for_update", AsyncMock(return_value=row))
+    monkeypatch.setattr(OfflineMessageRepository, "mark_archived", AsyncMock())
+    monkeypatch.setattr(OfflineMessageService, "_assert_view_access", AsyncMock())
+    monkeypatch.setattr(OfflineMessageRealtimeService, "emit_updated", emit_updated)
+
+    with pytest.raises(BusinessError, match="already been archived"):
+        await OfflineMessageService.archive(db, principal, row.id)
+
+    OfflineMessageRepository.mark_archived.assert_not_awaited()
+    emit_updated.assert_not_awaited()
+    db.rollback.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -139,6 +210,223 @@ async def test_offline_message_realtime_created_updates_count_and_list_rooms(mon
         "room": "workspace:1:offline:count",
         "namespace": "/chat",
     }
+
+
+@pytest.mark.asyncio
+async def test_offline_message_realtime_archived_updates_count_and_list_rooms(monkeypatch):
+    emit = AsyncMock()
+    row = SimpleNamespace(
+        id=12,
+        public_id="om_test",
+        tenant_id=1,
+        status="archived",
+        target_group_id=7,
+        last_message_at=datetime(2026, 6, 17, 10, 30),
+        message_count=1,
+    )
+
+    monkeypatch.setattr(
+        "app.services.offline_message_realtime_service.get_realtime_transport",
+        lambda: SimpleNamespace(emit=emit),
+    )
+
+    await OfflineMessageRealtimeService.emit_updated(row, action="archived")
+
+    assert emit.await_count == 2
+    list_call, count_call = emit.await_args_list
+    assert list_call.args[0] == "offline_list_updated"
+    assert count_call.args[0] == "offline_count_updated"
+    assert list_call.args[1]["action"] == "archived"
+    assert list_call.args[1]["status"] == "archived"
+
+
+@pytest.mark.asyncio
+async def test_leave_message_rejects_regular_entry_during_service_hours(monkeypatch):
+    channel = SimpleNamespace(tenant_id=1, id=2, config={})
+
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelService.check_human_service_gate",
+        AsyncMock(return_value={
+            "can_start_conversation": True,
+            "reason": "available",
+        }),
+    )
+
+    with pytest.raises(BusinessError):
+        await OfflineMessageService._ensure_leave_message_allowed(
+            AsyncMock(),
+            AsyncMock(),
+            channel.id,
+            visitor_id=20,
+        )
+
+
+@pytest.mark.asyncio
+async def test_outside_hours_leave_message_binds_routed_queue(monkeypatch):
+    channel = SimpleNamespace(
+        tenant_id=1,
+        id=2,
+        config={"outside_service_hours_strategy": "leave_message"},
+    )
+
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelService.check_human_service_gate",
+        AsyncMock(return_value={
+            "can_start_conversation": False,
+            "reason": "outside_service_hours",
+        }),
+    )
+    # Off-hours uses routing to resolve the visitor's target queue; the resolved
+    # group must be carried onto the leave message even when the queue is full
+    # (routing returns the overflowed queue alongside the queue_limit reason).
+    route = AsyncMock(return_value=(7, [1], {1: 5}))
+    monkeypatch.setattr(
+        "app.services.offline_message_service.RoutingService.route_conversation",
+        route,
+    )
+
+    _channel, config, gate, group_id = await OfflineMessageService._ensure_leave_message_allowed(
+        AsyncMock(),
+        AsyncMock(),
+        channel.id,
+        visitor_id=20,
+    )
+
+    assert gate["reason"] == "outside_service_hours"
+    assert config.outside_service_hours_strategy == "leave_message"
+    assert group_id == 7
+    route.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queue_full_source_uses_overflow_queue_from_metadata(monkeypatch):
+    channel = SimpleNamespace(
+        tenant_id=1,
+        id=2,
+        config={
+            "queue_full_show_leave_message_button": True,
+            "leave_message_prompt": "<p>请留言</p>",
+        },
+    )
+
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelService.check_human_service_gate",
+        AsyncMock(return_value={
+            "can_start_conversation": True,
+            "reason": "available",
+        }),
+    )
+    queue_exists = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.offline_message_service.QueueCandidateRepository.queue_exists",
+        queue_exists,
+    )
+    # Re-routing must not be used when the overflow queue is carried in metadata,
+    # so the leave message always lands on the queue that was full.
+    route = AsyncMock(side_effect=AssertionError("should not re-route"))
+    monkeypatch.setattr(
+        "app.services.offline_message_service.RoutingService.route_conversation_with_meta",
+        route,
+    )
+
+    _channel, config, _gate, group_id = await OfflineMessageService._ensure_leave_message_allowed(
+        AsyncMock(),
+        AsyncMock(),
+        channel.id,
+        visitor_id=20,
+        source=QUEUE_FULL_LEAVE_MESSAGE_SOURCE,
+        queue_type="employee_group",
+        queue_id=7,
+    )
+
+    assert config.queue_full_show_leave_message_button is True
+    assert group_id == 7
+    queue_exists.assert_awaited_once()
+    route.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_queue_full_source_rejects_unknown_queue(monkeypatch):
+    channel = SimpleNamespace(
+        tenant_id=1,
+        id=2,
+        config={"queue_full_show_leave_message_button": True},
+    )
+
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelService.check_human_service_gate",
+        AsyncMock(return_value={
+            "can_start_conversation": True,
+            "reason": "available",
+        }),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.QueueCandidateRepository.queue_exists",
+        AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(BusinessError):
+        await OfflineMessageService._ensure_leave_message_allowed(
+            AsyncMock(),
+            AsyncMock(),
+            channel.id,
+            visitor_id=20,
+            source=QUEUE_FULL_LEAVE_MESSAGE_SOURCE,
+            queue_type="employee_group",
+            queue_id=999,
+        )
+
+
+@pytest.mark.asyncio
+async def test_queue_full_source_without_metadata_falls_back_to_routing(monkeypatch):
+    channel = SimpleNamespace(
+        tenant_id=1,
+        id=2,
+        config={"queue_full_show_leave_message_button": True},
+    )
+
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ChannelService.check_human_service_gate",
+        AsyncMock(return_value={
+            "can_start_conversation": True,
+            "reason": "available",
+        }),
+    )
+    # Legacy client without queue metadata: resolve the visitor's target queue.
+    monkeypatch.setattr(
+        "app.services.offline_message_service.RoutingService.route_conversation_with_meta",
+        AsyncMock(return_value=(9, [1], {1: 5}, None)),
+    )
+
+    _channel, _config, _gate, group_id = await OfflineMessageService._ensure_leave_message_allowed(
+        AsyncMock(),
+        AsyncMock(),
+        channel.id,
+        visitor_id=20,
+        source=QUEUE_FULL_LEAVE_MESSAGE_SOURCE,
+    )
+
+    assert group_id == 9
 
 
 @pytest.mark.asyncio
@@ -359,6 +647,7 @@ async def test_create_conversation_appends_created_event_after_offline_messages(
         visitor_name="Visitor",
         channel_id=2,
         target_group_id=7,
+        handled_by=None,
         handled_by_id=None,
         handled_at=None,
         last_message_at=entry_visitor.created_at,
@@ -515,6 +804,7 @@ async def test_create_conversation_reuses_existing_active_conversation(monkeypat
         visitor_name=visitor.name,
         channel_id=existing.channel_id,
         target_group_id=existing.group_id,
+        handled_by=None,
         handled_by_id=None,
         handled_at=None,
         last_message_at=entry.created_at,
@@ -586,6 +876,171 @@ async def test_create_conversation_reuses_existing_active_conversation(monkeypat
     generate_public_id.assert_not_awaited()
     generate_share_code.assert_not_awaited()
     increment_count.assert_not_awaited()
+    db.commit.assert_awaited_once()
+    db.rollback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_closes_single_offline_bot_conversation(monkeypatch):
+    created_conversation = None
+    added_messages = []
+
+    def add_object(obj):
+        nonlocal created_conversation
+        if isinstance(obj, Conversation):
+            obj.id = 22
+            obj.agent = None
+            created_conversation = obj
+        elif isinstance(obj, Message):
+            obj.id = 3001 + len(added_messages)
+            added_messages.append(obj)
+
+    db = SimpleNamespace(
+        add=Mock(side_effect=add_object),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+    visitor = SimpleNamespace(
+        id=20,
+        public_id="usr_test",
+        external_id="visitor-1",
+        name="Visitor",
+        avatar_color="#60A5FA",
+    )
+    channel = SimpleNamespace(id=2, name="Web", channel_type="web")
+    existing_bot = SimpleNamespace(
+        id=21,
+        public_id="conv_bot",
+        share_code="sharebot",
+        tenant_id=1,
+        visitor_id=visitor.id,
+        visitor=visitor,
+        agent_id=None,
+        agent=None,
+        channel_id=channel.id,
+        channel=channel,
+        group_id=None,
+        group=None,
+        status="bot",
+        started_at=datetime(2026, 6, 18, 21, 0, tzinfo=timezone.utc),
+        ended_at=None,
+        ended_by=None,
+        last_message_at=datetime(2026, 6, 18, 21, 5, tzinfo=timezone.utc),
+        last_message_preview="bot",
+        unread_count=0,
+        created_at=datetime(2026, 6, 18, 21, 0, tzinfo=timezone.utc),
+    )
+    entry = SimpleNamespace(
+        id=2,
+        sender_type="visitor",
+        sender_id=visitor.id,
+        content_type="text",
+        content="please help",
+        metadata_={},
+        created_at=datetime(2026, 6, 18, 22, 7, tzinfo=timezone.utc),
+    )
+    row = SimpleNamespace(
+        id=12,
+        public_id="om_test",
+        tenant_id=1,
+        status="pending",
+        visitor=visitor,
+        channel=channel,
+        target_group=SimpleNamespace(id=7),
+        conversation=None,
+        visitor_id=visitor.id,
+        visitor_external_id=visitor.external_id,
+        visitor_name=visitor.name,
+        channel_id=channel.id,
+        target_group_id=7,
+        handled_by=None,
+        handled_by_id=None,
+        handled_at=None,
+        last_message_at=entry.created_at,
+        last_message_preview=entry.content,
+        message_count=1,
+        metadata_={},
+        created_at=datetime(2026, 6, 18, 22, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 6, 18, 22, 7, tzinfo=timezone.utc),
+        messages=[entry],
+    )
+    principal = _principal()
+
+    async def refresh_row(_db, _offline_message_id):
+        row.conversation = created_conversation
+        return row
+
+    monkeypatch.setattr(OfflineMessageService, "_assert_view_access", AsyncMock())
+    monkeypatch.setattr(OfflineMessageRepository, "get_by_id_for_update", AsyncMock(return_value=row))
+    monkeypatch.setattr(OfflineMessageRepository, "get_by_id", AsyncMock(side_effect=refresh_row))
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.get_active_visitor_conversation",
+        AsyncMock(return_value=existing_bot),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.count_active_visitor_conversations",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.VisitorWebStatusService.get_status",
+        AsyncMock(return_value="offline"),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.recompute_message_counts",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.recompute_first_human_response_seconds",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.recompute_agent_response_metrics",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.generate_unique_public_id",
+        AsyncMock(return_value="conv_new"),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.generate_unique_share_code",
+        AsyncMock(return_value="share_new"),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationRepository.get_by_id",
+        AsyncMock(side_effect=lambda _db, _conversation_id: created_conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.AgentStatusService.increment_count",
+        AsyncMock(),
+    )
+    emit_closed = AsyncMock()
+    monkeypatch.setattr(
+        OfflineMessageService,
+        "_emit_bot_conversation_closed_for_offline_message_assignment",
+        emit_closed,
+    )
+    monkeypatch.setattr(OfflineMessageRealtimeService, "emit_updated", AsyncMock())
+    monkeypatch.setattr(
+        "app.services.offline_message_service.EmployeeRepository.get_by_id",
+        AsyncMock(return_value=None),
+    )
+
+    result = await OfflineMessageService.create_conversation(db, object(), principal, row.id)
+
+    assert existing_bot.status == "closed"
+    assert existing_bot.ended_by == OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY
+    assert existing_bot.ended_at.tzinfo is not None
+    assert created_conversation is not None
+    assert created_conversation.status == "active"
+    assert result["conversation"] is created_conversation
+    assert result["reused_existing_conversation"] is False
+    assert row.conversation_id == created_conversation.id
+    assert [message.conversation_id for message in added_messages] == [
+        created_conversation.id,
+        created_conversation.id,
+    ]
+    emit_closed.assert_awaited_once_with(existing_bot)
     db.commit.assert_awaited_once()
     db.rollback.assert_not_awaited()
 
@@ -667,3 +1122,162 @@ async def test_create_or_continue_and_send_file_for_session_locks_existing_pendi
     db.commit.assert_awaited_once()
     db.rollback.assert_not_awaited()
     emit_updated.assert_awaited_once_with(refreshed, action="message")
+
+
+def _principal_without_assign_self() -> EffectivePrincipal:
+    return EffectivePrincipal(
+        user_id=10,
+        tenant_id=1,
+        permissions=["chat.offline_message.view"],
+        data_scopes={"offline_message": "group"},
+        group_ids=[7],
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_and_send_converts_then_sends_text(monkeypatch):
+    principal = _principal()
+    conversation = SimpleNamespace(
+        id=100,
+        tenant_id=1,
+        agent=SimpleNamespace(id=principal.user_id, display_name="Alice", name="alice", avatar=None),
+    )
+    convert_result = {
+        "offline_message": {},
+        "conversation": conversation,
+        "messages": [],
+        "assigned_to_current_user": True,
+        "assigned_agent": None,
+        "reused_existing_conversation": False,
+    }
+    message = SimpleNamespace(
+        id=901,
+        conversation_id=100,
+        sender_type="agent",
+        sender_id=principal.user_id,
+        content_type="text",
+        content="您好，我来处理",
+        metadata_=None,
+        created_at=datetime(2026, 6, 16, 10, 5),
+    )
+    message_item = {"id": 901, "content": "您好，我来处理", "sender_name": "Alice"}
+    convert = AsyncMock(return_value=convert_result)
+    send_message = AsyncMock(return_value=message)
+    mark_read = AsyncMock(return_value=[])
+    emit_sent = AsyncMock()
+    rt = SimpleNamespace(emit=AsyncMock())
+    monkeypatch.setattr(OfflineMessageService, "_convert_to_conversation", convert)
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationService.send_message",
+        send_message,
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationService.mark_read",
+        mark_read,
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.get_realtime_transport",
+        lambda: rt,
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.QueueWorkspaceService._emit_sent_message_events",
+        emit_sent,
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.QueueWorkspaceService._message_response_item",
+        lambda msg, conv: message_item,
+    )
+    db = object()
+    redis = object()
+
+    result = await OfflineMessageService.create_conversation_and_send(
+        db,
+        redis,
+        principal,
+        11,
+        content="您好，我来处理",
+    )
+
+    convert.assert_awaited_once_with(db, redis, principal, 11, principal.user_id)
+    send_message.assert_awaited_once()
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["conversation_id"] == 100
+    assert kwargs["sender_type"] == "agent"
+    assert kwargs["sender_id"] == principal.user_id
+    assert kwargs["content_type"] == "text"
+    assert kwargs["content"] == "您好，我来处理"
+    assert kwargs["principal"] is principal
+    emit_sent.assert_awaited_once_with(conversation, message, principal.user_id)
+    # Actively taking over + replying must clear the assignment's unread +1.
+    mark_read.assert_awaited_once_with(db, conversation.id)
+    cleared_events = [
+        call for call in rt.emit.await_args_list
+        if call.args[0] == "conversation_updated" and call.args[1].get("unread_count") == 0
+    ]
+    assert len(cleared_events) == 1
+    assert result["message_sent"] is True
+    assert result["message"] == message_item
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_and_send_requires_assign_self_permission(monkeypatch):
+    principal = _principal_without_assign_self()
+    monkeypatch.setattr(
+        OfflineMessageService,
+        "_convert_to_conversation",
+        AsyncMock(side_effect=AssertionError("conversion should not be attempted")),
+    )
+
+    with pytest.raises(ForbiddenError):
+        await OfflineMessageService.create_conversation_and_send(
+            object(),
+            object(),
+            principal,
+            11,
+            content="hello",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_and_send_keeps_assignment_when_message_fails(monkeypatch):
+    principal = _principal()
+    conversation = SimpleNamespace(id=100, tenant_id=1, agent=None)
+    convert_result = {
+        "offline_message": {},
+        "conversation": conversation,
+        "messages": [],
+        "assigned_to_current_user": True,
+        "assigned_agent": None,
+        "reused_existing_conversation": False,
+    }
+    convert = AsyncMock(return_value=convert_result)
+    send_message = AsyncMock(side_effect=BusinessError("Cannot send message to closed conversation"))
+    mark_read = AsyncMock()
+    emit_sent = AsyncMock()
+    monkeypatch.setattr(OfflineMessageService, "_convert_to_conversation", convert)
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationService.send_message",
+        send_message,
+    )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationService.mark_read",
+        mark_read,
+    )
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.QueueWorkspaceService._emit_sent_message_events",
+        emit_sent,
+    )
+
+    result = await OfflineMessageService.create_conversation_and_send(
+        object(),
+        object(),
+        principal,
+        11,
+        content="hello",
+    )
+
+    assert result["message_sent"] is False
+    assert result["message"] is None
+    assert result["assigned_to_current_user"] is True
+    emit_sent.assert_not_awaited()
+    mark_read.assert_not_awaited()

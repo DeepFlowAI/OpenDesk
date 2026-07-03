@@ -116,6 +116,27 @@ class TestWorkflow:
         assert wf.ctx.variables["ui"] == "1"
 
     @pytest.mark.asyncio
+    async def test_event_before_wait_is_buffered_then_consumed(self):
+        # An event that arrives before the node registers its WaitForEvent must
+        # be stashed and consumed once the wait is registered, not dropped.
+        tel = MockTelephonyClient()
+        await tel.connect()
+        wf = VoiceFlowWorkflow(
+            call_id="call-1",
+            tenant_id=1,
+            graph=_graph_play_then_hangup(),
+            telephony=tel,
+        )
+        # play_end arrives before the play node has even run.
+        await wf.handle_event("call.play_end", {"call_id": "call-1"})
+        assert wf.done.is_set() is False  # buffered, not lost
+
+        await wf.start()
+        # play node registers its wait → buffered play_end consumed → hangup.
+        assert wf.done.is_set() is True
+        assert any(m == "call.hangup" for m, _ in tel.recorded)
+
+    @pytest.mark.asyncio
     async def test_collect_then_default_branch(self):
         tel = MockTelephonyClient()
         await tel.connect()

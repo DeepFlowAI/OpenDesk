@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { IconLoader2 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
-import { useLocaleStore } from '@/context/locale-store'
+import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useSessionRecordMessages } from '@/service/use-session-records'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
@@ -61,6 +61,10 @@ function EventTimestamp({ createdAt }: { createdAt: string }) {
       {formatTime(createdAt)}
     </div>
   )
+}
+
+function isRecalledMessage(message: SessionRecordMessage): boolean {
+  return message.is_recalled === true || message.metadata?.is_recalled === true
 }
 
 type Props = {
@@ -162,7 +166,7 @@ function MessageBubble({
   onSatisfactionEventClick,
 }: {
   message: SessionRecordMessage
-  locale: string
+  locale: Locale
   onSatisfactionEventClick?: () => void
 }) {
   const isSystem = message.sender_type === 'system' || message.content_type === 'system'
@@ -176,6 +180,7 @@ function MessageBubble({
   const hasOpenAgentTrace =
     isBot && (textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0)
   const hasMessageText = message.content.trim().length > 0
+  const isRecalled = isRecalledMessage(message)
 
   if (isWelcomeLikeContentType(message.content_type) || isLeaveMessagePromptMessage(message)) {
     const openAgentWelcomeBlocks = getOpenAgentWelcomeBlocksFromMetadata(message.metadata)
@@ -222,7 +227,7 @@ function MessageBubble({
     )
   }
 
-  if (isBot && !hasOpenAgentTrace && !hasMessageText) return null
+  if (isBot && !hasOpenAgentTrace && !hasMessageText && !isRecalled) return null
 
   const avatarLetter = isAssistant
     ? getWorkspaceAgentAvatarLetter(isBot, message.sender_name)
@@ -230,7 +235,7 @@ function MessageBubble({
   const senderLabel = isBot
     ? (message.sender_name || '智能助手')
     : isAgent
-      ? null
+      ? message.sender_name
       : (message.sender_name || 'V')
 
   return (
@@ -252,7 +257,11 @@ function MessageBubble({
             {senderLabel}
           </div>
         )}
-        {message.content_type === 'image' || message.content_type === 'file' ? (
+        {isRecalled ? (
+          <div className="max-w-full rounded-lg border border-dashed border-border bg-muted px-3 py-2 text-sm text-muted-foreground">
+            {t('ws.records.sessions.detail.recalledMessage', locale)}
+          </div>
+        ) : message.content_type === 'image' || message.content_type === 'file' ? (
           <MessageAttachment
             conversationId={message.conversation_id}
             contentType={message.content_type}

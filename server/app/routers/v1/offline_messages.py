@@ -9,17 +9,22 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.deps import get_db, get_redis, get_current_principal, require_permission
+from app.db.session import AsyncSessionLocal
 from app.libs.realtime import get_realtime_transport
 from app.schemas.conversation_file import ConversationFileAccessResponse
 from app.schemas.offline_message import (
+    OfflineMessageArchiveResponse,
     OfflineMessageAssignRequest,
     OfflineMessageAssignSelfRequest,
+    OfflineMessageAssignSelfSendRequest,
     OfflineMessageCountResponse,
+    OfflineMessageConvertAndSendResponse,
     OfflineMessageConvertResponse,
     OfflineMessageDetail,
     OfflineMessageListResponse,
 )
 from app.schemas.permission import EffectivePrincipal
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_service import ConversationService
 from app.services.offline_message_service import OfflineMessageService
 
@@ -32,7 +37,7 @@ router = APIRouter(
 
 @router.get("", response_model=OfflineMessageListResponse)
 async def list_offline_messages(
-    status: Literal["pending", "converted", "all"] = Query("pending"),
+    status: Literal["pending", "converted", "archived", "all"] = Query("pending"),
     before_id: int | None = Query(None),
     limit: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -49,7 +54,7 @@ async def list_offline_messages(
 
 @router.get("/count", response_model=OfflineMessageCountResponse)
 async def count_offline_messages(
-    status: Literal["pending", "converted", "all"] = Query("pending"),
+    status: Literal["pending", "converted", "archived", "all"] = Query("pending"),
     db: AsyncSession = Depends(get_db),
     principal: EffectivePrincipal = Depends(get_current_principal),
 ):
@@ -74,6 +79,19 @@ async def get_offline_message(
         offline_message_id,
         before_id=before_id,
         limit=limit,
+    )
+
+
+@router.post("/{offline_message_id}/archive", response_model=OfflineMessageArchiveResponse)
+async def archive_offline_message(
+    offline_message_id: int,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+):
+    return await OfflineMessageService.archive(
+        db,
+        principal,
+        offline_message_id,
     )
 
 
@@ -108,6 +126,28 @@ async def assign_offline_message_to_self(
         principal,
         offline_message_id,
         reason=body.reason if body else None,
+    )
+    await _emit_conversation_created(result)
+    return result
+
+
+@router.post(
+    "/{offline_message_id}/assign-self/send",
+    response_model=OfflineMessageConvertAndSendResponse,
+)
+async def assign_offline_message_to_self_and_send(
+    offline_message_id: int,
+    body: OfflineMessageAssignSelfSendRequest,
+    db: AsyncSession = Depends(get_db),
+    r: aioredis.Redis = Depends(get_redis),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+):
+    result = await OfflineMessageService.create_conversation_and_send(
+        db,
+        r,
+        principal,
+        offline_message_id,
+        content=body.content,
     )
     await _emit_conversation_created(result)
     return result
@@ -166,6 +206,10 @@ async def _emit_conversation_created(result: dict) -> None:
     visitor = offline_message.get("visitor")
     visitor_external_id = offline_message.get("visitor_external_id")
     tenant_id = offline_message.get("tenant_id")
+    display_mode = None
+    if tenant_id is not None:
+        async with AsyncSessionLocal() as db:
+            display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
     payload = jsonable_encoder({
         "offline_message_public_id": offline_message["public_id"],
         "conversation_public_id": conversation.public_id,
@@ -173,7 +217,7 @@ async def _emit_conversation_created(result: dict) -> None:
         "status": conversation.status,
         "agent": {
             "id": conversation.agent.id,
-            "name": ConversationService.visitor_agent_display_name(conversation.agent),
+            "name": ConversationService.agent_display_name(conversation.agent, display_mode),
             "avatar": conversation.agent.avatar,
         } if conversation.agent else None,
     })

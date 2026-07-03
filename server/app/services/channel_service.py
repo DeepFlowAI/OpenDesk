@@ -31,6 +31,7 @@ from app.schemas.channel import (
     DEFAULT_OFFLINE_MESSAGE,
     DEFAULT_OFFLINE_TITLE,
     DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY,
+    DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL,
     DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL,
     DEFAULT_QUEUE_FULL_MESSAGE,
     DEFAULT_QUEUE_MESSAGE,
@@ -136,6 +137,11 @@ class ChannelService:
             ),
             "queue_message": config.queue_message or DEFAULT_QUEUE_MESSAGE,
             "queue_full_message": config.queue_full_message or DEFAULT_QUEUE_FULL_MESSAGE,
+            "queue_show_leave_message_button": config.queue_show_leave_message_button,
+            "queue_leave_message_button_label": (
+                config.queue_leave_message_button_label
+                or DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL
+            ),
             "queue_full_show_leave_message_button": config.queue_full_show_leave_message_button,
             "queue_full_leave_message_button_label": (
                 config.queue_full_leave_message_button_label
@@ -162,6 +168,13 @@ class ChannelService:
         )
         payload["queue_message"] = payload.get("queue_message") or DEFAULT_QUEUE_MESSAGE
         payload["queue_full_message"] = payload.get("queue_full_message") or DEFAULT_QUEUE_FULL_MESSAGE
+        payload["queue_show_leave_message_button"] = bool(
+            payload.get("queue_show_leave_message_button", False)
+        )
+        payload["queue_leave_message_button_label"] = (
+            payload.get("queue_leave_message_button_label")
+            or DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL
+        ).strip()
         payload["queue_full_show_leave_message_button"] = bool(
             payload.get("queue_full_show_leave_message_button", True)
         )
@@ -620,9 +633,22 @@ class ChannelService:
                 for member in group.members
                 if member.employee and member.employee.is_active
             }
-            agent_id = await AgentStatusService.find_available_agent(
-                r, item.tenant_id, member_ids, max_concurrent_map
-            )
+            agent_id = None
+            if visitor_id is not None:
+                from app.services.queue_service import QueueTaskService
+
+                agent_id = await QueueTaskService.select_immediate_online_chat_agent(
+                    db,
+                    r,
+                    item.tenant_id,
+                    queue_type="employee_group",
+                    queue_id=requested_group_id,
+                    visitor_id=visitor_id,
+                )
+            if agent_id is None:
+                agent_id = await AgentStatusService.find_available_agent(
+                    r, item.tenant_id, member_ids, max_concurrent_map
+                )
             if agent_id:
                 return {**availability, "agent_id": agent_id, "group_id": requested_group_id}
             return {
@@ -638,9 +664,22 @@ class ChannelService:
         group_id, group_member_ids, max_concurrent_map = await RoutingService.route_conversation(
             db, item.tenant_id, item.id, r, visitor_id=visitor_id
         )
-        agent_id = await AgentStatusService.find_available_agent(
-            r, item.tenant_id, group_member_ids, max_concurrent_map
-        )
+        agent_id = None
+        if group_id is not None and visitor_id is not None:
+            from app.services.queue_service import QueueTaskService
+
+            agent_id = await QueueTaskService.select_immediate_online_chat_agent(
+                db,
+                r,
+                item.tenant_id,
+                queue_type="employee_group",
+                queue_id=group_id,
+                visitor_id=visitor_id,
+            )
+        if agent_id is None:
+            agent_id = await AgentStatusService.find_available_agent(
+                r, item.tenant_id, group_member_ids, max_concurrent_map
+            )
         if not agent_id:
             return {
                 **availability,

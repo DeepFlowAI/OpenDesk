@@ -41,6 +41,7 @@ const DEFAULT_LEAVE_MESSAGE_PROMPT = '请留下您的问题和联系方式，我
 const DEFAULT_RESTRICTED_SERVICE_MESSAGE = '抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。'
 const DEFAULT_QUEUE_MESSAGE = '您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。客服接入后会立即回复您。'
 const DEFAULT_QUEUE_FULL_MESSAGE = '当前排队人数较多，暂时无法进入排队。您可以稍后再试，或点击留言，我们上线后会尽快联系您。'
+const DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL = '留言'
 const DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL = '留言'
 const QUEUE_COUNT_VARIABLE = '{{current_queue_count}}'
 const DEFAULT_OPEN_AGENT_INPUT_PLACEHOLDER = '输入消息...'
@@ -124,6 +125,8 @@ const DEFAULT_CONFIG: ChannelConfig = {
   restricted_service_message: DEFAULT_RESTRICTED_SERVICE_MESSAGE,
   queue_message: DEFAULT_QUEUE_MESSAGE,
   queue_full_message: DEFAULT_QUEUE_FULL_MESSAGE,
+  queue_show_leave_message_button: false,
+  queue_leave_message_button_label: DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL,
   queue_full_show_leave_message_button: true,
   queue_full_leave_message_button_label: DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL,
   open_agent_enabled: false,
@@ -851,6 +854,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [restrictedServiceMessageError, setRestrictedServiceMessageError] = useState('')
   const [queueMessageError, setQueueMessageError] = useState('')
   const [queueFullMessageError, setQueueFullMessageError] = useState('')
+  const [queueLeaveMessageButtonLabelError, setQueueLeaveMessageButtonLabelError] = useState('')
   const [queueFullButtonLabelError, setQueueFullButtonLabelError] = useState('')
   const [assistPanelTitleError, setAssistPanelTitleError] = useState('')
   const [assistPanelCodeError, setAssistPanelCodeError] = useState('')
@@ -1157,6 +1161,19 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       setQueueFullMessageError(t('ch.form.queueFullMessage.required', locale))
       return
     }
+    if (config.queue_show_leave_message_button) {
+      const label = config.queue_leave_message_button_label.trim()
+      if (!label) {
+        setActiveTab('service')
+        setQueueLeaveMessageButtonLabelError(t('ch.form.queueLeaveMessageButtonLabel.required', locale))
+        return
+      }
+      if (label.length > 16) {
+        setActiveTab('service')
+        setQueueLeaveMessageButtonLabelError(t('ch.form.queueLeaveMessageButtonLabel.max', locale))
+        return
+      }
+    }
     if (config.queue_full_show_leave_message_button) {
       const label = config.queue_full_leave_message_button_label.trim()
       if (!label) {
@@ -1209,6 +1226,10 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       restricted_service_message: config.restricted_service_message || DEFAULT_RESTRICTED_SERVICE_MESSAGE,
       queue_message: config.queue_message || DEFAULT_QUEUE_MESSAGE,
       queue_full_message: config.queue_full_message || DEFAULT_QUEUE_FULL_MESSAGE,
+      queue_leave_message_button_label: (
+        config.queue_leave_message_button_label.trim()
+        || DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL
+      ),
       queue_full_leave_message_button_label: (
         config.queue_full_leave_message_button_label.trim()
         || DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL
@@ -1773,6 +1794,40 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                       placeholder={DEFAULT_QUEUE_FULL_MESSAGE}
                     />
                     {queueFullMessageError && <p className="text-xs text-destructive">{queueFullMessageError}</p>}
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-white p-4">
+                    <div className="flex items-start justify-between gap-6">
+                      <div className="flex flex-col gap-1">
+                        <FieldLabel label={t('ch.form.queueLeaveMessageButton', locale)} />
+                        <p className="text-xs leading-5 text-muted-foreground">
+                          {t('ch.form.queueLeaveMessageButton.hint', locale)}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={config.queue_show_leave_message_button}
+                        onCheckedChange={(v) => {
+                          updateConfig('queue_show_leave_message_button', v)
+                          setQueueLeaveMessageButtonLabelError('')
+                        }}
+                      />
+                    </div>
+                    {config.queue_show_leave_message_button && (
+                      <div className="mt-4 flex flex-col gap-2">
+                        <FieldLabel label={t('ch.form.queueLeaveMessageButtonLabel', locale)} required />
+                        <TextInput
+                          value={config.queue_leave_message_button_label}
+                          onChange={(v) => {
+                            updateConfig('queue_leave_message_button_label', v)
+                            setQueueLeaveMessageButtonLabelError('')
+                          }}
+                          placeholder={DEFAULT_QUEUE_LEAVE_MESSAGE_BUTTON_LABEL}
+                        />
+                        {queueLeaveMessageButtonLabelError && (
+                          <p className="text-xs text-destructive">{queueLeaveMessageButtonLabelError}</p>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   <div className="rounded-lg border border-border bg-white p-4">

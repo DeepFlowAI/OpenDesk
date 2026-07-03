@@ -63,6 +63,7 @@ type VisitorChatState = {
   messages: Message[]
   hasMore: boolean
   agentTyping: boolean
+  messageAlertNonce: number
   activeAgent: { id: number; name: string; avatar: string | null } | null
   satisfactionInvitation: SatisfactionSurveyRecord | null
   pendingHumanHandoff: {
@@ -261,6 +262,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
   messages: [],
   hasMore: false,
   agentTyping: false,
+  messageAlertNonce: 0,
   activeAgent: null,
   satisfactionInvitation: null,
   pendingHumanHandoff: null,
@@ -375,6 +377,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
         set({
           messages: [...state.messages, msg],
           agentTyping: false,
+          messageAlertNonce: state.messageAlertNonce + 1,
           activeAgent: {
             id: msg.sender_id ?? state.activeAgent?.id ?? 0,
             name: msg.sender_name || state.activeAgent?.name || '客服',

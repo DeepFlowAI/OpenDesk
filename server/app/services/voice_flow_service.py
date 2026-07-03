@@ -46,6 +46,9 @@ _FIXED_HANDLES_BY_TYPE: dict[str, set[str]] = {
     # would be unreachable and misleading.
     "assign_queue": {"timeout"},
     "hangup": set(),
+    # `voicespeed` has a single `handoff` outlet (transfer-to-human); there is
+    # no `next` — a VoiceSpeed session that ends without a handoff ends the call.
+    "voicespeed": {"handoff"},
 }
 
 
@@ -369,6 +372,30 @@ class VoiceFlowService:
                             message=(
                                 f"Condition node '{node.id}' group '{gid}' has no outgoing edge"
                             ),
+                        ))
+            if node.type == "voicespeed":
+                if not node.data.agent_id or not node.data.agent_id.strip():
+                    errors.append(GraphError(
+                        node_id=node.id, field="data.agent_id",
+                        code="missing_agent_id",
+                        message=f"VoiceSpeed node '{node.id}' must specify an agent_id",
+                    ))
+                if "handoff" not in outs:
+                    errors.append(GraphError(
+                        node_id=node.id, field="outlet:handoff",
+                        code="missing_handoff_edge",
+                        message=f"VoiceSpeed node '{node.id}' must connect its 'handoff' outlet",
+                    ))
+                for edge in graph.edges:
+                    if (
+                        edge.source == node.id
+                        and edge.source_handle == "handoff"
+                        and edge.target == node.id
+                    ):
+                        errors.append(GraphError(
+                            node_id=node.id, field="outlet:handoff",
+                            code="self_handoff",
+                            message=f"VoiceSpeed node '{node.id}' cannot hand off to itself",
                         ))
 
         # Cross-entity references: queue targets, audio_asset_id, service_hours.id

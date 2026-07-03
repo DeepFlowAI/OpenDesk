@@ -92,6 +92,38 @@ class TestAuthAPI:
         assert data["user"]["username"] == "testuser"
 
     @pytest.mark.asyncio
+    async def test_second_login_replaces_previous_token(self, client: AsyncClient):
+        first = await client.post("/api/v1/auth/login", json={
+            "tenant": "test-corp",
+            "username": "testuser",
+            "password": "Test1234",
+        })
+        second = await client.post("/api/v1/auth/login", json={
+            "tenant": "test-corp",
+            "username": "testuser",
+            "password": "Test1234",
+        })
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        first_token = first.json()["access_token"]
+        second_token = second.json()["access_token"]
+
+        old_resp = await client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {first_token}"},
+        )
+        new_resp = await client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {second_token}"},
+        )
+
+        assert old_resp.status_code == 401
+        assert old_resp.json()["code"] == "SESSION_REPLACED"
+        assert new_resp.status_code == 200
+
+    @pytest.mark.asyncio
     async def test_login_wrong_password_returns_401(self, client: AsyncClient):
         resp = await client.post("/api/v1/auth/login", json={
             "tenant": "test-corp",

@@ -35,11 +35,11 @@ type Props = {
   connected: boolean
   agentStatus: AgentStatus | null
   onCreateTicket?: (conversationId: number) => void
-  onStartNewConversation?: (conversationId: number) => void | Promise<void>
+  onStartNewConversation?: (conversationId: number) => Conversation | void | Promise<Conversation | void>
   startingNewConversation?: boolean
   onTransferred?: (toName: string) => void
   composerInsertRequest?: ComposerInsertRequest | null
-  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id'>) => void
+  onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id' | 'conversationId'>) => void
   composerInputHeight?: number
   onComposerInputHeightCommit?: (height: number) => void
   messageSearchOpen?: boolean
@@ -164,6 +164,7 @@ export function MessagePanel({
         ? t('ws.chat.startNewDisabledMissingVisitor', locale)
         : null
   const canStartNewConversation = Boolean(isClosed && !startNewDisabledReason)
+  const canSendDeferredPublicReply = canStartNewConversation
   const composerReadOnlyReason = !isClosed && !canSendPublicReply && !canCreateInternalNote
     ? t(isCollaboratorConversation ? 'ws.chat.collabReadOnly' : 'ws.chat.peerReadOnly', locale)
     : null
@@ -355,7 +356,7 @@ export function MessagePanel({
         canTransfer={canTransfer}
         canEndConversation={canEndConversation}
         canInviteCollaborator={canInviteCollaborator}
-        canSendPublicReply={canSendPublicReply}
+        canSendPublicReply={canSendPublicReply || canSendDeferredPublicReply}
         canCreateInternalNote={canCreateInternalNote}
         composerReadOnlyReason={composerReadOnlyReason}
         canStartNewConversation={canStartNewConversation}
@@ -364,6 +365,15 @@ export function MessagePanel({
         onStartNewConversation={() => {
           if (convId) void onStartNewConversation?.(convId)
         }}
+        resolveConversationForSend={
+          canSendDeferredPublicReply
+            ? async () => {
+              const nextConversation = await onStartNewConversation?.(convId)
+              if (!nextConversation) throw new Error('Conversation is required')
+              return { conversation: nextConversation }
+            }
+            : undefined
+        }
         onTransferred={(toName) => onTransferred?.(toName)}
         onCollaborationInvitationSent={(name) => onCollaborationInvitationSent?.(name)}
         satisfactionState={satisfactionState ?? null}

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { IconBell, IconClock, IconGripVertical, IconHistory, IconMoodSmile, IconPencil, IconPlus, IconSettings, IconTrash } from '@tabler/icons-react'
+import { IconBell, IconBook2, IconClock, IconGripVertical, IconHistory, IconMoodSmile, IconPencil, IconPlus, IconSettings, IconTrash } from '@tabler/icons-react'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { Switch } from '@/components/ui/switch'
@@ -32,12 +32,25 @@ import {
   useReadStatusSettings,
   useSaveReadStatusSettings,
 } from '@/service/use-conversation-read-status'
+import {
+  useConversationAgentDisplaySetting,
+  useSaveConversationAgentDisplaySetting,
+} from '@/service/use-conversation-agent-display-setting'
 import { useVisitorTimeoutCloseSettings } from '@/service/use-visitor-timeout-close'
+import {
+  useQueueNoShowSetting,
+  useSaveQueueNoShowSetting,
+} from '@/service/use-queue-no-show'
+import {
+  useKnowledgeInputSuggestionSetting,
+  useSaveKnowledgeInputSuggestionSetting,
+} from '@/service/use-knowledge-input-suggestion-setting'
 import type { Channel } from '@/models/channel'
 import type {
   ConversationReadStatusConfig,
   ConversationReadStatusPayload,
 } from '@/models/conversation-read-status'
+import type { AgentDisplayMode } from '@/models/conversation-agent-display-setting'
 import type {
   UserStatFieldSettings,
   UserStatFieldSettingsPayload,
@@ -319,6 +332,24 @@ export default function ConversationSettingsPage() {
     isError: readStatusError,
     refetch: refetchReadStatusSettings,
   } = useReadStatusSettings()
+  const {
+    data: agentDisplaySetting,
+    isPending: agentDisplayPending,
+    isError: agentDisplayError,
+    refetch: refetchAgentDisplaySetting,
+  } = useConversationAgentDisplaySetting()
+  const {
+    data: queueNoShowSettings,
+    isPending: queueNoShowPending,
+    isError: queueNoShowError,
+    refetch: refetchQueueNoShowSettings,
+  } = useQueueNoShowSetting()
+  const {
+    data: knowledgeInputSuggestionSettings,
+    isPending: knowledgeInputSuggestionPending,
+    isError: knowledgeInputSuggestionError,
+    refetch: refetchKnowledgeInputSuggestionSettings,
+  } = useKnowledgeInputSuggestionSetting()
   const { data: channelsData } = useChannels()
   const deleteMut = useDeleteWelcomeMessageRule()
   const reorderMut = useReorderWelcomeMessageRules()
@@ -329,6 +360,9 @@ export default function ConversationSettingsPage() {
   const patchSatisfactionMut = usePatchSatisfactionSurveyEnabled()
   const saveUserStatMut = useSaveUserStatFieldSettings()
   const saveReadStatusMut = useSaveReadStatusSettings()
+  const saveAgentDisplayMut = useSaveConversationAgentDisplaySetting()
+  const saveQueueNoShowMut = useSaveQueueNoShowSetting()
+  const saveKnowledgeInputSuggestionMut = useSaveKnowledgeInputSuggestionSetting()
 
   const items = useMemo(() => data?.items ?? [], [data?.items])
   const announcementItems = useMemo(() => announcementData?.items ?? [], [announcementData?.items])
@@ -345,6 +379,8 @@ export default function ConversationSettingsPage() {
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const [announcementDragIndex, setAnnouncementDragIndex] = useState<number | null>(null)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [knowledgeInputTriggerDraft, setKnowledgeInputTriggerDraft] = useState('2')
+  const [knowledgeInputTriggerError, setKnowledgeInputTriggerError] = useState<string | null>(null)
 
   useEffect(() => {
     setOrderedIds(items.map((item) => item.id))
@@ -353,6 +389,12 @@ export default function ConversationSettingsPage() {
   useEffect(() => {
     setAnnouncementOrderedIds(announcementItems.map((item) => item.id))
   }, [announcementItems])
+
+  useEffect(() => {
+    if (!knowledgeInputSuggestionSettings) return
+    setKnowledgeInputTriggerDraft(String(knowledgeInputSuggestionSettings.trigger_length))
+    setKnowledgeInputTriggerError(null)
+  }, [knowledgeInputSuggestionSettings])
 
   const byId = useMemo(() => Object.fromEntries(items.map((item) => [item.id, item])), [items])
   const displayRows = orderedIds.map((id) => byId[id]).filter(Boolean) as WelcomeMessageRuleListItem[]
@@ -460,6 +502,54 @@ export default function ConversationSettingsPage() {
     }
   }
 
+  const handleToggleQueueNoShow = async () => {
+    if (!queueNoShowSettings) return
+    try {
+      await saveQueueNoShowMut.mutateAsync(!queueNoShowSettings.enabled)
+      showToast('success', t('queueNoShow.toggleSuccess', locale))
+    } catch {
+      showToast('error', t('queueNoShow.toggleFailed', locale))
+      refetchQueueNoShowSettings()
+    }
+  }
+
+  const saveKnowledgeInputSuggestion = async (payload: { enabled: boolean; trigger_length: number }) => {
+    try {
+      await saveKnowledgeInputSuggestionMut.mutateAsync(payload)
+      showToast('success', t('knowledgeInputSuggestion.saveSuccess', locale))
+    } catch {
+      showToast('error', t('knowledgeInputSuggestion.saveFailed', locale))
+      refetchKnowledgeInputSuggestionSettings()
+    }
+  }
+
+  const handleToggleKnowledgeInputSuggestion = async () => {
+    if (!knowledgeInputSuggestionSettings) return
+    setKnowledgeInputTriggerError(null)
+    await saveKnowledgeInputSuggestion({
+      enabled: !knowledgeInputSuggestionSettings.enabled,
+      trigger_length: knowledgeInputSuggestionSettings.trigger_length,
+    })
+  }
+
+  const handleCommitKnowledgeInputTrigger = async () => {
+    if (!knowledgeInputSuggestionSettings || !knowledgeInputSuggestionSettings.enabled) return
+    const value = Number(knowledgeInputTriggerDraft)
+    if (!Number.isInteger(value) || value < 1 || value > 10) {
+      setKnowledgeInputTriggerError(t('knowledgeInputSuggestion.triggerLength.error', locale))
+      return
+    }
+    if (value === knowledgeInputSuggestionSettings.trigger_length) {
+      setKnowledgeInputTriggerError(null)
+      return
+    }
+    setKnowledgeInputTriggerError(null)
+    await saveKnowledgeInputSuggestion({
+      enabled: knowledgeInputSuggestionSettings.enabled,
+      trigger_length: value,
+    })
+  }
+
   const handleToggleUserStatField = async (key: UserStatFieldKey) => {
     if (!userStatSettings) return
     const next = {
@@ -487,6 +577,17 @@ export default function ConversationSettingsPage() {
     } catch {
       showToast('error', t('readStatus.settings.saveFailed', locale))
       refetchReadStatusSettings()
+    }
+  }
+
+  const handleChangeAgentDisplayMode = async (displayMode: AgentDisplayMode) => {
+    if (!agentDisplaySetting || agentDisplaySetting.display_mode === displayMode) return
+    try {
+      await saveAgentDisplayMut.mutateAsync({ display_mode: displayMode })
+      showToast('success', t('agentDisplay.settings.saveSuccess', locale))
+    } catch {
+      showToast('error', t('agentDisplay.settings.saveFailed', locale))
+      refetchAgentDisplaySetting()
     }
   }
 
@@ -984,6 +1085,186 @@ export default function ConversationSettingsPage() {
               </button>
             </div>
           )
+        ) : null}
+      </section>
+
+      <section className="flex flex-col gap-4 border-t border-border pt-6">
+        <div>
+          <h2 className="text-lg font-semibold text-foreground">{t('queueNoShow.title', locale)}</h2>
+        </div>
+
+        {queueNoShowPending ? (
+          <div className="h-24 animate-pulse rounded-md border border-border bg-muted/50" />
+        ) : queueNoShowError ? (
+          <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border py-12">
+            <p className="text-sm text-muted-foreground">{t('queueNoShow.loadFailed', locale)}</p>
+            <button
+              type="button"
+              onClick={() => refetchQueueNoShowSettings()}
+              className="inline-flex h-9 items-center rounded-md border border-border px-4 text-sm font-medium text-foreground hover:bg-accent"
+            >
+              {t('vc.retry', locale)}
+            </button>
+          </div>
+        ) : queueNoShowSettings ? (
+          <div className="overflow-hidden rounded-md border border-border bg-background">
+            <div className="flex min-w-0 items-start justify-between gap-4 p-5">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-semibold text-foreground">{t('queueNoShow.label', locale)}</h3>
+                  <span className="rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                    {queueNoShowSettings.enabled
+                      ? t('queueNoShow.enabled.on', locale)
+                      : t('queueNoShow.enabled.off', locale)}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm leading-5 text-muted-foreground">{t('queueNoShow.desc', locale)}</p>
+              </div>
+              <Switch
+                checked={queueNoShowSettings.enabled}
+                disabled={saveQueueNoShowMut.isPending}
+                aria-label={t('queueNoShow.label', locale)}
+                onCheckedChange={handleToggleQueueNoShow}
+              />
+            </div>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="flex flex-col gap-4 border-t border-border pt-6">
+        <div>
+          <h2 className="text-lg font-semibold text-foreground">{t('knowledgeInputSuggestion.title', locale)}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">{t('knowledgeInputSuggestion.description', locale)}</p>
+        </div>
+
+        {knowledgeInputSuggestionPending ? (
+          <div className="h-32 animate-pulse rounded-md border border-border bg-muted/50" />
+        ) : knowledgeInputSuggestionError ? (
+          <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border py-12">
+            <p className="text-sm text-muted-foreground">{t('knowledgeInputSuggestion.loadFailed', locale)}</p>
+            <button
+              type="button"
+              onClick={() => refetchKnowledgeInputSuggestionSettings()}
+              className="inline-flex h-9 items-center rounded-md border border-border px-4 text-sm font-medium text-foreground hover:bg-accent"
+            >
+              {t('vc.retry', locale)}
+            </button>
+          </div>
+        ) : knowledgeInputSuggestionSettings ? (
+          <div className="overflow-hidden rounded-md border border-border bg-background">
+            <div className="flex min-w-0 items-start justify-between gap-4 border-b border-border p-5">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <IconBook2 size={17} className="text-muted-foreground" />
+                  <h3 className="text-sm font-semibold text-foreground">{t('knowledgeInputSuggestion.label', locale)}</h3>
+                  <span className="rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                    {knowledgeInputSuggestionSettings.enabled
+                      ? t('knowledgeInputSuggestion.enabled.on', locale)
+                      : t('knowledgeInputSuggestion.enabled.off', locale)}
+                  </span>
+                </div>
+                <p className="mt-2 text-sm leading-5 text-muted-foreground">{t('knowledgeInputSuggestion.hint', locale)}</p>
+              </div>
+              <Switch
+                checked={knowledgeInputSuggestionSettings.enabled}
+                disabled={saveKnowledgeInputSuggestionMut.isPending}
+                aria-label={t('knowledgeInputSuggestion.label', locale)}
+                onCheckedChange={handleToggleKnowledgeInputSuggestion}
+              />
+            </div>
+            <div className="grid gap-3 p-5 md:grid-cols-[180px_1fr]">
+              <label
+                htmlFor="knowledge-input-suggestion-trigger-length"
+                className="pt-2 text-sm font-medium text-foreground"
+              >
+                {t('knowledgeInputSuggestion.triggerLength.label', locale)}
+              </label>
+              <div className="max-w-[240px]">
+                <input
+                  id="knowledge-input-suggestion-trigger-length"
+                  type="number"
+                  min={1}
+                  max={10}
+                  step={1}
+                  value={knowledgeInputTriggerDraft}
+                  disabled={!knowledgeInputSuggestionSettings.enabled || saveKnowledgeInputSuggestionMut.isPending}
+                  onChange={(event) => {
+                    setKnowledgeInputTriggerDraft(event.target.value)
+                    setKnowledgeInputTriggerError(null)
+                  }}
+                  onBlur={() => void handleCommitKnowledgeInputTrigger()}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.currentTarget.blur()
+                    }
+                  }}
+                  className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t('knowledgeInputSuggestion.triggerLength.help', locale)}
+                </p>
+                {knowledgeInputTriggerError && (
+                  <p className="mt-1 text-xs text-destructive">{knowledgeInputTriggerError}</p>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </section>
+
+      <section className="flex flex-col gap-4 border-t border-border pt-6">
+        <div>
+          <h2 className="text-lg font-semibold text-foreground">{t('agentDisplay.settings.title', locale)}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">{t('agentDisplay.settings.description', locale)}</p>
+        </div>
+
+        {agentDisplayPending ? (
+          <div className="h-24 animate-pulse rounded-md border border-border bg-muted/50" />
+        ) : agentDisplayError ? (
+          <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border py-12">
+            <p className="text-sm text-muted-foreground">{t('agentDisplay.settings.loadFailed', locale)}</p>
+            <button
+              type="button"
+              onClick={() => refetchAgentDisplaySetting()}
+              className="inline-flex h-9 items-center rounded-md border border-border px-4 text-sm font-medium text-foreground hover:bg-accent"
+            >
+              {t('vc.retry', locale)}
+            </button>
+          </div>
+        ) : agentDisplaySetting ? (
+          <div className="overflow-hidden rounded-md border border-border bg-background">
+            <div className="grid divide-y divide-border md:grid-cols-2 md:divide-x md:divide-y-0">
+              {(['name', 'nickname'] as const).map((mode) => {
+                const checked = agentDisplaySetting.display_mode === mode
+                return (
+                  <button
+                    key={mode}
+                    type="button"
+                    disabled={saveAgentDisplayMut.isPending}
+                    onClick={() => void handleChangeAgentDisplayMode(mode)}
+                    className="flex min-w-0 items-start gap-3 p-5 text-left transition-colors hover:bg-accent/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    aria-pressed={checked}
+                  >
+                    <span
+                      className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border ${
+                        checked ? 'border-primary' : 'border-border'
+                      }`}
+                    >
+                      {checked && <span className="h-2 w-2 rounded-full bg-primary" />}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-sm font-semibold text-foreground">
+                        {t(`agentDisplay.settings.mode.${mode}`, locale)}
+                      </span>
+                      <span className="mt-1 block text-sm leading-5 text-muted-foreground">
+                        {t(`agentDisplay.settings.mode.${mode}.description`, locale)}
+                      </span>
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
         ) : null}
       </section>
 

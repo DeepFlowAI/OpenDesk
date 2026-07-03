@@ -32,6 +32,8 @@ import {
   recallPublicMessage,
   sendOfflineMessage,
   type ChannelPublicConfig,
+  type OfflineMessageQueueType,
+  type OfflineMessageSource,
   type PublicMessage,
   type VisitorEnvironmentPayload,
 } from '@/service/use-visitor-chat'
@@ -79,10 +81,17 @@ export type VisitorChatConfigValue = {
   conversationPublicId: string | null
   offlineMode: boolean
   offlineMessagePublicId: string | null
+  offlineMessageSource: OfflineMessageSource | null
+  offlineMessageQueueTarget: {
+    queueType: OfflineMessageQueueType
+    queueId: number
+  } | null
   queueFull: boolean
   queueFullMessage: string
   queueFullShowLeaveMessageButton: boolean
   queueFullLeaveMessageButtonLabel: string
+  queueLeaveMessageLoading: boolean
+  handoffQueueFullInline: boolean
   startConversationError: string | null
   currentQueueCount: number | null
   visitorSessionToken: string
@@ -123,6 +132,8 @@ export type VisitorChatConfigValue = {
   onTyping: (content: string) => void
   onRestartConversation: () => Promise<void>
   onQueueFullLeaveMessage: () => void
+  onQueueLeaveMessage: () => void | Promise<void>
+  onHandoffQueueFullContinueBot: () => void
   onAssistSendMessage: (text: string) => Promise<boolean>
   onRequestHumanHandoff: (payload?: HumanHandoffEventPayload | null) => Promise<boolean>
   onDismissHumanHandoff: () => void
@@ -658,7 +669,7 @@ type ProviderProps = Omit<
   onCurrentQueueCountChange?: (count: number | null) => void
   onOfflineMessageCreated: (offlineMessagePublicId: string) => void
   onHandoffLeaveMessage?: (prompt?: string) => void
-  onHandoffQueueFull?: (payload: HandoffRouteUnavailablePayload) => void
+  onHandoffQueueFull?: (payload: HandoffRouteUnavailablePayload, inline?: boolean) => void
   children: ReactNode
 }
 
@@ -773,6 +784,8 @@ export function VisitorChatRuntimeProvider({
     conversationPublicId,
     offlineMode,
     offlineMessagePublicId,
+    offlineMessageSource,
+    offlineMessageQueueTarget,
     visitorSessionToken,
     visitorEnvironment,
   } = chatConfig
@@ -910,7 +923,10 @@ export function VisitorChatRuntimeProvider({
     }
   }, [onConversationStatusChange, onCurrentQueueCountChange, resetHandoffUiState])
 
-  const applyHandoffUnavailableState = useCallback((payload: HandoffRouteUnavailablePayload) => {
+  const applyHandoffUnavailableState = useCallback((
+    payload: HandoffRouteUnavailablePayload,
+    preferInlineQueueFull = false,
+  ) => {
     if (isHandoffLeaveMessagePayload(payload)) {
       resetHandoffUiState()
       onHandoffLeaveMessage?.(payload.leave_message_prompt)
@@ -918,7 +934,7 @@ export function VisitorChatRuntimeProvider({
     }
     if (isHandoffQueueFullPayload(payload)) {
       resetHandoffUiState()
-      onHandoffQueueFull?.(payload)
+      onHandoffQueueFull?.(payload, preferInlineQueueFull)
       return true
     }
     return false
@@ -974,13 +990,15 @@ export function VisitorChatRuntimeProvider({
             error?: string
             leave_message?: boolean
             queue_full?: boolean
+            queue_type?: string
+            queue_id?: number
             leave_message_prompt?: string
             queue_full_message?: string
             queue_full_show_leave_message_button?: boolean
             queue_full_leave_message_button_label?: string
           }) => {
             if (res?.message) addMessage(res.message)
-            if (applyHandoffUnavailableState(res)) {
+            if (applyHandoffUnavailableState(res, Boolean(payload))) {
               trackEvent('human_handoff_unavailable', {
                 props: {
                   error: res.error || res.reason || 'unknown',
@@ -1119,6 +1137,9 @@ export function VisitorChatRuntimeProvider({
             visitorSessionToken,
             file,
             visitorEnvironment,
+            source: offlineMessageSource,
+            queueType: offlineMessageQueueTarget?.queueType,
+            queueId: offlineMessageQueueTarget?.queueId,
           })
           const returnedMessages = res.messages?.length
             ? res.messages
@@ -1246,6 +1267,8 @@ export function VisitorChatRuntimeProvider({
       conversationPublicId,
       offlineMode,
       offlineMessagePublicId,
+      offlineMessageSource,
+      offlineMessageQueueTarget,
       visitorExternalId,
       visitorSessionToken,
       visitorEnvironment,
@@ -1617,6 +1640,8 @@ export function VisitorChatRuntimeProvider({
               reason: getStringValue(data.reason) || undefined,
               leave_message: data.leave_message === true,
               queue_full: data.queue_full === true,
+              queue_type: getStringValue(data.queue_type) || undefined,
+              queue_id: typeof data.queue_id === 'number' ? data.queue_id : undefined,
               leave_message_prompt: getStringValue(data.leave_message_prompt) || undefined,
               queue_full_message: getStringValue(data.queue_full_message) || undefined,
               queue_full_show_leave_message_button:
@@ -1626,7 +1651,7 @@ export function VisitorChatRuntimeProvider({
               queue_full_leave_message_button_label: (
                 getStringValue(data.queue_full_leave_message_button_label) || undefined
               ),
-            })) {
+            }, true)) {
               return
             }
             applyQueueConversationState({
@@ -1842,6 +1867,9 @@ export function VisitorChatRuntimeProvider({
                 contentType: 'text',
                 content: trimmed,
                 visitorEnvironment,
+                source: offlineMessageSource,
+                queueType: offlineMessageQueueTarget?.queueType,
+                queueId: offlineMessageQueueTarget?.queueId,
               })
           if (res.ok && res.message) {
             if (res.offline_message_public_id) {
@@ -1886,6 +1914,11 @@ export function VisitorChatRuntimeProvider({
 
       if (chatConfig.botMode) {
         if (botRunning) return false
+        // Typing while the bot-handoff queue-full card is up means "keep chatting
+        // with the bot": dismiss the card and continue the bot turn.
+        if (chatConfig.handoffQueueFullInline) {
+          chatConfig.onHandoffQueueFullContinueBot()
+        }
         await runOpenAgentTurn({
           text: trimmed,
           quotedMessageId: quotedMessage?.id,
@@ -1938,10 +1971,14 @@ export function VisitorChatRuntimeProvider({
       conversationPublicId,
       offlineMode,
       offlineMessagePublicId,
+      offlineMessageSource,
+      offlineMessageQueueTarget,
       visitorSessionToken,
       visitorEnvironment,
       onOfflineMessageCreated,
       chatConfig.botMode,
+      chatConfig.handoffQueueFullInline,
+      chatConfig.onHandoffQueueFullContinueBot,
       botRunning,
       runOpenAgentTurn,
       addOptimistic,

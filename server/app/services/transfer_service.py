@@ -52,6 +52,7 @@ from app.services.conversation_realtime_service import ConversationRealtimeServi
 from app.services.data_scope_service import DataScopeService, RESOURCE_PEER_CONVERSATION
 from app.services.permission_service import PermissionService
 from app.services.reception_event_service import ReceptionEventService
+from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 
 logger = logging.getLogger(__name__)
 
@@ -426,6 +427,10 @@ class TransferService:
                 "agent_id": target.id,
                 "last_message_at": now,
                 "last_message_preview": system_text[:200],
+                # The transfer itself is a pending item for the receiver, so it
+                # raises an unread badge. When the source agent left unread
+                # messages this stacks on top (accepted behaviour).
+                "unread_count": Conversation.unread_count + 1,
             }
             update_stmt = (
                 update(Conversation)
@@ -476,6 +481,13 @@ class TransferService:
                 reason=ReceptionEventReason.TRANSFER.value,
             )
 
+            await VisitorTimeoutCloseService.restart_on_transfer(
+                db,
+                conversation,
+                anchor_at=now,
+                commit=False,
+            )
+
             await db.flush()
             await db.commit()
         except BusinessError:
@@ -493,6 +505,7 @@ class TransferService:
                 "agent_id",
                 "last_message_at",
                 "last_message_preview",
+                "unread_count",
                 "visitor",
                 "agent",
                 "channel",

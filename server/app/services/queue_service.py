@@ -3,6 +3,7 @@ Unified queue engine service.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError, ConflictError, NotFoundError, ValidationError
 from app.enums import (
+    ConversationStatus,
     QueueAssignmentStrategy,
     QueueAssignmentType,
     QueueChannel,
@@ -54,6 +56,14 @@ from app.schemas.queue import (
 from app.services.queue_resource_provider import QueueResourceProviderFactory
 from app.services.queue_realtime_service import QueueRealtimeService
 from app.services.queue_strategy import QueueCandidate, QueueStrategyService
+
+
+logger = logging.getLogger(__name__)
+
+# Queue no-show cancel: when a Web SDK visitor is offline at auto-assignment
+# time, the queued task is canceled instead of assigned to an agent.
+QUEUE_NO_SHOW_REASON = "visitor_offline_no_show"
+QUEUE_NO_SHOW_ENDED_BY = "queue_no_show"
 
 
 DEFAULT_QUEUE_POLICY = {
@@ -166,6 +176,74 @@ class QueuePolicyResolver:
 
 
 class QueueTaskService:
+    @staticmethod
+    async def select_immediate_online_chat_agent(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        tenant_id: int,
+        *,
+        queue_type: str,
+        queue_id: int,
+        visitor_id: int,
+    ) -> int | None:
+        if queue_type != QueueType.EMPLOYEE_GROUP.value:
+            return None
+
+        provider = QueueResourceProviderFactory.create(QueueChannel.ONLINE_CHAT.value)
+        candidates = await provider.list_candidates(
+            db,
+            r,
+            tenant_id,
+            queue_type,
+            queue_id,
+            None,
+        )
+        available = [candidate for candidate in candidates if candidate.available]
+        if not available:
+            return None
+
+        policy = await QueuePolicyResolver.resolve(
+            db,
+            tenant_id,
+            channel=QueueChannel.ONLINE_CHAT.value,
+            queue_type=queue_type,
+            queue_id=queue_id,
+        )
+        rr_state = await QueueRoundRobinRepository.get_state(
+            db,
+            tenant_id,
+            QueueChannel.ONLINE_CHAT.value,
+            queue_type,
+            queue_id,
+        )
+        ordered = QueueStrategyService.ordered_candidates(
+            candidates,
+            policy.get("assignment_strategy"),
+            last_agent_id=rr_state.last_agent_id if rr_state else None,
+            config=policy.get("config") or {},
+        )
+        returning_candidate = await QueueTaskService._returning_online_chat_candidate_for_visitor(
+            db,
+            tenant_id,
+            visitor_id=visitor_id,
+            policy_snapshot=policy,
+            available=available,
+        )
+        is_returning_agent = returning_candidate is not None
+        selected = returning_candidate or (ordered[0] if ordered else None)
+        if selected is None:
+            return None
+        if policy.get("assignment_strategy") == QueueAssignmentStrategy.ROUND_ROBIN.value and not is_returning_agent:
+            await QueueRoundRobinRepository.set_last_agent(
+                db,
+                tenant_id,
+                QueueChannel.ONLINE_CHAT.value,
+                queue_type,
+                queue_id,
+                selected.employee_id,
+            )
+        return selected.employee_id
+
     @staticmethod
     async def enqueue_task(db: AsyncSession, tenant_id: int, data: QueueEnqueueRequest) -> QueueEnqueueResponse:
         exists = await QueueCandidateRepository.queue_exists(db, tenant_id, data.queue_type.value, data.queue_id)
@@ -391,16 +469,25 @@ class QueueTaskService:
         tenant_id: int,
         employee_id: int,
         data: QueuePullRequest,
+        *,
+        enforce_visitor_online: bool = False,
     ) -> QueueTask:
-        task = await QueueTaskRepository.find_pullable_task(
-            db,
-            tenant_id,
-            employee_id,
-            queue_type=data.queue_type.value if data.queue_type else None,
-            queue_id=data.queue_id,
-        )
-        if not task:
-            raise NotFoundError("No queue task available")
+        while True:
+            task = await QueueTaskRepository.find_pullable_task(
+                db,
+                tenant_id,
+                employee_id,
+                queue_type=data.queue_type.value if data.queue_type else None,
+                queue_id=data.queue_id,
+            )
+            if not task:
+                raise NotFoundError("No queue task available")
+            # System auto-backfill: skip and void tasks whose visitor is offline.
+            if enforce_visitor_online and await QueueTaskService._void_task_if_visitor_offline(
+                db, r, tenant_id, task
+            ):
+                continue
+            break
         await QueueTaskRepository.mark_assigning(db, task, _now())
         provider = QueueResourceProviderFactory.create(QueueChannel.ONLINE_CHAT.value)
         reserve = await provider.try_reserve(db, r, tenant_id, employee_id, task, bypass_capacity=True)
@@ -502,6 +589,11 @@ class QueueTaskService:
         )
         if not task:
             return QueueDispatchResponse(dispatched=False, reason="no_queued_task")
+
+        # Auto dispatch: void the task instead of assigning when the Web SDK
+        # visitor is offline and the tenant enabled queue no-show cancel.
+        if await QueueTaskService._void_task_if_visitor_offline(db, tenant_id=tenant_id, r=r, task=task):
+            return QueueDispatchResponse(dispatched=False, reason=QUEUE_NO_SHOW_REASON)
 
         await QueueTaskRepository.mark_assigning(db, task, _now())
         provider = QueueResourceProviderFactory.create(data.channel.value)
@@ -645,6 +737,32 @@ class QueueTaskService:
         return candidate_by_id.get(agent_id)
 
     @staticmethod
+    async def _returning_online_chat_candidate_for_visitor(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        visitor_id: int,
+        policy_snapshot: dict[str, Any],
+        available: list[QueueCandidate],
+    ) -> QueueCandidate | None:
+        if len(available) <= 1:
+            return None
+        enabled, window_hours = QueueTaskService._returning_agent_config(policy_snapshot)
+        if not enabled:
+            return None
+        cutoff = _now() - timedelta(hours=window_hours)
+        agent_id = await QueueReturningAgentRepository.find_recent_online_chat_agent_for_visitor(
+            db,
+            tenant_id,
+            visitor_id=visitor_id,
+            cutoff=cutoff,
+        )
+        if agent_id is None:
+            return None
+        candidate_by_id = {candidate.employee_id: candidate for candidate in available}
+        return candidate_by_id.get(agent_id)
+
+    @staticmethod
     def _returning_agent_config(policy_snapshot: dict[str, Any]) -> tuple[bool, int]:
         config = policy_snapshot.get("config") if isinstance(policy_snapshot, dict) else None
         if not isinstance(config, dict) or config.get(RETURNING_AGENT_PRIORITY_ENABLED_KEY) is not True:
@@ -710,6 +828,118 @@ class QueueTaskService:
         from app.services.queue_materialization_service import QueueMaterializationService
 
         await QueueMaterializationService.materialize_conversation(db, task.tenant_id, conversation_id)
+
+    @staticmethod
+    async def _void_task_if_visitor_offline(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        tenant_id: int,
+        task: QueueTask,
+    ) -> bool:
+        """Cancel a queued online-chat task when its Web SDK visitor is offline.
+
+        Returns True when the task was voided (tenant opted in and the visitor is
+        offline), so the caller must skip assigning it. A single evaluation
+        failure never blocks assignment of other tasks: any error is swallowed,
+        pending changes are rolled back and False is returned so the normal
+        assignment flow continues.
+        """
+        if task.channel != QueueChannel.ONLINE_CHAT.value:
+            return False
+        if task.task_type not in [QueueTaskType.CONVERSATION.value, QueueTaskType.OPEN_AGENT_HANDOFF.value]:
+            return False
+
+        try:
+            from app.repositories.conversation_repository import ConversationRepository
+            from app.services.queue_no_show_setting_service import QueueNoShowSettingService
+            from app.services.visitor_web_status_service import VisitorWebStatusService
+
+            if not await QueueNoShowSettingService.is_enabled(db, tenant_id):
+                return False
+            try:
+                conversation_id = int(task.task_ref_id)
+            except (TypeError, ValueError):
+                return False
+            conversation = await ConversationRepository.get_by_id(db, conversation_id)
+            if not conversation or conversation.tenant_id != tenant_id:
+                return False
+            if conversation.status != ConversationStatus.QUEUED.value:
+                return False
+            if not VisitorWebStatusService.can_display(conversation):
+                return False
+            status = await VisitorWebStatusService.get_status(
+                r,
+                tenant_id,
+                int(conversation.channel_id),
+                conversation.visitor.external_id,
+            )
+            if status != "offline":
+                return False
+
+            await QueueTaskRepository.mark_terminal(
+                db,
+                task,
+                QueueTaskStatus.CANCELED.value,
+                now=_now(),
+                reason=QUEUE_NO_SHOW_REASON,
+            )
+            await QueueTaskService._record_event(db, task, "canceled", reason=QUEUE_NO_SHOW_REASON)
+            await QueueTaskService._materialize_conversation_summary(db, task)
+            await ConversationRepository.end_conversation(db, conversation, QUEUE_NO_SHOW_ENDED_BY)
+            await db.refresh(task)
+            await QueueTaskService._emit_queue_change(task, "canceled")
+            await QueueTaskService._emit_no_show_conversation_ended(conversation)
+            logger.info(
+                "queue_no_show_voided tenant_id=%s task_id=%s conversation_id=%s",
+                tenant_id,
+                task.id,
+                conversation_id,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to evaluate queue no-show for task_id=%s tenant_id=%s",
+                getattr(task, "id", None),
+                tenant_id,
+            )
+            # Discard any partial writes so the caller's later commit cannot
+            # persist a half-voided task; never let cleanup mask the fallback.
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            return False
+
+    @staticmethod
+    async def _emit_no_show_conversation_ended(conversation) -> None:
+        """Notify agent workspace and visitor widget that the conversation ended."""
+        try:
+            from app.libs.realtime import get_realtime_transport
+            from app.services.conversation_realtime_service import ConversationRealtimeService
+
+            rt = get_realtime_transport()
+        except Exception:
+            return
+        try:
+            end_payload = {
+                "conversation_id": conversation.id,
+                "conversation_public_id": conversation.public_id,
+                "ended_by": QUEUE_NO_SHOW_ENDED_BY,
+            }
+            conv_room = f"conv:{conversation.id}"
+            await rt.emit("conversation_ended", end_payload, room=conv_room, namespace="/chat")
+            await rt.emit("conversation_ended", end_payload, room=conv_room, namespace="/visitor")
+            await ConversationRealtimeService.emit_conversation_list_updated(
+                conversation.tenant_id,
+                action="ended",
+                conversation_id=conversation.id,
+                rt=rt,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to emit queue no-show conversation_ended for conversation=%s",
+                getattr(conversation, "id", None),
+            )
 
     @staticmethod
     async def _record_reception_assignment(

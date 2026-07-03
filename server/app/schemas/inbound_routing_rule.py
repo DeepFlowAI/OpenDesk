@@ -7,9 +7,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from app.schemas.base import PaginatedResponse
+from app.schemas.voice_flow_graph import AssignQueueTarget
 
 
 ConditionType = Literal["caller_number", "callee_number", "call_time"]
+TargetType = Literal["voice_flow", "voicespeed_agent"]
 
 
 class RoutingCondition(BaseModel):
@@ -51,7 +53,11 @@ class InboundRoutingRuleCreate(BaseModel):
     name: str
     enabled: bool = True
     conditions: list[RoutingCondition] = []
-    target_voice_flow_id: int
+    target_type: TargetType = "voice_flow"
+    target_voice_flow_id: int | None = None
+    voicespeed_agent_id: str | None = None
+    voicespeed_agent_name: str | None = None
+    transfer_target: AssignQueueTarget | None = None
 
     @field_validator("name")
     @classmethod
@@ -68,7 +74,11 @@ class InboundRoutingRuleUpdate(BaseModel):
     name: str
     enabled: bool = True
     conditions: list[RoutingCondition] = []
-    target_voice_flow_id: int
+    target_type: TargetType = "voice_flow"
+    target_voice_flow_id: int | None = None
+    voicespeed_agent_id: str | None = None
+    voicespeed_agent_name: str | None = None
+    transfer_target: AssignQueueTarget | None = None
 
     @field_validator("name")
     @classmethod
@@ -104,8 +114,12 @@ class InboundRoutingRuleResponse(BaseModel):
     name: str
     enabled: bool
     conditions: list[dict]
-    target_voice_flow_id: int
+    target_type: str = "voice_flow"
+    target_voice_flow_id: int | None = None
     target_flow_name: str = ""
+    voicespeed_agent_id: str | None = None
+    voicespeed_agent_name: str | None = None
+    transfer_target: dict | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -117,8 +131,11 @@ class InboundRoutingRuleListItem(BaseModel):
     priority: int
     name: str
     enabled: bool
-    target_voice_flow_id: int
+    target_type: str = "voice_flow"
+    target_voice_flow_id: int | None = None
     target_flow_name: str = ""
+    voicespeed_agent_id: str | None = None
+    voicespeed_agent_name: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

@@ -17,3 +17,6 @@ class SystemSettings(Base, TimestampMixin):
     default_language: Mapped[str] = mapped_column(String(10), nullable=False, server_default="zh")
     default_timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="Asia/Shanghai")
     organization_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    bridge_asr_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )

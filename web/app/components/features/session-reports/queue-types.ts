@@ -1,3 +1,4 @@
+import type { Locale } from '@/context/locale-store'
 import type {
   QueueMetricFormat,
   QueueMetricGroup,
@@ -5,23 +6,27 @@ import type {
   QueueStatus,
   QueueType,
 } from '@/models/session-report'
+import type { MetricDistribution } from '@/models/session-report-overall'
 import { formatDuration } from '@/utils/format-duration'
+import { t } from '@/utils/i18n'
+import { metricDisplayLabel } from './overall/metric-format'
 
 export const QUEUE_METRIC_GROUPS: QueueMetricGroup[] = [
   'queue_access',
   'human_messages',
   'service_efficiency',
+  'satisfaction',
 ]
 
 export const queueGroupLabelKey: Record<QueueMetricGroup, string> = {
   queue_access: 'ws.records.sessionReports.overall.group.queueAccess',
   human_messages: 'ws.records.sessionReports.overall.group.humanMessages',
   service_efficiency: 'ws.records.sessionReports.overall.group.serviceEfficiency',
+  satisfaction: 'ws.records.sessionReports.overall.group.satisfaction',
 }
 
 export const queueTypeLabelKey: Record<QueueType, string> = {
   employee_group: 'ws.records.sessionReports.queues.type.group',
-  employee: 'ws.records.sessionReports.queues.type.personal',
 }
 
 export const queueStatusLabelKey: Record<QueueStatus, string> = {
@@ -46,6 +51,11 @@ export const queueMetricLabelKey: Record<QueueMetricKey, string> = {
   avg_first_human_response_seconds: 'ws.records.sessionReports.overall.metric.avgFirstHumanResponseSeconds',
   avg_agent_response_seconds: 'ws.records.sessionReports.overall.metric.avgAgentResponseSeconds',
   avg_human_session_duration_seconds: 'ws.records.sessionReports.overall.metric.avgHumanSessionDurationSeconds',
+  satisfaction_invitation_count: 'ws.records.sessionReports.overall.metric.satisfactionInvitationCount',
+  satisfaction_submission_count: 'ws.records.sessionReports.overall.metric.satisfactionSubmissionCount',
+  satisfaction_participation_rate: 'ws.records.sessionReports.overall.metric.satisfactionParticipationRate',
+  satisfaction_submission_rate: 'ws.records.sessionReports.overall.metric.satisfactionSubmissionRate',
+  product_satisfaction_count: 'ws.records.sessionReports.overall.metric.productSatisfactionCount',
 }
 
 export const queueMetricFormat: Record<QueueMetricKey, QueueMetricFormat> = {
@@ -64,6 +74,11 @@ export const queueMetricFormat: Record<QueueMetricKey, QueueMetricFormat> = {
   avg_first_human_response_seconds: 'duration_seconds',
   avg_agent_response_seconds: 'duration_seconds',
   avg_human_session_duration_seconds: 'duration_seconds',
+  satisfaction_invitation_count: 'integer',
+  satisfaction_submission_count: 'integer',
+  satisfaction_participation_rate: 'percent',
+  satisfaction_submission_rate: 'percent',
+  product_satisfaction_count: 'integer',
 }
 
 export const queueOverviewGroups: Record<QueueMetricGroup, QueueMetricKey[]> = {
@@ -88,6 +103,13 @@ export const queueOverviewGroups: Record<QueueMetricGroup, QueueMetricKey[]> = {
     'avg_agent_response_seconds',
     'avg_human_session_duration_seconds',
   ],
+  satisfaction: [
+    'satisfaction_invitation_count',
+    'satisfaction_submission_count',
+    'satisfaction_participation_rate',
+    'satisfaction_submission_rate',
+    'product_satisfaction_count',
+  ],
 }
 
 export function formatQueueMetricValue(
@@ -100,4 +122,19 @@ export function formatQueueMetricValue(
   if (format === 'duration_seconds') return formatDuration(value)
   if (format === 'percent') return `${(value * 100).toFixed(1)}%`
   return value.toLocaleString()
+}
+
+export function queueMetricDisplayLabel(
+  key: string,
+  locale: Locale,
+  distributions: MetricDistribution[] = [],
+): string {
+  if (isQueueMetricKey(key)) {
+    return t(queueMetricLabelKey[key], locale)
+  }
+  return metricDisplayLabel(key, locale, distributions)
+}
+
+function isQueueMetricKey(key: string): key is QueueMetricKey {
+  return Object.prototype.hasOwnProperty.call(queueMetricLabelKey, key)
 }

@@ -3,7 +3,7 @@
  * Custom ReactFlow node visuals for the voice flow editor. All node types
  * live in this single file to keep the surface compact; each gets ~30 lines.
  */
-import { Handle, Position, type NodeProps } from '@xyflow/react'
+import { Handle, Position, useEdges, useNodes, type NodeProps } from '@xyflow/react'
 import {
   IconPlayerPlay,
   IconVolume,
@@ -11,6 +11,7 @@ import {
   IconUserCheck,
   IconKeyboard,
   IconGitBranch,
+  IconRobot,
 } from '@tabler/icons-react'
 import {
   COLLECT_OUTLET_COLOR,
@@ -20,6 +21,7 @@ import {
   type ConditionData,
   type HangupData,
   type PlayData,
+  type VoiceSpeedData,
 } from '@/models/voice-flow-graph'
 
 // Reusable card chrome
@@ -267,6 +269,75 @@ function queueTargetLabel(target: AssignQueueData['queue_targets'][number]): str
   return target.queue_id ? `${prefix} #${target.queue_id}` : `未选择${prefix}`
 }
 
+// ──────────────── voicespeed ────────────────
+
+export function nodeTypeLabel(type: string | undefined): string {
+  switch (type) {
+    case 'start': return '开始'
+    case 'play': return '纯语音'
+    case 'collect': return '收集输入'
+    case 'condition': return '信息判定'
+    case 'assign_queue': return '分配队列'
+    case 'voicespeed': return 'VoiceSpeed'
+    case 'hangup': return '挂断'
+    default: return type ?? ''
+  }
+}
+
+// Human-readable label for a node when it appears in a picker (e.g. the
+// VoiceSpeed handoff-outlet dropdown). Friendly type name + a short content
+// snippet so multiple nodes of the same type stay distinguishable.
+export function nodeOptionLabel(type: string | undefined, data: unknown): string {
+  const base = nodeTypeLabel(type)
+  const d = (data ?? {}) as Record<string, unknown>
+  let summary = ''
+  switch (type) {
+    case 'play':
+    case 'collect':
+      summary = String((d.prompt as { text?: string } | undefined)?.text ?? '')
+      break
+    case 'voicespeed':
+      summary = String(d.agent_name ?? '')
+      break
+  }
+  summary = summary.trim().slice(0, 12)
+  return summary ? `${base} · ${summary}` : base
+}
+
+export function VoiceSpeedNodeView({ id, data, selected }: NodeProps) {
+  const d = data as VoiceSpeedData
+  const edges = useEdges()
+  const nodes = useNodes()
+  const handoffEdge = edges.find((e) => e.source === id && (e.sourceHandle ?? 'next') === 'handoff')
+  const targetNode = handoffEdge ? nodes.find((n) => n.id === handoffEdge.target) : undefined
+  const handoffConfigured = Boolean(handoffEdge && targetNode)
+  return (
+    <NodeCard
+      color={NODE_COLOR.voicespeed}
+      icon={<IconRobot size={14} />}
+      title="VoiceSpeed"
+      badge="voicespeed"
+      selected={selected}
+    >
+      <p className="line-clamp-1">{d.agent_name || '未选择 Agent'}</p>
+      <div className="mt-1 flex items-center justify-between gap-2">
+        {handoffConfigured ? (
+          <span className="truncate text-foreground/70">转人工 → {nodeTypeLabel(targetNode?.type)}</span>
+        ) : (
+          <span className="truncate text-amber-600">转人工出口未配置</span>
+        )}
+        <span className="shrink-0 text-[10px] text-foreground/50">转人工</span>
+      </div>
+      <Handle
+        type="source"
+        position={Position.Right}
+        id="handoff"
+        style={{ top: '50%', width: 8, height: 8, background: NODE_COLOR.voicespeed }}
+      />
+    </NodeCard>
+  )
+}
+
 // ──────────────── hangup ────────────────
 
 export function HangupNodeView({ data, selected }: NodeProps) {
@@ -298,5 +369,6 @@ export const NODE_TYPES = {
   collect: CollectNodeView,
   condition: ConditionNodeView,
   assign_queue: AssignQueueNodeView,
+  voicespeed: VoiceSpeedNodeView,
   hangup: HangupNodeView,
 }

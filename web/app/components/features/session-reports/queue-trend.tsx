@@ -12,6 +12,7 @@ import type {
   QueueType,
   TrendType,
 } from '@/models/session-report'
+import type { MetricDistribution } from '@/models/session-report-overall'
 import { TREND_TYPES, trendTypeLabelKey } from './types'
 import {
   isTrendChartEmpty,
@@ -23,7 +24,7 @@ import {
   formatQueueMetricValue,
   QUEUE_METRIC_GROUPS,
   queueGroupLabelKey,
-  queueMetricLabelKey,
+  queueMetricDisplayLabel,
 } from './queue-types'
 
 type Props = {
@@ -33,6 +34,7 @@ type Props = {
   group: QueueMetricGroup
   queueType: QueueType
   queueId: number
+  distributions?: MetricDistribution[]
   onTrendChange: (trend: TrendType) => void
   onGroupChange: (group: QueueMetricGroup) => void
   onLoadingChange?: (loading: boolean) => void
@@ -45,6 +47,7 @@ export function QueueTrend({
   group,
   queueType,
   queueId,
+  distributions = [],
   onTrendChange,
   onGroupChange,
   onLoadingChange,
@@ -71,11 +74,11 @@ export function QueueTrend({
     () =>
       descriptors.map((d) => ({
         key: d.key,
-        name: t(queueMetricLabelKey[d.key], locale),
+        name: queueMetricDisplayLabel(d.key, locale, distributions),
         format: d.format,
         level: d.level,
       })),
-    [descriptors, locale],
+    [descriptors, distributions, locale],
   )
 
   const chartBuckets = useMemo<TrendChartBucket[]>(
@@ -174,7 +177,7 @@ export function QueueTrend({
         <div className="mb-3 text-sm font-semibold text-foreground">
           {t('ws.records.sessionReports.trend.detail', locale)}
         </div>
-        <QueueTrendTable buckets={buckets} descriptors={descriptors} />
+        <QueueTrendTable buckets={buckets} descriptors={descriptors} distributions={distributions} />
       </div>
     </div>
   )
@@ -183,9 +186,11 @@ export function QueueTrend({
 function QueueTrendTable({
   buckets,
   descriptors,
+  distributions,
 }: {
   buckets: QueueTrendBucket[]
   descriptors: QueueTrendDescriptor[]
+  distributions: MetricDistribution[]
 }) {
   const { locale } = useLocaleStore()
   return (
@@ -197,7 +202,7 @@ function QueueTrendTable({
           </div>
           {descriptors.map((descriptor) => (
             <div key={descriptor.key} className="w-[150px] shrink-0 text-center">
-              {t(queueMetricLabelKey[descriptor.key], locale)}
+              {queueMetricDisplayLabel(descriptor.key, locale, distributions)}
             </div>
           ))}
         </div>

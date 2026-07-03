@@ -8,7 +8,9 @@ FROM ${NODE_BASE_IMAGE} AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-ENV APP_ENV=production
+# Selects which web/.env.<APP_ENV> is baked into the client bundle at build time.
+ARG APP_ENV=production
+ENV APP_ENV=${APP_ENV}
 # Build stamp: baked into the client bundle (NEXT_PUBLIC_APP_VERSION) and
 # written to public/version.json. The frontend polls version.json and compares
 # it to the baked value to detect a new deploy and prompt users to refresh.

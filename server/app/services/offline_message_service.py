@@ -12,7 +12,9 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError, ForbiddenError, NotFoundError, ValidationError
-from app.enums import ConversationStatus, MessageContentType, MessageSenderType
+from app.enums import ConversationStatus, MessageContentType, MessageSenderType, QueueType
+from app.libs.realtime import get_realtime_transport
+from app.libs.conversation_metrics import compute_duration_seconds
 from app.libs.storage import create_storage_client
 from app.models.conversation import Conversation
 from app.models.message import Message
@@ -21,6 +23,7 @@ from app.repositories.channel_repository import ChannelRepository
 from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.offline_message_repository import OfflineMessageRepository
+from app.repositories.queue_repository import QueueCandidateRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.channel import ChannelConfig
 from app.schemas.permission import EffectivePrincipal
@@ -35,9 +38,16 @@ from app.services.conversation_file_service import (
 from app.services.conversation_service import ConversationService
 from app.services.data_scope_service import DataScopeService, RESOURCE_OFFLINE_MESSAGE
 from app.services.offline_message_realtime_service import OfflineMessageRealtimeService
+from app.services.visitor_web_status_service import VisitorWebStatusService
 from app.services.routing_service import RoutingService
 
 logger = logging.getLogger(__name__)
+QUEUE_FULL_LEAVE_MESSAGE_SOURCE = "queue_full"
+QUEUE_WAITING_LEAVE_MESSAGE_SOURCE = "queue_waiting"
+QUEUE_LEAVE_MESSAGE_SOURCES = {
+    QUEUE_FULL_LEAVE_MESSAGE_SOURCE,
+    QUEUE_WAITING_LEAVE_MESSAGE_SOURCE,
+}
 
 _AVATAR_COLORS = [
     "#F87171", "#FB923C", "#FBBF24", "#34D399",
@@ -46,6 +56,7 @@ _AVATAR_COLORS = [
 OFFLINE_MESSAGE_CONVERSATION_CREATED_TEXT = "客服已基于留言创建会话"
 OFFLINE_MESSAGE_CONVERSATION_CREATED_EVENT = "offline_message_conversation_created"
 OFFLINE_MESSAGE_PROMPT_EVENT = "leave_message_prompt"
+OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY = "offline_message"
 OFFLINE_MESSAGE_ASSIGN_SELF_PERMISSION = "chat.queue.assign_self"
 OFFLINE_MESSAGE_ASSIGN_OTHER_PERMISSION = "chat.queue.assign_other"
 VISITOR_ENVIRONMENT_METADATA_KEY = "visitor_environment"
@@ -122,6 +133,7 @@ class OfflineMessageService:
             "channel": row.channel,
             "target_group": row.target_group,
             "conversation": row.conversation,
+            "handled_by": row.handled_by,
             "visitor_external_id": row.visitor_external_id,
             "visitor_name": row.visitor_name,
             "handled_by_id": row.handled_by_id,
@@ -212,6 +224,79 @@ class OfflineMessageService:
             content_type=MessageContentType.INTERNAL_NOTE.value,
             content=note,
             tenant_id=principal.tenant_id,
+        )
+
+    @staticmethod
+    async def _should_close_single_offline_bot_conversation(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        conversation: Conversation,
+    ) -> bool:
+        if conversation.status != ConversationStatus.BOT.value:
+            return False
+        active_count = await ConversationRepository.count_active_visitor_conversations(
+            db,
+            tenant_id=conversation.tenant_id,
+            visitor_id=conversation.visitor_id,
+            channel_id=conversation.channel_id,
+        )
+        if active_count != 1 or not VisitorWebStatusService.can_display(conversation):
+            return False
+        try:
+            status = await VisitorWebStatusService.get_status(
+                r,
+                conversation.tenant_id,
+                int(conversation.channel_id),
+                conversation.visitor.external_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to read visitor Web status before offline-message assignment "
+                "conversation_id=%s",
+                conversation.id,
+            )
+            return False
+        return status == "offline"
+
+    @staticmethod
+    async def _close_bot_conversation_for_offline_message_assignment(
+        db: AsyncSession,
+        conversation: Conversation,
+    ) -> None:
+        ended_at = datetime.now(timezone.utc)
+        conversation.status = ConversationStatus.CLOSED.value
+        conversation.ended_at = ended_at
+        conversation.ended_by = OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY
+        conversation.duration_seconds = compute_duration_seconds(conversation.started_at, ended_at)
+        await db.flush()
+        await ConversationRepository.recompute_message_counts(db, conversation.id)
+        await ConversationRepository.recompute_first_human_response_seconds(db, conversation.id)
+        await ConversationRepository.recompute_agent_response_metrics(db, conversation.id)
+
+    @staticmethod
+    async def _emit_bot_conversation_closed_for_offline_message_assignment(
+        conversation: Conversation,
+    ) -> None:
+        try:
+            rt = get_realtime_transport()
+        except RuntimeError:
+            return
+
+        payload = {
+            "conversation_id": conversation.id,
+            "conversation_public_id": conversation.public_id,
+            "ended_by": OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY,
+        }
+        conv_room = f"conv:{conversation.id}"
+        await rt.emit("conversation_ended", payload, room=conv_room, namespace="/chat")
+        await rt.emit("conversation_ended", payload, room=conv_room, namespace="/visitor")
+        from app.services.conversation_realtime_service import ConversationRealtimeService
+
+        await ConversationRealtimeService.emit_conversation_list_updated(
+            conversation.tenant_id,
+            action="ended",
+            conversation_id=conversation.id,
+            rt=rt,
         )
 
     @staticmethod
@@ -328,6 +413,9 @@ class OfflineMessageService:
         r: aioredis.Redis,
         channel_id: int,
         visitor_id: int | None,
+        source: str | None = None,
+        queue_type: str | None = None,
+        queue_id: int | None = None,
     ) -> tuple[object, ChannelConfig, dict, int | None]:
         channel = await ChannelRepository.get_by_id(db, channel_id)
         if not channel:
@@ -335,9 +423,34 @@ class OfflineMessageService:
         config = ChannelConfig.model_validate(channel.config or {})
         gate = await ChannelService.check_human_service_gate(db, channel, config)
         if gate["can_start_conversation"] or gate["reason"] != "outside_service_hours":
-            raise BusinessError("Leave message is only available outside service hours")
+            if source not in QUEUE_LEAVE_MESSAGE_SOURCES:
+                raise BusinessError("Leave message is only available outside service hours")
+            group_id = await OfflineMessageService._resolve_queue_leave_message_group_id(
+                db,
+                r,
+                channel,
+                config,
+                visitor_id,
+                source=source,
+                queue_type=queue_type,
+                queue_id=queue_id,
+            )
+            return channel, config, gate, group_id
+
         if config.outside_service_hours_strategy != "leave_message":
-            raise BusinessError("Leave message is not enabled for this channel")
+            if source not in QUEUE_LEAVE_MESSAGE_SOURCES:
+                raise BusinessError("Leave message is not enabled for this channel")
+            group_id = await OfflineMessageService._resolve_queue_leave_message_group_id(
+                db,
+                r,
+                channel,
+                config,
+                visitor_id,
+                source=source,
+                queue_type=queue_type,
+                queue_id=queue_id,
+            )
+            return channel, config, gate, group_id
 
         group_id, _, _ = await RoutingService.route_conversation(
             db,
@@ -349,6 +462,47 @@ class OfflineMessageService:
         return channel, config, gate, group_id
 
     @staticmethod
+    async def _resolve_queue_leave_message_group_id(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        channel,
+        config: ChannelConfig,
+        visitor_id: int | None,
+        source: str | None,
+        queue_type: str | None = None,
+        queue_id: int | None = None,
+    ) -> int | None:
+        if source == QUEUE_FULL_LEAVE_MESSAGE_SOURCE and not config.queue_full_show_leave_message_button:
+            raise BusinessError("Leave message is not enabled when the queue is full")
+        if source == QUEUE_WAITING_LEAVE_MESSAGE_SOURCE and not config.queue_show_leave_message_button:
+            raise BusinessError("Leave message is not enabled while queuing")
+
+        # Queue leave-message notices carry the exact queue the visitor was routed to.
+        # Attach the leave message there rather than re-routing after capacity changes.
+        if queue_id is not None:
+            if queue_type != QueueType.EMPLOYEE_GROUP.value:
+                raise BusinessError("Queue leave message only supports employee group queues")
+            exists = await QueueCandidateRepository.queue_exists(
+                db,
+                channel.tenant_id,
+                QueueType.EMPLOYEE_GROUP.value,
+                int(queue_id),
+            )
+            if not exists:
+                raise BusinessError("Queue not found")
+            return int(queue_id)
+
+        # Legacy clients without queue metadata: resolve the visitor's target queue.
+        group_id, _member_ids, _max_map, _block_reason = await RoutingService.route_conversation_with_meta(
+            db,
+            channel.tenant_id,
+            channel.id,
+            r,
+            visitor_id=visitor_id,
+        )
+        return group_id
+
+    @staticmethod
     async def create_or_continue_for_session(
         db: AsyncSession,
         r: aioredis.Redis,
@@ -358,6 +512,9 @@ class OfflineMessageService:
         metadata: dict | None = None,
         visitor_system: object = None,
         visitor_browser: object = None,
+        source: str | None = None,
+        queue_type: str | None = None,
+        queue_id: int | None = None,
     ) -> dict:
         tenant_id, channel_id, visitor_external_id, visitor, group_id, row_metadata, _leave_message_prompt = (
             await OfflineMessageService._prepare_leave_message_session(
@@ -368,6 +525,9 @@ class OfflineMessageService:
                 metadata=metadata,
                 visitor_system=visitor_system,
                 visitor_browser=visitor_browser,
+                source=source,
+                queue_type=queue_type,
+                queue_id=queue_id,
             )
         )
 
@@ -419,6 +579,9 @@ class OfflineMessageService:
         metadata: dict | None = None,
         visitor_system: object = None,
         visitor_browser: object = None,
+        source: str | None = None,
+        queue_type: str | None = None,
+        queue_id: int | None = None,
     ) -> tuple[int, int, str, object, int | None, dict, str]:
         tenant_id = int(visitor_context["tenant_id"])
         channel_id = int(visitor_context["channel_id"])
@@ -457,6 +620,9 @@ class OfflineMessageService:
             r,
             channel_id,
             visitor.id,
+            source=source,
+            queue_type=queue_type,
+            queue_id=queue_id,
         )
         return tenant_id, channel_id, visitor_external_id, visitor, group_id, row_metadata, config.leave_message_prompt
 
@@ -494,6 +660,9 @@ class OfflineMessageService:
         content: str,
         visitor_system: object = None,
         visitor_browser: object = None,
+        source: str | None = None,
+        queue_type: str | None = None,
+        queue_id: int | None = None,
     ) -> dict:
         if content_type not in {MessageContentType.TEXT.value, MessageContentType.IMAGE.value, MessageContentType.FILE.value}:
             raise ValidationError("Unsupported message type")
@@ -505,6 +674,9 @@ class OfflineMessageService:
                 visitor_context,
                 visitor_system=visitor_system,
                 visitor_browser=visitor_browser,
+                source=source,
+                queue_type=queue_type,
+                queue_id=queue_id,
             )
         )
         row = await OfflineMessageRepository.get_pending_by_visitor_for_update(
@@ -601,6 +773,9 @@ class OfflineMessageService:
         *,
         visitor_system: object = None,
         visitor_browser: object = None,
+        source: str | None = None,
+        queue_type: str | None = None,
+        queue_id: int | None = None,
     ) -> dict:
         tenant_id, channel_id, visitor_external_id, visitor, group_id, row_metadata, leave_message_prompt = (
             await OfflineMessageService._prepare_leave_message_session(
@@ -609,6 +784,9 @@ class OfflineMessageService:
                 visitor_context,
                 visitor_system=visitor_system,
                 visitor_browser=visitor_browser,
+                source=source,
+                queue_type=queue_type,
+                queue_id=queue_id,
             )
         )
         row = await OfflineMessageRepository.get_pending_by_visitor_for_update(
@@ -875,6 +1053,95 @@ class OfflineMessageService:
         )
 
     @staticmethod
+    async def create_conversation_and_send(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        principal: EffectivePrincipal,
+        offline_message_id: int,
+        *,
+        content: str,
+    ) -> dict:
+        if not principal.has_permission(OFFLINE_MESSAGE_ASSIGN_SELF_PERMISSION):
+            raise ForbiddenError("Permission denied")
+
+        # Imported lazily to avoid a module import cycle between the workspace services.
+        from app.services.queue_workspace_service import QueueWorkspaceService
+
+        result = await OfflineMessageService._convert_to_conversation(
+            db,
+            r,
+            principal,
+            offline_message_id,
+            principal.user_id,
+        )
+        conversation = result.get("conversation")
+        if conversation is None:
+            result["message"] = None
+            result["message_sent"] = False
+            return result
+
+        try:
+            message = await ConversationService.send_message(
+                db,
+                conversation_id=conversation.id,
+                sender_type=MessageSenderType.AGENT.value,
+                sender_id=principal.user_id,
+                content_type=MessageContentType.TEXT.value,
+                content=content,
+                tenant_id=principal.tenant_id,
+                principal=principal,
+            )
+        except BusinessError:
+            logger.warning(
+                "offline_message_assign_send_message_failed tenant_id=%s user_id=%s "
+                "offline_message_id=%s conversation_id=%s",
+                principal.tenant_id,
+                principal.user_id,
+                offline_message_id,
+                conversation.id,
+            )
+            result["message"] = None
+            result["message_sent"] = False
+            return result
+
+        await QueueWorkspaceService._emit_sent_message_events(
+            conversation,
+            message,
+            principal.user_id,
+        )
+
+        # Converting a leave message and replying in one shot means the agent is
+        # actively taking over, so the assignment +1 must not linger as a badge.
+        # Clear the counter and notify the agent's room so other pages drop the dot.
+        await ConversationService.mark_read(db, conversation.id)
+        try:
+            rt = get_realtime_transport()
+            await rt.emit(
+                "conversation_updated",
+                {"conversation_id": conversation.id, "unread_count": 0},
+                room=f"agent:{principal.tenant_id}:{principal.user_id}",
+                namespace="/chat",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to emit unread-cleared event for assign-and-send conversation %s",
+                conversation.id,
+            )
+
+        logger.info(
+            "offline_message_assigned_and_sent tenant_id=%s user_id=%s offline_message_id=%s "
+            "conversation_id=%s message_id=%s",
+            principal.tenant_id,
+            principal.user_id,
+            offline_message_id,
+            conversation.id,
+            message.id,
+        )
+        result["message"] = QueueWorkspaceService._message_response_item(message, conversation)
+        result["message_sent"] = True
+        return result
+
+    @staticmethod
     async def assign_to_agent(
         db: AsyncSession,
         r: aioredis.Redis,
@@ -900,6 +1167,46 @@ class OfflineMessageService:
         )
 
     @staticmethod
+    async def archive(
+        db: AsyncSession,
+        principal: EffectivePrincipal,
+        offline_message_id: int,
+    ) -> dict:
+        try:
+            row = await OfflineMessageRepository.get_by_id_for_update(db, offline_message_id)
+            if not row:
+                raise NotFoundError("Offline message not found")
+            await OfflineMessageService._assert_view_access(db, principal, row)
+            if row.status == "converted":
+                raise BusinessError("Offline message has already been converted")
+            if row.status == "archived":
+                raise BusinessError("Offline message has already been archived")
+            if row.status != "pending":
+                raise BusinessError("Offline message cannot be archived")
+
+            row = await OfflineMessageRepository.mark_archived(
+                db,
+                row,
+                handled_by_id=principal.user_id,
+                handled_at=datetime.now(timezone.utc),
+            )
+        except Exception:
+            await db.rollback()
+            raise
+
+        row = await OfflineMessageRepository.get_by_id(db, offline_message_id)
+        if not row:
+            raise NotFoundError("Archived offline message not found")
+        await OfflineMessageRealtimeService.emit_updated(row, action="archived")
+        logger.info(
+            "offline_message_archived tenant_id=%s user_id=%s offline_message_id=%s",
+            row.tenant_id,
+            principal.user_id,
+            row.id,
+        )
+        return {"offline_message": OfflineMessageService._brief(row)}
+
+    @staticmethod
     async def _convert_to_conversation(
         db: AsyncSession,
         r: aioredis.Redis,
@@ -910,6 +1217,7 @@ class OfflineMessageService:
         reason: str | None = None,
     ) -> dict:
         copied_messages: list[Message] = []
+        closed_bot_conversation: Conversation | None = None
         try:
             row = await OfflineMessageRepository.get_by_id_for_update(db, offline_message_id)
             if not row:
@@ -928,6 +1236,17 @@ class OfflineMessageService:
                 visitor_id=row.visitor_id,
                 channel_id=row.channel_id,
             )
+            if existing and await OfflineMessageService._should_close_single_offline_bot_conversation(
+                db,
+                r,
+                existing,
+            ):
+                await OfflineMessageService._close_bot_conversation_for_offline_message_assignment(
+                    db,
+                    existing,
+                )
+                closed_bot_conversation = existing
+                existing = None
             reused_existing_conversation = existing is not None
             if existing:
                 if existing.agent_id != agent_id:
@@ -1023,6 +1342,10 @@ class OfflineMessageService:
         conversation = await ConversationRepository.get_by_id(db, conversation.id)
         if not row or not conversation:
             raise NotFoundError("Converted offline message not found")
+        if closed_bot_conversation:
+            await OfflineMessageService._emit_bot_conversation_closed_for_offline_message_assignment(
+                closed_bot_conversation,
+            )
         await OfflineMessageRealtimeService.emit_updated(row, action="converted")
         logger.info(
             "offline_message_converted tenant_id=%s user_id=%s target_agent_id=%s offline_message_id=%s "
@@ -1082,13 +1405,15 @@ class OfflineMessageService:
         if len(data) > MAX_CONVERSATION_FILE_SIZE:
             raise ValidationError("File size exceeds 100MB limit")
 
-        safe_ext = ext if ext and ext not in BLOCKED_CONVERSATION_FILE_EXTENSIONS else "bin"
+        content_type, safe_ext = ConversationFileService._normalize_upload_metadata(
+            file.content_type,
+            ext,
+            data,
+        )
         date_prefix = datetime.now().strftime("%Y%m%d")
         key = f"offline-message-files/{row.tenant_id}/{row.id}/{date_prefix}/{uuid.uuid4().hex}.{safe_ext}"
 
         storage = create_storage_client()
-        content_type = file.content_type or "application/octet-stream"
-        ConversationFileService._validate_magic_number(content_type, data)
         await storage.upload(key, data, content_type=content_type)
 
         file_id = ConversationFileService.encode_file_id(key)

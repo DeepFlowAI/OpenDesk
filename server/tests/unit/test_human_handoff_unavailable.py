@@ -22,6 +22,7 @@ class FakeConversation:
     status: str = ConversationStatus.BOT.value
     open_agent_handoff_state: str | None = None
     open_agent_handoff_payload: dict = field(default_factory=dict)
+    ended_by: str | None = None
     agent: object | None = None
     visitor: object = field(default_factory=lambda: SimpleNamespace(id=11))
 
@@ -33,10 +34,15 @@ async def test_handoff_outside_service_hours_returns_leave_message(monkeypatch):
     async def fake_get_conversation(*_args, **_kwargs):
         return conversation
 
-    async def fake_update_handoff_state_if_unassigned(_db, conv, **_kwargs):
+    async def fake_update_handoff_state_if_unassigned(_db, conv, **kwargs):
         conv.open_agent_handoff_state = "failed"
-        conv.status = ConversationStatus.BOT.value
+        conv.status = kwargs.get("status") or conv.status
         return conv, True
+
+    async def fake_end_conversation(_db, conv, ended_by):
+        conv.status = ConversationStatus.CLOSED.value
+        conv.ended_by = ended_by
+        return conv
 
     availability = {
         "can_start_conversation": False,
@@ -53,6 +59,10 @@ async def test_handoff_outside_service_hours_returns_leave_message(monkeypatch):
     monkeypatch.setattr(
         "app.repositories.conversation_repository.ConversationRepository.update_handoff_state_if_unassigned",
         fake_update_handoff_state_if_unassigned,
+    )
+    monkeypatch.setattr(
+        "app.repositories.conversation_repository.ConversationRepository.end_conversation",
+        fake_end_conversation,
     )
     monkeypatch.setattr(
         "app.repositories.conversation_repository.ConversationRepository.get_by_id",
@@ -78,6 +88,10 @@ async def test_handoff_outside_service_hours_returns_leave_message(monkeypatch):
     assert result["leave_message"] is True
     assert result["availability"]["leave_message_prompt"] == "请留言"
     assert result["reason"] == "outside_service_hours"
+    # The bot session must be closed so the visitor no longer holds an active
+    # conversation, otherwise the leave message can't be assigned later.
+    assert conversation.status == ConversationStatus.CLOSED.value
+    assert conversation.ended_by == "handoff_leave_message"
 
 
 @pytest.mark.asyncio
@@ -102,8 +116,9 @@ async def test_handoff_queue_limit_returns_queue_full(monkeypatch):
     async def fake_update_open_agent_state(_db, conv, _payload):
         return conv
 
-    async def fake_update_status(_db, conv, status):
-        conv.status = status
+    async def fake_end_conversation(_db, conv, ended_by):
+        conv.status = ConversationStatus.CLOSED.value
+        conv.ended_by = ended_by
         return conv
 
     monkeypatch.setattr(
@@ -120,8 +135,8 @@ async def test_handoff_queue_limit_returns_queue_full(monkeypatch):
         fake_update_open_agent_state,
     )
     monkeypatch.setattr(
-        "app.repositories.conversation_repository.ConversationRepository.update_status",
-        fake_update_status,
+        "app.repositories.conversation_repository.ConversationRepository.end_conversation",
+        fake_end_conversation,
     )
     monkeypatch.setattr(
         "app.repositories.conversation_repository.ConversationRepository.get_by_id",
@@ -159,9 +174,108 @@ async def test_handoff_queue_limit_returns_queue_full(monkeypatch):
 
     assert result["ok"] is False
     assert result["queue_full"] is True
+    assert result["queue_type"] == "employee_group"
+    assert result["queue_id"] == 3
     assert result["reason"] == "queue_full"
     assert result["availability"]["queue_full_message"] == "<p>Queue full</p>"
     assert result["availability"]["queue_full_leave_message_button_label"] == "留言"
+    assert conversation.status == ConversationStatus.CLOSED.value
+    assert conversation.ended_by == "handoff_queue_full"
+
+
+@pytest.mark.asyncio
+async def test_handoff_routing_queue_limit_returns_queue_full(monkeypatch):
+    conversation = FakeConversation()
+    channel = SimpleNamespace(
+        config={
+            "queue_full_message": "<p>Queue full</p>",
+            "queue_full_show_leave_message_button": True,
+            "queue_full_leave_message_button_label": "留言",
+        }
+    )
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_update_handoff_state_if_unassigned(_db, conv, **_kwargs):
+        conv.open_agent_handoff_state = "requested"
+        conv.status = ConversationStatus.HANDOFF_PENDING.value
+        return conv, True
+
+    async def fake_update_open_agent_state(_db, conv, _payload):
+        return conv
+
+    async def fake_end_conversation(_db, conv, ended_by):
+        conv.status = ConversationStatus.CLOSED.value
+        conv.ended_by = ended_by
+        return conv
+
+    monkeypatch.setattr(
+        ConversationService,
+        "get_conversation_for_visitor_session",
+        fake_get_conversation,
+    )
+    monkeypatch.setattr(
+        "app.repositories.conversation_repository.ConversationRepository.update_handoff_state_if_unassigned",
+        fake_update_handoff_state_if_unassigned,
+    )
+    monkeypatch.setattr(
+        "app.repositories.conversation_repository.ConversationRepository.update_open_agent_state",
+        fake_update_open_agent_state,
+    )
+    monkeypatch.setattr(
+        "app.repositories.conversation_repository.ConversationRepository.end_conversation",
+        fake_end_conversation,
+    )
+    monkeypatch.setattr(
+        "app.repositories.conversation_repository.ConversationRepository.get_by_id",
+        AsyncMock(side_effect=lambda _db, conv_id: conversation),
+    )
+    monkeypatch.setattr(
+        "app.repositories.channel_repository.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.resolve_human_handoff_target",
+        AsyncMock(return_value={
+            "can_start_conversation": False,
+            "reason": "no_available_agent",
+            "agent_id": None,
+            "group_id": None,
+        }),
+    )
+    monkeypatch.setattr(
+        "app.services.routing_service.RoutingService.route_conversation_with_meta",
+        AsyncMock(return_value=(3, [], {}, "queue_limit")),
+    )
+
+    result = await ConversationService.request_human_handoff_for_session(
+        AsyncMock(),
+        AsyncMock(),
+        conversation_public_id=conversation.public_id,
+        visitor_context={
+            "tenant_id": conversation.tenant_id,
+            "channel_id": conversation.channel_id,
+            "visitor_external_id": "visitor-1",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["queue_full"] is True
+    assert result["queue_type"] == "employee_group"
+    assert result["queue_id"] == 3
+    assert result["reason"] == "queue_full"
+    assert result["availability"]["queue_full_message"] == "<p>Queue full</p>"
+    assert conversation.status == ConversationStatus.CLOSED.value
+    assert conversation.ended_by == "handoff_queue_full"
+
+
+def test_handoff_should_submit_tool_result_skips_queue_full_and_leave_message():
+    from app.socketio.visitor_handlers import _handoff_should_submit_tool_result
+
+    assert _handoff_should_submit_tool_result({"queue_full": True}) is False
+    assert _handoff_should_submit_tool_result({"leave_message": True}) is False
+    assert _handoff_should_submit_tool_result({"ok": False, "reason": "no_available_agent"}) is True
 
 
 def test_handoff_unavailable_status_fields():
@@ -169,6 +283,8 @@ def test_handoff_unavailable_status_fields():
 
     fields = OpenAgentConversationService._handoff_unavailable_status_fields({
         "queue_full": True,
+        "queue_type": "employee_group",
+        "queue_id": 3,
         "availability": {
             "queue_full_message": "Full",
             "queue_full_show_leave_message_button": True,
@@ -178,6 +294,8 @@ def test_handoff_unavailable_status_fields():
     })
 
     assert fields["queue_full"] is True
+    assert fields["queue_type"] == "employee_group"
+    assert fields["queue_id"] == 3
     assert fields["queue_full_message"] == "Full"
     assert fields["leave_message_prompt"] == "请留言"
 
@@ -197,5 +315,34 @@ def test_handoff_unavailable_socket_response_leave_message():
         "ok": False,
         "error": "LEAVE_MESSAGE",
         "reason": "outside_service_hours",
+        "leave_message_prompt": "请留言",
+    }
+
+
+def test_handoff_unavailable_socket_response_queue_full():
+    from app.socketio.visitor_handlers import _handoff_unavailable_socket_response
+
+    payload = _handoff_unavailable_socket_response({
+        "queue_full": True,
+        "reason": "queue_full",
+        "queue_type": "employee_group",
+        "queue_id": 3,
+        "availability": {
+            "queue_full_message": "Full",
+            "queue_full_show_leave_message_button": True,
+            "queue_full_leave_message_button_label": "留言",
+            "leave_message_prompt": "请留言",
+        },
+    })
+
+    assert payload == {
+        "ok": False,
+        "error": "QUEUE_FULL",
+        "reason": "queue_full",
+        "queue_type": "employee_group",
+        "queue_id": 3,
+        "queue_full_message": "Full",
+        "queue_full_show_leave_message_button": True,
+        "queue_full_leave_message_button_label": "留言",
         "leave_message_prompt": "请留言",
     }

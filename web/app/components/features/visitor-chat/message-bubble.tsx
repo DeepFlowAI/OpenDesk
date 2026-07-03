@@ -37,6 +37,7 @@ import {
 } from '@/lib/message-quote'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { cn } from '@/lib/utils'
+import { getBoundedFixedMenuPosition } from '@/lib/floating-menu-position'
 import { t } from '@/utils/i18n'
 import { IconChevronRight, IconInfoCircle, IconLoader2, IconTool } from '@tabler/icons-react'
 import { getAssistantAvatarSrc } from './avatar'
@@ -60,9 +61,71 @@ type MessageBubbleProps = {
 }
 
 const MESSAGE_RECALL_WINDOW_MS = 2 * 60 * 1000
+const MESSAGE_ACTION_MENU_WIDTH = 112
+const MESSAGE_ACTION_MENU_VERTICAL_PADDING = 8
+const MESSAGE_ACTION_MENU_ITEM_HEIGHT = 32
+const HTTP_URL_PATTERN = /https?:\/\/[^\s<>"'`]+/gi
+const TRAILING_URL_PUNCTUATION_PATTERN = /[.,!?;:)\]}，。！？；：、）】》]+$/
+
+type TextLinkSegment = {
+  type: 'link'
+  text: string
+  href: string
+} | {
+  type: 'text'
+  text: string
+}
 
 function isRecallableContentType(contentType: string): boolean {
   return contentType === 'text' || contentType === 'rich_text' || contentType === 'image' || contentType === 'file'
+}
+
+function splitHttpLinks(content: string): TextLinkSegment[] {
+  const segments: TextLinkSegment[] = []
+  let lastIndex = 0
+
+  for (const match of content.matchAll(HTTP_URL_PATTERN)) {
+    const matchedText = match[0]
+    const matchIndex = match.index ?? 0
+    const linkText = matchedText.replace(TRAILING_URL_PUNCTUATION_PATTERN, '')
+    const trailingText = matchedText.slice(linkText.length)
+
+    if (matchIndex > lastIndex) {
+      segments.push({ type: 'text', text: content.slice(lastIndex, matchIndex) })
+    }
+
+    segments.push({ type: 'link', text: linkText, href: linkText })
+    if (trailingText) segments.push({ type: 'text', text: trailingText })
+    lastIndex = matchIndex + matchedText.length
+  }
+
+  if (lastIndex < content.length) {
+    segments.push({ type: 'text', text: content.slice(lastIndex) })
+  }
+
+  return segments.length > 0 ? segments : [{ type: 'text', text: content }]
+}
+
+function LinkifiedText({ content }: { content: string }) {
+  return (
+    <>
+      {splitHttpLinks(content).map((segment, index) => (
+        segment.type === 'link' ? (
+          <a
+            key={`${segment.href}-${index}`}
+            href={segment.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-current underline underline-offset-2 hover:opacity-80"
+          >
+            {segment.text}
+          </a>
+        ) : (
+          <span key={`text-${index}`}>{segment.text}</span>
+        )
+      ))}
+    </>
+  )
 }
 
 function isWithinRecallWindow(createdAt: string): boolean {
@@ -712,8 +775,15 @@ export function MessageBubble({
 
   const openMessageMenu = useCallback((x: number, y: number) => {
     if (!hasMessageActions) return
-    setMessageMenu({ x, y })
-  }, [hasMessageActions])
+    const itemCount = Number(canQuoteCurrentMessage) + Number(canRecall)
+    setMessageMenu(getBoundedFixedMenuPosition(
+      { x, y },
+      {
+        width: MESSAGE_ACTION_MENU_WIDTH,
+        height: MESSAGE_ACTION_MENU_VERTICAL_PADDING + MESSAGE_ACTION_MENU_ITEM_HEIGHT * itemCount,
+      },
+    ))
+  }, [canQuoteCurrentMessage, canRecall, hasMessageActions])
 
   const handleRecall = useCallback(async () => {
     setMessageMenu(null)
@@ -1033,7 +1103,7 @@ export function MessageBubble({
               <MarkdownText>{message.content}</MarkdownText>
             ) : (
               <span className="min-w-0 break-words break-all whitespace-pre-wrap leading-5">
-                {message.content}
+                <LinkifiedText content={message.content} />
               </span>
             )}
           </div>

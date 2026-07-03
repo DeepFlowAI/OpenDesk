@@ -7,6 +7,8 @@ from app.core.exceptions import ValidationError
 from app.schemas.permission import EffectivePrincipal
 from app.services.conversation_file_service import ConversationFileService
 
+PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+
 
 def test_file_id_round_trip_returns_original_key():
     key = "conversation-files/1/2/20260501/demo.pdf"
@@ -33,6 +35,51 @@ def test_safe_download_name_strips_header_breaking_characters():
 def test_validate_image_magic_number_rejects_mismatch():
     with pytest.raises(ValidationError):
         ConversationFileService._validate_magic_number("image/png", b"not-a-png")
+
+
+def test_normalize_upload_metadata_rejects_declared_image_without_image_magic():
+    with pytest.raises(ValidationError):
+        ConversationFileService._normalize_upload_metadata("image/png", "png", b"not-a-png")
+
+
+@pytest.mark.asyncio
+async def test_upload_normalizes_mismatched_image_mime_and_extension(monkeypatch):
+    class MismatchedImageUploadFile:
+        filename = "screenshot.jpg"
+        content_type = "image/jpeg"
+
+        async def read(self):
+            return PNG_BYTES
+
+    class CapturingStorage:
+        def __init__(self):
+            self.key: str | None = None
+            self.content_type: str | None = None
+
+        async def upload(self, key, _data, *, content_type):
+            self.key = key
+            self.content_type = content_type
+
+        async def get_temporary_url(self, *_args, **_kwargs):
+            return "https://storage.example.com/screenshot.png?signature=1"
+
+    storage = CapturingStorage()
+    monkeypatch.setattr(
+        "app.services.conversation_file_service.create_storage_client",
+        lambda: storage,
+    )
+
+    result = await ConversationFileService._upload_file(
+        conversation_id=2,
+        tenant_id=1,
+        file=MismatchedImageUploadFile(),
+    )
+
+    assert result["name"] == "screenshot.jpg"
+    assert result["mime_type"] == "image/png"
+    assert storage.content_type == "image/png"
+    assert storage.key is not None
+    assert storage.key.endswith(".png")
 
 
 @pytest.mark.asyncio

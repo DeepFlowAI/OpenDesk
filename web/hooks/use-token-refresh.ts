@@ -4,6 +4,7 @@ import { useEffect, useRef } from 'react'
 import { useAuthStore } from '@/context/auth-store'
 import { refreshAccessToken } from '@/service/base'
 import { logAuthEvent } from '@/utils/auth-log'
+import { redirectToSessionReplacedLogin } from '@/utils/session-replacement'
 
 // Re-evaluate whether the token needs refreshing on a short tick. Using a
 // repeating check (instead of a single long timer) survives background-tab
@@ -71,6 +72,10 @@ export function useTokenRefresh() {
         const { user: currentUser, setAuth, clearAuth } = useAuthStore.getState()
         if (outcome.status === 'success' && currentUser) {
           setAuth(currentUser, outcome.token)
+        } else if (outcome.status === 'session_replaced') {
+          await logAuthEvent('session_cleared', { trigger: 'periodic_refresh_session_replaced' }, { immediate: true })
+          clearAuth()
+          redirectToSessionReplacedLogin()
         } else if (outcome.status === 'auth_error' || outcome.status === 'no_token') {
           await logAuthEvent('session_cleared', { trigger: 'periodic_refresh_auth_error' }, { immediate: true })
           clearAuth()

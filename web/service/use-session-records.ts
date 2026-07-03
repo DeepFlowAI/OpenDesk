@@ -6,6 +6,7 @@ import type {
   SessionRecordMessageListResponse,
   SessionRecordFilters,
   ReceptionTrajectory,
+  SessionRecordAgentFilterOptionsResponse,
 } from '@/models/session-record'
 
 const NS = 'session-records'
@@ -14,6 +15,7 @@ export const sessionRecordKeys = {
   all: [NS] as const,
   lists: () => [...sessionRecordKeys.all, 'list'] as const,
   list: (filters: SessionRecordFilters) => [...sessionRecordKeys.lists(), filters] as const,
+  agentOptions: () => [...sessionRecordKeys.all, 'agent-options'] as const,
   detail: (id: number) => [...sessionRecordKeys.all, 'detail', id] as const,
   messages: (id: number, afterId?: number) => [...sessionRecordKeys.all, 'messages', id, afterId] as const,
   receptionTrajectory: (id: number) => [...sessionRecordKeys.all, 'reception-trajectory', id] as const,
@@ -42,6 +44,13 @@ export const useSessionRecords = (filters: SessionRecordFilters) =>
       if (filters.satisfaction_product_label) params.satisfaction_product_label = filters.satisfaction_product_label
       return get<SessionRecordListResponse>('v1/session-records', { searchParams: params })
     },
+  })
+
+export const useSessionRecordAgentOptions = (enabled = true) =>
+  useQuery({
+    queryKey: sessionRecordKeys.agentOptions(),
+    queryFn: () => get<SessionRecordAgentFilterOptionsResponse>('v1/session-records/agent-options'),
+    enabled,
   })
 
 export const useSessionRecordDetail = (id: number) =>

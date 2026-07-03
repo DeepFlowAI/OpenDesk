@@ -422,6 +422,11 @@ async def test_create_from_visitor_persists_matched_welcome_message(monkeypatch)
         "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.initialize_for_conversation",
         AsyncMock(),
     )
+    reset_outbound = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.reset_on_outbound_message",
+        reset_outbound,
+    )
 
     result = await ConversationService.create_from_visitor(
         AsyncMock(),
@@ -438,7 +443,132 @@ async def test_create_from_visitor_persists_matched_welcome_message(monkeypatch)
     assert welcome_data["content_type"] == "welcome"
     assert welcome_data["content"] == welcome_msg.content
     assert update_last.await_count == 2
+    reset_outbound.assert_awaited_once()
     assert update_last.await_args.args[2] == "Hello there"
+
+
+@pytest.mark.asyncio
+async def test_create_from_visitor_uses_queue_returning_agent_for_group_route(monkeypatch):
+    db = AsyncMock()
+    r = AsyncMock()
+    visitor = SimpleNamespace(id=20, name="访客", external_id="visitor-1")
+    channel = SimpleNamespace(id=5, tenant_id=10, channel_type="web", config={})
+    conversation = SimpleNamespace(
+        id=30,
+        tenant_id=10,
+        channel_id=5,
+        visitor=visitor,
+        channel=channel,
+        status="active",
+        agent_id=22,
+        group_id=8,
+    )
+    system_msg = SimpleNamespace(
+        id=100,
+        content_type="system",
+        content="用户发起了新会话",
+        created_at=_dt(1),
+    )
+    select_agent = AsyncMock(return_value=22)
+    fallback_find_agent = AsyncMock(return_value=21)
+    create_conversation = AsyncMock(return_value=conversation)
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_or_create",
+        AsyncMock(return_value=(visitor, False)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_active_visitor_conversation",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ChannelRepository.get_by_id",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.check_human_service_gate",
+        AsyncMock(return_value={"can_start_conversation": True, "reason": "available"}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.RoutingService.route_conversation_with_meta",
+        AsyncMock(return_value=(8, [21, 22], {21: 5, 22: 5}, None)),
+    )
+    monkeypatch.setattr(
+        "app.services.queue_service.QueueTaskService.select_immediate_online_chat_agent",
+        select_agent,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.AgentStatusService.find_available_agent",
+        fallback_find_agent,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.AgentStatusService.increment_count",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ReceptionEventService.record",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.generate_unique_public_id",
+        AsyncMock(return_value="cv_test"),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.generate_unique_share_code",
+        AsyncMock(return_value="CV-TEST123"),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.create",
+        create_conversation,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.create",
+        AsyncMock(return_value=system_msg),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.update_last_message",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        ConversationService,
+        "create_welcome_message_on_agent_assignment",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.initialize_for_conversation",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        ConversationService,
+        "_sync_web_sdk_context_if_present",
+        AsyncMock(return_value=None),
+    )
+
+    result = await ConversationService.create_from_visitor(
+        db,
+        r,
+        tenant_id=10,
+        channel_id=5,
+        visitor_external_id="visitor-1",
+    )
+
+    select_agent.assert_awaited_once_with(
+        db,
+        r,
+        10,
+        queue_type="employee_group",
+        queue_id=8,
+        visitor_id=20,
+    )
+    fallback_find_agent.assert_not_awaited()
+    create_data = create_conversation.await_args.args[1]
+    assert create_data["agent_id"] == 22
+    assert create_data["group_id"] == 8
+    assert result["conversation"] is conversation
 
 
 @pytest.mark.asyncio
@@ -473,7 +603,7 @@ async def test_create_from_visitor_returns_queue_full_when_routing_blocked_by_qu
     )
     monkeypatch.setattr(
         "app.services.conversation_service.RoutingService.route_conversation_with_meta",
-        AsyncMock(return_value=(None, [], {}, "queue_limit")),
+        AsyncMock(return_value=(8, [], {}, "queue_limit")),
     )
     create_conversation = AsyncMock()
 
@@ -491,6 +621,8 @@ async def test_create_from_visitor_returns_queue_full_when_routing_blocked_by_qu
     )
 
     assert result["queue_full"] is True
+    assert result["queue_type"] == "employee_group"
+    assert result["queue_id"] == 8
     assert result["conversation"] is None
     assert result["availability"]["reason"] == "queue_full"
     assert result["availability"]["queue_full_message"] == "<p>Queue is full</p>"
@@ -628,6 +760,7 @@ async def test_create_welcome_message_on_agent_assignment_persists_matched_welco
     get_by_id = AsyncMock(return_value=conversation)
     create_welcome = AsyncMock(return_value=welcome_msg)
     update_last = AsyncMock()
+    reset_outbound = AsyncMock()
 
     monkeypatch.setattr(
         "app.services.conversation_service.MessageRepository.has_welcome_message",
@@ -646,6 +779,10 @@ async def test_create_welcome_message_on_agent_assignment_persists_matched_welco
         "app.services.conversation_service.ConversationRepository.update_last_message",
         update_last,
     )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.reset_on_outbound_message",
+        reset_outbound,
+    )
 
     result = await ConversationService.create_welcome_message_on_agent_assignment(
         AsyncMock(),
@@ -658,6 +795,7 @@ async def test_create_welcome_message_on_agent_assignment_persists_matched_welco
     create_welcome.assert_awaited_once_with(ANY, conversation)
     update_last.assert_awaited_once()
     assert update_last.await_args.args[2] == "Hello there"
+    reset_outbound.assert_awaited_once_with(ANY, conversation, welcome_msg)
 
 
 @pytest.mark.asyncio
@@ -1094,6 +1232,10 @@ async def test_get_visitor_history_assembles_messages_and_has_more(monkeypatch):
         "app.services.conversation_service.EmployeeRepository.get_by_ids",
         get_agents,
     )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationAgentDisplaySettingService.get_display_mode",
+        AsyncMock(return_value="nickname"),
+    )
 
     result = await ConversationService.get_visitor_history(
         AsyncMock(),
@@ -1194,6 +1336,10 @@ async def test_get_unread_offline_replies_for_session_assembles_customer_unread_
         "app.services.conversation_service.EmployeeRepository.get_by_ids",
         AsyncMock(return_value=[agent]),
     )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationAgentDisplaySettingService.get_display_mode",
+        AsyncMock(return_value="nickname"),
+    )
 
     result = await ConversationService.get_unread_offline_replies_for_session(
         AsyncMock(),
@@ -1275,6 +1421,11 @@ async def test_agent_message_marks_offline_reply_customer_unread(monkeypatch):
         "app.services.conversation_service.OfflineMessageRepository.mark_customer_unread_by_conversation",
         mark_unread,
     )
+    reset_outbound = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.reset_on_outbound_message",
+        reset_outbound,
+    )
 
     result = await ConversationService.send_message(
         AsyncMock(),
@@ -1290,6 +1441,7 @@ async def test_agent_message_marks_offline_reply_customer_unread(monkeypatch):
     mark_unread.assert_awaited_once()
     assert mark_unread.await_args.kwargs["conversation_id"] == 3
     assert mark_unread.await_args.kwargs["message_id"] == 301
+    reset_outbound.assert_awaited_once_with(ANY, conversation, message)
 
 
 @pytest.mark.asyncio
@@ -1324,6 +1476,11 @@ async def test_send_message_updates_last_message_with_aware_timestamp(monkeypatc
         "app.services.conversation_service.OfflineMessageRepository.mark_customer_unread_by_conversation",
         mark_unread,
     )
+    reset_outbound = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.reset_on_outbound_message",
+        reset_outbound,
+    )
 
     await ConversationService.send_message(
         AsyncMock(),
@@ -1338,6 +1495,7 @@ async def test_send_message_updates_last_message_with_aware_timestamp(monkeypatc
     timestamp = update_last_message.await_args.args[3]
     assert timestamp.tzinfo is timezone.utc
     assert mark_unread.await_args.kwargs["unread_at"] is timestamp
+    reset_outbound.assert_awaited_once_with(ANY, conversation, message)
 
 
 @pytest.mark.asyncio
@@ -1432,6 +1590,10 @@ async def test_get_workspace_visitor_history_assembles_channel_and_agent(monkeyp
     monkeypatch.setattr(
         "app.services.conversation_service.EmployeeRepository.get_by_ids",
         AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationAgentDisplaySettingService.get_display_mode",
+        AsyncMock(return_value="name"),
     )
 
     result = await ConversationService.get_workspace_visitor_history(
