@@ -93,10 +93,19 @@ type RetryOptions = {
   baseDelayMs?: number
 }
 
+export type OpenAgentChatAttachment = {
+  file_id: string
+  type: 'image' | 'file'
+  name: string
+  mime_type: string
+  size: number
+}
+
 type StreamOpenAgentConversationParams = {
   conversationPublicId: string
   visitorSessionToken: string
-  message: string
+  message?: string
+  attachments?: OpenAgentChatAttachment[]
   quotedMessageId?: number
   clientMessageId?: string
   requestId?: string
@@ -105,6 +114,34 @@ type StreamOpenAgentConversationParams = {
   signal?: AbortSignal
   retry?: RetryOptions
   handlers?: OpenAgentSseHandlers
+}
+
+export function buildOpenAgentChatRequestBody({
+  message,
+  attachments,
+  quotedMessageId,
+  requestId,
+  clientMessageId,
+  resume,
+  lastEventId,
+}: {
+  message?: string
+  attachments?: OpenAgentChatAttachment[]
+  quotedMessageId?: number
+  requestId: string
+  clientMessageId: string
+  resume: boolean
+  lastEventId: string | null
+}): Record<string, unknown> {
+  return {
+    ...(message ? { message } : {}),
+    ...(attachments?.length ? { attachments } : {}),
+    ...(quotedMessageId ? { quoted_message_id: quotedMessageId } : {}),
+    request_id: requestId,
+    client_message_id: clientMessageId,
+    resume,
+    ...(lastEventId ? { last_event_id: lastEventId } : {}),
+  }
 }
 
 export type SubmitOpenAgentFeedbackParams = {
@@ -692,6 +729,7 @@ export function streamOpenAgentConversation({
   conversationPublicId,
   visitorSessionToken,
   message,
+  attachments,
   quotedMessageId,
   clientMessageId,
   requestId,
@@ -726,16 +764,15 @@ export function streamOpenAgentConversation({
   }
 
   const buildInit = (): RequestInit => {
-    const body: Record<string, unknown> = {
+    const body = buildOpenAgentChatRequestBody({
       message,
-      ...(quotedMessageId ? { quoted_message_id: quotedMessageId } : {}),
-      request_id: state.requestId,
-      client_message_id: state.clientMessageId,
+      attachments,
+      quotedMessageId,
+      requestId: state.requestId,
+      clientMessageId: state.clientMessageId,
       resume: state.resume || state.isRetry,
-    }
-    if (state.lastEventId) {
-      body.last_event_id = state.lastEventId
-    }
+      lastEventId: state.lastEventId,
+    })
 
     return {
       method: 'POST',

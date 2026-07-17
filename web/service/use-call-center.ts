@@ -3,6 +3,7 @@ import { del, get, post, put } from './base'
 import type {
   AgentStatusResponse,
   AgentStatusUpdate,
+  ConsultableAgent,
   CallRecordDetail,
   CallRecordListResponse,
   CallTranscriptResponse,
@@ -15,11 +16,33 @@ const NS = 'call-center'
 const keys = {
   status: () => [NS, 'agent-status', 'me'] as const,
   session: () => [NS, 'webrtc-session', 'me'] as const,
+  consultableAgents: (keyword: string) => [NS, 'consultable-agents', keyword] as const,
   recordsRoot: () => [NS, 'records'] as const,
   records: (params: Record<string, unknown>) => [NS, 'records', params] as const,
   record: (id: number | null | undefined) => [NS, 'records', id ?? null] as const,
   transcript: (id: number | null | undefined) => [NS, 'records', id ?? null, 'transcript'] as const,
 }
+
+/**
+ * Workspace agents that can be a consult / transfer / conference target,
+ * each with their live call-center status. `keyword` filters by name on the
+ * server. Only enabled while a picker is open (pass `enabled`).
+ */
+export const useConsultableAgents = (keyword: string, enabled = true) =>
+  useQuery({
+    queryKey: keys.consultableAgents(keyword),
+    queryFn: () =>
+      get<ConsultableAgent[]>('v1/call-center/agents/consultable', {
+        searchParams: keyword ? { keyword } : {},
+      }),
+    enabled,
+    // The picker shows live agent reachability, so it must not serve the global
+    // 60s cache: reopening always refetches, and while it's open we poll so a
+    // colleague who just logged in (or dropped off) shows up without a full
+    // page refresh. Polling only runs while the picker is open (enabled).
+    staleTime: 0,
+    refetchInterval: enabled ? 10_000 : false,
+  })
 
 export const useMyAgentStatus = () =>
   useQuery({
@@ -33,6 +56,17 @@ export const useSetAgentStatus = () => {
   return useMutation({
     mutationFn: (data: AgentStatusUpdate) =>
       put<AgentStatusResponse>('v1/call-center/agent-status/me', { json: data }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: keys.status() }),
+  })
+}
+
+// Escape hatch: force-free a stranded call resource (e.g. after a lost
+// call-end event) so the agent can switch status again.
+export const useResetAgentStatus = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      post<AgentStatusResponse>('v1/call-center/agent-status/me/reset', { json: {} }),
     onSuccess: () => qc.invalidateQueries({ queryKey: keys.status() }),
   })
 }
@@ -102,6 +136,65 @@ export const rejectCurrentCall = (offerId: string) =>
 
 export const hangupCurrentCall = () =>
   post<CurrentCallActionResponse>('v1/call-center/agents/me/current-call/hangup')
+
+// ─────────── In-call control (hold / dtmf / transfer / consult / conference) ───────────
+
+export type CallControlResult = { ok: boolean; note?: string | null; call_id?: string | null }
+
+export type TransferTargetType = 'employee' | 'queue' | 'external'
+export type ConsultTargetType = 'employee' | 'external'
+
+export type CallControlTarget = {
+  target_type: TransferTargetType
+  target_id?: number | null
+  number?: string | null
+}
+
+export const holdCurrentCall = () =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/hold')
+
+export const unholdCurrentCall = () =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/unhold')
+
+export const sendCurrentCallDtmf = (digits: string) =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/dtmf', {
+    json: { digits },
+  })
+
+export const setCurrentCallMute = (muted: boolean) =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/mute', {
+    json: { muted },
+  })
+
+export const transferCurrentCall = (target: CallControlTarget) =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/transfer', {
+    json: target,
+  })
+
+export const startConsult = (target: { target_type: ConsultTargetType; target_id?: number | null; number?: string | null }) =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/consult', {
+    json: target,
+  })
+
+export const endConsult = () =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/consult/end')
+
+export const conferenceAdd = (target: { target_type: ConsultTargetType; target_id?: number | null; number?: string | null }) =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/conference/add', {
+    json: target,
+  })
+
+export const conferenceMerge = () =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/conference/merge')
+
+export const conferenceRemove = () =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/conference/remove')
+
+export const conferenceLeave = () =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/conference/leave')
+
+export const conferenceEndAll = () =>
+  post<CallControlResult>('v1/call-center/agents/me/current-call/conference/end-all')
 
 export type DialOutboundResponse = {
   call_id: string

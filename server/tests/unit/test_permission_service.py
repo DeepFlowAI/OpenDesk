@@ -8,7 +8,12 @@ import pytest
 
 from app.core.exceptions import ValidationError
 from app.services.employee_service import EmployeeService
-from app.services.permission_catalog import ALL_PERMISSION_KEYS, RESOURCE_CHAT_QUEUE, RESOURCE_PEER_CONVERSATION
+from app.services.permission_catalog import (
+    ALL_PERMISSION_KEYS,
+    RESOURCE_CHAT_QUEUE,
+    RESOURCE_COLLABORATION_INVITE,
+    RESOURCE_PEER_CONVERSATION,
+)
 from app.services.permission_service import PermissionService
 from app.services.role_service import RoleService
 
@@ -88,20 +93,56 @@ def test_merge_role_data_scopes_keeps_peer_and_queue_scopes_independent():
     assert data_scopes[RESOURCE_CHAT_QUEUE] == "all"
 
 
+def test_merge_role_data_scopes_keeps_collaboration_invite_scope_independent():
+    roles = [
+        _role(
+            1,
+            ["chat.workspace.use", "chat.conversation.collaboration.invite"],
+            {RESOURCE_COLLABORATION_INVITE: "group"},
+        ),
+        _role(
+            2,
+            ["chat.workspace.use", "chat.session_record.view"],
+            {"session_record": "all"},
+        ),
+    ]
+    permissions = [
+        "chat.workspace.use",
+        "chat.conversation.collaboration.invite",
+        "chat.session_record.view",
+    ]
+
+    data_scopes = PermissionService.merge_role_data_scopes(roles, permissions)
+
+    assert data_scopes[RESOURCE_COLLABORATION_INVITE] == "group"
+    assert data_scopes["session_record"] == "all"
+
+
 def test_merge_role_data_scopes_falls_back_to_legacy_session_scope():
     roles = [
         _role(
             1,
-            ["chat.workspace.use", "chat.conversation.peer.view", "chat.queue.view"],
+            [
+                "chat.workspace.use",
+                "chat.conversation.peer.view",
+                "chat.queue.view",
+                "chat.conversation.collaboration.invite",
+            ],
             {"session_record": "group"},
         )
     ]
-    permissions = ["chat.workspace.use", "chat.conversation.peer.view", "chat.queue.view"]
+    permissions = [
+        "chat.workspace.use",
+        "chat.conversation.peer.view",
+        "chat.queue.view",
+        "chat.conversation.collaboration.invite",
+    ]
 
     data_scopes = PermissionService.merge_role_data_scopes(roles, permissions)
 
     assert data_scopes[RESOURCE_PEER_CONVERSATION] == "group"
     assert data_scopes[RESOURCE_CHAT_QUEUE] == "group"
+    assert data_scopes[RESOURCE_COLLABORATION_INVITE] == "group"
 
 
 @pytest.mark.asyncio
@@ -213,6 +254,7 @@ async def test_get_current_principal_super_admin_has_all_permissions():
     assert principal.is_super_admin is True
     assert set(principal.permissions) == ALL_PERMISSION_KEYS
     assert principal.data_scopes == {
+        "chat.conversation.collaboration.invite": "all",
         "chat.conversation.peer.view": "all",
         "chat.queue.view": "all",
         "call_record": "all",

@@ -409,6 +409,108 @@ async def test_stream_chat_saves_final_bot_message(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_managed_attachment_turn_saves_file_metadata_and_sends_fresh_url(monkeypatch):
+    conversation = FakeConversation(
+        channel=FakeChannel({
+            "open_agent_enabled": True,
+            "open_agent_agent_id": 7,
+            "open_agent_agent_name": "Support Bot",
+            "open_agent_attachment_upload_enabled": True,
+        })
+    )
+    file_key = "conversation-files/1/101/20260715/demo.pdf"
+    from app.services.conversation_file_service import ConversationFileService
+
+    file_id = ConversationFileService.encode_file_id(file_key)
+    sent_messages: list[dict] = []
+    generated_urls: list[str] = []
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_get_credentials(*_args, **_kwargs):
+        return "https://openagent.example.com", "sk-test"
+
+    async def fake_get_by_client_message_id(*_args, **_kwargs):
+        return object() if sent_messages else None
+
+    async def fake_send_message(*_args, **kwargs):
+        sent_messages.append(kwargs)
+        return None
+
+    async def fake_update_open_agent_state(_db, conv, data):
+        for key, value in data.items():
+            setattr(conv, key, value)
+        return conv
+
+    async def fake_get_attachment_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_build_attachment(**kwargs):
+        assert kwargs["file_id"] == file_id
+        url = f"https://storage.example.com/demo.pdf?signature={len(generated_urls) + 1}"
+        generated_urls.append(url)
+        return {
+            "type": "file",
+            "url": url,
+            "name": "demo.pdf",
+            "mime_type": "application/pdf",
+            "size": 12,
+        }
+
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+    monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
+    monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
+    monkeypatch.setattr(ConversationService, "send_message", fake_send_message)
+    monkeypatch.setattr(ConversationRepository, "update_open_agent_state", fake_update_open_agent_state)
+    monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_attachment_conversation)
+    monkeypatch.setattr(ConversationFileService, "build_open_agent_attachment", fake_build_attachment)
+
+    client = CapturingOpenAgentClient()
+    stream = OpenAgentConversationService.stream_chat_for_session_managed(
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        OpenAgentChatRequest(
+            client_message_id="cm_attachment",
+            attachments=[{
+                "file_id": file_id,
+                "type": "file",
+                "name": "demo.pdf",
+                "mime_type": "application/pdf",
+                "size": 12,
+            }],
+        ),
+        open_agent_client=client,
+    )
+    _chunks = [chunk async for chunk in stream]
+
+    retry_stream = OpenAgentConversationService.stream_chat_for_session_managed(
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        OpenAgentChatRequest(
+            client_message_id="cm_attachment",
+            attachments=[{
+                "file_id": file_id,
+                "type": "file",
+                "name": "demo.pdf",
+                "mime_type": "application/pdf",
+                "size": 12,
+            }],
+        ),
+        open_agent_client=client,
+    )
+    _retry_chunks = [chunk async for chunk in retry_stream]
+
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["content_type"] == "file"
+    assert "signature" not in sent_messages[0]["content"]
+    assert sent_messages[0]["metadata"]["client_message_id"] == "cm_attachment"
+    assert [payload["attachments"][0]["url"] for payload in client.payloads] == generated_urls
+    assert len(set(generated_urls)) == 2
+    assert "message" not in client.payloads[0]
+
+
+@pytest.mark.asyncio
 async def test_managed_stream_chat_closes_db_session_while_waiting_for_open_agent(monkeypatch):
     conversation = FakeConversation()
     created_messages: list[dict] = []

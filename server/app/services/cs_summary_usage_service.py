@@ -9,12 +9,13 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
+from app.core.exceptions import NotFoundError, ValidationError
 from app.models.cs_summary_config_field import CsSummaryConfigField
 from app.repositories.cs_summary_config_repository import CsSummaryConfigRepository
 from app.repositories.cs_summary_usage_repository import CsSummaryUsageRepository
 from app.schemas.cs_summary_usage import CsSummaryFieldValueUpdate
 from app.schemas.permission import EffectivePrincipal
+from app.services.data_scope_service import DataScopeService
 
 
 class CsSummaryUsageService:
@@ -87,11 +88,15 @@ class CsSummaryUsageService:
         return None
 
     @staticmethod
-    def _assert_owner_access(conversation, principal: EffectivePrincipal | None) -> None:
+    async def _assert_summary_access(
+        db: AsyncSession,
+        conversation,
+        principal: EffectivePrincipal | None,
+    ) -> None:
         if principal is None:
             return
-        if conversation.agent_id != principal.user_id:
-            raise ForbiddenError("No permission to access session summary")
+        peer_ids = await DataScopeService.get_group_peer_employee_ids(db, principal.group_ids)
+        DataScopeService.assert_conversation_in_scope(principal, conversation, peer_ids)
 
     @staticmethod
     def _calculate_states(fields: list[CsSummaryConfigField], rules: list, values: dict[str, Any]) -> dict[str, str]:
@@ -185,7 +190,7 @@ class CsSummaryUsageService:
         conversation = await CsSummaryUsageRepository.get_conversation(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
-        CsSummaryUsageService._assert_owner_access(conversation, principal)
+        await CsSummaryUsageService._assert_summary_access(db, conversation, principal)
 
         config = await CsSummaryConfigRepository.get_or_create(db, tenant_id)
         fields = await CsSummaryUsageRepository.get_active_fields(db, config.id)
@@ -213,7 +218,7 @@ class CsSummaryUsageService:
         conversation = await CsSummaryUsageRepository.get_conversation(db, conversation_id)
         if not conversation or conversation.tenant_id != tenant_id:
             raise NotFoundError("Conversation not found")
-        CsSummaryUsageService._assert_owner_access(conversation, principal)
+        await CsSummaryUsageService._assert_summary_access(db, conversation, principal)
 
         config = await CsSummaryConfigRepository.get_or_create(db, tenant_id)
         fields = await CsSummaryUsageRepository.get_active_fields(db, config.id)

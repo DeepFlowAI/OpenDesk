@@ -60,6 +60,13 @@ class CallRecord(Base, TimestampMixin):
     ring_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     talk_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # Device attribution snapshot taken when the call was established.
+    # device_type: webrtc | sip_phone | ... ; device_identifier holds the
+    # extension_number for sip_phone. Unbinding / rebinding / device switches
+    # never rewrite these historical values.
+    device_type: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    device_identifier: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
     hangup_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
     recording_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     recording_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -43,7 +43,7 @@ class MessageResponse(BaseModel):
     recalled_by_name: str | None = None
     metadata: dict = Field(default_factory=dict)
     created_at: datetime
-    status: Literal["unread", "read"] | None = None
+    status: Literal["sending", "offline", "unread", "read"] | None = None
     event_type: str | None = None
     satisfaction_record_id: int | None = None
     config_version: int | None = None
@@ -90,6 +90,7 @@ class VisitorConversationHistoryItem(BaseModel):
     created_at: datetime | None = None
     agent_name: str | None = None
     agent_avatar: str | None = None
+    agent_unread_message_ids: list[int] = []
     messages: list[PublicMessageResponse]
     messages_truncated: bool = False
 
@@ -100,8 +101,8 @@ class VisitorConversationHistoryResponse(BaseModel):
 
 
 class VisitorUnreadOfflineReplyItem(VisitorConversationHistoryItem):
-    offline_message_public_id: str
-    customer_unread_at: datetime
+    offline_message_public_id: str | None = None
+    customer_unread_at: datetime | None = None
     customer_unread_message_id: int | None = None
     offline_reply_unread: bool = True
 

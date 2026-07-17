@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { get, post, put } from './base'
 import type {
   OpenAgentAgentListResponse,
+  OpenAgentAttachmentHandoffStatus,
   OpenAgentSettings,
   TestOpenAgentConnectionPayload,
   TestOpenAgentConnectionResponse,
@@ -19,6 +20,7 @@ export const openAgentSettingsKeys = {
   all: [NS] as const,
   detail: () => [...openAgentSettingsKeys.all, 'detail'] as const,
   agents: () => [...openAgentSettingsKeys.all, 'agents'] as const,
+  attachmentHandoff: (agentId: number | null) => [...openAgentSettingsKeys.all, 'agents', agentId, 'attachment-handoff'] as const,
   voiceSpeed: () => [...openAgentSettingsKeys.all, 'voice-speed'] as const,
   voiceSpeedAgents: () => [...openAgentSettingsKeys.all, 'voice-speed', 'agents'] as const,
 }
@@ -74,6 +76,16 @@ export const useOpenAgentAgents = (enabled = true) =>
     queryKey: openAgentSettingsKeys.agents(),
     queryFn: () => get<OpenAgentAgentListResponse>('v1/open-agent-settings/agents'),
     enabled,
+    retry: false,
+  })
+
+export const useOpenAgentAttachmentHandoffStatus = (agentId: number | null, enabled = true) =>
+  useQuery({
+    queryKey: openAgentSettingsKeys.attachmentHandoff(agentId),
+    queryFn: () => get<OpenAgentAttachmentHandoffStatus>(
+      `v1/open-agent-settings/agents/${agentId}/attachment-handoff`,
+    ),
+    enabled: enabled && agentId !== null,
     retry: false,
   })
 

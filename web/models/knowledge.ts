@@ -44,6 +44,22 @@ export type KnowledgeDirectoryPathItem = {
   name: string
 }
 
+export type KnowledgeDocumentAttachment = {
+  id: number
+  document_id: number | null
+  name: string
+  size: number
+  mime_type: string
+  sort_order: number
+  created_at: string
+  updated_at: string
+}
+
+export type KnowledgeDocumentAttachmentUrl = {
+  url: string
+  expires_seconds: number
+}
+
 export type KnowledgeDocument = {
   id: number
   tenant_id: number
@@ -51,6 +67,7 @@ export type KnowledgeDocument = {
   directory_path: KnowledgeDirectoryPathItem[]
   title: string
   content_html: string
+  attachments: KnowledgeDocumentAttachment[]
   status: KnowledgeDocumentStatus
   display_status: KnowledgeDocumentDisplayStatus
   validity_type: KnowledgeValidityType
@@ -74,6 +91,7 @@ export type KnowledgeDocumentPayload = {
   title: string
   directory_id: number
   content_html: string
+  attachment_ids: number[]
   status: KnowledgeDocumentStatus
   validity_type: KnowledgeValidityType
   valid_from?: string | null
@@ -95,6 +113,47 @@ export type KnowledgeRecommendationResponse = {
   limit: number
   vector_updated_at: string | null
   message: string | null
+}
+
+export type KnowledgeInspirationStatus = 'pending' | 'archived' | 'document_created'
+export type KnowledgeInspirationContentFormat = 'text' | 'rich_text'
+
+export type KnowledgeInspiration = {
+  id: number
+  tenant_id: number
+  content_html: string
+  content_plain: string
+  source_type: string
+  source_conversation_id: number | null
+  source_message_id: number | null
+  status: KnowledgeInspirationStatus
+  created_at: string
+  updated_at: string
+  created_by: KnowledgeActorRef | null
+  updated_by: KnowledgeActorRef | null
+}
+
+export type KnowledgeInspirationListParams = {
+  q?: string
+  status?: KnowledgeInspirationStatus | null
+  page?: number
+  per_page?: number
+}
+
+export type KnowledgeInspirationPayload = {
+  content: string
+  content_format?: KnowledgeInspirationContentFormat
+  source_conversation_id?: number | null
+  source_message_id?: number | null
+}
+
+export type KnowledgeInspirationListResponse = PaginatedResponse<KnowledgeInspiration>
+
+export type KnowledgeInspirationCountsResponse = {
+  total: number
+  pending: number
+  archived: number
+  document_created: number
 }
 
 export type KnowledgeImportAction = 'create' | 'update' | 'skip' | 'error'

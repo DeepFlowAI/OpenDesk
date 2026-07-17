@@ -16,6 +16,7 @@ from app.services.permission_catalog import (
     DATA_SCOPE_VALUES,
     PERMISSION_DATA_SCOPE_RESOURCES,
     RESOURCE_CHAT_QUEUE,
+    RESOURCE_COLLABORATION_INVITE,
     RESOURCE_PEER_CONVERSATION,
     SYSTEM_ROLE_PRESETS,
     missing_required_permissions,
@@ -24,7 +25,11 @@ from app.services.permission_catalog import (
     permission_tree,
 )
 
-LEGACY_SESSION_SCOPED_RESOURCES = {RESOURCE_PEER_CONVERSATION, RESOURCE_CHAT_QUEUE}
+LEGACY_SESSION_SCOPED_RESOURCES = {
+    RESOURCE_PEER_CONVERSATION,
+    RESOURCE_CHAT_QUEUE,
+    RESOURCE_COLLABORATION_INVITE,
+}
 
 
 class RoleService:

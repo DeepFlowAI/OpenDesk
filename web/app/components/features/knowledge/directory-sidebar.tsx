@@ -15,6 +15,7 @@ import {
   IconCheck,
   IconChevronDown,
   IconChevronRight,
+  IconBulb,
   IconDotsVertical,
   IconFolder,
   IconFolderPlus,
@@ -34,9 +35,13 @@ import {
 type DirectorySidebarProps = {
   directories: KnowledgeDirectoryNode[]
   selectedDirectoryId: number | null
+  activeView?: 'documents' | 'inspirations'
   canManage: boolean
+  canViewInspirations?: boolean
+  pendingInspirations?: number
   isZh: boolean
   onSelect: (directoryId: number | null) => void
+  onSelectInspirations?: () => void
   onCreate: (parentId: number | null) => void
   onEdit: (directory: KnowledgeDirectoryNode) => void
   onDelete: (directory: KnowledgeDirectoryNode) => void
@@ -223,9 +228,13 @@ function DirectoryRow({
 export function DirectorySidebar({
   directories,
   selectedDirectoryId,
+  activeView = 'documents',
   canManage,
+  canViewInspirations = false,
+  pendingInspirations = 0,
   isZh,
   onSelect,
+  onSelectInspirations,
   onCreate,
   onEdit,
   onDelete,
@@ -274,7 +283,7 @@ export function DirectorySidebar({
         <DirectoryRow
           node={node}
           depth={depth}
-          selected={selectedDirectoryId === node.id}
+          selected={activeView === 'documents' && selectedDirectoryId === node.id}
           expanded={expandedIds.has(node.id)}
           adjusting={adjusting}
           canManage={canManage}
@@ -335,12 +344,33 @@ export function DirectorySidebar({
         </div>
       </div>
 
+      {canViewInspirations && (
+        <button
+          type="button"
+          onClick={onSelectInspirations}
+          className={cn(
+            'mb-2 flex h-9 items-center gap-2 rounded-lg px-2 text-left text-sm transition-colors',
+            activeView === 'inspirations' ? 'bg-[#E5E5E5] text-[#1A1A1A]' : 'text-[#404040] hover:bg-[#F5F5F5]',
+          )}
+        >
+          <IconBulb size={16} className="text-[#737373]" />
+          <span className="min-w-0 flex-1 truncate">{isZh ? '知识灵感' : 'Knowledge inspirations'}</span>
+          {pendingInspirations > 0 && (
+            <span className="shrink-0 rounded-full bg-[#1A1A1A] px-1.5 py-0.5 text-[10px] font-medium text-white">
+              {pendingInspirations}
+            </span>
+          )}
+        </button>
+      )}
+
       <button
         type="button"
         onClick={() => onSelect(null)}
         className={cn(
           'mb-2 flex h-9 items-center gap-2 rounded-lg px-2 text-left text-sm transition-colors',
-          selectedDirectoryId === null ? 'bg-[#E5E5E5] text-[#1A1A1A]' : 'text-[#404040] hover:bg-[#F5F5F5]',
+          activeView === 'documents' && selectedDirectoryId === null
+            ? 'bg-[#E5E5E5] text-[#1A1A1A]'
+            : 'text-[#404040] hover:bg-[#F5F5F5]',
         )}
       >
         <IconFolder size={16} className="text-[#737373]" />

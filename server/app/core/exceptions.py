@@ -60,6 +60,18 @@ class InvalidCodeError(BusinessError):
         super().__init__(message, status_code=400, code="INVALID_CODE")
 
 
+class NotImplementedApiError(BusinessError):
+    """The requested operation isn't supported by the current backend.
+
+    Returned when a call-control action depends on a media-kernel capability
+    that isn't wired up yet, so callers get a clear 501 instead of a silent
+    no-op or a misleading success.
+    """
+
+    def __init__(self, message: str = "Operation not supported"):
+        super().__init__(message, status_code=501, code="NOT_IMPLEMENTED")
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(UnauthorizedError)
     async def unauthorized_error_handler(request: Request, exc: UnauthorizedError):

@@ -16,10 +16,14 @@ from app.core.exceptions import NotFoundError
 from app.db.session import AsyncSessionLocal
 from app.enums import MessageContentType
 from app.libs.embedding import create_embedding_client
-from app.models.knowledge import KnowledgeDocument
+from app.models.knowledge import KnowledgeDocument, KnowledgeDocumentAttachment
 from app.models.message import Message
 from app.repositories.conversation_repository import ConversationRepository
-from app.repositories.knowledge_repository import KnowledgeDirectoryRepository, KnowledgeDocumentRepository
+from app.repositories.knowledge_repository import (
+    KnowledgeDirectoryRepository,
+    KnowledgeDocumentAttachmentRepository,
+    KnowledgeDocumentRepository,
+)
 from app.repositories.knowledge_recommendation_repository import KnowledgeRecommendationRepository
 from app.schemas.knowledge import (
     KnowledgeDocumentResponse,
@@ -146,8 +150,17 @@ class KnowledgeRecommendationService:
             return KnowledgeRecommendationService._response("failed", resolved_limit)
 
         directories = await KnowledgeDirectoryRepository.list_all(db, tenant_id)
+        attachments_by_document = await KnowledgeDocumentAttachmentRepository.list_for_document_ids(
+            db,
+            tenant_id,
+            [document.id for document, _distance in rows],
+        )
         items = [
-            KnowledgeRecommendationService._document_response(document, directories)
+            KnowledgeRecommendationService._document_response(
+                document,
+                directories,
+                attachments_by_document.get(document.id, []),
+            )
             for document, _distance in rows
         ]
         logger.info(
@@ -350,10 +363,12 @@ class KnowledgeRecommendationService:
     def _document_response(
         document: KnowledgeDocument,
         directories: list,
+        attachments: list[KnowledgeDocumentAttachment] | None = None,
     ) -> KnowledgeDocumentResponse:
         return KnowledgeService._document_response(
             document,
             KnowledgeService._directory_path(directories, document.directory_id),
+            attachments,
         )
 
     @staticmethod

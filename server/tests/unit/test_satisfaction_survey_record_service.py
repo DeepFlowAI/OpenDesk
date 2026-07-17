@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.satisfaction_survey_record_repository import SatisfactionSurveyRecordRepository
 from app.schemas.satisfaction_survey_record import SatisfactionSubmissionPayload, SatisfactionSubmissionTypePayload
+from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.satisfaction_survey_config_service import SatisfactionSurveyConfigService
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 
@@ -261,6 +263,7 @@ async def test_resending_invitation_preserves_existing_feedback_when_repeat_allo
     monkeypatch.setattr(EmployeeRepository, "get_by_id", get_actor)
     monkeypatch.setattr(SatisfactionSurveyRecordRepository, "create_or_update_invitation", create_or_update)
     monkeypatch.setattr(SatisfactionSurveyRecordService, "emit_invitation_event", emit_noop)
+    monkeypatch.setattr(ConversationAgentDisplaySettingService, "get_display_mode", AsyncMock(return_value="name"))
 
     await SatisfactionSurveyRecordService.send_agent_invitation(
         object(),

@@ -17,6 +17,9 @@ class _FakeOrchestrator:
         self.decisions.append((offer_id, decision))
         return True
 
+    async def deliver_offer_decision(self, offer_id: str, decision: dict) -> bool:
+        return self.resolve_offer(offer_id, decision)
+
 
 class _FakeTelephony:
     def __init__(self, result: dict | None = None, error: Exception | None = None) -> None:

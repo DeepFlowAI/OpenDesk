@@ -72,6 +72,15 @@ def _principal(permissions: set[str], data_scopes: dict[str, str] | None = None)
     )
 
 
+@pytest.fixture(autouse=True)
+def _valid_employee_socket_session(monkeypatch):
+    monkeypatch.setattr(
+        chat_handlers.EmployeeSessionService,
+        "validate_payload",
+        AsyncMock(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_connect_auto_assign_uses_queue_service(monkeypatch):
     db = SimpleNamespace()
@@ -364,7 +373,7 @@ async def test_send_message_broadcasts_normalized_payload_to_agent_message_strea
         created_at=created_at,
         metadata_={},
     )
-    conversation = SimpleNamespace(id=100, agent_id=20)
+    conversation = SimpleNamespace(id=100, agent_id=20, public_id="cv_100")
     employee = SimpleNamespace(
         id=10,
         display_name="Agent",
@@ -389,17 +398,35 @@ async def test_send_message_broadcasts_normalized_payload_to_agent_message_strea
         AsyncMock(),
     )
 
+    from app.repositories.conversation_collaboration_repository import ConversationCollaborationRepository
     from app.repositories.conversation_repository import ConversationRepository
     from app.repositories.employee_repository import EmployeeRepository
+    from app.repositories.message_repository import MessageRepository
 
     monkeypatch.setattr(EmployeeRepository, "get_by_id", AsyncMock(return_value=employee))
+    monkeypatch.setattr(MessageRepository, "get_by_client_message_id", AsyncMock(return_value=None))
     monkeypatch.setattr(ConversationRepository, "get_by_id", AsyncMock(return_value=conversation))
+    monkeypatch.setattr(
+        ConversationCollaborationRepository,
+        "get_active_collaborator_agent_ids",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        chat_handlers.ConversationAgentDisplaySettingService,
+        "get_display_mode",
+        AsyncMock(return_value="name"),
+    )
 
     chat_handlers.register_chat_handlers(rt)
 
     response = await rt.handlers[("/chat", "send_message")](
         "sid-1",
-        {"conversation_id": "100", "content": "hello", "content_type": "text"},
+        {
+            "conversation_id": "100",
+            "content": "hello",
+            "content_type": "text",
+            "client_message_id": "client-501",
+        },
     )
 
     assert response["ok"] is True
@@ -414,6 +441,8 @@ async def test_send_message_broadcasts_normalized_payload_to_agent_message_strea
         content="hello",
         tenant_id=1,
         principal=principal,
+        quoted_message_id=None,
+        metadata={"client_message_id": "client-501"},
     )
     chat_handlers.ConversationRealtimeService.emit_conversation_list_updated.assert_awaited_once_with(
         1,
@@ -432,3 +461,207 @@ async def test_send_message_broadcasts_normalized_payload_to_agent_message_strea
         payload = call.args[1]
         assert payload["conversation_id"] == 100
         assert payload["sender_id"] == 10
+
+
+@pytest.mark.asyncio
+async def test_recall_message_broadcasts_to_agents_and_visitor(monkeypatch):
+    db = SimpleNamespace()
+    rt = _RealtimeHarness(session={"user_id": "10", "tenant_id": "1"})
+    principal = SimpleNamespace(user_id=10, tenant_id=1)
+    created_at = datetime(2026, 6, 19, 10, 30, 0)
+    recalled_at = datetime(2026, 6, 19, 10, 31, 0)
+    message = SimpleNamespace(
+        id=501,
+        conversation_id=100,
+        sender_type="agent",
+        sender_id=10,
+        content_type="text",
+        content="hello",
+        created_at=created_at,
+        metadata_={},
+        is_recalled=True,
+        recalled_at=recalled_at,
+        recalled_by_type="agent",
+        recalled_by_id=10,
+        recalled_by_name="Agent",
+        visitor_read_at=None,
+        agent_read_at=None,
+    )
+    conversation = SimpleNamespace(id=100, agent_id=20, public_id="cv_100", unread_count=2)
+    employee = SimpleNamespace(id=10, display_name="Agent", name="agent", avatar=None)
+    conversation_update = {
+        "conversation_id": 100,
+        "last_message_preview": "客服撤回了一条消息",
+        "last_message_at": recalled_at.isoformat(),
+    }
+
+    monkeypatch.setattr(chat_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(
+        chat_handlers.PermissionService,
+        "get_current_principal",
+        AsyncMock(return_value=principal),
+    )
+    monkeypatch.setattr(
+        chat_handlers.ConversationService,
+        "recall_agent_message",
+        AsyncMock(return_value=(message, conversation, conversation_update)),
+    )
+    monkeypatch.setattr(
+        chat_handlers.ConversationRealtimeService,
+        "emit_conversation_list_updated",
+        AsyncMock(),
+    )
+
+    from app.repositories.conversation_collaboration_repository import ConversationCollaborationRepository
+    from app.repositories.employee_repository import EmployeeRepository
+
+    monkeypatch.setattr(EmployeeRepository, "get_by_id", AsyncMock(return_value=employee))
+    monkeypatch.setattr(
+        ConversationCollaborationRepository,
+        "get_active_collaborator_agent_ids",
+        AsyncMock(return_value=[30]),
+    )
+    monkeypatch.setattr(
+        chat_handlers.ConversationAgentDisplaySettingService,
+        "get_display_mode",
+        AsyncMock(return_value="name"),
+    )
+
+    chat_handlers.register_chat_handlers(rt)
+
+    response = await rt.handlers[("/chat", "recall_message")](
+        "sid-1",
+        {"conversation_id": "100", "message_id": "501"},
+    )
+
+    assert response["ok"] is True
+    chat_handlers.ConversationService.recall_agent_message.assert_awaited_once_with(
+        db,
+        conversation_id=100,
+        message_id=501,
+        tenant_id=1,
+        principal=principal,
+    )
+    recall_calls = [
+        call for call in rt.emit.await_args_list
+        if call.args[0] == "message_recalled"
+    ]
+    recall_rooms = {(call.kwargs.get("namespace"), call.kwargs.get("room")) for call in recall_calls}
+    assert ("/chat", "agent:1:10") in recall_rooms
+    assert ("/chat", "agent:1:20") in recall_rooms
+    assert ("/chat", "agent:1:30") in recall_rooms
+    assert ("/visitor", "conv:100") in recall_rooms
+    chat_handlers.ConversationRealtimeService.emit_conversation_list_updated.assert_awaited_once_with(
+        1,
+        action="message",
+        conversation_id=100,
+        rt=rt,
+        message_flow_id=ANY,
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_conversation_socket_closes_and_broadcasts(monkeypatch):
+    db = SimpleNamespace()
+    rt = _RealtimeHarness(session={"user_id": "10", "tenant_id": "1"})
+    redis_stub = SimpleNamespace(client=SimpleNamespace())
+    principal = SimpleNamespace(user_id=10, tenant_id=1)
+    conversation = SimpleNamespace(id=100, public_id="cv_100")
+
+    monkeypatch.setattr(chat_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(chat_handlers, "redis_client", redis_stub)
+    monkeypatch.setattr(
+        chat_handlers.PermissionService,
+        "get_current_principal",
+        AsyncMock(return_value=principal),
+    )
+    monkeypatch.setattr(
+        chat_handlers.ConversationService,
+        "end_conversation",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        chat_handlers.ConversationRealtimeService,
+        "emit_conversation_list_updated",
+        AsyncMock(),
+    )
+
+    chat_handlers.register_chat_handlers(rt)
+
+    response = await rt.handlers[("/chat", "end_conversation")](
+        "sid-1",
+        {"conversation_id": "100"},
+    )
+
+    assert response == {"ok": True}
+    chat_handlers.ConversationService.end_conversation.assert_awaited_once_with(
+        db,
+        redis_stub.client,
+        "100",
+        ended_by="agent",
+        principal=principal,
+    )
+    ended_calls = [
+        call for call in rt.emit.await_args_list
+        if call.args[0] == "conversation_ended"
+    ]
+    ended_targets = {(call.kwargs.get("namespace"), call.kwargs.get("room")) for call in ended_calls}
+    assert ended_targets == {
+        ("/chat", "agent:1:10"),
+        ("/chat", "conv:100"),
+        ("/visitor", "conv:100"),
+    }
+    chat_handlers.ConversationRealtimeService.emit_conversation_list_updated.assert_awaited_once_with(
+        1,
+        action="ended",
+        conversation_id=100,
+        rt=rt,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_read_socket_marks_owner_messages_and_notifies_visitor(monkeypatch):
+    db = SimpleNamespace()
+    rt = _RealtimeHarness(session={"user_id": "10", "tenant_id": "1"})
+    conversation = SimpleNamespace(id=100, agent_id=10, public_id="cv_100")
+    read_message_ids = [201, 202]
+
+    monkeypatch.setattr(chat_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(
+        chat_handlers.ConversationService,
+        "get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        chat_handlers.ConversationService,
+        "mark_read",
+        AsyncMock(return_value=read_message_ids),
+    )
+
+    chat_handlers.register_chat_handlers(rt)
+
+    response = await rt.handlers[("/chat", "mark_read")](
+        "sid-1",
+        {"conversation_id": "100"},
+    )
+
+    assert response == {"ok": True}
+    chat_handlers.ConversationService.mark_read.assert_awaited_once_with(db, "100")
+    read_payload = {
+        "reader": "agent",
+        "conversation_id": "100",
+        "conversation_public_id": "cv_100",
+        "message_ids": read_message_ids,
+    }
+    rt.emit.assert_any_await(
+        "messages_read",
+        read_payload,
+        room="conv:100",
+        namespace="/visitor",
+    )
+    rt.emit.assert_any_await(
+        "conversation_updated",
+        {"conversation_id": "100", "unread_count": 0},
+        room="agent:1:10",
+        namespace="/chat",
+    )

@@ -128,6 +128,10 @@ async def test_search_workspace_visitor_messages_passes_scope_and_builds_items(m
         "app.services.conversation_service.EmployeeRepository.get_by_ids",
         AsyncMock(return_value=[current.agent]),
     )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationAgentDisplaySettingService.get_display_mode",
+        AsyncMock(return_value="name"),
+    )
 
     result = await ConversationService.search_workspace_visitor_messages(
         AsyncMock(),

@@ -204,6 +204,28 @@ class AgentStatusService:
         return sid if isinstance(sid, str) else None
 
     @staticmethod
+    async def is_connected(r: aioredis.Redis, tenant_id: int, user_id: int) -> bool:
+        """Whether the agent currently holds a live Socket.IO connection.
+
+        True when a connection sid is tracked and no disconnect grace window
+        has expired. ``connection_sid`` is written on connect and deleted on
+        offline finalize, so its presence — minus an expired pending-offline
+        marker — is a reliable liveness signal that is independent of the
+        agent's chosen online/offline status.
+        """
+        data = await r.hgetall(AgentStatusService._key(tenant_id, user_id))
+        if not data or not data.get(_CONNECTION_SID_FIELD):
+            return False
+        pending = data.get(_PENDING_OFFLINE_FIELD)
+        if pending:
+            try:
+                if time.time() >= float(pending):
+                    return False
+            except ValueError:
+                pass
+        return True
+
+    @staticmethod
     async def schedule_disconnect(
         r: aioredis.Redis,
         tenant_id: int,

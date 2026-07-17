@@ -31,6 +31,13 @@ export type AgentStatusUpdate = {
   reason?: string | null
 }
 
+export type ConsultableAgent = {
+  employee_id: number
+  name: string | null
+  avatar: string | null
+  status: AgentStatus
+}
+
 export type CallUserAssociationStatus =
   | 'unknown'
   | 'unlinked'

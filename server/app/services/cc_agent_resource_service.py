@@ -28,6 +28,12 @@ ACTIVE_RESOURCE_STATES = {"reserved", "ringing", "in_call"}
 class CcAgentResourceService:
     DEFAULT_OFFER_TTL_SEC = 30
     DEFAULT_OUTBOUND_TTL_SEC = 120
+    # `in_call` has no natural TTL: if the call-end event is lost (kernel crash
+    # or WS disconnect) the agent would be stranded on "busy" forever. Give it a
+    # generous lease as a last-resort backstop so it always eventually frees.
+    # The reconnect reconcile and the manual reset recover much faster; this
+    # only guarantees eventual self-healing when everything else is unreachable.
+    IN_CALL_LEASE_SEC = 4 * 60 * 60
 
     @staticmethod
     def key(tenant_id: int, employee_id: int) -> str:
@@ -61,9 +67,12 @@ class CcAgentResourceService:
             return None
         snapshot = cls._snapshot_from_raw(employee_id, raw)
         if cls._is_expired(snapshot):
+            state = snapshot.get("resource_state")
             reason = (
                 "offer_expired"
-                if snapshot.get("resource_state") == "ringing"
+                if state == "ringing"
+                else "in_call_lease_expired"
+                if state == "in_call"
                 else "reservation_expired"
             )
             snapshot = await cls.release(
@@ -72,7 +81,7 @@ class CcAgentResourceService:
                 employee_id,
                 reason=reason,
                 expected_offer_id=snapshot.get("offer_id"),
-                allow_in_call=False,
+                allow_in_call=(state == "in_call"),
             )
         return snapshot
 
@@ -122,6 +131,11 @@ class CcAgentResourceService:
                     await pipe.watch(key)
                     raw = await pipe.hgetall(key)
                     current = cls._snapshot_from_raw(employee_id, raw) if raw else None
+                    if current and cls._is_expired(current):
+                        # Stale reservation / lost in_call lease — the call is
+                        # gone, so treat the agent as free rather than blocking
+                        # every future status change forever.
+                        current = None
                     if current and current["resource_state"] in ACTIVE_RESOURCE_STATES:
                         if current["resource_state"] == "in_call" and status == "busy":
                             resource_state = "in_call"
@@ -373,6 +387,16 @@ class CcAgentResourceService:
                     current = cls._snapshot_from_raw(employee_id, raw) if raw else None
                     if current is None:
                         raise ConflictError("Call resource not reserved")
+                    # Idempotent: the in_call transition is driven twice for an
+                    # internal-ring leg — the browser accept endpoint (keyed on
+                    # the reservation call_id) AND the ring initiator (keyed on
+                    # the WebRTC leg id), with DIFFERENT call_ids. Whichever flips
+                    # first consumes the offer and clears offer_id, so the loser
+                    # must not fail the offer_id check with a spurious "Offer
+                    # expired". Once the resource is already in_call the offer is
+                    # spent, so treat any repeat as a no-op regardless of call_id.
+                    if current.get("resource_state") == "in_call":
+                        return current
                     if offer_id and current.get("offer_id") != offer_id:
                         raise ConflictError("Offer expired")
                     if current.get("resource_state") not in {"reserved", "ringing", "in_call"}:
@@ -382,6 +406,7 @@ class CcAgentResourceService:
                         resource_state="in_call",
                         current_call_id=call_id,
                         direction=direction,
+                        reserved_until=cls._now_epoch() + cls.IN_CALL_LEASE_SEC,
                         previous_visible_status=current.get("previous_visible_status"),
                     )
                     pipe.multi()
@@ -391,6 +416,124 @@ class CcAgentResourceService:
                 except WatchError:
                     continue
         raise ConflictError("Call-center resource state changed, please retry")
+
+    @classmethod
+    async def renew_in_call(
+        cls,
+        r: aioredis.Redis,
+        tenant_id: int,
+        employee_id: int,
+        *,
+        call_id: str,
+        ttl_seconds: float | None = None,
+    ) -> dict | None:
+        """Extend the in_call lease for a call still active in the kernel.
+        No-op (returns current) when the agent is not in this call."""
+        ttl = float(ttl_seconds or cls.IN_CALL_LEASE_SEC)
+        key = cls.key(tenant_id, employee_id)
+        for _ in range(3):
+            async with r.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.hgetall(key)
+                    current = cls._snapshot_from_raw(employee_id, raw) if raw else None
+                    if (
+                        not current
+                        or current.get("resource_state") != "in_call"
+                        or current.get("current_call_id") != call_id
+                    ):
+                        return current
+                    mapping = cls._base_mapping(
+                        visible_status=current.get("visible_status") or "busy",
+                        resource_state="in_call",
+                        current_call_id=call_id,
+                        offer_id=current.get("offer_id"),
+                        queue_id=current.get("queue_id"),
+                        direction=current.get("direction"),
+                        reserved_until=cls._now_epoch() + ttl,
+                        last_assigned_at=current.get("last_assigned_at"),
+                        previous_visible_status=current.get("previous_visible_status"),
+                    )
+                    pipe.multi()
+                    pipe.hset(key, mapping=mapping)
+                    await pipe.execute()
+                    return cls._snapshot_from_raw(employee_id, mapping)
+                except WatchError:
+                    continue
+        return None
+
+    @classmethod
+    async def force_release(
+        cls,
+        r: aioredis.Redis,
+        tenant_id: int,
+        employee_id: int,
+        *,
+        reason: str = "manual_reset",
+    ) -> dict:
+        """Escape hatch: unconditionally free the agent's resource, including a
+        stuck in_call, so a stranded agent can always recover their status."""
+        return await cls.release(
+            r, tenant_id, employee_id, reason=reason, allow_in_call=True
+        )
+
+    @classmethod
+    async def reconcile_in_call(
+        cls,
+        r: aioredis.Redis,
+        active_call_ids,
+        *,
+        renew: bool = True,
+    ) -> list[tuple[int, int, str]]:
+        """Reconcile in_call resources against the kernel's active calls.
+
+        Releases any agent stuck in_call whose call is no longer active in the
+        kernel (its end event was lost); refreshes the lease for calls still
+        live. Returns the released ``(tenant_id, employee_id, call_id)`` tuples
+        so the caller can also close the corresponding stale call records.
+        """
+        active = {c for c in (active_call_ids or []) if c}
+        released: list[tuple[int, int, str]] = []
+        cursor = 0
+        while True:
+            cursor, keys = await r.scan(
+                cursor=cursor, match="cc:agent:resource:*", count=200
+            )
+            for raw_key in keys:
+                key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+                parts = key.split(":")
+                if len(parts) != 5:
+                    continue
+                try:
+                    tenant_id = int(parts[3])
+                    employee_id = int(parts[4])
+                except ValueError:
+                    continue
+                raw = await r.hgetall(key)
+                if not raw:
+                    continue
+                snap = cls._snapshot_from_raw(employee_id, raw)
+                if snap.get("resource_state") != "in_call":
+                    continue
+                call_id = snap.get("current_call_id")
+                if call_id and call_id in active:
+                    if renew:
+                        await cls.renew_in_call(
+                            r, tenant_id, employee_id, call_id=call_id
+                        )
+                    continue
+                await cls.release(
+                    r,
+                    tenant_id,
+                    employee_id,
+                    reason="reconnect_reconcile",
+                    allow_in_call=True,
+                )
+                if call_id:
+                    released.append((tenant_id, employee_id, call_id))
+            if cursor == 0:
+                break
+        return released
 
     @classmethod
     async def mark_after_call_work(
@@ -490,6 +633,10 @@ class CcAgentResourceService:
                 resource_state="in_call",
                 current_call_id=active_call_id,
                 direction=active_call_direction,
+                # Lease the rebuilt in_call too: if the source call record is
+                # stale (its end event was lost), the agent still self-heals
+                # instead of being resurrected into a permanent busy state.
+                reserved_until=cls._now_epoch() + cls.IN_CALL_LEASE_SEC,
             )
         elif active_call_id and active_call_state in {"ringing", "queued"}:
             mapping = cls._base_mapping(
@@ -668,7 +815,7 @@ class CcAgentResourceService:
         state = snapshot.get("resource_state")
         deadline = snapshot.get("reserved_until_epoch")
         return (
-            state in {"reserved", "ringing"}
+            state in {"reserved", "ringing", "in_call"}
             and deadline is not None
             and deadline <= CcAgentResourceService._now_epoch()
         )

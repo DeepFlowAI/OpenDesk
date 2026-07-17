@@ -12,7 +12,7 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { AssistPanelConfigValue, ChannelConfig, ChannelCustomButton, CreateChannelPayload } from '@/models/channel'
 import { useChannel, useCreateChannel, useUpdateChannel } from '@/service/use-channels'
-import { useOpenAgentAgents, useOpenAgentSettings } from '@/service/use-open-agent-settings'
+import { useOpenAgentAgents, useOpenAgentAttachmentHandoffStatus, useOpenAgentSettings } from '@/service/use-open-agent-settings'
 import { useServiceHours } from '@/service/use-service-hours'
 import {
   useUploadChannelLogo,
@@ -136,6 +136,7 @@ const DEFAULT_CONFIG: ChannelConfig = {
   open_agent_bot_service_hours_id: null,
   open_agent_avatar_url: null,
   open_agent_input_placeholder: null,
+  open_agent_attachment_upload_enabled: false,
   open_agent_handoff_enabled: true,
   open_agent_handoff_label: DEFAULT_OPEN_AGENT_HANDOFF_LABEL,
   open_agent_handoff_after_messages: 2,
@@ -844,6 +845,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [openAgentAgentError, setOpenAgentAgentError] = useState('')
   const [openAgentBotServiceHoursError, setOpenAgentBotServiceHoursError] = useState('')
   const [openAgentInputPlaceholderError, setOpenAgentInputPlaceholderError] = useState('')
+  const [openAgentAttachmentError, setOpenAgentAttachmentError] = useState('')
   const [openAgentHandoffLabelError, setOpenAgentHandoffLabelError] = useState('')
   const [openAgentHandoffThresholdError, setOpenAgentHandoffThresholdError] = useState('')
   const [openAgentCustomButtonsError, setOpenAgentCustomButtonsError] = useState('')
@@ -872,6 +874,14 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   } = useOpenAgentAgents(activeTab === 'service' && config.open_agent_enabled && openAgentConfigured)
   const openAgentAgentItems = openAgentAgents?.items ?? []
   const selectedOpenAgent = openAgentAgentItems.find((item) => item.id === config.open_agent_agent_id)
+  const {
+    data: openAgentAttachmentStatus,
+    isFetching: openAgentAttachmentStatusFetching,
+    isError: openAgentAttachmentStatusIsError,
+  } = useOpenAgentAttachmentHandoffStatus(
+    config.open_agent_agent_id,
+    config.open_agent_enabled && openAgentConfigured,
+  )
 
   useEffect(() => {
     if (isNew) { if (!initialized) setInitialized(true); return }
@@ -1053,6 +1063,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     setOpenAgentAgentError('')
     setOpenAgentBotServiceHoursError('')
     setOpenAgentInputPlaceholderError('')
+    setOpenAgentAttachmentError('')
     setOpenAgentHandoffLabelError('')
     setOpenAgentHandoffThresholdError('')
     setOpenAgentCustomButtonsError('')
@@ -1092,6 +1103,14 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       if ((config.open_agent_input_placeholder ?? '').trim().length > 50) {
         setActiveTab('service')
         setOpenAgentInputPlaceholderError(t('ch.form.openAgent.inputPlaceholder.max', locale))
+        return
+      }
+      if (
+        config.open_agent_attachment_upload_enabled
+        && (!openAgentAttachmentStatus?.ready || openAgentAttachmentStatusIsError)
+      ) {
+        setActiveTab('service')
+        setOpenAgentAttachmentError(t('ch.form.openAgent.attachmentUpload.unavailable', locale))
         return
       }
       if (config.open_agent_handoff_enabled) {
@@ -2086,6 +2105,37 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                         placeholder={DEFAULT_OPEN_AGENT_INPUT_PLACEHOLDER}
                       />
                       {openAgentInputPlaceholderError && <p className="text-xs text-destructive">{openAgentInputPlaceholderError}</p>}
+                    </div>
+
+                    <div className="rounded-lg border border-border bg-white p-4">
+                      <div className="flex items-start justify-between gap-6">
+                        <div className="flex flex-col gap-1">
+                          <FieldLabel label={t('ch.form.openAgent.attachmentUpload', locale)} />
+                          <p className="text-xs leading-5 text-muted-foreground">
+                            {t('ch.form.openAgent.attachmentUpload.hint', locale)}
+                          </p>
+                        </div>
+                        <Switch
+                          checked={config.open_agent_attachment_upload_enabled}
+                          disabled={openAgentAttachmentStatusFetching}
+                          onCheckedChange={(checked) => {
+                            if (checked && !openAgentAttachmentStatus?.ready) {
+                              setOpenAgentAttachmentError(
+                                t('ch.form.openAgent.attachmentUpload.unavailable', locale),
+                              )
+                              return
+                            }
+                            updateConfig('open_agent_attachment_upload_enabled', checked)
+                            setOpenAgentAttachmentError('')
+                          }}
+                        />
+                      </div>
+                      {config.open_agent_attachment_upload_enabled && !openAgentAttachmentStatusFetching && !openAgentAttachmentStatus?.ready && (
+                        <p className="mt-3 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+                          {t('ch.form.openAgent.attachmentUpload.warning', locale)}
+                        </p>
+                      )}
+                      {openAgentAttachmentError && <p className="mt-2 text-xs text-destructive">{openAgentAttachmentError}</p>}
                     </div>
 
                     <div className="rounded-lg border border-border bg-white p-4">

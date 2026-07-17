@@ -54,3 +54,9 @@ export type OpenAgentAgentListResponse = {
   per_page: number
   pages: number
 }
+
+export type OpenAgentAttachmentHandoffStatus = {
+  ready: boolean
+  reason: 'ready' | 'not_configured' | 'tool_unavailable' | 'agent_unavailable'
+  tool_id: number | null
+}

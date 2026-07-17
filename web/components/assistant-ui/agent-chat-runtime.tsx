@@ -19,10 +19,18 @@ import {
 import { useChatStore } from '@/context/chat-store'
 import { useAuthStore } from '@/context/auth-store'
 import type { Locale } from '@/context/locale-store'
-import { uploadAgentConversationFile } from '@/service/use-conversation-files'
+import {
+  prepareKnowledgeAttachmentForConversation,
+  uploadAgentConversationFile,
+} from '@/service/use-conversation-files'
+import {
+  buildKnowledgeSendPlan,
+  type KnowledgeSendPlanItem,
+} from '@/app/components/features/knowledge/knowledge-utils'
 import type { Message, Conversation, WorkspaceConversationHistoryItem } from '@/models/conversation'
 import type { ConversationFileUploadResponse } from '@/models/conversation-file'
 import type { EmojiTargetConfig } from '@/models/emoji-setting'
+import type { KnowledgeDocumentAttachment } from '@/models/knowledge'
 import type { SatisfactionConversationState } from '@/models/satisfaction-survey'
 import type { Socket } from 'socket.io-client'
 
@@ -37,6 +45,22 @@ export type ResolvedConversationForSend = {
 
 export type DeferredConversationSendResult = {
   messageSent: boolean
+}
+
+export type KnowledgeDraftSendInput = {
+  bodyContent: string
+  bodyText: string
+  bodyContentType: 'text' | 'rich_text'
+  attachments: KnowledgeDocumentAttachment[]
+  requestId: string
+  onItemSent: (item: KnowledgeSendPlanItem) => void
+  onAttachmentPreparing: (attachmentId: number | null) => void
+}
+
+export type KnowledgeDraftSendResult = {
+  sent: number
+  total: number
+  errorMessage: string | null
 }
 
 export type AgentChatConfigValue = {
@@ -84,6 +108,7 @@ export type AgentChatConfigValue = {
   emojiConfig: EmojiTargetConfig | null
   readStatusEnabled: boolean
   resolveConversationForSend?: () => Promise<ResolvedConversationForSend>
+  uploadDeferredRichTextImage?: (file: File) => Promise<ConversationFileUploadResponse>
   onDeferredConversationResolved?: (
     conversation: Conversation,
     result: DeferredConversationSendResult,
@@ -100,11 +125,13 @@ type AgentChatContextValue = AgentChatConfigValue & {
   onFileSend: (file: File) => Promise<void>
   onRichTextImageUpload: (file: File) => Promise<ConversationFileUploadResponse>
   onRichTextSend: (html: string) => Promise<void>
+  onKnowledgeDraftSend: (input: KnowledgeDraftSendInput) => Promise<KnowledgeDraftSendResult>
   composerMode: ComposerMode
   setComposerMode: (mode: ComposerMode) => void
   quotedMessage: Message | null
   onQuoteMessage: (message: Message) => void
   onClearQuote: () => void
+  onRetryMessage: (message: Message) => void
 }
 
 const AgentChatConfigCtx = createContext<AgentChatContextValue | null>(null)
@@ -118,22 +145,9 @@ export function useAgentChatConfig() {
 // ─── Message metadata ────────────────────────────────────────────
 
 export type AgentMessageMeta = {
-  senderName: string | null
-  senderAvatar: string | null
-  senderType: string
-  senderId: number | null
-  contentType: string
-  conversationId: number
-  metadata?: Record<string, unknown>
-  messageStatus?: string
-  isOwn: boolean
-  isRecalled?: boolean
-  recalledAt?: string | null
-  recalledByType?: string | null
-  recalledByName?: string | null
-  eventType?: string
-  satisfactionRecordId?: number
-  configVersion?: number
+  // The full original message is the single source of truth. Both rendering and
+  // interaction logic derive everything they need from it, so no field is lost.
+  original: Message
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
@@ -142,6 +156,15 @@ function mapRole(senderType: string): 'user' | 'assistant' | 'system' {
   if (senderType === 'visitor') return 'user'
   if (senderType === 'agent' || senderType === 'bot') return 'assistant'
   return 'system'
+}
+
+let optimisticMessageId = -1
+
+function createClientMessageId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `agent-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
 // ─── Provider ────────────────────────────────────────────────────
@@ -157,6 +180,7 @@ export function AgentChatRuntimeProvider({
   ...chatConfig
 }: ProviderProps) {
   const { conversation } = chatConfig
+  const currentUser = useAuthStore((state) => state.user)
   const convId = conversation.id
   const [composerMode, setComposerMode] = useState<ComposerMode>(
     chatConfig.canSendPublicReply ? 'public' : 'internal',
@@ -172,7 +196,6 @@ export function AgentChatRuntimeProvider({
         .map((msg) => ({ id: String(msg.id), content: msg.content })),
     [currentMessages],
   )
-  const userId = useAuthStore((s) => s.user?.id)
 
   useEffect(() => {
     setComposerMode(chatConfig.canSendPublicReply ? 'public' : 'internal')
@@ -198,27 +221,79 @@ export function AgentChatRuntimeProvider({
       content: string
       content_type: string
       quoted_message_id?: number
-    }) =>
-      new Promise<void>((resolve, reject) => {
-        if (!socket) {
-          resolve()
+      client_message_id?: string
+    }, retryMessage?: Message) => {
+      const clientMessageId = payload.client_message_id
+        || retryMessage?.metadata?.client_message_id
+        || createClientMessageId()
+      const tempId = retryMessage?.id && retryMessage.id < 0 ? retryMessage.id : optimisticMessageId--
+      const optimisticMessage: Message = {
+        id: tempId,
+        conversation_id: payload.conversation_id,
+        sender_type: 'agent',
+        sender_id: currentUser?.id ?? null,
+        sender_name: currentUser?.display_name || currentUser?.name || null,
+        sender_avatar: currentUser?.avatar ?? null,
+        content_type: payload.content_type as Message['content_type'],
+        content: payload.content,
+        created_at: retryMessage?.created_at || new Date().toISOString(),
+        status: 'sending',
+        metadata: {
+          ...(retryMessage?.metadata || {}),
+          client_message_id: clientMessageId,
+          ...(payload.quoted_message_id ? { retry_quoted_message_id: payload.quoted_message_id } : {}),
+        },
+      }
+      const store = useChatStore.getState()
+      if (retryMessage) store.updateMessage(payload.conversation_id, optimisticMessage)
+      else store.addMessage(payload.conversation_id, optimisticMessage)
+
+      return new Promise<void>((resolve, reject) => {
+        if (!socket?.connected) {
+          useChatStore.getState().updateMessage(payload.conversation_id, {
+            ...optimisticMessage,
+            status: 'failed',
+          })
+          reject(new Error('socket disconnected'))
           return
         }
-        socket.emit('send_message', payload, (response?: { ok?: boolean; message?: unknown; error?: string }) => {
-          if (response?.ok === false || response?.error) {
-            const message = typeof response.message === 'string' ? response.message : response.error
-            window.alert(message || (chatConfig.locale === 'zh'
-              ? '发送失败，请稍后重试'
-              : 'Send failed. Try again later'))
-            reject(new Error(message || 'send_message failed'))
-            return
-          }
-          if (payload.quoted_message_id) setQuotedMessage(null)
-          resolve()
-        })
-      }),
-    [chatConfig.locale, socket],
+        socket.timeout(10_000).emit(
+          'send_message',
+          { ...payload, client_message_id: clientMessageId },
+          (timeoutError: Error | null, response?: { ok?: boolean; message?: Message | string; error?: string }) => {
+            if (timeoutError || response?.ok === false || response?.error) {
+              const errorMessage = typeof response?.message === 'string' ? response.message : response?.error
+              useChatStore.getState().updateMessage(payload.conversation_id, {
+                ...optimisticMessage,
+                status: 'failed',
+              })
+              reject(new Error(errorMessage || timeoutError?.message || 'send_message failed'))
+              return
+            }
+            if (response?.message && typeof response.message !== 'string') {
+              useChatStore.getState().addMessage(payload.conversation_id, response.message)
+            }
+            if (payload.quoted_message_id) setQuotedMessage(null)
+            resolve()
+          },
+        )
+      })
+    },
+    [currentUser, socket],
   )
+
+  const onRetryMessage = useCallback((message: Message) => {
+    if (message.status !== 'failed') return
+    const quotedMessageId = typeof message.metadata?.retry_quoted_message_id === 'number'
+      ? message.metadata.retry_quoted_message_id
+      : undefined
+    void emitSendMessage({
+      conversation_id: message.conversation_id,
+      content: message.content,
+      content_type: message.content_type,
+      ...(quotedMessageId ? { quoted_message_id: quotedMessageId } : {}),
+    }, message).catch(() => {})
+  }, [emitSendMessage])
 
   const ensureSendConversation = useCallback(async () => {
     if (!chatConfig.resolveConversationForSend) return conversation
@@ -310,13 +385,16 @@ export function AgentChatRuntimeProvider({
         throw new Error('Rich text image upload is not available')
       }
       if (!convId) throw new Error('Conversation is required')
+      if (chatConfig.resolveConversationForSend && chatConfig.uploadDeferredRichTextImage) {
+        return chatConfig.uploadDeferredRichTextImage(file)
+      }
       const sendConversation = await ensureSendConversation()
       return uploadAgentConversationFile({
         conversationId: sendConversation.id,
         file,
       })
     },
-    [convId, composerMode, chatConfig.canSendPublicReply, ensureSendConversation],
+    [convId, composerMode, chatConfig, ensureSendConversation],
   )
 
   const onRichTextSend = useCallback(
@@ -342,27 +420,83 @@ export function AgentChatRuntimeProvider({
     ],
   )
 
-  const convertMessage = useCallback(
-    (msg: Message): ThreadMessageLike => {
-      const meta: AgentMessageMeta = {
-        senderName: msg.sender_name,
-        senderAvatar: msg.sender_avatar,
-        senderType: msg.sender_type,
-        senderId: msg.sender_id,
-        contentType: msg.content_type,
-        conversationId: msg.conversation_id,
-        metadata: msg.metadata,
-        messageStatus: msg.status,
-        isOwn: msg.sender_type === 'agent' && msg.sender_id === userId,
-        isRecalled: msg.is_recalled,
-        recalledAt: msg.recalled_at,
-        recalledByType: msg.recalled_by_type,
-        recalledByName: msg.recalled_by_name,
-        eventType: msg.event_type,
-        satisfactionRecordId: msg.satisfaction_record_id,
-        configVersion: msg.config_version,
+  const onKnowledgeDraftSend = useCallback(
+    async (input: KnowledgeDraftSendInput): Promise<KnowledgeDraftSendResult> => {
+      const plan = buildKnowledgeSendPlan({
+        messageHtml: input.bodyContent,
+        messageText: input.bodyText,
+        attachments: input.attachments,
+        requestId: input.requestId,
+      })
+      if (!socket || !convId || composerMode === 'internal' || !chatConfig.canSendPublicReply) {
+        return { sent: 0, total: plan.length, errorMessage: 'Knowledge draft cannot be sent' }
       }
 
+      let sent = 0
+      let sendConversation: Conversation | null = null
+
+      try {
+        sendConversation = await ensureSendConversation()
+        for (const item of plan) {
+          let content: string
+          let contentType: 'text' | 'rich_text' | 'file'
+          if (item.kind === 'body') {
+            content = item.content
+            contentType = input.bodyContentType
+          } else {
+            input.onAttachmentPreparing(item.attachment.id)
+            const prepared = await prepareKnowledgeAttachmentForConversation({
+              conversationId: sendConversation.id,
+              attachmentId: item.attachment.id,
+            })
+            content = JSON.stringify({
+              schema_version: prepared.schema_version,
+              file_id: prepared.file_id,
+              name: prepared.name,
+              size: prepared.size,
+              mime_type: prepared.mime_type,
+            })
+            contentType = 'file'
+          }
+
+          await emitSendMessage({
+            conversation_id: sendConversation.id,
+            content,
+            content_type: contentType,
+            client_message_id: item.clientMessageId,
+            ...(sent === 0 && quotedMessage ? { quoted_message_id: quotedMessage.id } : {}),
+          })
+          sent += 1
+          input.onItemSent(item)
+        }
+        await notifyDeferredConversationResolved(sendConversation, plan.length > 0)
+        return { sent, total: plan.length, errorMessage: null }
+      } catch (error) {
+        if (sendConversation) await notifyDeferredConversationResolved(sendConversation, sent > 0)
+        return {
+          sent,
+          total: plan.length,
+          errorMessage: error instanceof Error && error.message ? error.message : null,
+        }
+      } finally {
+        input.onAttachmentPreparing(null)
+      }
+    },
+    [
+      chatConfig.canSendPublicReply,
+      composerMode,
+      convId,
+      emitSendMessage,
+      ensureSendConversation,
+      notifyDeferredConversationResolved,
+      quotedMessage,
+      socket,
+    ],
+  )
+
+  const convertMessage = useCallback(
+    (msg: Message): ThreadMessageLike => {
+      const meta: AgentMessageMeta = { original: msg }
       return {
         role: mapRole(msg.sender_type),
         content: [{ type: 'text', text: msg.content }],
@@ -371,7 +505,7 @@ export function AgentChatRuntimeProvider({
         metadata: { custom: meta },
       }
     },
-    [userId],
+    [],
   )
 
   const onNew = useCallback(
@@ -419,11 +553,13 @@ export function AgentChatRuntimeProvider({
         onFileSend,
         onRichTextImageUpload,
         onRichTextSend,
+        onKnowledgeDraftSend,
         composerMode,
         setComposerMode,
         quotedMessage,
         onQuoteMessage,
         onClearQuote,
+        onRetryMessage,
       }}
     >
       <AssistantRuntimeProvider runtime={runtime}>

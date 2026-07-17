@@ -3,6 +3,9 @@ Knowledge base service.
 """
 from __future__ import annotations
 
+import asyncio
+import html
+import re
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 
@@ -10,11 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models.employee import Employee
-from app.models.knowledge import KnowledgeDirectory, KnowledgeDocument
+from app.models.knowledge import KnowledgeDirectory, KnowledgeDocument, KnowledgeDocumentAttachment, KnowledgeInspiration
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.knowledge_repository import (
     KnowledgeDirectoryRepository,
+    KnowledgeDocumentAttachmentRepository,
     KnowledgeDocumentRepository,
+    KnowledgeInspirationRepository,
 )
 from app.schemas.knowledge import (
     KnowledgeDirectoryCreate,
@@ -25,11 +30,20 @@ from app.schemas.knowledge import (
     KnowledgeDirectoryResponse,
     KnowledgeDirectoryUpdate,
     KnowledgeDocumentCreate,
+    KnowledgeDocumentAttachmentResponse,
     KnowledgeDocumentListResponse,
     KnowledgeDocumentResponse,
     KnowledgeDocumentUpdate,
+    KnowledgeInspirationCountsResponse,
+    KnowledgeInspirationCreate,
+    KnowledgeInspirationListResponse,
+    KnowledgeInspirationResponse,
 )
 from app.schemas.permission import EffectivePrincipal
+from app.services.knowledge_attachment_service import (
+    MAX_KNOWLEDGE_DOCUMENT_ATTACHMENTS,
+    KnowledgeAttachmentService,
+)
 
 MAX_DIRECTORY_DEPTH = 3
 
@@ -38,6 +52,15 @@ class _PlainTextParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        attr_map = {name.lower(): value for name, value in attrs if value is not None}
+        if not attr_map.get("src", "").strip():
+            return
+        label = attr_map.get("alt", "").strip() or attr_map.get("title", "").strip() or "[image]"
+        self.parts.append(label)
 
     def handle_data(self, data: str) -> None:
         if data:
@@ -238,6 +261,7 @@ class KnowledgeService:
     def _document_response(
         document: KnowledgeDocument,
         directory_path: list[KnowledgeDirectoryPathItem],
+        attachments: list[KnowledgeDocumentAttachment] | None = None,
     ) -> KnowledgeDocumentResponse:
         return KnowledgeDocumentResponse(
             id=document.id,
@@ -246,6 +270,10 @@ class KnowledgeService:
             directory_path=directory_path,
             title=document.title,
             content_html=document.content_html,
+            attachments=[
+                KnowledgeDocumentAttachmentResponse.model_validate(attachment)
+                for attachment in (attachments or [])
+            ],
             status=document.status,
             display_status=KnowledgeService.document_display_status(document),
             validity_type=document.validity_type,
@@ -255,6 +283,55 @@ class KnowledgeService:
             updated_at=document.updated_at,
             created_by=document.created_by,
             updated_by=document.updated_by,
+        )
+
+    @staticmethod
+    def _plain_text_to_html(content: str) -> str:
+        paragraphs = [part.strip() for part in content.splitlines() if part.strip()]
+        if not paragraphs:
+            paragraphs = [content.strip()]
+        return "".join(f"<p>{html.escape(paragraph)}</p>" for paragraph in paragraphs)
+
+    @staticmethod
+    def _content_looks_like_html(content: str) -> bool:
+        return bool(
+            re.search(
+                r"<\s*(p|br|strong|b|em|i|u|ul|ol|li|h[1-6]|span|div|a|blockquote|mark|img)\b",
+                content,
+                re.I,
+            )
+        )
+
+    @staticmethod
+    def _normalize_inspiration_content(data: KnowledgeInspirationCreate) -> tuple[str, str]:
+        preserve_html = data.content_format == "rich_text" or (
+            data.content_format == "text" and KnowledgeService._content_looks_like_html(data.content)
+        )
+        if preserve_html:
+            content_html = data.content.strip()
+            content_plain = html_to_plain_text(content_html)
+        else:
+            content_plain = " ".join(data.content.split())
+            content_html = KnowledgeService._plain_text_to_html(data.content)
+        if not content_plain:
+            raise ValidationError("Inspiration content is required")
+        return content_html, content_plain
+
+    @staticmethod
+    def _inspiration_response(inspiration: KnowledgeInspiration) -> KnowledgeInspirationResponse:
+        return KnowledgeInspirationResponse(
+            id=inspiration.id,
+            tenant_id=inspiration.tenant_id,
+            content_html=inspiration.content_html,
+            content_plain=inspiration.content_plain,
+            source_type=inspiration.source_type,
+            source_conversation_id=inspiration.source_conversation_id,
+            source_message_id=inspiration.source_message_id,
+            status=inspiration.status,
+            created_at=inspiration.created_at,
+            updated_at=inspiration.updated_at,
+            created_by=inspiration.created_by,
+            updated_by=inspiration.updated_by,
         )
 
     @staticmethod
@@ -492,11 +569,17 @@ class KnowledgeService:
             page=page,
             per_page=per_page,
         )
+        attachments_by_document = await KnowledgeDocumentAttachmentRepository.list_for_document_ids(
+            db,
+            tenant_id,
+            [item.id for item in items],
+        )
         return KnowledgeDocumentListResponse(
             items=[
                 KnowledgeService._document_response(
                     item,
                     KnowledgeService._directory_path(all_directories, item.directory_id),
+                    attachments_by_document.get(item.id, []),
                 )
                 for item in items
             ],
@@ -505,6 +588,149 @@ class KnowledgeService:
             per_page=per_page,
             pages=(total + per_page - 1) // per_page if total > 0 else 0,
         )
+
+    @staticmethod
+    async def list_inspirations(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        search: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        per_page: int = 20,
+    ) -> KnowledgeInspirationListResponse:
+        page = max(1, page)
+        per_page = max(1, min(per_page, 100))
+        items, total = await KnowledgeInspirationRepository.query_paginated(
+            db,
+            tenant_id,
+            search=search.strip() if search else None,
+            status=status,
+            page=page,
+            per_page=per_page,
+        )
+        return KnowledgeInspirationListResponse(
+            items=[KnowledgeService._inspiration_response(item) for item in items],
+            total=total,
+            page=page,
+            per_page=per_page,
+            pages=(total + per_page - 1) // per_page if total > 0 else 0,
+        )
+
+    @staticmethod
+    async def count_inspirations(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        search: str | None = None,
+    ) -> KnowledgeInspirationCountsResponse:
+        counts = await KnowledgeInspirationRepository.count_by_status(
+            db,
+            tenant_id,
+            search=search.strip() if search else None,
+        )
+        pending = counts.get("pending", 0)
+        archived = counts.get("archived", 0)
+        document_created = counts.get("document_created", 0)
+        return KnowledgeInspirationCountsResponse(
+            total=pending + archived + document_created,
+            pending=pending,
+            archived=archived,
+            document_created=document_created,
+        )
+
+    @staticmethod
+    async def create_inspiration(
+        db: AsyncSession,
+        tenant_id: int,
+        data: KnowledgeInspirationCreate,
+        actor_id: int | None,
+        *,
+        actor_type: str = "employee",
+        actor_name: str | None = None,
+    ) -> KnowledgeInspirationResponse:
+        content_html, content_plain = KnowledgeService._normalize_inspiration_content(data)
+        inspiration = await KnowledgeInspirationRepository.create(
+            db,
+            {
+                "tenant_id": tenant_id,
+                "content_html": content_html,
+                "content_plain": content_plain,
+                "source_type": "chat_message" if data.source_message_id is not None or data.source_conversation_id is not None else "manual",
+                "source_conversation_id": data.source_conversation_id,
+                "source_message_id": data.source_message_id,
+                **await KnowledgeService._actor_create(
+                    db,
+                    tenant_id,
+                    actor_id,
+                    actor_type=actor_type,
+                    actor_name=actor_name,
+                ),
+            },
+        )
+        return KnowledgeService._inspiration_response(inspiration)
+
+    @staticmethod
+    async def get_inspiration(
+        db: AsyncSession,
+        tenant_id: int,
+        inspiration_id: int,
+    ) -> KnowledgeInspirationResponse:
+        inspiration = await KnowledgeInspirationRepository.get_by_id(db, inspiration_id)
+        if not inspiration or inspiration.tenant_id != tenant_id:
+            raise NotFoundError("Inspiration not found")
+        return KnowledgeService._inspiration_response(inspiration)
+
+    @staticmethod
+    async def archive_inspiration(
+        db: AsyncSession,
+        tenant_id: int,
+        inspiration_id: int,
+        actor_id: int | None,
+    ) -> KnowledgeInspirationResponse:
+        inspiration = await KnowledgeInspirationRepository.get_by_id(db, inspiration_id)
+        if not inspiration or inspiration.tenant_id != tenant_id:
+            raise NotFoundError("Inspiration not found")
+        if inspiration.status != "pending":
+            raise ValidationError("Only pending inspirations can be archived")
+        updated = await KnowledgeInspirationRepository.update(
+            db,
+            inspiration,
+            {
+                "status": "archived",
+                **await KnowledgeService._actor_update(db, tenant_id, actor_id),
+            },
+        )
+        return KnowledgeService._inspiration_response(updated)
+
+    @staticmethod
+    async def mark_inspiration_document_created(
+        db: AsyncSession,
+        tenant_id: int,
+        inspiration_id: int,
+        actor_id: int | None,
+    ) -> KnowledgeInspirationResponse:
+        inspiration = await KnowledgeInspirationRepository.get_by_id(db, inspiration_id)
+        if not inspiration or inspiration.tenant_id != tenant_id:
+            raise NotFoundError("Inspiration not found")
+        if inspiration.status != "pending":
+            return KnowledgeService._inspiration_response(inspiration)
+        updated = await KnowledgeInspirationRepository.update(
+            db,
+            inspiration,
+            {
+                "status": "document_created",
+                **await KnowledgeService._actor_update(db, tenant_id, actor_id),
+            },
+        )
+        return KnowledgeService._inspiration_response(updated)
+
+    @staticmethod
+    async def delete_inspiration(db: AsyncSession, tenant_id: int, inspiration_id: int) -> None:
+        inspiration = await KnowledgeInspirationRepository.get_by_id(db, inspiration_id)
+        if not inspiration or inspiration.tenant_id != tenant_id:
+            raise NotFoundError("Inspiration not found")
+        await KnowledgeInspirationRepository.delete(db, inspiration)
 
     @staticmethod
     async def create_document(
@@ -519,25 +745,46 @@ class KnowledgeService:
         await KnowledgeService._validate_directory_exists(db, tenant_id, data.directory_id)
         if await KnowledgeDocumentRepository.get_by_title(db, tenant_id, data.directory_id, data.title):
             raise ValidationError("Document title already exists")
-        content_plain = html_to_plain_text(data.content_html)
-        if not content_plain:
-            raise ValidationError("Document content is required")
         values = KnowledgeService._validate_document_values(data.model_dump())
-        document = await KnowledgeDocumentRepository.create(
-            db,
-            {
-                **values,
-                "tenant_id": tenant_id,
-                "content_plain": content_plain,
-                **await KnowledgeService._actor_create(
-                    db,
-                    tenant_id,
-                    actor_id,
-                    actor_type=actor_type,
-                    actor_name=actor_name,
-                ),
-            },
-        )
+        attachment_ids = values.pop("attachment_ids", [])
+        content_plain = html_to_plain_text(data.content_html)
+        if not content_plain and not attachment_ids:
+            raise ValidationError("Document content or attachment is required")
+        try:
+            document = await KnowledgeDocumentRepository.create_pending(
+                db,
+                {
+                    **values,
+                    "tenant_id": tenant_id,
+                    "content_plain": content_plain,
+                    **await KnowledgeService._actor_create(
+                        db,
+                        tenant_id,
+                        actor_id,
+                        actor_type=actor_type,
+                        actor_name=actor_name,
+                    ),
+                },
+            )
+            _, removed_storage_keys = await KnowledgeService._sync_document_attachments(
+                db,
+                tenant_id,
+                document,
+                attachment_ids,
+                actor_id,
+            )
+            await db.commit()
+            await db.refresh(document)
+            attachments = (
+                await KnowledgeDocumentAttachmentRepository.list_for_document(db, tenant_id, document.id)
+                if attachment_ids
+                else []
+            )
+        except Exception:
+            await db.rollback()
+            raise
+        if removed_storage_keys:
+            asyncio.create_task(KnowledgeAttachmentService.delete_storage_keys(removed_storage_keys))
         directories = await KnowledgeDirectoryRepository.list_all(db, tenant_id)
         from app.services.knowledge_recommendation_service import KnowledgeRecommendationService
 
@@ -545,6 +792,7 @@ class KnowledgeService:
         return KnowledgeService._document_response(
             document,
             KnowledgeService._directory_path(directories, document.directory_id),
+            attachments,
         )
 
     @staticmethod
@@ -565,10 +813,60 @@ class KnowledgeService:
         if document.status == "draft" and not can_include_drafts:
             raise NotFoundError("Document not found")
         directories = await KnowledgeDirectoryRepository.list_all(db, tenant_id)
+        attachments = await KnowledgeDocumentAttachmentRepository.list_for_document(db, tenant_id, document.id)
         return KnowledgeService._document_response(
             document,
             KnowledgeService._directory_path(directories, document.directory_id),
+            attachments,
         )
+
+    @staticmethod
+    async def _sync_document_attachments(
+        db: AsyncSession,
+        tenant_id: int,
+        document: KnowledgeDocument,
+        attachment_ids: list[int],
+        actor_id: int | None,
+    ) -> tuple[list[KnowledgeDocumentAttachment], list[str]]:
+        if len(attachment_ids) > MAX_KNOWLEDGE_DOCUMENT_ATTACHMENTS:
+            raise ValidationError(f"A document can have at most {MAX_KNOWLEDGE_DOCUMENT_ATTACHMENTS} attachments")
+        if len(set(attachment_ids)) != len(attachment_ids):
+            raise ValidationError("Attachment IDs must be unique")
+
+        current = await KnowledgeDocumentAttachmentRepository.list_for_document(db, tenant_id, document.id)
+        requested = await KnowledgeDocumentAttachmentRepository.get_by_ids_for_update(db, tenant_id, attachment_ids)
+        requested_by_id = {attachment.id: attachment for attachment in requested}
+        if len(requested_by_id) != len(attachment_ids):
+            raise ValidationError("Attachment not found")
+
+        now = datetime.now(timezone.utc)
+        ordered: list[KnowledgeDocumentAttachment] = []
+        for sort_order, attachment_id in enumerate(attachment_ids):
+            attachment = requested_by_id[attachment_id]
+            if attachment.document_id not in (None, document.id):
+                raise ValidationError("Attachment belongs to another document")
+            if attachment.document_id is None:
+                expires_at = attachment.expires_at
+                if expires_at is not None and expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if expires_at is not None and expires_at <= now:
+                    raise ValidationError("Attachment upload has expired")
+                if actor_id is None or attachment.created_by_actor_id != actor_id:
+                    raise ValidationError("Attachment does not belong to current user")
+            attachment.document_id = document.id
+            attachment.sort_order = sort_order
+            attachment.expires_at = None
+            attachment.updated_by_actor_type = "employee" if actor_id is not None else None
+            attachment.updated_by_actor_id = actor_id
+            ordered.append(attachment)
+
+        requested_ids = set(attachment_ids)
+        removed = [attachment for attachment in current if attachment.id not in requested_ids]
+        removed_storage_keys = [attachment.storage_key for attachment in removed]
+        for attachment in removed:
+            await db.delete(attachment)
+        await db.flush()
+        return ordered, removed_storage_keys
 
     @staticmethod
     async def update_document(
@@ -585,6 +883,7 @@ class KnowledgeService:
         if not document or document.tenant_id != tenant_id:
             raise NotFoundError("Document not found")
         update_data = data.model_dump(exclude_unset=True)
+        attachment_ids = update_data.pop("attachment_ids", None)
         directory_id = update_data.get("directory_id", document.directory_id)
         await KnowledgeService._validate_directory_exists(db, tenant_id, directory_id)
         title = update_data.get("title", document.title)
@@ -598,9 +897,12 @@ class KnowledgeService:
             raise ValidationError("Document title already exists")
         if "content_html" in update_data:
             content_plain = html_to_plain_text(update_data["content_html"])
-            if not content_plain:
-                raise ValidationError("Document content is required")
             update_data["content_plain"] = content_plain
+        current_attachments = await KnowledgeDocumentAttachmentRepository.list_for_document(db, tenant_id, document.id)
+        final_attachment_ids = attachment_ids if attachment_ids is not None else [item.id for item in current_attachments]
+        final_content_plain = update_data.get("content_plain", document.content_plain)
+        if not final_content_plain and not final_attachment_ids:
+            raise ValidationError("Document content or attachment is required")
         update_data = KnowledgeService._validate_document_values(update_data, existing=document)
         update_data.update(
             await KnowledgeService._actor_update(
@@ -611,7 +913,27 @@ class KnowledgeService:
                 actor_name=actor_name,
             )
         )
-        updated = await KnowledgeDocumentRepository.update(db, document, update_data)
+        try:
+            updated = await KnowledgeDocumentRepository.update_pending(db, document, update_data)
+            _, removed_storage_keys = await KnowledgeService._sync_document_attachments(
+                db,
+                tenant_id,
+                updated,
+                final_attachment_ids,
+                actor_id,
+            )
+            await db.commit()
+            await db.refresh(updated)
+            attachments = (
+                await KnowledgeDocumentAttachmentRepository.list_for_document(db, tenant_id, updated.id)
+                if final_attachment_ids
+                else []
+            )
+        except Exception:
+            await db.rollback()
+            raise
+        if removed_storage_keys:
+            asyncio.create_task(KnowledgeAttachmentService.delete_storage_keys(removed_storage_keys))
         directories = await KnowledgeDirectoryRepository.list_all(db, tenant_id)
         from app.services.knowledge_recommendation_service import KnowledgeRecommendationService
 
@@ -619,6 +941,7 @@ class KnowledgeService:
         return KnowledgeService._document_response(
             updated,
             KnowledgeService._directory_path(directories, updated.directory_id),
+            attachments,
         )
 
     @staticmethod
@@ -626,4 +949,9 @@ class KnowledgeService:
         document = await KnowledgeDocumentRepository.get_by_id(db, document_id)
         if not document or document.tenant_id != tenant_id:
             raise NotFoundError("Document not found")
+        attachments = await KnowledgeDocumentAttachmentRepository.list_for_document(db, tenant_id, document.id)
         await KnowledgeDocumentRepository.delete(db, document)
+        if attachments:
+            asyncio.create_task(
+                KnowledgeAttachmentService.delete_storage_keys([attachment.storage_key for attachment in attachments])
+            )

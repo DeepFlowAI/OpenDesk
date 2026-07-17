@@ -5,8 +5,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ImagePreviewLightbox } from '@/app/components/ui/image-preview-lightbox'
 import { IconDownload, IconEye, IconFile, IconLoader2, IconX } from '@tabler/icons-react'
 import type { ConversationFilePayload } from '@/models/conversation-file'
-import { getConversationFileUrl } from '@/service/use-conversation-files'
+import {
+  CONVERSATION_IMAGE_DISPLAY_PROCESS,
+  getConversationFileUrl,
+} from '@/service/use-conversation-files'
 import { cn } from '@/lib/utils'
+import { parsePendingAttachmentContent } from '@/lib/pending-attachment'
+import {
+  canPlayH264Mp4,
+  isMp4VideoCandidate,
+  MessageVideoAttachment,
+} from '@/app/components/features/chat/message-video-attachment'
 
 const PDFViewer = dynamic(
   () => import('@embedpdf/react-pdf-viewer').then((mod) => mod.PDFViewer),
@@ -24,6 +33,19 @@ const attachmentCardClassName =
   'overflow-hidden rounded-[18px] border border-border bg-background p-3 text-foreground'
 const imageAttachmentClassName =
   'overflow-hidden rounded-[18px] border border-border bg-muted text-foreground'
+const PDFIUM_WASM_PATH = '/vendor/embedpdf/pdfium.wasm'
+const ATTACHMENT_URL_CACHE_EARLY_EXPIRY_MS = 30 * 1000
+
+export function resolvePdfiumWasmUrl(origin: string): string {
+  return new URL(PDFIUM_WASM_PATH, origin).href
+}
+
+type CachedAttachmentUrl = {
+  url: string
+  expiresAt: number
+}
+
+const attachmentUrlCache = new Map<string, CachedAttachmentUrl>()
 
 type MessageAttachmentProps = {
   conversationId?: number
@@ -37,6 +59,7 @@ type MessageAttachmentProps = {
   imageGallery?: MessageAttachmentGalleryItem[]
   currentImageId?: string | number
   compact?: boolean
+  inlinePlayableVideo?: boolean
 }
 
 export type MessageAttachmentGalleryItem = {
@@ -57,6 +80,45 @@ function parsePayload(content: string): ConversationFilePayload | null {
   } catch {
     return null
   }
+}
+
+function attachmentUrlCacheKey(input: {
+  conversationId?: number
+  conversationPublicId?: string
+  offlineMessageId?: number
+  offlineMessagePublicId?: string
+  visitorSessionToken?: string
+  fileId: string
+  downloadName?: string
+  imageProcess?: string
+}): string {
+  return [
+    input.conversationId ?? '',
+    input.conversationPublicId ?? '',
+    input.offlineMessageId ?? '',
+    input.offlineMessagePublicId ?? '',
+    input.visitorSessionToken ?? '',
+    input.fileId,
+    input.downloadName ?? '',
+    input.imageProcess ?? '',
+  ].join('\u0000')
+}
+
+function getCachedAttachmentUrl(cacheKey: string): string | null {
+  const cached = attachmentUrlCache.get(cacheKey)
+  if (!cached) return null
+  if (cached.expiresAt <= Date.now()) {
+    attachmentUrlCache.delete(cacheKey)
+    return null
+  }
+  return cached.url
+}
+
+function setCachedAttachmentUrl(cacheKey: string, url: string, expiresSeconds: number): void {
+  attachmentUrlCache.set(cacheKey, {
+    url,
+    expiresAt: Date.now() + expiresSeconds * 1000 - ATTACHMENT_URL_CACHE_EARLY_EXPIRY_MS,
+  })
 }
 
 function formatSize(size: number): string {
@@ -206,25 +268,88 @@ export function MessageAttachment({
   imageGallery,
   currentImageId,
   compact = false,
+  inlinePlayableVideo = false,
 }: MessageAttachmentProps) {
   const payload = useMemo(() => parsePayload(content), [content])
-  const [url, setUrl] = useState<string | null>(payload ? null : content)
-  const [loading, setLoading] = useState(Boolean(payload))
+  const pendingPayload = useMemo(() => parsePendingAttachmentContent(content), [content])
+  const attachmentPayload = payload ?? pendingPayload
+  const isImage = contentType === 'image'
+  const skipUrlFetch = compact && !isImage
+  const displayImageProcess = isImage ? CONVERSATION_IMAGE_DISPLAY_PROCESS : undefined
+  const displayUrlCacheKey = useMemo(
+    () =>
+      payload && !skipUrlFetch
+        ? attachmentUrlCacheKey({
+            conversationId,
+            conversationPublicId,
+            offlineMessageId,
+            offlineMessagePublicId,
+            visitorSessionToken,
+            fileId: payload.file_id,
+            downloadName: payload.name,
+            imageProcess: displayImageProcess,
+          })
+        : null,
+    [
+      conversationId,
+      conversationPublicId,
+      displayImageProcess,
+      offlineMessageId,
+      offlineMessagePublicId,
+      payload,
+      skipUrlFetch,
+      visitorSessionToken,
+    ],
+  )
+  const cachedDisplayUrl = displayUrlCacheKey ? getCachedAttachmentUrl(displayUrlCacheKey) : null
+  const [url, setUrl] = useState<string | null>(
+    payload ? cachedDisplayUrl : pendingPayload?.local_url ?? content,
+  )
+  const [loading, setLoading] = useState(Boolean(payload && !skipUrlFetch && !cachedDisplayUrl))
   const [error, setError] = useState(false)
   const [previewOpen, setPreviewOpen] = useState(false)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [lightboxSlides, setLightboxSlides] = useState<Array<{ src: string; alt: string }>>([])
   const [lightboxIndex, setLightboxIndex] = useState(0)
-  const isImage = contentType === 'image'
-  const isPdfFile = isPdf(payload?.mime_type, payload?.name)
-  const fileName = payload?.name || '附件'
-  const fileIconSrc = getFileIconSrc(payload?.mime_type, fileName)
+  const [browserSupportsInlineVideo, setBrowserSupportsInlineVideo] = useState<boolean | null>(null)
+  const [videoPlaybackFailed, setVideoPlaybackFailed] = useState(false)
+  const isPdfFile = isPdf(attachmentPayload?.mime_type, attachmentPayload?.name)
+  const fileName = attachmentPayload?.name || '附件'
+  const fileIconSrc = getFileIconSrc(attachmentPayload?.mime_type, fileName)
+  const inlineVideoCandidate = inlinePlayableVideo
+    && !compact
+    && !isImage
+    && isMp4VideoCandidate(attachmentPayload)
 
-  const skipUrlFetch = compact && !isImage
+  useEffect(() => {
+    setVideoPlaybackFailed(false)
+    if (!inlineVideoCandidate) {
+      setBrowserSupportsInlineVideo(null)
+      return
+    }
+    setBrowserSupportsInlineVideo(canPlayH264Mp4(document.createElement('video')))
+  }, [content, inlineVideoCandidate])
+
+  useEffect(() => {
+    if (!pendingPayload) return
+    setUrl(pendingPayload.local_url)
+    setLoading(false)
+    setError(false)
+  }, [pendingPayload])
 
   useEffect(() => {
     let alive = true
     if (!payload || skipUrlFetch) return
+
+    if (displayUrlCacheKey) {
+      const cachedUrl = getCachedAttachmentUrl(displayUrlCacheKey)
+      if (cachedUrl) {
+        setUrl(cachedUrl)
+        setLoading(false)
+        setError(false)
+        return
+      }
+    }
 
     setLoading(true)
     setError(false)
@@ -236,8 +361,10 @@ export function MessageAttachment({
       visitorSessionToken,
       fileId: payload.file_id,
       downloadName: payload.name,
+      imageProcess: displayImageProcess,
     })
       .then((res) => {
+        if (displayUrlCacheKey) setCachedAttachmentUrl(displayUrlCacheKey, res.url, res.expires_seconds)
         if (alive) setUrl(res.url)
       })
       .catch(() => {
@@ -250,7 +377,17 @@ export function MessageAttachment({
     return () => {
       alive = false
     }
-  }, [conversationId, conversationPublicId, offlineMessageId, offlineMessagePublicId, payload, skipUrlFetch, visitorSessionToken])
+  }, [
+    conversationId,
+    conversationPublicId,
+    displayImageProcess,
+    displayUrlCacheKey,
+    offlineMessageId,
+    offlineMessagePublicId,
+    payload,
+    skipUrlFetch,
+    visitorSessionToken,
+  ])
 
   const handleDownload = useCallback(async () => {
     if (!payload) {
@@ -283,10 +420,14 @@ export function MessageAttachment({
         try {
           const itemPayload = parsePayload(item.content)
           if (!itemPayload) {
-            return { id: item.id, slide: { src: item.content, alt: 'image' } }
-          }
-          if (String(item.id) === String(currentId) && url) {
-            return { id: item.id, slide: { src: url, alt: itemPayload.name || 'image' } }
+            const pendingItem = parsePendingAttachmentContent(item.content)
+            return {
+              id: item.id,
+              slide: {
+                src: pendingItem?.local_url ?? item.content,
+                alt: pendingItem?.name ?? 'image',
+              },
+            }
           }
           const res = await getConversationFileUrl({
             conversationId,
@@ -334,7 +475,7 @@ export function MessageAttachment({
         <div className={cn('inline-block overflow-hidden rounded-md border border-border/60 bg-muted', className)}>
           <img
             src={url}
-            alt={payload?.name || 'image'}
+            alt={attachmentPayload?.name || 'image'}
             className="block max-h-14 max-w-[120px] object-contain"
           />
         </div>
@@ -347,7 +488,7 @@ export function MessageAttachment({
         </div>
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-medium text-foreground" title={fileName}>{fileName}</div>
-          {payload && <div className="text-[11px] text-muted-foreground">{formatSize(payload.size)}</div>}
+          {attachmentPayload && <div className="text-[11px] text-muted-foreground">{formatSize(attachmentPayload.size)}</div>}
         </div>
       </div>
     )
@@ -381,19 +522,41 @@ export function MessageAttachment({
               void handleImagePreview()
             }}
           >
-            <img src={url} alt={payload?.name || 'image'} className="block max-h-60 max-w-full object-cover" />
+            <img src={url} alt={attachmentPayload?.name || 'image'} className="block max-h-60 max-w-full object-cover" />
           </button>
         </div>
         <ImagePreviewLightbox
           open={previewOpen}
           close={() => setPreviewOpen(false)}
           index={lightboxIndex}
-          slides={lightboxSlides.length > 0 ? lightboxSlides : [{ src: url, alt: payload?.name || 'image' }]}
+          slides={lightboxSlides.length > 0 ? lightboxSlides : [{ src: url, alt: attachmentPayload?.name || 'image' }]}
           carousel={{ finite: true }}
           render={lightboxSlides.length <= 1 ? { buttonPrev: () => null, buttonNext: () => null } : undefined}
         />
       </>
     )
+  }
+
+  if (inlineVideoCandidate && browserSupportsInlineVideo !== false && !videoPlaybackFailed) {
+    if (browserSupportsInlineVideo === null || loading) {
+      return (
+        <div className={cn('flex aspect-video w-[420px] max-w-full items-center justify-center overflow-hidden rounded-[18px] border border-border bg-black', className)}>
+          <IconLoader2 size={20} className="animate-spin text-white/70" />
+        </div>
+      )
+    }
+    if (!error && url) {
+      return (
+        <MessageVideoAttachment
+          url={url}
+          fileName={fileName}
+          sizeLabel={attachmentPayload ? formatSize(attachmentPayload.size) : '文件'}
+          onDownload={handleDownload}
+          onPlaybackError={() => setVideoPlaybackFailed(true)}
+          className={className}
+        />
+      )
+    }
   }
 
   return (
@@ -409,7 +572,7 @@ export function MessageAttachment({
         <div className="min-w-0 flex-1">
           <TruncatedFileName name={fileName} />
           <div className="mt-0.5 text-xs text-muted-foreground">
-            {payload ? formatSize(payload.size) : '文件'}
+            {attachmentPayload ? formatSize(attachmentPayload.size) : '文件'}
           </div>
         </div>
       </div>
@@ -465,6 +628,7 @@ export function MessageAttachment({
               <PDFViewer
                 config={{
                   src: url,
+                  wasmUrl: resolvePdfiumWasmUrl(window.location.origin),
                   tabBar: 'never',
                   theme: { preference: 'light' },
                 }}

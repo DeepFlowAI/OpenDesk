@@ -299,6 +299,23 @@ export function useWebRTCLeg() {
     }
   }, [ensureRemoteAudio, state, teardownPc])
 
+  /**
+   * Toggle the local microphone track. Muting is a purely local WebRTC
+   * operation (track.enabled=false); the media kernel is not involved, so the
+   * far end simply stops receiving the agent's audio. Returns the resulting
+   * muted state (true = muted). No-op returns the requested state when no
+   * local track exists yet.
+   */
+  const setMuted = useCallback((muted: boolean): boolean => {
+    const stream = streamRef.current
+    if (!stream) return muted
+    stream.getAudioTracks().forEach((track) => {
+      track.enabled = !muted
+    })
+    log('setMuted', muted)
+    return muted
+  }, [])
+
   const applyRemoteIce = useCallback(async (candidate: RTCIceCandidateInit) => {
     const pc = pcRef.current
     if (!pc) return
@@ -327,5 +344,6 @@ export function useWebRTCLeg() {
     originateOffer,
     goOffline,
     applyRemoteIce,
+    setMuted,
   }
 }

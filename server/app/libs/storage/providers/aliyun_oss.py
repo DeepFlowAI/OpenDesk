@@ -40,15 +40,24 @@ class AliyunOSSClient(BaseStorageClient):
         bucket.delete_object(key)
         logger.info("Deleted from OSS: %s", key)
 
+    async def copy(self, source_key: str, destination_key: str) -> None:
+        """Copy an object inside the configured OSS bucket."""
+        bucket = _get_bucket()
+        bucket.copy_object(settings.OSS_BUCKET, source_key, destination_key)
+        logger.info("Copied OSS object: %s -> %s", source_key, destination_key)
+
     async def get_temporary_url(
         self,
         key: str,
         expires_seconds: int = 300,
         download_name: str | None = None,
+        image_process: str | None = None,
     ) -> str:
         """Create a short-lived signed URL for object reads."""
         bucket = _get_bucket()
         params = {}
+        if image_process:
+            params["x-oss-process"] = image_process
         if download_name:
             params["response-content-disposition"] = f'attachment; filename="{download_name}"'
         return bucket.sign_url("GET", key, expires_seconds, params=params)

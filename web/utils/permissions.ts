@@ -7,6 +7,7 @@ export type DataScopeResource =
   | 'call_record'
   | 'offline_message'
   | 'chat.conversation.peer.view'
+  | 'chat.conversation.collaboration.invite'
   | 'chat.queue.view'
 export type DataScopeValue = 'all' | 'group' | 'self'
 
@@ -15,6 +16,7 @@ type PermissionUser = Pick<UserInfo, 'is_super_admin' | 'permissions' | 'data_sc
 const DEFAULT_HOME_PRIORITY: Array<{ permissions: string[]; path: string }> = [
   { permissions: ['chat.workspace.use'], path: '/workspace/chat' },
   { permissions: ['call.workspace.use'], path: '/workspace/call' },
+  { permissions: ['engagement.outbound_task.manage', 'engagement.outbound_task.create'], path: '/workspace/engagement/outbound-tasks' },
   { permissions: ['ticket.workspace.view', 'ticket.workspace.create'], path: '/workspace/tickets' },
   { permissions: ['knowledge.workspace.view'], path: '/workspace/knowledge' },
   { permissions: ['crm.workspace.user.view'], path: '/workspace/users' },

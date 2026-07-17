@@ -60,8 +60,8 @@ export default function RoleForm({ initialData, readOnly = false, onSubmit }: Pr
   const nodes = useMemo(() => {
     const items: PermissionNode[] = []
     for (const tab of treeData?.tabs ?? []) {
-      for (const module of tab.modules) {
-        items.push(...module.permissions)
+      for (const permModule of tab.modules) {
+        items.push(...permModule.permissions)
       }
     }
     return items

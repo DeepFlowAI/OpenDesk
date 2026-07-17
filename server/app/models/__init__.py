@@ -3,6 +3,7 @@ from app.models.employee import Employee  # noqa: F401
 from app.models.role import Role, EmployeeRole  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.system_settings import SystemSettings  # noqa: F401
+from app.models.call_prompt_tone_settings import CallPromptToneSettings  # noqa: F401
 from app.models.open_agent_settings import OpenAgentSettings  # noqa: F401
 from app.models.service_hours import ServiceHours  # noqa: F401
 from app.models.api_key import ApiKey  # noqa: F401
@@ -17,6 +18,8 @@ from app.models.agent_status import AgentStatus  # noqa: F401
 from app.models.call_record import CallRecord  # noqa: F401
 from app.models.call_transcript_segment import CallTranscriptSegment  # noqa: F401
 from app.models.agent_webrtc_session import AgentWebRTCSession  # noqa: F401
+from app.models.sip_extension import SipExtension  # noqa: F401
+from app.models.agent_call_device import AgentCallDevice  # noqa: F401
 from app.models.inbound_routing_rule import InboundRoutingRule  # noqa: F401
 from app.models.sip_trunk import SipTrunk  # noqa: F401
 from app.models.phone_number import PhoneNumber  # noqa: F401
@@ -52,7 +55,7 @@ from app.models.fd_form_layout_tab import FdFormLayoutTab  # noqa: F401
 from app.models.fd_form_layout_field import FdFormLayoutField  # noqa: F401
 from app.models.fd_interaction_rule import FdInteractionRule  # noqa: F401
 from app.models.ticket import Ticket  # noqa: F401
-from app.models.knowledge import KnowledgeDirectory, KnowledgeDocument  # noqa: F401
+from app.models.knowledge import KnowledgeDirectory, KnowledgeDocument, KnowledgeDocumentAttachment, KnowledgeInspiration  # noqa: F401
 from app.models.knowledge_recommendation import ConversationUserEmbedding  # noqa: F401
 from app.models.ticket_change import TicketChange  # noqa: F401
 from app.models.entity_change import EntityChange  # noqa: F401
@@ -71,3 +74,4 @@ from app.models.organization_view import OrganizationView  # noqa: F401
 from app.models.queue import QueueTask, QueuePolicy, QueueRoundRobinState, QueueAssignmentEvent, QueueOutboxEvent  # noqa: F401
 from app.models.queue_no_show_setting import QueueNoShowSetting  # noqa: F401
 from app.models.knowledge_input_suggestion_setting import KnowledgeInputSuggestionSetting  # noqa: F401
+from app.models.outbound_task import OutboundTaskTemplate, OutboundTask, OutboundTaskTarget, OutboundCallRecord  # noqa: F401

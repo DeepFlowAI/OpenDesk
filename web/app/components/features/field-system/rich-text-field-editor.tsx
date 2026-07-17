@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { useEditor, EditorContent, type Editor } from '@tiptap/react'
 import { Node, mergeAttributes } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
@@ -9,8 +9,10 @@ import Link from '@tiptap/extension-link'
 import Highlight from '@tiptap/extension-highlight'
 import TurndownService from 'turndown'
 import { marked } from 'marked'
+import { IconPhotoPlus } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
+import { TextColor } from '@/lib/tiptap-text-color'
 import { useUploadCustomFieldFile } from '@/service/use-upload'
 import { BlockquoteButton } from '@/components/tiptap-ui/blockquote-button'
 import { ColorHighlightPopover } from '@/components/tiptap-ui/color-highlight-popover'
@@ -19,10 +21,11 @@ import { LinkPopover } from '@/components/tiptap-ui/link-popover'
 import { ListDropdownMenu } from '@/components/tiptap-ui/list-dropdown-menu'
 import { MarkButton } from '@/components/tiptap-ui/mark-button'
 import { UndoRedoButton } from '@/components/tiptap-ui/undo-redo-button'
+import { Button } from '@/components/tiptap-ui-primitive/button'
 import { ButtonGroup } from '@/components/tiptap-ui-primitive/button-group'
 import { Separator } from '@/components/tiptap-ui-primitive/separator'
 
-const MAX_PASTE_IMAGE_SIZE = 10 * 1024 * 1024
+const MAX_IMAGE_UPLOAD_SIZE = 10 * 1024 * 1024
 
 const RichTextImage = Node.create({
   name: 'image',
@@ -104,9 +107,11 @@ export function RichTextFieldEditor({
   const richFormat = ((typeConfig.rich_format as string) ?? 'html').toLowerCase()
   const isMarkdown = richFormat === 'markdown'
   const uploadMutation = useUploadCustomFieldFile()
-  const [pasteImageError, setPasteImageError] = useState<string | null>(null)
-  const [isPastingImage, setIsPastingImage] = useState(false)
+  const uploadCustomFieldFile = uploadMutation.mutateAsync
+  const [imageUploadError, setImageUploadError] = useState<string | null>(null)
+  const [isUploadingImage, setIsUploadingImage] = useState(false)
   const editorRef = useRef<Editor | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const stringVal = value != null ? String(value) : ''
   const contentForEditor = !stringVal.trim()
@@ -114,6 +119,42 @@ export function RichTextFieldEditor({
     : isMarkdown
       ? markdownToHtml(stringVal) || '<p></p>'
       : stringVal
+
+  const uploadImages = useCallback(
+    async (files: File[]) => {
+      if (disabled || files.length === 0) return
+      setImageUploadError(null)
+      setIsUploadingImage(true)
+
+      try {
+        for (const file of files) {
+          if (file.size > MAX_IMAGE_UPLOAD_SIZE) {
+            setImageUploadError(`图片过大: ${file.name || 'image'}`)
+            continue
+          }
+
+          const meta = await uploadCustomFieldFile(file)
+          editorRef.current
+            ?.chain()
+            .focus()
+            .insertContent({
+              type: 'image',
+              attrs: {
+                src: meta.url,
+                alt: meta.name || file.name || 'uploaded image',
+                title: meta.name || file.name || null,
+              },
+            })
+            .run()
+        }
+      } catch {
+        setImageUploadError('图片上传失败')
+      } finally {
+        setIsUploadingImage(false)
+      }
+    },
+    [disabled, uploadCustomFieldFile],
+  )
 
   const editor = useEditor({
     immediatelyRender: false,
@@ -134,6 +175,7 @@ export function RichTextFieldEditor({
       Highlight.configure({
         multicolor: true,
       }),
+      TextColor,
       RichTextImage,
     ],
     content: contentForEditor,
@@ -158,37 +200,7 @@ export function RichTextFieldEditor({
         if (files.length === 0) return false
 
         event.preventDefault()
-        setPasteImageError(null)
-        setIsPastingImage(true)
-
-        void (async () => {
-          try {
-            for (const file of files) {
-              if (file.size > MAX_PASTE_IMAGE_SIZE) {
-                setPasteImageError(`图片过大: ${file.name || 'clipboard image'}`)
-                continue
-              }
-
-              const meta = await uploadMutation.mutateAsync(file)
-              editorRef.current
-                ?.chain()
-                .focus()
-                .insertContent({
-                  type: 'image',
-                  attrs: {
-                    src: meta.url,
-                    alt: meta.name || file.name || 'pasted image',
-                    title: meta.name || file.name || null,
-                  },
-                })
-                .run()
-            }
-          } catch {
-            setPasteImageError('图片上传失败')
-          } finally {
-            setIsPastingImage(false)
-          }
-        })()
+        void uploadImages(files)
 
         return true
       },
@@ -246,6 +258,15 @@ export function RichTextFieldEditor({
     editor.commands.setContent(next, { emitUpdate: false })
   }, [value, editor, isMarkdown])
 
+  const handleImageInput = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith('image/'))
+      event.target.value = ''
+      void uploadImages(files)
+    },
+    [uploadImages],
+  )
+
   if (!editor) {
     return (
       <div
@@ -296,20 +317,43 @@ export function RichTextFieldEditor({
         </ButtonGroup>
         <Separator />
         <ButtonGroup>
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={disabled || isUploadingImage}
+            data-disabled={disabled || isUploadingImage}
+            tabIndex={-1}
+            aria-label="图片"
+            tooltip="图片"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <IconPhotoPlus className="tiptap-button-icon" />
+          </Button>
+        </ButtonGroup>
+        <Separator />
+        <ButtonGroup>
           <UndoRedoButton editor={editor} action="undo" disabled={disabled} />
           <UndoRedoButton editor={editor} action="redo" disabled={disabled} />
         </ButtonGroup>
       </div>
-      {(isPastingImage || pasteImageError) && (
+      {(isUploadingImage || imageUploadError) && (
         <div className="border-b border-border px-3 py-1 text-xs">
-          {isPastingImage ? (
+          {isUploadingImage ? (
             <span className="text-muted-foreground">图片上传中…</span>
           ) : (
-            <span className="text-destructive">{pasteImageError}</span>
+            <span className="text-destructive">{imageUploadError}</span>
           )}
         </div>
       )}
       <EditorContent editor={editor} className="max-h-[min(360px,50vh)] overflow-y-auto" />
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/jpeg,image/png,image/gif,image/webp"
+        multiple
+        className="hidden"
+        onChange={handleImageInput}
+      />
     </div>
   )
 }

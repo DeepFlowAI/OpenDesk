@@ -22,6 +22,7 @@ import { UnifiedFieldValueEditor } from '@/app/components/features/field-system/
 import { SessionSummaryFields } from '@/app/components/features/session-summary/session-summary-fields'
 import { ChatTicketDraftPanel, hasTicketDraft } from '@/app/components/features/chat/chat-ticket-draft-panel'
 import { KnowledgeAssistant, type KnowledgeAssistantActionContext } from '@/app/components/features/knowledge/knowledge-assistant'
+import type { KnowledgeComposerContentType } from '@/app/components/features/knowledge/knowledge-utils'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { FieldType } from '@/types/field-enums'
 import { getLinkedSelectTypeConfig } from '@/lib/field-linked-select-config'
@@ -34,8 +35,9 @@ type Props = {
   width: number
   ticketDraftOpen?: boolean
   onCloseTicketDraft?: (conversationId: number) => void
-  onKnowledgeUse?: (messageText: string) => void
-  onKnowledgeSend?: (messageText: string) => void | Promise<void>
+  knowledgeUseContentType?: KnowledgeComposerContentType
+  onKnowledgeUse?: (context: KnowledgeAssistantActionContext) => void
+  onKnowledgeSend?: (context: KnowledgeAssistantActionContext) => void | Promise<void>
 }
 
 const SYSTEM_KEY_ALIAS: Record<string, keyof User> = {
@@ -79,6 +81,7 @@ export function AuxiliaryPanel({
   width,
   ticketDraftOpen = false,
   onCloseTicketDraft,
+  knowledgeUseContentType = 'text',
   onKnowledgeUse,
   onKnowledgeSend,
 }: Props) {
@@ -188,11 +191,11 @@ export function AuxiliaryPanel({
     : null
 
   const handleKnowledgeUse = (context: KnowledgeAssistantActionContext) => {
-    onKnowledgeUse?.(context.messageText)
+    onKnowledgeUse?.(context)
   }
 
   const handleKnowledgeSend = async (context: KnowledgeAssistantActionContext) => {
-    await onKnowledgeSend?.(context.messageText)
+    await onKnowledgeSend?.(context)
   }
 
   const handleToggleBlacklist = () => {
@@ -260,6 +263,7 @@ export function AuxiliaryPanel({
               <>
                 <button
                   type="button"
+                  data-testid="aux-tab-basic"
                   onClick={() => switchTab('basic')}
                   className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', visibleActiveTab === 'basic' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
                 >
@@ -268,6 +272,7 @@ export function AuxiliaryPanel({
                 {showSummaryTab && (
                   <button
                     type="button"
+                    data-testid="aux-tab-summary"
                     onClick={() => switchTab('summary')}
                     className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', visibleActiveTab === 'summary' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
                   >
@@ -301,6 +306,7 @@ export function AuxiliaryPanel({
                 mode="chat"
                 conversationId={conversation?.id ?? null}
                 canUse={Boolean(conversation && !conversationClosed)}
+                useContentType={knowledgeUseContentType}
                 useDisabledReason={knowledgeUseReason}
                 canSend={Boolean(conversation && !conversationClosed && connected)}
                 sendDisabledReason={knowledgeSendReason}
@@ -690,8 +696,10 @@ function EditableInfoRow({
 }) {
   const shouldSaveOnChange = INSTANT_SAVE_FIELD_TYPES.has(field.field_type)
 
+  const fieldKey = field.key ?? (field.id != null ? String(field.id) : field.name)
+
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-1" data-field={fieldKey}>
       <div className="flex items-center gap-1.5">
         <span className="text-[12px] text-[#999999]">{field.name}</span>
         {field.help_text && <FieldHelpTooltip text={field.help_text} />}

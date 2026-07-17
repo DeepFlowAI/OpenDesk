@@ -32,6 +32,15 @@ class TelephonyRPCError(TelephonyError):
         self.data = data
 
 
+class TelephonyMethodNotFoundError(TelephonyRPCError):
+    """The kernel does not expose this RPC method.
+
+    Signalled by a JSON-RPC ``-32601 method not found`` response. Callers use
+    it to detect a kernel that has an optional capability disabled (e.g. SIP
+    extensions not enabled) and degrade gracefully instead of failing hard.
+    """
+
+
 class TelephonyNotConnectedError(TelephonyError):
     """Raised when calling an RPC before the client is connected."""
 
@@ -131,6 +140,27 @@ class BaseTelephonyClient(ABC):
         """Stop play/listen/both on the call. `target` ∈ {play, listen, all}."""
 
     @abstractmethod
+    async def call_play(
+        self,
+        call_id: str,
+        *,
+        text: str | None = None,
+        audio_url: str | None = None,
+        loop: bool = False,
+        interval_ms: int | None = None,
+        voice: str | None = None,
+    ) -> dict:
+        """Play a prompt tone on the call leg. Returns `{play_id, status}`.
+
+        Supply exactly one of `text` (TTS) or `audio_url` (a fetchable WAV URL —
+        the kernel rejects other container formats). `loop=True` with
+        `interval_ms` repeats the prompt on that cadence until
+        `call_stop(target="play")`. Used for hold/consult/three-party waiting
+        tones on the customer leg; distinct from `call_say`, which is a
+        one-shot spoken utterance in the voice-flow path.
+        """
+
+    @abstractmethod
     async def call_dtmf(
         self,
         call_id: str,
@@ -199,6 +229,43 @@ class BaseTelephonyClient(ABC):
     @abstractmethod
     async def call_unbridge(self, call_id: str, other_call_id: str) -> None: ...
 
+    # ── Multi-party rooms (conference mixer) ──
+
+    @abstractmethod
+    async def room_create(self, *, leg_call_ids: list[str] | None = None) -> dict:
+        """Create a mixing room. Returns `{room_id, legs}`.
+
+        Any legs passed in `leg_call_ids` are added at creation time; the kernel
+        automatically un-bridges those legs from any pairwise bridge and stops
+        their TTS/ASR as it moves them into the mixer. Raises
+        TelephonyMethodNotFoundError when the kernel has rooms disabled, so
+        callers can degrade to a clear "not supported" instead of failing hard.
+        """
+
+    @abstractmethod
+    async def room_add_leg(self, room_id: str, call_id: str) -> dict:
+        """Add a call leg to an existing room."""
+
+    @abstractmethod
+    async def room_remove_leg(self, room_id: str, call_id: str) -> dict:
+        """Remove a call leg from a room (the leg stays up, just un-mixed)."""
+
+    @abstractmethod
+    async def room_replace_leg(
+        self, room_id: str, old_call_id: str, new_call_id: str
+    ) -> dict:
+        """Swap one leg for another inside a room."""
+
+    @abstractmethod
+    async def room_set_mix_gain(
+        self, room_id: str, *, listener_call_id: str, speaker_call_id: str, gain: float
+    ) -> dict:
+        """Set how loudly `speaker_call_id` is mixed into `listener_call_id` (0..1)."""
+
+    @abstractmethod
+    async def room_close(self, room_id: str, *, reason: str | None = None) -> dict:
+        """Close a room, un-mixing every remaining leg."""
+
     @abstractmethod
     async def call_hold(self, call_id: str) -> None: ...
 
@@ -208,8 +275,9 @@ class BaseTelephonyClient(ABC):
     @abstractmethod
     async def call_originate(
         self,
-        uri: str,
+        uri: str | None = None,
         *,
+        extension: str | None = None,
         caller_id: str | None = None,
         trunk_id: str | None = None,
         timeout_ms: int | None = None,
@@ -218,6 +286,10 @@ class BaseTelephonyClient(ABC):
         """Start an outbound call. Returns `{call_id, conversation_id, status}`.
 
         - `uri`: destination (e.g. "13800138000" or "sip:1001@host:5060")
+        - `extension`: instead of `uri`, dial a registered SIP extension by its
+          number/AOR — the kernel resolves the current Contact and rings the
+          physical phone directly (no trunk). Raises TelephonyRPCError
+          `-32602 extension not registered` when the phone isn't registered.
         - `caller_id`: SIP From user-part (outbound DID); omitted → trunk default
         - `trunk_id`: which Trunk to route through; omitted → kernel default
           (system_outbound for single-trunk deployments)
@@ -225,6 +297,30 @@ class BaseTelephonyClient(ABC):
         Errors mapped to TelephonyRPCError:
         - `-32602 trunk_id not found` / `trunk not ready for outbound`
         - `-32008 originate concurrent limit reached`
+        """
+
+    @abstractmethod
+    async def extension_query(self, extension: str) -> dict:
+        """Look up one registered extension.
+
+        Returns `{extension, registered: bool, contact?}`. Raises
+        TelephonyMethodNotFoundError when the kernel has extensions disabled.
+        """
+
+    @abstractmethod
+    async def extension_list(self) -> list[dict]:
+        """List currently registered extensions.
+
+        Returns `[{extension, contact, expires_at, last_seen}]`. Raises
+        TelephonyMethodNotFoundError when the kernel has extensions disabled.
+        """
+
+    @abstractmethod
+    async def registrar_info(self) -> dict | None:
+        """Return the SIP registrar endpoint `{host, port, transport}`.
+
+        None when the kernel has no registrar configured. Raises
+        TelephonyMethodNotFoundError when the kernel has extensions disabled.
         """
 
     @abstractmethod

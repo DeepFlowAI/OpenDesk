@@ -81,7 +81,7 @@ export type VisitorWebStatusResponse = {
   checked_at: string
 }
 
-export type MessageStatus = 'sending' | 'delivered' | 'unread' | 'read'
+export type MessageStatus = 'sending' | 'offline' | 'delivered' | 'unread' | 'read' | 'failed'
 
 export type MessageQuote = {
   schema_version: 1
@@ -97,6 +97,8 @@ export type MessageQuote = {
 
 export type MessageMetadata = Record<string, unknown> & {
   quote?: MessageQuote
+  client_message_id?: string
+  retry_quoted_message_id?: number
 }
 
 export type OpenAgentThinkingBlock = {
@@ -169,6 +171,7 @@ export type VisitorConversationHistoryItem = {
   created_at: string | null
   agent_name: string | null
   agent_avatar: string | null
+  agent_unread_message_ids: number[]
   messages: Message[]
   messages_truncated: boolean
 }
@@ -179,8 +182,8 @@ export type VisitorConversationHistoryResponse = {
 }
 
 export type VisitorUnreadOfflineReplyItem = VisitorConversationHistoryItem & {
-  offline_message_public_id: string
-  customer_unread_at: string
+  offline_message_public_id: string | null
+  customer_unread_at: string | null
   customer_unread_message_id: number | null
   offline_reply_unread: boolean
 }

@@ -4,9 +4,10 @@ OpenAgent settings router.
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, require_permission
+from app.db.deps import get_db, require_any_permission, require_permission
 from app.schemas.open_agent_settings import (
     OpenAgentAgentListResponse,
+    OpenAgentAttachmentHandoffStatus,
     OpenAgentConnectionTestRequest,
     OpenAgentConnectionTestResponse,
     OpenAgentSettingsResponse,
@@ -82,8 +83,29 @@ async def test_voice_speed_connection(
 
 @router.get("/agents", response_model=OpenAgentAgentListResponse)
 async def list_open_agent_agents(
-    principal: EffectivePrincipal = Depends(require_permission("settings.open_agent.manage")),
+    principal: EffectivePrincipal = Depends(
+        require_any_permission(["settings.open_agent.manage", "chat.admin.channel.manage"])
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """List active OpenAgent agents through saved tenant credentials."""
     return await OpenAgentSettingsService.list_active_agents(db, principal.tenant_id)
+
+
+@router.get(
+    "/agents/{agent_id}/attachment-handoff",
+    response_model=OpenAgentAttachmentHandoffStatus,
+)
+async def get_open_agent_attachment_handoff_status(
+    agent_id: int,
+    principal: EffectivePrincipal = Depends(
+        require_any_permission(["settings.open_agent.manage", "chat.admin.channel.manage"])
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check whether the selected agent supports attachment handoff."""
+    return await OpenAgentSettingsService.get_attachment_handoff_status(
+        db,
+        principal.tenant_id,
+        agent_id,
+    )

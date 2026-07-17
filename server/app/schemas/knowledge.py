@@ -14,6 +14,8 @@ KnowledgeDocumentStatus = Literal["draft", "published"]
 KnowledgeDocumentDisplayStatus = Literal["draft", "published", "expired"]
 KnowledgeValidityType = Literal["permanent", "scheduled"]
 KnowledgeRecommendationStatus = Literal["no_conversation", "updating", "no_vector", "ready", "failed"]
+KnowledgeInspirationStatus = Literal["pending", "archived", "document_created"]
+KnowledgeInspirationContentFormat = Literal["text", "rich_text"]
 
 
 class ActorRef(BaseModel):
@@ -89,7 +91,8 @@ class KnowledgeDirectoryPathItem(BaseModel):
 class KnowledgeDocumentBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=120)
     directory_id: int
-    content_html: str = Field(..., min_length=1)
+    content_html: str
+    attachment_ids: list[int] = Field(default_factory=list, max_length=10)
     status: KnowledgeDocumentStatus = "draft"
     validity_type: KnowledgeValidityType = "permanent"
     valid_from: datetime | None = None
@@ -111,7 +114,8 @@ class KnowledgeDocumentCreate(KnowledgeDocumentBase):
 class KnowledgeDocumentUpdate(BaseModel):
     title: str | None = Field(None, min_length=1, max_length=120)
     directory_id: int | None = None
-    content_html: str | None = Field(None, min_length=1)
+    content_html: str | None = None
+    attachment_ids: list[int] | None = Field(None, max_length=10)
     status: KnowledgeDocumentStatus | None = None
     validity_type: KnowledgeValidityType | None = None
     valid_from: datetime | None = None
@@ -127,6 +131,29 @@ class KnowledgeDocumentUpdate(BaseModel):
             raise ValueError("Document title is required")
         return normalized
 
+    @field_validator("content_html")
+    @classmethod
+    def reject_null_content(cls, value: str | None) -> str | None:
+        if value is None:
+            raise ValueError("Document content cannot be null")
+        return value
+
+
+class KnowledgeDocumentAttachmentResponse(TimestampSchema):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    document_id: int | None = None
+    name: str
+    size: int
+    mime_type: str
+    sort_order: int
+
+
+class KnowledgeDocumentAttachmentUrlResponse(BaseModel):
+    url: str
+    expires_seconds: int
+
 
 class KnowledgeDocumentResponse(TimestampSchema):
     model_config = ConfigDict(from_attributes=True)
@@ -137,6 +164,7 @@ class KnowledgeDocumentResponse(TimestampSchema):
     directory_path: list[KnowledgeDirectoryPathItem] = Field(default_factory=list)
     title: str
     content_html: str
+    attachments: list[KnowledgeDocumentAttachmentResponse] = Field(default_factory=list)
     status: KnowledgeDocumentStatus
     display_status: KnowledgeDocumentDisplayStatus
     validity_type: KnowledgeValidityType
@@ -156,6 +184,47 @@ class KnowledgeRecommendationResponse(BaseModel):
     limit: int = 5
     vector_updated_at: datetime | None = None
     message: str | None = None
+
+
+class KnowledgeInspirationCreate(BaseModel):
+    content: str = Field(..., min_length=1)
+    content_format: KnowledgeInspirationContentFormat = "text"
+    source_conversation_id: int | None = None
+    source_message_id: int | None = None
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Inspiration content is required")
+        return normalized
+
+
+class KnowledgeInspirationResponse(TimestampSchema):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    tenant_id: int
+    content_html: str
+    content_plain: str
+    source_type: str
+    source_conversation_id: int | None = None
+    source_message_id: int | None = None
+    status: KnowledgeInspirationStatus
+    created_by: ActorRef | None = None
+    updated_by: ActorRef | None = None
+
+
+class KnowledgeInspirationListResponse(PaginatedResponse):
+    items: list[KnowledgeInspirationResponse]
+
+
+class KnowledgeInspirationCountsResponse(BaseModel):
+    total: int = 0
+    pending: int = 0
+    archived: int = 0
+    document_created: int = 0
 
 
 KnowledgeDirectoryNode.model_rebuild()

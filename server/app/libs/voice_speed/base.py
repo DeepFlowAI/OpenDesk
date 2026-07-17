@@ -54,15 +54,18 @@ class BaseVoiceSpeedClient(ABC):
 
     @staticmethod
     def build_turn_url(base_url: str, agent_id: str) -> str:
-        """URL of an agent's text-turn endpoint (v2 flowkit-中枢架构).
+        """URL of an agent's streaming text-turn endpoint (v2 flowkit-中枢架构).
 
         flowkit owns the call leg and POSTs each transcribed utterance here,
-        getting back ``{reply, commands, voice_spk_id}``. Mirrors the same
-        base-path rules as the realtime-sessions endpoint.
+        consuming the reply as an SSE ``data: {"type":"delta","text":...}``
+        stream (``/turn/stream``) so TTS can start mid-reply. The non-streaming
+        ``/turn`` returns plain JSON, which flowkit's SSE reader can't parse —
+        it must be the ``/stream`` variant. Mirrors the same base-path rules as
+        the realtime-sessions endpoint.
         """
         path = urlparse(base_url).path.rstrip("/")
         base = base_url.rstrip("/")
-        suffix = f"agents/{agent_id}/turn"
+        suffix = f"agents/{agent_id}/turn/stream"
         if path.endswith("/api/v1/openapi"):
             return f"{base}/{suffix}"
         if path.endswith("/api/v1"):

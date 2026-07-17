@@ -13,6 +13,7 @@ from app.libs.voice_speed.base import BaseVoiceSpeedClient, VoiceSpeedClientErro
 from app.repositories.open_agent_settings_repository import OpenAgentSettingsRepository
 from app.schemas.open_agent_settings import (
     OpenAgentAIDisclaimer,
+    OpenAgentAttachmentHandoffStatus,
     OpenAgentFAQ,
     OpenAgentAgentListResponse,
     OpenAgentAgentSummary,
@@ -246,6 +247,66 @@ class OpenAgentSettingsService:
             page=result.page,
             per_page=result.per_page,
             pages=result.pages,
+        )
+
+    @staticmethod
+    async def get_attachment_handoff_status(
+        db: AsyncSession,
+        tenant_id: int,
+        agent_id: int,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentAttachmentHandoffStatus:
+        """Check whether an agent can route attachment-only turns to a human."""
+        credentials = await OpenAgentSettingsService.get_credentials(db, tenant_id)
+        if not credentials or not credentials[1]:
+            raise ValidationError("OpenAgent settings are required before checking attachments")
+
+        base_url, api_key = credentials
+        client = open_agent_client or create_open_agent_client()
+        try:
+            agent = await client.get_agent(base_url, api_key, agent_id)
+        except OpenAgentClientError as exc:
+            if exc.status_code == 404:
+                return OpenAgentAttachmentHandoffStatus(
+                    ready=False,
+                    reason="agent_unavailable",
+                )
+            raise ValidationError(str(exc)) from exc
+
+        if agent.status != "active":
+            return OpenAgentAttachmentHandoffStatus(
+                ready=False,
+                reason="agent_unavailable",
+            )
+
+        tool_id = agent.attachment_handoff_tool_id
+        if tool_id is None:
+            return OpenAgentAttachmentHandoffStatus(
+                ready=False,
+                reason="not_configured",
+            )
+
+        try:
+            tool = await client.get_agent_tool(base_url, api_key, agent_id, tool_id)
+        except OpenAgentClientError as exc:
+            if exc.status_code == 404:
+                return OpenAgentAttachmentHandoffStatus(
+                    ready=False,
+                    reason="tool_unavailable",
+                    tool_id=tool_id,
+                )
+            raise ValidationError(str(exc)) from exc
+
+        ready = (
+            tool.id == tool_id
+            and tool.agent_id == agent_id
+            and tool.tool_type == "human_handoff"
+            and tool.is_enabled
+        )
+        return OpenAgentAttachmentHandoffStatus(
+            ready=ready,
+            reason="ready" if ready else "tool_unavailable",
+            tool_id=tool_id,
         )
 
     @staticmethod

@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useState } from 'react'
 import { ChevronDown, X, Check } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { FdFieldOption } from '@/models/field-definition'
@@ -44,6 +44,7 @@ export function OptionComboBox({
   className,
 }: OptionComboBoxProps) {
   const [open, setOpen] = useState(false)
+  const listboxId = useId()
 
   const activeOptions = useMemo(() => options.filter((o) => o.is_active), [options])
   const optionByValue = useMemo(() => {
@@ -96,6 +97,7 @@ export function OptionComboBox({
       <div
         role="combobox"
         aria-haspopup="listbox"
+        aria-controls={listboxId}
         aria-expanded={open}
         aria-disabled={disabled}
         tabIndex={disabled ? -1 : 0}
@@ -185,7 +187,7 @@ export function OptionComboBox({
                 {placeholder}
               </div>
             ) : (
-              <ul role="listbox" className="py-1">
+              <ul id={listboxId} role="listbox" className="py-1">
                 {activeOptions.map((opt) => {
                   const selected = multi
                     ? multiValues.includes(opt.value)

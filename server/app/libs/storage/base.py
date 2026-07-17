@@ -22,11 +22,17 @@ class BaseStorageClient(ABC):
         ...
 
     @abstractmethod
+    async def copy(self, source_key: str, destination_key: str) -> None:
+        """Copy an object within the configured storage bucket."""
+        ...
+
+    @abstractmethod
     async def get_temporary_url(
         self,
         key: str,
         expires_seconds: int = 300,
         download_name: str | None = None,
+        image_process: str | None = None,
     ) -> str:
         """Return a temporary URL for reading an object."""
         ...

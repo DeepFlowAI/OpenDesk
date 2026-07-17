@@ -1,6 +1,8 @@
 'use client'
 
+import Link from 'next/link'
 import {
+  IconArrowBackUp,
   IconCheck,
   IconPhone,
   IconPhoneIncoming,
@@ -12,7 +14,10 @@ import {
   formatCallDuration,
   useCallCenterRuntime,
 } from '@/context/call-center-runtime'
+import { useLocaleStore } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
+import { AgentCallBar } from './agent-call-bar'
 
 type GlobalCallBarProps = {
   hidden?: boolean
@@ -30,11 +35,34 @@ export function GlobalCallBar({ hidden = false }: GlobalCallBarProps) {
     hangup,
     completeWrapUp,
   } = useCallCenterRuntime()
+  const { locale } = useLocaleStore()
 
   if (hidden || phase === 'idle' || phase === 'mic_check' || phase === 'mic_denied') {
     return null
   }
   if (!incoming && phase !== 'wrap_up') return null
+
+  // Active call: reuse the universal call bar shell (compact main row + inline
+  // downward extension) with a "back to call workspace" link. The extension is
+  // the bar's own inline area — it pushes page content down, not an overlay.
+  if (phase === 'on_call' && incoming) {
+    return (
+      <div className="w-full max-w-[min(760px,calc(100vw-8rem))]">
+        <AgentCallBar
+          compact
+          trailing={
+            <Link
+              href="/workspace/call"
+              className="ml-1 flex h-8 items-center gap-1 rounded-md px-2 text-xs font-medium text-foreground/70 transition-colors hover:bg-background/60"
+            >
+              <IconArrowBackUp size={14} />
+              <span className="hidden sm:inline">{t('ws.callbar.backToWorkspace', locale)}</span>
+            </Link>
+          }
+        />
+      </div>
+    )
+  }
 
   const duration = formatCallDuration(callStart ? now - callStart : 0)
   const isIncoming = phase === 'incoming'
@@ -88,26 +116,44 @@ export function GlobalCallBar({ hidden = false }: GlobalCallBarProps) {
       </span>
       <div className="ml-1 flex shrink-0 items-center gap-1">
         {isIncoming ? (
-          <>
-            <button
-              type="button"
-              onClick={() => void reject()}
-              disabled={leg.state === 'connecting'}
-              title="拒接"
-              className="grid h-7 w-7 place-items-center rounded-full bg-red-500 text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <IconPhoneOff size={14} />
-            </button>
-            <button
-              type="button"
-              onClick={() => void accept()}
-              disabled={leg.state === 'connecting'}
-              title={leg.state === 'connecting' ? '正在接通...' : '接听'}
-              className="grid h-7 w-7 place-items-center rounded-full bg-green-500 text-white transition-colors hover:bg-green-600 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <IconPhone size={14} />
-            </button>
-          </>
+          incoming?.device_type === 'sip_phone' ? (
+            // SIP phone: the handset rings and is answered physically — no
+            // browser "接听". Show a ringing hint; reject is still available.
+            <>
+              <span className="shrink-0 whitespace-nowrap text-[11px] text-foreground/70">
+                话机响铃中
+              </span>
+              <button
+                type="button"
+                onClick={() => void reject()}
+                title="拒接"
+                className="grid h-7 w-7 place-items-center rounded-full bg-red-500 text-white transition-colors hover:bg-red-600"
+              >
+                <IconPhoneOff size={14} />
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => void reject()}
+                disabled={leg.state === 'connecting'}
+                title="拒接"
+                className="grid h-7 w-7 place-items-center rounded-full bg-red-500 text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <IconPhoneOff size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => void accept()}
+                disabled={leg.state === 'connecting'}
+                title={leg.state === 'connecting' ? '正在接通...' : '接听'}
+                className="grid h-7 w-7 place-items-center rounded-full bg-green-500 text-white transition-colors hover:bg-green-600 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <IconPhone size={14} />
+              </button>
+            </>
+          )
         ) : phase === 'wrap_up' ? (
           <button
             type="button"

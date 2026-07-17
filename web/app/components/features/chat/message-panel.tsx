@@ -12,7 +12,7 @@ import { useAgentReadStatusSettings } from '@/service/use-conversation-read-stat
 import { useConversationSatisfaction, useSendSatisfactionInvitation } from '@/service/use-satisfaction-survey'
 import { AgentChatRuntimeProvider } from '@/components/assistant-ui/agent-chat-runtime'
 import { AgentThread } from '@/components/assistant-ui/agent-thread'
-import type { ComposerInsertRequest } from '@/components/assistant-ui/agent-composer'
+import type { ComposerContentType, ComposerInsertRequest } from '@/components/assistant-ui/agent-composer'
 import { t } from '@/utils/i18n'
 import { getDataScope, hasPermission } from '@/utils/permissions'
 import type { AgentStatus, Conversation, WorkspaceConversationHistoryItem } from '@/models/conversation'
@@ -42,6 +42,7 @@ type Props = {
   onComposerInsertRequest?: (request: Omit<ComposerInsertRequest, 'id' | 'conversationId'>) => void
   composerInputHeight?: number
   onComposerInputHeightCommit?: (height: number) => void
+  onComposerContentTypeChange?: (contentType: ComposerContentType) => void
   messageSearchOpen?: boolean
   onOpenMessageSearch?: () => void
   messageSearchTarget?: {
@@ -70,6 +71,7 @@ export function MessagePanel({
   onComposerInsertRequest,
   composerInputHeight,
   onComposerInputHeightCommit,
+  onComposerContentTypeChange,
   messageSearchOpen,
   onOpenMessageSearch,
   messageSearchTarget,
@@ -390,6 +392,7 @@ export function MessagePanel({
             onComposerInsertRequest={onComposerInsertRequest}
             composerInputHeight={composerInputHeight}
             onComposerInputHeightCommit={onComposerInputHeightCommit}
+            onComposerContentTypeChange={onComposerContentTypeChange}
             messageSearchOpen={messageSearchOpen}
             onOpenMessageSearch={onOpenMessageSearch}
             messageSearchTarget={messageSearchTarget}

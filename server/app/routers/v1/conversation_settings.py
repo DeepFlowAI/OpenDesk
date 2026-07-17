@@ -4,7 +4,15 @@ Conversation settings router.
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_current_user, get_db, require_all_permissions, require_permission
+from app.db.deps import (
+    get_current_principal_short_session,
+    get_current_user,
+    get_db,
+    require_all_permissions,
+    require_permission,
+)
+from app.core.exceptions import ForbiddenError
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.emoji_setting import (
     EmojiSettingPayload,
     EmojiSettingResponse,
@@ -43,6 +51,13 @@ from app.schemas.visitor_timeout_close import (
     VisitorTimeoutClosePayload,
     VisitorTimeoutCloseResponse,
 )
+from app.schemas.robot_qa import (
+    RobotQaKnowledgeBaseListResponse,
+    RobotQaDirectoryListResponse,
+    RobotQaRuntimeResponse,
+    RobotQaSettingPayload,
+    RobotQaSettingResponse,
+)
 from app.schemas.welcome_message_rule import (
     WelcomeMessageRuleCreate,
     WelcomeMessageRuleEnabledPatch,
@@ -68,6 +83,7 @@ from app.services.conversation_agent_display_setting_service import Conversation
 from app.services.conversation_user_stat_service import ConversationUserStatService
 from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 from app.services.welcome_message_rule_service import WelcomeMessageRuleService
+from app.services.robot_qa_service import RobotQaService
 
 router = APIRouter(prefix="/conversation-settings", tags=["ConversationSettings"])
 EMOJI_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
@@ -78,6 +94,77 @@ KNOWLEDGE_INPUT_SUGGESTION_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.sett
 ANNOUNCEMENT_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 READ_STATUS_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 AGENT_DISPLAY_NAME_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
+ROBOT_QA_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
+
+
+async def require_robot_qa_admin_short_session(
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+) -> EffectivePrincipal:
+    """Authorize robot-QA proxy calls without retaining the auth DB session."""
+    if not principal.has_all_permissions(ROBOT_QA_ADMIN_PERMISSIONS):
+        raise ForbiddenError("Permission denied")
+    return principal
+
+
+async def require_robot_qa_workspace_short_session(
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+) -> EffectivePrincipal:
+    """Require both workspace access and the robot-QA action permission."""
+    if not principal.has_all_permissions([
+        "chat.workspace.use",
+        "chat.conversation.robot_qa.create",
+    ]):
+        raise ForbiddenError("Permission denied")
+    return principal
+
+
+@router.get(
+    "/robot-qa",
+    response_model=RobotQaSettingResponse,
+    dependencies=[Depends(require_all_permissions(ROBOT_QA_ADMIN_PERMISSIONS))],
+)
+async def get_robot_qa_setting(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the tenant robot-QA setting."""
+    return await RobotQaService.get_setting(db, current_user["tenant_id"])
+
+
+@router.put("/robot-qa", response_model=RobotQaSettingResponse)
+async def save_robot_qa_setting(
+    body: RobotQaSettingPayload,
+    principal: EffectivePrincipal = Depends(require_robot_qa_admin_short_session),
+):
+    """Validate and save the tenant robot-QA setting."""
+    return await RobotQaService.save_setting_managed(principal.tenant_id, body)
+
+
+@router.get(
+    "/robot-qa/knowledge-bases",
+    response_model=RobotQaKnowledgeBaseListResponse,
+)
+async def list_robot_qa_knowledge_bases(
+    principal: EffectivePrincipal = Depends(require_robot_qa_admin_short_session),
+):
+    """List all OpenAgent knowledge bases available to the saved API key."""
+    return await RobotQaService.list_knowledge_bases_managed(principal.tenant_id)
+
+
+@router.get("/robot-qa/runtime", response_model=RobotQaRuntimeResponse)
+async def get_robot_qa_runtime(
+    principal: EffectivePrincipal = Depends(require_robot_qa_workspace_short_session),
+):
+    """Return the validated agent-workspace robot-QA runtime config."""
+    return await RobotQaService.get_runtime_config_managed(principal.tenant_id)
+
+
+@router.get("/robot-qa/directories", response_model=RobotQaDirectoryListResponse)
+async def list_robot_qa_directories(
+    principal: EffectivePrincipal = Depends(require_robot_qa_workspace_short_session),
+):
+    """List QA directories for the configured target knowledge base."""
+    return await RobotQaService.list_directories_managed(principal.tenant_id)
 
 
 @router.get(

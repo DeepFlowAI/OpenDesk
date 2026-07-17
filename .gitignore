@@ -44,3 +44,6 @@ htmlcov/
 # Misc
 *.log
 .vercel
+
+# Generated from @embedpdf/pdfium before frontend dev/build.
+web/public/vendor/embedpdf/pdfium.wasm

@@ -37,6 +37,16 @@ def _conversation(agent_id: int = 20):
     )
 
 
+def _conversation_with_time(conversation_id: int, agent_id: int, last_message_at: datetime):
+    conversation = _conversation(agent_id=agent_id)
+    conversation.id = conversation_id
+    conversation.public_id = f"cv_{conversation_id}"
+    conversation.last_message_at = last_message_at
+    conversation.created_at = last_message_at
+    conversation.started_at = last_message_at
+    return conversation
+
+
 def _principal(
     *,
     permissions: list[str],
@@ -50,6 +60,56 @@ def _principal(
         data_scopes={"chat.conversation.peer.view": data_scope},
         group_ids=[7],
     )
+
+
+@pytest.mark.asyncio
+async def test_conversation_view_access_relation_matrix(monkeypatch):
+    db = AsyncMock()
+    principal = _principal(
+        permissions=["chat.conversation.peer.view"],
+        data_scope="all",
+        user_id=10,
+    )
+    owner = _conversation(agent_id=10)
+    collaborator = _conversation(agent_id=20)
+    collaborator.id = 101
+    closed_participated = _conversation(agent_id=20)
+    closed_participated.id = 102
+    closed_participated.status = "closed"
+    peer = _conversation(agent_id=30)
+    peer.id = 103
+    forbidden = _conversation(agent_id=40)
+    forbidden.id = 104
+    collaborator_ids = {collaborator.id}
+    participated_ids = {closed_participated.id}
+
+    async def is_collaborator(_db, *, conversation_id: int, **_kwargs):
+        return conversation_id in collaborator_ids
+
+    async def has_participated(_db, *, conversation_id: int, **_kwargs):
+        return conversation_id in participated_ids
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationCollaborationRepository.is_active_collaborator",
+        AsyncMock(side_effect=is_collaborator),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.has_agent_participated",
+        AsyncMock(side_effect=has_participated),
+    )
+    monkeypatch.setattr(
+        "app.services.data_scope_service.EmployeeRepository.get_employee_ids_in_groups",
+        AsyncMock(return_value=[30]),
+    )
+
+    assert await ConversationService._assert_conversation_view_access(db, principal, owner) == "own"
+    assert await ConversationService._assert_conversation_view_access(db, principal, collaborator) == "collaborator"
+    assert await ConversationService._assert_conversation_view_access(db, principal, closed_participated) == "own"
+    assert await ConversationService._assert_conversation_view_access(db, principal, peer) == "peer"
+
+    no_peer_permission = _principal(permissions=[], data_scope="all", user_id=10)
+    with pytest.raises(ForbiddenError):
+        await ConversationService._assert_conversation_view_access(db, no_peer_permission, forbidden)
 
 
 @pytest.mark.asyncio
@@ -129,6 +189,63 @@ async def test_peer_list_returns_collaboration_marker(monkeypatch):
 
     assert result[0]["viewer_relation"] == "peer"
     assert result[0]["collaborated_by_current_user"] is True
+
+
+@pytest.mark.asyncio
+async def test_my_conversation_list_merges_collaborator_conversations(monkeypatch):
+    newer = datetime(2026, 6, 16, 9, 0, tzinfo=timezone.utc)
+    older = datetime(2026, 6, 16, 8, 0, tzinfo=timezone.utc)
+    own = _conversation_with_time(100, 10, older)
+    duplicate_own = _conversation_with_time(100, 10, older)
+    collaborator = _conversation_with_time(101, 20, newer)
+    principal = _principal(permissions=[], user_id=10)
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_active_by_agent",
+        AsyncMock(return_value=[own]),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationCollaborationRepository.get_active_conversations_by_agent",
+        AsyncMock(return_value=[duplicate_own, collaborator]),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.DataScopeService.session_history_filters",
+        AsyncMock(return_value=(None, None)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_agent_message_conversation_ids",
+        AsyncMock(return_value={collaborator.id}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationCollaborationRepository.get_active_collaborator_agents_by_conversation_ids",
+        AsyncMock(return_value={own.id: [], collaborator.id: []}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationPinRepository.get_by_conversation_ids",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.VisitorTimeoutCloseStateRepository.get_by_conversation_ids",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_visitor_history",
+        AsyncMock(side_effect=[[], [SimpleNamespace(id=1)]]),
+    )
+
+    result = await ConversationService.get_agent_conversations(
+        AsyncMock(),
+        tenant_id=1,
+        agent_id=10,
+        principal=principal,
+        scope="my",
+    )
+
+    assert [item["id"] for item in result] == [101, 100]
+    assert result[0]["viewer_relation"] == "collaborator"
+    assert result[0]["collaborated_by_current_user"] is True
+    assert result[1]["viewer_relation"] == "own"
+    assert result[1]["has_history_conversations"] is True
 
 
 @pytest.mark.asyncio

@@ -69,6 +69,11 @@ def _conversation(**overrides):
             "handoff_in_progress",
         ),
         (_conversation(open_agent_agent_id=12, open_agent_handoff_state="queued"), "bot", "in_queue"),
+        (
+            _conversation(open_agent_agent_id=12, open_agent_handoff_state="queue_offline_canceled"),
+            "bot",
+            "queue_offline_canceled",
+        ),
         (_conversation(open_agent_agent_id=12, open_agent_handoff_state="success"), "bot_human", "succeeded"),
         (_conversation(open_agent_agent_id=12, open_agent_handoff_state="failed"), "bot", "failed"),
         (_conversation(open_agent_agent_id=12, open_agent_handoff_state="dismissed"), "bot", "dismissed"),
@@ -125,6 +130,7 @@ def test_conversation_to_response_includes_message_counts():
 async def test_get_messages_enriches_bot_sender_name(monkeypatch):
     conversation = SimpleNamespace(
         id=1,
+        tenant_id=1,
         visitor=None,
         agent=None,
         open_agent_agent_name="Fallback Bot",
@@ -151,6 +157,10 @@ async def test_get_messages_enriches_bot_sender_name(monkeypatch):
     monkeypatch.setattr(
         "app.services.session_record_service.EmployeeRepository.get_by_ids",
         AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "app.services.session_record_service.ConversationAgentDisplaySettingService.get_display_mode",
+        AsyncMock(return_value="name"),
     )
 
     result = await SessionRecordService.get_messages(AsyncMock(), conversation_id=1)

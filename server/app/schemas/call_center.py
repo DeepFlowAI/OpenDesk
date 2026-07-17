@@ -59,6 +59,17 @@ class OnlineAgentList(BaseModel):
     items: list[OnlineAgentItem]
 
 
+class ConsultableAgent(BaseModel):
+    """A workspace agent that can be a consult / transfer / conference target."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    employee_id: int
+    name: str | None = None
+    avatar: str | None = None
+    status: AgentStatusValue
+
+
 # ─────────────── Call record ───────────────
 
 

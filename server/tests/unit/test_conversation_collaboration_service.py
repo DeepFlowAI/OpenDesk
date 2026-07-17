@@ -23,7 +23,7 @@ from app.services.conversation_collaboration_service import (
     COLLABORATION_RESPOND_PERMISSION,
     ConversationCollaborationService,
 )
-from app.services.data_scope_service import DataScopeService
+from app.services.data_scope_service import DataScopeService, RESOURCE_COLLABORATION_INVITE
 
 
 def _principal() -> EffectivePrincipal:
@@ -45,7 +45,7 @@ def _invite_principal(
         user_id=10,
         tenant_id=1,
         permissions=[COLLABORATION_INVITE_PERMISSION],
-        data_scopes={"session_record": data_scope},
+        data_scopes={RESOURCE_COLLABORATION_INVITE: data_scope},
         group_ids=group_ids if group_ids is not None else [7],
     )
 

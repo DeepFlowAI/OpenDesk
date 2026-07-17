@@ -24,7 +24,7 @@ from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.schemas.permission import EffectivePrincipal
 from app.services.agent_status_service import AgentStatusService
-from app.services.data_scope_service import DataScopeService, RESOURCE_SESSION_RECORD
+from app.services.data_scope_service import DataScopeService, RESOURCE_COLLABORATION_INVITE
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ class ConversationCollaborationService:
             principal,
             conversation,
             peer_ids,
-            RESOURCE_SESSION_RECORD,
+            RESOURCE_COLLABORATION_INVITE,
         )
 
     @staticmethod
@@ -126,7 +126,7 @@ class ConversationCollaborationService:
         db: AsyncSession,
         principal: EffectivePrincipal,
     ) -> set[int] | None:
-        scope = DataScopeService.get_scope(principal, RESOURCE_SESSION_RECORD)
+        scope = DataScopeService.get_scope(principal, RESOURCE_COLLABORATION_INVITE)
         if scope == "all":
             return None
         if scope == "self":

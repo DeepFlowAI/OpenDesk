@@ -54,9 +54,11 @@ import {
   type OpenAgentToolCallPayload,
   type OpenAgentToolResultPayload,
   type OpenAgentStreamController,
+  type OpenAgentChatAttachment,
 } from '@/service/use-open-agent-conversation'
 import { createStreamMetrics, telemetry } from '@/service/telemetry'
 import { isVisitorQueueEnteredMessage } from '@/lib/visitor-queue-notice'
+import { emitTestEvent } from '@/lib/e2e-test-events'
 import type { OpenAgentFeedbackSubmitInput } from '@/app/components/features/chat/open-agent-feedback'
 import {
   getAssistantAvatarSrc,
@@ -68,6 +70,7 @@ import {
   type HandoffRouteUnavailablePayload,
 } from '@/lib/handoff-route-unavailable'
 import { quoteFromMessage } from '@/lib/message-quote'
+import { createPendingAttachmentContent } from '@/lib/pending-attachment'
 
 // ─── Config context ──────────────────────────────────────────────
 
@@ -138,6 +141,8 @@ export type VisitorChatConfigValue = {
   onRequestHumanHandoff: (payload?: HumanHandoffEventPayload | null) => Promise<boolean>
   onDismissHumanHandoff: () => void
   onRecallMessage: (message: Message) => Promise<boolean>
+  onRetryOfflineMessage: (message: Message) => Promise<void>
+  onRetryOpenAgentAttachment: (message: Message) => Promise<void>
   quotedMessage: Message | null
   onQuoteMessage: (message: Message) => void
   onClearQuote: () => void
@@ -280,6 +285,20 @@ export function getOpenAgentTextBlocks(metadata?: Record<string, unknown>): Open
       timelineIndex: getNumberValue(record.timelineIndex) ?? getNumberValue(record.timeline_index) ?? 0,
     }]
   })
+}
+
+export function isOpenAgentMessageStreaming(metadata?: Record<string, unknown>): boolean {
+  const thinkingBlocks = getOpenAgentThinkingBlocks(metadata)
+  const visibleToolBlocks = getOpenAgentToolBlocks(metadata).filter(
+    (block) => block.toolName.trim().toLowerCase() !== 'human_handoff' && block.usedForHandoff !== true,
+  )
+  const textBlocks = getOpenAgentTextBlocks(metadata)
+  return (
+    metadata?.streaming === true
+    || thinkingBlocks.some((block) => block.isStreaming)
+    || visibleToolBlocks.some((block) => block.isExecuting)
+    || textBlocks.some((block) => block.isStreaming)
+  )
 }
 
 function getToolCallId(data: OpenAgentToolCallPayload | OpenAgentToolResultPayload, fallback: string): string {
@@ -470,15 +489,23 @@ function mapDeliveredPublicMessage(message: PublicMessage): Message {
     : mapped
 }
 
+function mapOfflinePublicMessage(message: PublicMessage): Message {
+  return {
+    ...mapPublicMessage(message),
+    status: message.sender_type === 'visitor' ? 'offline' : message.status,
+  }
+}
+
 // ─── OpenAgent in-flight turn persistence ───────────────────────
 
-const OPEN_AGENT_PENDING_TURN_VERSION = 1
+const OPEN_AGENT_PENDING_TURN_VERSION = 2
 const OPEN_AGENT_PENDING_TURN_TTL_MS = 10 * 60 * 1000
 
 type PendingOpenAgentTurn = {
   schemaVersion: typeof OPEN_AGENT_PENDING_TURN_VERSION
   conversationPublicId: string
   message: string
+  attachment?: OpenAgentChatAttachment
   requestId: string
   clientMessageId: string
   lastEventId: string | null
@@ -506,6 +533,17 @@ function isPendingTurn(value: unknown): value is PendingOpenAgentTurn {
   return record.schemaVersion === OPEN_AGENT_PENDING_TURN_VERSION
     && typeof record.conversationPublicId === 'string'
     && typeof record.message === 'string'
+    && (
+      record.attachment === undefined
+      || (
+        isPlainRecord(record.attachment)
+        && typeof record.attachment.file_id === 'string'
+        && (record.attachment.type === 'image' || record.attachment.type === 'file')
+        && typeof record.attachment.name === 'string'
+        && typeof record.attachment.mime_type === 'string'
+        && typeof record.attachment.size === 'number'
+      )
+    )
     && typeof record.requestId === 'string'
     && typeof record.clientMessageId === 'string'
     && (typeof record.lastEventId === 'string' || record.lastEventId === null)
@@ -659,6 +697,8 @@ type ProviderProps = Omit<
   | 'onRequestHumanHandoff'
   | 'onDismissHumanHandoff'
   | 'onRecallMessage'
+  | 'onRetryOfflineMessage'
+  | 'onRetryOpenAgentAttachment'
   | 'quotedMessage'
   | 'onQuoteMessage'
   | 'onClearQuote'
@@ -675,6 +715,8 @@ type ProviderProps = Omit<
 
 type RunOpenAgentTurnOptions = {
   text: string
+  attachment?: OpenAgentChatAttachment
+  visitorTempId?: number
   quotedMessageId?: number
   requestId?: string
   clientMessageId?: string
@@ -795,6 +837,12 @@ export function VisitorChatRuntimeProvider({
   const pendingTurnRef = useRef<PendingOpenAgentTurn | null>(null)
   const detachedRequestIdsRef = useRef<Set<string>>(new Set())
   const resumedClientMessageIdRef = useRef<string | null>(null)
+  const submittedNoticeShownRef = useRef(Boolean(offlineMessagePublicId))
+  const submittedNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const submittedNoticeIdRef = useRef<number | null>(null)
+  const pendingOfflineFilesRef = useRef(new Map<number, { file: File; localUrl: string }>())
+  const retryingOfflineMessageIdsRef = useRef(new Set<number>())
+  const runOpenAgentTurnRef = useRef<((options: RunOpenAgentTurnOptions) => Promise<void>) | null>(null)
 
   const convertMessage = useCallback(
     (msg: Message, idx: number): ThreadMessageLike => {
@@ -875,6 +923,7 @@ export function VisitorChatRuntimeProvider({
   const removeMessage = useVisitorChatStore((s) => s.removeMessage)
   const replaceMessage = useVisitorChatStore((s) => s.replaceMessage)
   const addMessage = useVisitorChatStore((s) => s.addMessage)
+  const updateMessage = useVisitorChatStore((s) => s.updateMessage)
   const addSystemNotice = useVisitorChatStore((s) => s.addSystemNotice)
   const setPendingHumanHandoff = useVisitorChatStore((s) => s.setPendingHumanHandoff)
   const markHandoffConfirming = useVisitorChatStore((s) => s.markHandoffConfirming)
@@ -884,6 +933,60 @@ export function VisitorChatRuntimeProvider({
   const handleHandoffRouteFailed = useVisitorChatStore((s) => s.handleHandoffRouteFailed)
   const handoffRouting = useVisitorChatStore((s) => s.handoffRouting)
   const visitorExternalId = useVisitorChatStore((s) => s.visitorId)
+
+  const markMessageFailed = useCallback((messageId: number) => {
+    const message = useVisitorChatStore.getState().messages.find((item) => item.id === messageId)
+    if (message) updateMessage({ ...message, status: 'failed' })
+  }, [updateMessage])
+
+  const releasePendingOfflineFile = useCallback((messageId: number) => {
+    const pending = pendingOfflineFilesRef.current.get(messageId)
+    if (!pending) return
+    URL.revokeObjectURL(pending.localUrl)
+    pendingOfflineFilesRef.current.delete(messageId)
+  }, [])
+
+  const addPendingOfflineFile = useCallback((file: File) => {
+    const localUrl = URL.createObjectURL(file)
+    const contentType = file.type.startsWith('image/') ? 'image' : 'file'
+    const tempId = addOptimistic(
+      offlineMessagePublicId ?? 'offline-message-pending',
+      createPendingAttachmentContent(file, localUrl),
+      contentType,
+    )
+    pendingOfflineFilesRef.current.set(tempId, { file, localUrl })
+    return tempId
+  }, [addOptimistic, offlineMessagePublicId])
+
+  useEffect(() => () => {
+    pendingOfflineFilesRef.current.forEach(({ localUrl }) => URL.revokeObjectURL(localUrl))
+    pendingOfflineFilesRef.current.clear()
+  }, [])
+
+  const showSubmittedNotice = useCallback((messageThreadPublicId: string) => {
+    if (submittedNoticeShownRef.current) return
+    submittedNoticeShownRef.current = true
+    const noticeId = addSystemNotice(
+      messageThreadPublicId,
+      chatConfig.locale === 'zh' ? '留言已提交' : 'Message submitted',
+      { offline_message_submit_success: true },
+    )
+    submittedNoticeIdRef.current = noticeId
+    submittedNoticeTimerRef.current = setTimeout(() => {
+      removeMessage(noticeId)
+      submittedNoticeTimerRef.current = null
+      submittedNoticeIdRef.current = null
+    }, 2000)
+  }, [addSystemNotice, chatConfig.locale, removeMessage])
+
+  useEffect(() => () => {
+    if (submittedNoticeTimerRef.current) clearTimeout(submittedNoticeTimerRef.current)
+    if (submittedNoticeIdRef.current !== null) removeMessage(submittedNoticeIdRef.current)
+  }, [removeMessage])
+
+  useEffect(() => {
+    if (!offlineMode) submittedNoticeShownRef.current = false
+  }, [offlineMode])
 
   useEffect(() => {
     setQuotedMessage(null)
@@ -1119,9 +1222,75 @@ export function VisitorChatRuntimeProvider({
     [chatConfig.locale, conversationPublicId, socket, visitorSessionToken],
   )
 
+  const sendPendingOfflineFile = useCallback(async (messageId: number, file: File) => {
+    if (!offlineMessagePublicId) {
+      const res = await sendVisitorOfflineMessageFile({
+        visitorSessionToken,
+        file,
+        visitorEnvironment,
+        source: offlineMessageSource,
+        queueType: offlineMessageQueueTarget?.queueType,
+        queueId: offlineMessageQueueTarget?.queueId,
+      })
+      const returnedMessages = res.messages?.length
+        ? res.messages
+        : res.message
+          ? [res.message]
+          : []
+      if (!res.ok || !res.offline_message_public_id || returnedMessages.length === 0) {
+        throw new Error('Empty offline message file acknowledgement')
+      }
+      releasePendingOfflineFile(messageId)
+      removeMessage(messageId)
+      onOfflineMessageCreated(res.offline_message_public_id)
+      returnedMessages.forEach((message) => addMessage(mapOfflinePublicMessage(message)))
+      showSubmittedNotice(res.offline_message_public_id)
+      return true
+    }
+
+    const uploaded = await uploadVisitorOfflineMessageFile({
+      offlineMessagePublicId,
+      visitorSessionToken,
+      file,
+    })
+    const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
+    const content = JSON.stringify({
+      schema_version: uploaded.schema_version,
+      file_id: uploaded.file_id,
+      name: uploaded.name,
+      size: uploaded.size,
+      mime_type: uploaded.mime_type,
+    })
+    const pendingMessage = useVisitorChatStore.getState().messages.find((item) => item.id === messageId)
+    if (pendingMessage) updateMessage({ ...pendingMessage, content, content_type: contentType })
+    releasePendingOfflineFile(messageId)
+    const res = await sendOfflineMessage({
+      offlineMessagePublicId,
+      visitorSessionToken,
+      contentType,
+      content,
+      visitorEnvironment,
+    })
+    if (!res.ok || !res.message) throw new Error('Empty offline message file acknowledgement')
+    confirmOptimistic(messageId, mapOfflinePublicMessage(res.message))
+    return false
+  }, [
+    addMessage,
+    confirmOptimistic,
+    offlineMessagePublicId,
+    offlineMessageQueueTarget,
+    offlineMessageSource,
+    onOfflineMessageCreated,
+    releasePendingOfflineFile,
+    removeMessage,
+    showSubmittedNotice,
+    updateMessage,
+    visitorEnvironment,
+    visitorSessionToken,
+  ])
+
   const onFileSend = useCallback(
     async (file: File) => {
-      if (chatConfig.botMode) return
       const startedAt = Date.now()
       trackEvent('file_send_started', {
         props: {
@@ -1131,80 +1300,67 @@ export function VisitorChatRuntimeProvider({
         metrics: { size_bytes: file.size },
       })
 
-      if (offlineMode && !offlineMessagePublicId) {
+      if (offlineMode) {
+        const tempId = addPendingOfflineFile(file)
         try {
-          const res = await sendVisitorOfflineMessageFile({
-            visitorSessionToken,
-            file,
-            visitorEnvironment,
-            source: offlineMessageSource,
-            queueType: offlineMessageQueueTarget?.queueType,
-            queueId: offlineMessageQueueTarget?.queueId,
-          })
-          const returnedMessages = res.messages?.length
-            ? res.messages
-            : res.message
-              ? [res.message]
-              : []
-          if (res.ok && res.offline_message_public_id && returnedMessages.length > 0) {
-            onOfflineMessageCreated(res.offline_message_public_id)
-            returnedMessages.forEach((message) => {
-              addMessage(mapDeliveredPublicMessage(message))
-            })
-            trackEvent('file_send_succeeded', {
-              props: { target: 'offline_message', created_thread: true },
-              metrics: { duration_ms: Date.now() - startedAt },
-            })
-          }
-        } catch {
-          trackEvent('file_send_failed', {
-            level: 'error',
-            props: { target: 'offline_message', stage: 'create_and_upload' },
+          const createdThread = await sendPendingOfflineFile(tempId, file)
+          trackEvent('file_send_succeeded', {
+            props: { target: 'offline_message', created_thread: createdThread },
             metrics: { duration_ms: Date.now() - startedAt },
           })
-          throw new Error('Failed to send offline message file')
-        }
-        return
-      }
-
-      if (offlineMode && offlineMessagePublicId) {
-        try {
-          const uploaded = await uploadVisitorOfflineMessageFile({
-            offlineMessagePublicId,
-            visitorSessionToken,
-            file,
-          })
-          const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
-          const content = JSON.stringify({
-            schema_version: uploaded.schema_version,
-            file_id: uploaded.file_id,
-            name: uploaded.name,
-            size: uploaded.size,
-            mime_type: uploaded.mime_type,
-          })
-          const tempId = addOptimistic(offlineMessagePublicId, content, contentType)
-          const res = await sendOfflineMessage({
-            offlineMessagePublicId,
-            visitorSessionToken,
-            contentType,
-            content,
-            visitorEnvironment,
-          })
-          if (res.ok && res.message) {
-            confirmOptimistic(tempId, mapPublicMessage(res.message))
-            trackEvent('file_send_succeeded', {
-              props: { target: 'offline_message', created_thread: false },
-              metrics: { duration_ms: Date.now() - startedAt },
-            })
-          }
+          return
         } catch {
           trackEvent('file_send_failed', {
             level: 'error',
             props: { target: 'offline_message', stage: 'upload_or_send' },
             metrics: { duration_ms: Date.now() - startedAt },
           })
-          throw new Error('Failed to send offline message file')
+          markMessageFailed(tempId)
+          return
         }
+      }
+
+      if (chatConfig.botMode) {
+        if (
+          !chatConfig.config.open_agent_attachment_upload_enabled
+          || !conversationPublicId
+          || botRunning
+          || !runOpenAgentTurnRef.current
+        ) return
+
+        const uploaded = await uploadVisitorConversationFile({
+          conversationPublicId,
+          visitorSessionToken,
+          file,
+        })
+        const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
+        const content = JSON.stringify({
+          schema_version: uploaded.schema_version,
+          file_id: uploaded.file_id,
+          name: uploaded.name,
+          size: uploaded.size,
+          mime_type: uploaded.mime_type,
+        })
+        const clientMessageId = generateClientMessageId()
+        const attachment: OpenAgentChatAttachment = {
+          file_id: uploaded.file_id,
+          type: contentType,
+          name: uploaded.name,
+          mime_type: uploaded.mime_type,
+          size: uploaded.size,
+        }
+        const tempId = addOptimistic(conversationPublicId, content, contentType, {
+          open_agent: true,
+          open_agent_attachment: true,
+          client_message_id: clientMessageId,
+        })
+        markOptimisticDelivered(tempId)
+        await runOpenAgentTurnRef.current({
+          text: '',
+          attachment,
+          clientMessageId,
+          visitorTempId: tempId,
+        })
         return
       }
 
@@ -1263,20 +1419,20 @@ export function VisitorChatRuntimeProvider({
     [
       socket,
       chatConfig.botMode,
+      chatConfig.config.open_agent_attachment_upload_enabled,
       chatConfig.locale,
+      botRunning,
       conversationPublicId,
       offlineMode,
-      offlineMessagePublicId,
-      offlineMessageSource,
-      offlineMessageQueueTarget,
       visitorExternalId,
       visitorSessionToken,
-      visitorEnvironment,
-      onOfflineMessageCreated,
+      addPendingOfflineFile,
       addOptimistic,
       confirmOptimistic,
-      addMessage,
+      markMessageFailed,
+      markOptimisticDelivered,
       removeMessage,
+      sendPendingOfflineFile,
       trackEvent,
       quotedMessage,
     ],
@@ -1285,6 +1441,8 @@ export function VisitorChatRuntimeProvider({
   const runOpenAgentTurn = useCallback(
     async ({
       text,
+      attachment,
+      visitorTempId,
       quotedMessageId,
       requestId = generateRequestId(),
       clientMessageId = generateClientMessageId(),
@@ -1306,8 +1464,11 @@ export function VisitorChatRuntimeProvider({
       })
 
       if (addVisitorOptimistic) {
-        const quoteMetadata = quotedMessage ? { quote: quoteFromMessage(quotedMessage, chatConfig.locale) } : undefined
-        const tempId = addOptimistic(conversationPublicId, text, 'text', quoteMetadata)
+        const metadata = {
+          open_agent: true,
+          ...(quotedMessage ? { quote: quoteFromMessage(quotedMessage, chatConfig.locale) } : {}),
+        }
+        const tempId = addOptimistic(conversationPublicId, text, 'text', metadata)
         markOptimisticDelivered(tempId)
       }
 
@@ -1315,6 +1476,7 @@ export function VisitorChatRuntimeProvider({
         schemaVersion: OPEN_AGENT_PENDING_TURN_VERSION,
         conversationPublicId,
         message: text,
+        ...(attachment ? { attachment } : {}),
         requestId,
         clientMessageId,
         lastEventId,
@@ -1471,11 +1633,16 @@ export function VisitorChatRuntimeProvider({
         streamErrorShown = true
         clearPendingTurn()
         clearAssistantPlaceholder()
+        if (visitorTempId !== undefined) markMessageFailed(visitorTempId)
         addSystemNotice(
           conversationPublicId,
-          message || (chatConfig.locale === 'zh'
-            ? '智能助手暂时没有响应，请稍后重试或转人工'
-            : 'The assistant is not responding. Please retry or contact support.'),
+          message || (attachment
+            ? chatConfig.locale === 'zh'
+              ? '附件发送失败，请点击重试'
+              : 'Failed to send the attachment. Click retry.'
+            : chatConfig.locale === 'zh'
+              ? '智能助手暂时没有响应，请稍后重试或转人工'
+              : 'The assistant is not responding. Please retry or contact support.'),
           { event_type: 'open_agent_stream_error' },
         )
       }
@@ -1484,6 +1651,7 @@ export function VisitorChatRuntimeProvider({
         conversationPublicId,
         visitorSessionToken,
         message: text,
+        attachments: attachment ? [attachment] : undefined,
         quotedMessageId,
         requestId,
         clientMessageId,
@@ -1600,6 +1768,10 @@ export function VisitorChatRuntimeProvider({
           },
           onMessageSaved: (saved) => {
             persistControllerSnapshot()
+            if (saved.sender_type === 'visitor' && visitorTempId !== undefined) {
+              confirmOptimistic(visitorTempId, saved)
+              return
+            }
             if (isOpenAgentHandoffMessage(saved)) {
               const payload = resolveHandoffPayloadFromMessage(saved)
               if (payload) {
@@ -1813,6 +1985,9 @@ export function VisitorChatRuntimeProvider({
           abortRef.current = null
         }
         setBotRunning(false)
+        emitTestEvent('agent:reply-done', {
+          conversation_public_id: conversationPublicId,
+        })
       }
     },
     [
@@ -1820,6 +1995,8 @@ export function VisitorChatRuntimeProvider({
       chatConfig.config.open_agent_agent_name,
       chatConfig.config.open_agent_handoff_behavior,
       chatConfig.locale,
+      confirmOptimistic,
+      markMessageFailed,
       visitorSessionToken,
       addOptimistic,
       markOptimisticDelivered,
@@ -1840,6 +2017,43 @@ export function VisitorChatRuntimeProvider({
       quotedMessage,
     ],
   )
+
+  useEffect(() => {
+    runOpenAgentTurnRef.current = runOpenAgentTurn
+    return () => {
+      runOpenAgentTurnRef.current = null
+    }
+  }, [runOpenAgentTurn])
+
+  const onRetryOpenAgentAttachment = useCallback(async (message: Message) => {
+    if (!chatConfig.botMode || message.status !== 'failed' || botRunning) return
+    const clientMessageId = getMetadataString(message, 'client_message_id')
+    if (!clientMessageId) return
+    try {
+      const content = JSON.parse(message.content) as Record<string, unknown>
+      if (
+        typeof content.file_id !== 'string'
+        || typeof content.name !== 'string'
+        || typeof content.mime_type !== 'string'
+        || typeof content.size !== 'number'
+      ) return
+      updateMessage({ ...message, status: 'sending' })
+      await runOpenAgentTurn({
+        text: '',
+        attachment: {
+          file_id: content.file_id,
+          type: content.mime_type.startsWith('image/') ? 'image' : 'file',
+          name: content.name,
+          mime_type: content.mime_type,
+          size: content.size,
+        },
+        clientMessageId,
+        visitorTempId: message.id,
+      })
+    } catch {
+      markMessageFailed(message.id)
+    }
+  }, [botRunning, chatConfig.botMode, markMessageFailed, runOpenAgentTurn, updateMessage])
 
   const sendTextMessage = useCallback(
     async (text: string) => {
@@ -1878,10 +2092,13 @@ export function VisitorChatRuntimeProvider({
             if (!offlineMessagePublicId && res.messages?.length) {
               removeMessage(tempId)
               res.messages.forEach((message) => {
-                addMessage(mapDeliveredPublicMessage(message))
+                addMessage(mapOfflinePublicMessage(message))
               })
             } else {
-              confirmOptimistic(tempId, mapDeliveredPublicMessage(res.message))
+              confirmOptimistic(tempId, mapOfflinePublicMessage(res.message))
+            }
+            if (!offlineMessagePublicId && res.offline_message_public_id) {
+              showSubmittedNotice(res.offline_message_public_id)
             }
             trackEvent('message_send_succeeded', {
               props: {
@@ -1889,6 +2106,9 @@ export function VisitorChatRuntimeProvider({
                 created_thread: Boolean(res.offline_message_public_id && !offlineMessagePublicId),
               },
               metrics: { duration_ms: Date.now() - startedAt },
+            })
+            emitTestEvent('leave-message:submitted', {
+              offline_message_public_id: res.offline_message_public_id ?? offlineMessagePublicId,
             })
             return true
           }
@@ -1898,7 +2118,7 @@ export function VisitorChatRuntimeProvider({
             props: { target: 'offline_message' },
             metrics: { duration_ms: Date.now() - startedAt },
           })
-          removeMessage(tempId)
+          markMessageFailed(tempId)
           return false
         }
         trackEvent('message_send_failed', {
@@ -1906,7 +2126,7 @@ export function VisitorChatRuntimeProvider({
           props: { target: 'offline_message', reason: 'empty_ack' },
           metrics: { duration_ms: Date.now() - startedAt },
         })
-        removeMessage(tempId)
+        markMessageFailed(tempId)
         return false
       }
 
@@ -1988,8 +2208,73 @@ export function VisitorChatRuntimeProvider({
       trackEvent,
       quotedMessage,
       chatConfig.locale,
+      markMessageFailed,
+      showSubmittedNotice,
+      updateMessage,
     ],
   )
+
+  const onRetryOfflineMessage = useCallback(async (message: Message) => {
+    if (!offlineMode || message.status !== 'failed') return
+    if (retryingOfflineMessageIdsRef.current.has(message.id)) return
+    retryingOfflineMessageIdsRef.current.add(message.id)
+    updateMessage({ ...message, status: 'sending' })
+    try {
+      const pendingFile = pendingOfflineFilesRef.current.get(message.id)?.file
+      if (pendingFile) {
+        await sendPendingOfflineFile(message.id, pendingFile)
+        return
+      }
+
+      const res = offlineMessagePublicId
+        ? await sendOfflineMessage({
+            offlineMessagePublicId,
+            visitorSessionToken,
+            contentType: message.content_type as 'text' | 'image' | 'file',
+            content: message.content,
+            visitorEnvironment,
+          })
+        : await createOfflineMessageWithMessage({
+            visitorSessionToken,
+            contentType: message.content_type as 'text' | 'image' | 'file',
+            content: message.content,
+            visitorEnvironment,
+            source: offlineMessageSource,
+            queueType: offlineMessageQueueTarget?.queueType,
+            queueId: offlineMessageQueueTarget?.queueId,
+      })
+      if (!res.ok || !res.message) throw new Error('Empty offline message acknowledgement')
+      if (res.offline_message_public_id) onOfflineMessageCreated(res.offline_message_public_id)
+      if (!offlineMessagePublicId && res.messages?.length) {
+        removeMessage(message.id)
+        res.messages.forEach((savedMessage) => addMessage(mapOfflinePublicMessage(savedMessage)))
+      } else {
+        confirmOptimistic(message.id, mapOfflinePublicMessage(res.message))
+      }
+      if (!offlineMessagePublicId && res.offline_message_public_id) {
+        showSubmittedNotice(res.offline_message_public_id)
+      }
+    } catch {
+      markMessageFailed(message.id)
+    } finally {
+      retryingOfflineMessageIdsRef.current.delete(message.id)
+    }
+  }, [
+    confirmOptimistic,
+    addMessage,
+    offlineMessagePublicId,
+    offlineMessageQueueTarget,
+    offlineMessageSource,
+    offlineMode,
+    onOfflineMessageCreated,
+    removeMessage,
+    markMessageFailed,
+    sendPendingOfflineFile,
+    showSubmittedNotice,
+    updateMessage,
+    visitorEnvironment,
+    visitorSessionToken,
+  ])
 
   const onNew = useCallback(
     async (message: AppendMessage) => {
@@ -2053,7 +2338,7 @@ export function VisitorChatRuntimeProvider({
     const pending = readPendingOpenAgentTurn(conversationPublicId)
     if (!pending) return
 
-    if (!pending.message.trim() || isPendingTurnAlreadyTerminal(messages, pending)) {
+    if ((!pending.message.trim() && !pending.attachment) || isPendingTurnAlreadyTerminal(messages, pending)) {
       clearPendingOpenAgentTurn(conversationPublicId)
       return
     }
@@ -2064,6 +2349,7 @@ export function VisitorChatRuntimeProvider({
 
     void runOpenAgentTurn({
       text: pending.message,
+      attachment: pending.attachment,
       requestId: pending.requestId,
       clientMessageId: pending.clientMessageId,
       lastEventId: pending.lastEventId,
@@ -2102,6 +2388,8 @@ export function VisitorChatRuntimeProvider({
         onAssistSendMessage: sendTextMessage,
         onRequestHumanHandoff: requestHumanHandoff,
         onRecallMessage,
+        onRetryOfflineMessage,
+        onRetryOpenAgentAttachment,
         quotedMessage,
         onQuoteMessage,
         onClearQuote,

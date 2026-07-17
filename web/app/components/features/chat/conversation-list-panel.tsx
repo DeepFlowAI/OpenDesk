@@ -4,12 +4,7 @@ import { useState, useRef, useEffect, useMemo, type ReactNode } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { IconChevronDown, IconLoader2, IconLock, IconPinned, IconRefresh, IconSearch } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
-import {
-  VISITOR_AVATAR_BACKGROUND,
-  VISITOR_AVATAR_FOREGROUND,
-  avatarBackgroundForName,
-  singleAvatarLetter,
-} from '@/lib/avatar-fallback'
+import { resolveVisitorAvatarState, visitorAvatarInitial } from '@/lib/visitor-avatar'
 import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
 import { conversationKeys, setVisitorWebStatusQueryData, useUpdateAgentStatus, useVisitorWebStatus } from '@/service/use-conversations'
@@ -130,34 +125,41 @@ function VisitorConversationAvatar({
     enabled: visible,
     refetchInterval: 10_000,
   })
-  const status = statusQuery.isError ? 'unknown' : statusQuery.data?.status
-  const canDisplay = statusQuery.data?.can_display ?? true
-  const showDot = visible && canDisplay && (status === 'online' || status === 'offline')
-  const title = status === 'online'
+  const status = resolveVisitorAvatarState({
+    enabled: visible,
+    status: statusQuery.data?.status,
+    canDisplay: statusQuery.data?.can_display,
+    isError: statusQuery.isError,
+  })
+  const statusLabel = status === 'online'
     ? t('ws.chat.visitorWebStatusOnline', locale)
-    : t('ws.chat.visitorWebStatusOffline', locale)
+    : status === 'offline'
+      ? t('ws.chat.visitorWebStatusOffline', locale)
+      : t('ws.chat.visitorWebStatusUnknown', locale)
+  const tooltip = status === 'unknown'
+    ? t('ws.chat.visitorWebStatusUnavailable', locale)
+    : t('ws.chat.visitorWebStatusTooltip', locale, { status: statusLabel })
 
   return (
-    <div className="relative h-10 w-10 shrink-0">
-      <div
-        className="flex h-10 w-10 items-center justify-center rounded-full text-base font-medium"
-        style={{
-          backgroundColor: VISITOR_AVATAR_BACKGROUND,
-          color: VISITOR_AVATAR_FOREGROUND,
-        }}
-      >
-        {(conversation.visitor?.name || '访').charAt(0)}
-      </div>
-      {showDot && (
-        <span
-          aria-label={title}
-          title={title}
-          className={cn(
-            'absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-[#F5F5F5]',
-            status === 'online' ? 'bg-[#22C55E]' : 'bg-[#D4D4D4]',
-          )}
-        />
+    <div
+      role="img"
+      aria-label={tooltip}
+      title={tooltip}
+      className={cn(
+        'h-10 w-10 shrink-0 rounded-full border-2 p-[2px] transition-colors duration-150',
+        status === 'online' ? 'border-success' : 'border-border',
       )}
+    >
+      <div
+        className={cn(
+          'flex h-full w-full items-center justify-center rounded-full text-base font-medium transition-colors duration-150',
+          status === 'online'
+            ? 'bg-success/15 text-success'
+            : 'bg-muted text-muted-foreground',
+        )}
+      >
+        {visitorAvatarInitial(conversation.visitor?.name)}
+      </div>
     </div>
   )
 }
@@ -296,6 +298,7 @@ export function ConversationListPanel({
         <div className="flex min-w-0 items-center gap-2.5">
           <div className="relative shrink-0" ref={dropdownRef}>
             <button
+              data-testid="agent-status-trigger"
               onClick={() => {
                 setMaxConcurrentOpen(false)
                 setStatusDropdownOpen(!statusDropdownOpen)
@@ -325,6 +328,7 @@ export function ConversationListPanel({
                 {STATUS_OPTIONS.map((opt) => (
                   <button
                     key={opt.value}
+                    data-status-option={opt.value}
                     onClick={() => {
                       updateStatus.mutate(opt.value)
                       setStatusDropdownOpen(false)
@@ -404,6 +408,7 @@ export function ConversationListPanel({
           {canOfflineTab ? (
             <button
               role="tab"
+              data-testid="workspace-tab-offline"
               aria-selected={activeTab === 'offline'}
               type="button"
               onClick={() => onTabChange('offline')}
@@ -423,6 +428,7 @@ export function ConversationListPanel({
           {canQueueTab ? (
             <button
               role="tab"
+              data-testid="workspace-tab-queue"
               aria-selected={activeTab === 'queue'}
               type="button"
               onClick={() => onTabChange('queue')}
@@ -552,7 +558,6 @@ export function ConversationListPanel({
               {displayedConversations.map((conv) => {
                 const selected = selectedId === conv.id
                 const ownerName = conv.agent?.display_name || conv.agent?.name
-                const peerAvatarName = ownerName || '?'
                 const isCollaboratorConversation = conv.viewer_relation === 'collaborator'
                 const pinLabel = conv.is_pinned
                   ? t('ws.chat.unpinConversation', locale)
@@ -562,6 +567,8 @@ export function ConversationListPanel({
                 return (
                   <div
                     key={conv.id}
+                    data-testid="conversation-item"
+                    data-conversation-id={String(conv.id)}
                     role="button"
                     tabIndex={0}
                     onClick={() => onSelect(conv.id)}
@@ -572,33 +579,23 @@ export function ConversationListPanel({
                       onSelect(conv.id)
                     }}
                     className={cn(
-                      'group mb-1 flex min-h-[72px] w-full cursor-pointer items-center gap-3 rounded-[20px] px-4 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                      'group relative mb-1 flex min-h-[72px] w-full cursor-pointer items-center gap-3 overflow-hidden rounded-[9px] px-4 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
                       selected
-                        ? 'border border-[#E0E0E0] bg-[#FAFAFA]'
-                        : 'border border-transparent hover:bg-white/60',
+                        ? '-mx-2 w-[calc(100%+1rem)] rounded-none bg-white px-6'
+                        : 'hover:-mx-2 hover:w-[calc(100%+1rem)] hover:rounded-none hover:bg-white/60 hover:px-6',
                     )}
                   >
-                    {scope === 'peers' && !isHistoryView ? (
-                      <div
-                        className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full text-base font-medium text-white"
-                        style={!conv.agent?.avatar ? { backgroundColor: avatarBackgroundForName(peerAvatarName) } : undefined}
-                      >
-                        {conv.agent?.avatar ? (
-                          <img
-                            src={conv.agent.avatar}
-                            alt={peerAvatarName}
-                            className="h-full w-full object-cover"
-                          />
-                        ) : (
-                          singleAvatarLetter(peerAvatarName)
-                        )}
-                      </div>
-                    ) : (
-                      <VisitorConversationAvatar
-                        conversation={conv}
-                        showStatus={scope === 'my' && !isHistoryView}
-                      />
+                    {selected && (
+                      <>
+                        <span aria-hidden="true" className="absolute inset-x-0 top-0 h-px bg-[linear-gradient(to_right,color-mix(in_oklab,var(--color-success)_15%,transparent),var(--color-success))]" />
+                        <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-px bg-[linear-gradient(to_right,color-mix(in_oklab,var(--color-success)_15%,transparent),var(--color-success))]" />
+                        <span aria-hidden="true" className="absolute inset-y-0 right-0 w-1 bg-success" />
+                      </>
                     )}
+                    <VisitorConversationAvatar
+                      conversation={conv}
+                      showStatus={!isHistoryView}
+                    />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex min-w-0 items-center gap-1.5">

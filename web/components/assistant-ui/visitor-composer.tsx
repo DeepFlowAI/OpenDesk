@@ -271,6 +271,8 @@ export function VisitorComposer({
     focusTextarea(insertRequest.text.length)
   }, [composer, disabled, focusTextarea, insertRequest, locale, onClearQuote, onQuoteMessage])
 
+  const attachmentUploadEnabled = !botMode || config.open_agent_attachment_upload_enabled
+
   const handleImageSelect = useCallback(() => {
     fileInputRef.current?.click()
   }, [])
@@ -296,7 +298,7 @@ export function VisitorComposer({
 
   const handlePaste = useCallback(
     (e: ReactClipboardEvent<HTMLTextAreaElement>) => {
-      if (disabled || uploading || botMode || botRunning) return
+      if (disabled || uploading || botRunning || !attachmentUploadEnabled) return
 
       const attachmentFile = getClipboardAttachmentFile(e.clipboardData)
       if (!attachmentFile) return
@@ -308,7 +310,7 @@ export function VisitorComposer({
         previewUrl: getPastedAttachmentPreviewUrl(attachmentFile),
       })
     },
-    [botMode, botRunning, disabled, uploading],
+    [attachmentUploadEnabled, botRunning, disabled, uploading],
   )
 
   const handlePastedAttachmentCancel = useCallback(() => {
@@ -409,6 +411,7 @@ export function VisitorComposer({
           {showHandoffButton && (
             <button
               type="button"
+              data-action="request-handoff"
               className="h-8 shrink-0 rounded-full border border-border bg-background px-3 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
               onClick={() => void onRequestHumanHandoff(null)}
               disabled={disabled || botRunning || handoffRouting}
@@ -418,7 +421,10 @@ export function VisitorComposer({
           )}
         </div>
       )}
-      <ComposerPrimitive.Root className="rounded-[14px] border border-border bg-background sm:rounded-2xl">
+      <ComposerPrimitive.Root
+        className="rounded-[14px] border border-border bg-background sm:rounded-2xl"
+        {...(offlineMode ? { 'data-form': 'leave-message' } : {})}
+      >
         {quotePreview && quotedMessage && (
           <MessageQuotePreview
             quote={quotePreview}
@@ -436,6 +442,8 @@ export function VisitorComposer({
         )}
         {/* Text input */}
         <ComposerPrimitive.Input
+          data-testid="composer-input"
+          {...(offlineMode ? { 'data-field': 'message' } : {})}
           placeholder={disabled ? disabledText : placeholder}
           disabled={disabled}
           submitMode={isTouchDevice && !isEmbed ? 'none' : 'enter'}
@@ -453,12 +461,14 @@ export function VisitorComposer({
         <div className="flex items-center justify-between px-2 pb-2 sm:px-3 sm:pb-2.5">
           {/* Left: attachment button */}
           <div className="flex items-center gap-1">
-            {!botMode && (
+            {attachmentUploadEnabled && (
               <button
                 type="button"
                 className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                 onClick={handleImageSelect}
-                disabled={disabled || uploading}
+                disabled={disabled || uploading || botRunning || handoffRouting}
+                aria-label={locale === 'zh' ? '上传附件' : 'Upload attachment'}
+                title={locale === 'zh' ? '上传附件' : 'Upload attachment'}
               >
                 {uploading ? <IconLoader2 size={18} className="animate-spin" /> : <IconPaperclip size={18} />}
               </button>
@@ -485,7 +495,7 @@ export function VisitorComposer({
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/jpeg,image/png,image/gif,image/webp,.pdf,.doc,.docx,.xls,.xlsx,.csv,.ppt,.pptx,.txt,.md,.zip,.rar,.7z"
+              accept="image/jpeg,image/png,image/gif,image/webp,video/*,.mp4,.mov,.m4v,.avi,.webm,.mkv,.mpeg,.mpg,.wmv,.flv,.3gp,.pdf,.doc,.docx,.xls,.xlsx,.csv,.ppt,.pptx,.txt,.md,.zip,.rar,.7z"
               className="hidden"
               onChange={handleFileChange}
             />
@@ -509,7 +519,9 @@ export function VisitorComposer({
             </ComposerPrimitive.Cancel>
           ) : (
             <ComposerPrimitive.Send
-              disabled={disabled}
+              data-testid="composer-send"
+              {...(offlineMode ? { 'data-action': 'submit-leave-message' } : {})}
+              disabled={disabled || uploading}
               className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#F4F4F5] text-[#9CA3AF] transition-colors enabled:cursor-pointer enabled:bg-[var(--opendesk-send-button-bg)] enabled:text-primary-foreground enabled:hover:opacity-90 disabled:cursor-not-allowed sm:h-9 sm:w-9"
               style={sendButtonStyle}
             >
@@ -543,12 +555,15 @@ export function VisitorComposer({
                 </div>
               ) : (
                 <div className="rounded-t-2xl bg-muted p-4">
-                  <div className="flex items-center gap-3 rounded-xl bg-background p-4">
+                  <div className="flex items-start gap-3 rounded-xl bg-background p-4">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
                       <IconPaperclip size={20} stroke={1.7} />
                     </div>
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium text-foreground">
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className="line-clamp-2 min-h-10 break-all text-sm font-medium text-foreground"
+                        title={pastedAttachment.file.name || t('ws.chat.pastedAttachmentFallbackName', locale)}
+                      >
                         {pastedAttachment.file.name || t('ws.chat.pastedAttachmentFallbackName', locale)}
                       </div>
                       <div className="mt-1 text-xs text-muted-foreground">

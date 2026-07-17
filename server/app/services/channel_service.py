@@ -185,6 +185,9 @@ class ChannelService:
         payload["open_agent_input_placeholder"] = (
             payload.get("open_agent_input_placeholder") or None
         )
+        payload["open_agent_attachment_upload_enabled"] = bool(
+            payload.get("open_agent_attachment_upload_enabled", False)
+        )
         payload["agent_default_avatar_url"] = payload.get("agent_default_avatar_url") or None
         payload["open_agent_avatar_url"] = payload.get("open_agent_avatar_url") or None
         payload["open_agent_handoff_label"] = (
@@ -215,8 +218,10 @@ class ChannelService:
 
         if payload.get("open_agent_enabled"):
             await ChannelService._normalize_open_agent_config(db, tenant_id, payload)
-        elif payload.get("open_agent_bot_strategy") != "service_hours":
-            payload["open_agent_bot_service_hours_id"] = None
+        else:
+            payload["open_agent_attachment_upload_enabled"] = False
+            if payload.get("open_agent_bot_strategy") != "service_hours":
+                payload["open_agent_bot_service_hours_id"] = None
 
         return payload
 
@@ -261,6 +266,17 @@ class ChannelService:
         if not selected_agent:
             raise ValidationError("OpenAgent agent is not active or unavailable")
         payload["open_agent_agent_name"] = payload.get("open_agent_agent_name") or selected_agent.name
+
+        if payload.get("open_agent_attachment_upload_enabled"):
+            status = await OpenAgentSettingsService.get_attachment_handoff_status(
+                db,
+                tenant_id,
+                int(agent_id),
+            )
+            if not status.ready:
+                raise ValidationError(
+                    "OpenAgent attachment upload requires an enabled human handoff tool"
+                )
 
     @staticmethod
     async def list_by_tenant(db: AsyncSession, tenant_id: int):

@@ -7,7 +7,14 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, get_redis, require_permission
+from app.core.exceptions import ForbiddenError
+from app.db.deps import (
+    get_current_principal_short_session,
+    get_db,
+    get_redis,
+    require_permission,
+    require_permission_short_session,
+)
 from app.libs.excel import XLSX_MEDIA_TYPE, xlsx_content_disposition
 from app.schemas.knowledge import (
     KnowledgeDirectoryCreate,
@@ -16,9 +23,15 @@ from app.schemas.knowledge import (
     KnowledgeDirectoryResponse,
     KnowledgeDirectoryUpdate,
     KnowledgeDocumentCreate,
+    KnowledgeDocumentAttachmentResponse,
+    KnowledgeDocumentAttachmentUrlResponse,
     KnowledgeDocumentListResponse,
     KnowledgeDocumentResponse,
     KnowledgeDocumentUpdate,
+    KnowledgeInspirationCountsResponse,
+    KnowledgeInspirationCreate,
+    KnowledgeInspirationListResponse,
+    KnowledgeInspirationResponse,
     KnowledgeRecommendationResponse,
 )
 from app.schemas.knowledge_import import (
@@ -28,10 +41,92 @@ from app.schemas.knowledge_import import (
 )
 from app.schemas.permission import EffectivePrincipal
 from app.services.knowledge_import_service import KnowledgeImportService
+from app.services.knowledge_attachment_service import KnowledgeAttachmentService
 from app.services.knowledge_recommendation_service import KnowledgeRecommendationService
 from app.services.knowledge_service import KnowledgeService
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge"])
+
+
+async def require_knowledge_attachment_manage(
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+) -> EffectivePrincipal:
+    if not principal.has_any_permission(
+        ["knowledge.workspace.document.create", "knowledge.workspace.document.edit"]
+    ):
+        raise ForbiddenError("Permission denied")
+    return principal
+
+
+async def require_knowledge_attachment_from_message(
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+) -> EffectivePrincipal:
+    if not principal.has_all_permissions(
+        ["chat.workspace.use", "knowledge.workspace.document.create"]
+    ):
+        raise ForbiddenError("Permission denied")
+    return principal
+
+
+@router.post(
+    "/attachments",
+    response_model=KnowledgeDocumentAttachmentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_knowledge_attachment(
+    file: UploadFile = File(...),
+    principal: EffectivePrincipal = Depends(require_knowledge_attachment_manage),
+):
+    """Upload a staged knowledge document attachment."""
+    return await KnowledgeAttachmentService.upload_managed(
+        principal.tenant_id,
+        principal.user_id,
+        file,
+    )
+
+
+@router.post(
+    "/attachments/from-conversation-message/{message_id}",
+    response_model=KnowledgeDocumentAttachmentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def stage_knowledge_attachment_from_conversation_message(
+    message_id: int,
+    principal: EffectivePrincipal = Depends(require_knowledge_attachment_from_message),
+):
+    """Copy an accessible agent file message into knowledge attachment staging."""
+    return await KnowledgeAttachmentService.stage_from_conversation_message_managed(
+        principal,
+        message_id,
+    )
+
+
+@router.delete("/attachments/{attachment_id}", status_code=status.HTTP_200_OK)
+async def delete_staged_knowledge_attachment(
+    attachment_id: int,
+    principal: EffectivePrincipal = Depends(require_knowledge_attachment_manage),
+):
+    """Delete an unbound knowledge document attachment."""
+    await KnowledgeAttachmentService.delete_staged_managed(
+        principal.tenant_id,
+        principal.user_id,
+        attachment_id,
+    )
+    return {"message": "Deleted successfully"}
+
+
+@router.get(
+    "/attachments/{attachment_id}/url",
+    response_model=KnowledgeDocumentAttachmentUrlResponse,
+)
+async def get_knowledge_attachment_url(
+    attachment_id: int,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("knowledge.workspace.view")
+    ),
+):
+    """Get a temporary download URL for a saved attachment."""
+    return await KnowledgeAttachmentService.get_temporary_url_managed(principal, attachment_id)
 
 
 @router.get(
@@ -235,6 +330,121 @@ async def retry_knowledge_recommendations(
         limit=limit,
         retry_failed=True,
     )
+
+
+@router.get(
+    "/inspirations",
+    response_model=KnowledgeInspirationListResponse,
+    dependencies=[Depends(require_permission("knowledge.workspace.inspiration.view"))],
+)
+async def list_knowledge_inspirations(
+    q: str | None = None,
+    status: Literal["pending", "archived", "document_created"] | None = None,
+    page: int = 1,
+    per_page: int = 20,
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.inspiration.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """List knowledge inspirations."""
+    return await KnowledgeService.list_inspirations(
+        db,
+        principal.tenant_id,
+        search=q,
+        status=status,
+        page=page,
+        per_page=per_page,
+    )
+
+
+@router.get(
+    "/inspirations/counts",
+    response_model=KnowledgeInspirationCountsResponse,
+    dependencies=[Depends(require_permission("knowledge.workspace.inspiration.view"))],
+)
+async def count_knowledge_inspirations(
+    q: str | None = None,
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.inspiration.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Count knowledge inspirations by status."""
+    return await KnowledgeService.count_inspirations(db, principal.tenant_id, search=q)
+
+
+@router.post(
+    "/inspirations",
+    response_model=KnowledgeInspirationResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("knowledge.workspace.inspiration.create"))],
+)
+async def create_knowledge_inspiration(
+    body: KnowledgeInspirationCreate,
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.inspiration.create")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a knowledge inspiration."""
+    return await KnowledgeService.create_inspiration(db, principal.tenant_id, body, principal.user_id)
+
+
+@router.get(
+    "/inspirations/{inspiration_id}",
+    response_model=KnowledgeInspirationResponse,
+    dependencies=[Depends(require_permission("knowledge.workspace.inspiration.view"))],
+)
+async def get_knowledge_inspiration(
+    inspiration_id: int,
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.inspiration.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get a knowledge inspiration."""
+    return await KnowledgeService.get_inspiration(db, principal.tenant_id, inspiration_id)
+
+
+@router.patch(
+    "/inspirations/{inspiration_id}/archive",
+    response_model=KnowledgeInspirationResponse,
+    dependencies=[Depends(require_permission("knowledge.workspace.inspiration.manage"))],
+)
+async def archive_knowledge_inspiration(
+    inspiration_id: int,
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.inspiration.manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Archive a knowledge inspiration."""
+    return await KnowledgeService.archive_inspiration(db, principal.tenant_id, inspiration_id, principal.user_id)
+
+
+@router.patch(
+    "/inspirations/{inspiration_id}/document-created",
+    response_model=KnowledgeInspirationResponse,
+    dependencies=[Depends(require_permission("knowledge.workspace.document.create"))],
+)
+async def mark_knowledge_inspiration_document_created(
+    inspiration_id: int,
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.document.create")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark a knowledge inspiration as converted to a document."""
+    return await KnowledgeService.mark_inspiration_document_created(
+        db,
+        principal.tenant_id,
+        inspiration_id,
+        principal.user_id,
+    )
+
+
+@router.delete(
+    "/inspirations/{inspiration_id}",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(require_permission("knowledge.workspace.inspiration.manage"))],
+)
+async def delete_knowledge_inspiration(
+    inspiration_id: int,
+    principal: EffectivePrincipal = Depends(require_permission("knowledge.workspace.inspiration.manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a knowledge inspiration."""
+    await KnowledgeService.delete_inspiration(db, principal.tenant_id, inspiration_id)
+    return {"message": "Deleted successfully"}
 
 
 @router.get(

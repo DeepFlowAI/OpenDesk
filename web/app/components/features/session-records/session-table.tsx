@@ -106,6 +106,7 @@ const botHandoffClassName: Record<BotHandoffStatus, string> = {
   waiting_confirmation: 'bg-warning/10 text-warning',
   handoff_in_progress: 'bg-warning/10 text-warning',
   in_queue: 'bg-warning/10 text-warning',
+  queue_offline_canceled: 'bg-muted text-muted-foreground',
   succeeded: 'bg-success/10 text-success',
   failed: 'bg-destructive/10 text-destructive',
   dismissed: 'bg-muted text-muted-foreground',
@@ -1035,6 +1036,9 @@ export function SessionTable({ onSelectRecord }: Props) {
                   {items.map((record) => (
                     <tr
                       key={record.id}
+                      data-testid="session-record-row"
+                      data-visitor-name={record.visitor?.name || ''}
+                      data-transfer-count={record.reception_transfer_count ?? 0}
                       onClick={(e) => handleRowClick(record, e)}
                       className="cursor-pointer transition-colors hover:bg-accent/30"
                     >

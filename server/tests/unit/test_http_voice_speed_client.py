@@ -1,6 +1,21 @@
 import httpx
 
+from app.libs.voice_speed.base import BaseVoiceSpeedClient
 from app.libs.voice_speed.providers.http import HTTPVoiceSpeedClient
+
+
+def test_build_turn_url_targets_sse_stream_endpoint():
+    # flowkit's converse reader parses SSE `data:` lines, so it must hit the
+    # streaming variant — the plain /turn returns JSON and yields a silent reply.
+    for base in (
+        "https://voicespeed.example.com",
+        "https://voicespeed.example.com/api/v1",
+        "https://voicespeed.example.com/api/v1/openapi",
+    ):
+        assert (
+            BaseVoiceSpeedClient.build_turn_url(base, "1")
+            == "https://voicespeed.example.com/api/v1/openapi/agents/1/turn/stream"
+        )
 
 
 def test_build_agents_url_from_root_base_url():

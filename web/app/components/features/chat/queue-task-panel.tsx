@@ -26,10 +26,8 @@ import { VISITOR_AVATAR_BACKGROUND, VISITOR_AVATAR_FOREGROUND } from '@/lib/avat
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
 import { t } from '@/utils/i18n'
-import { MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
 import { DeferredConversationComposer } from '@/app/components/features/chat/deferred-conversation-composer'
-import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
-import { getWorkspaceHumanAgentLabel } from '@/lib/workspace-agent-display'
+import { WorkspaceMessageBubble } from '@/app/components/features/chat/workspace-message-bubble'
 import { getDataScope, hasPermission } from '@/utils/permissions'
 import {
   useAssignableAgents,
@@ -38,7 +36,9 @@ import {
   useQueueTask,
 } from '@/service/use-queue-workspace'
 import { get } from '@/service/base'
-import type { AgentStatus, Conversation, Message } from '@/models/conversation'
+import { uploadAgentQueueTaskFile } from '@/service/use-conversation-files'
+import { useBottomScrollAnchor } from '@/hooks/use-bottom-scroll-anchor'
+import type { AgentStatus, Conversation } from '@/models/conversation'
 import type {
   QueueAssignableAgent,
   QueueAssignmentWorkspaceResponse,
@@ -73,6 +73,8 @@ type QueueTaskPanelProps = {
   selectedId: number | null
   agentStatus: AgentStatus | null
   socket: Socket | null
+  composerInputHeight?: number
+  onComposerInputHeightCommit?: (height: number) => void
   onAssigned: (
     response: QueueAssignmentWorkspaceResponse,
     options?: { openConversation?: boolean; messageSent?: boolean },
@@ -169,15 +171,6 @@ function sourceLabel(value: string, locale: Locale): string {
   return locale === 'zh' ? '手动入队' : 'Manual'
 }
 
-function messagePreview(message: Message, locale: Locale): string {
-  if (message.content_type === 'text' || message.content_type === 'system' || message.content_type === 'internal_note') {
-    return message.content
-  }
-  if (message.content_type === 'image') return locale === 'zh' ? '[图片]' : '[Image]'
-  if (message.content_type === 'file') return locale === 'zh' ? '[附件]' : '[File]'
-  return `[${message.content_type}]`
-}
-
 function displayAgentName(agent: QueueAssignableAgent): string {
   return agent.display_name || agent.name || `#${agent.id}`
 }
@@ -233,7 +226,6 @@ export function QueueTaskListSidebar({
     setAssigningSelfId(task.id)
     try {
       const response = await assignSelf.mutateAsync({ taskId: task.id })
-      showToast(t('ws.chat.queueAssignedToMe', locale))
       onAssigned(response)
     } catch {
       showToast(t('ws.chat.queueAssignFailed', locale))
@@ -281,7 +273,7 @@ export function QueueTaskListSidebar({
           {toast}
         </div>
       )}
-      <div className="shrink-0 border-b border-[#E5E5E5] px-2 py-2">
+      <div className="shrink-0 px-2 py-2">
         <div className="flex items-center gap-2">
           <div ref={queueMenuRef} className="relative min-w-0 flex-1">
             <button
@@ -367,10 +359,19 @@ export function QueueTaskListSidebar({
                   onSelect(item.id)
                 }}
                 className={cn(
-                  'mb-1 flex min-h-[88px] w-full cursor-pointer gap-3 rounded-[18px] border px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
-                  selected ? 'border-[#E0E0E0] bg-white shadow-sm' : 'border-transparent hover:bg-white/70',
+                  'relative mb-1 flex min-h-[88px] w-full cursor-pointer gap-3 overflow-hidden rounded-[9px] px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                  selected
+                    ? '-mx-2 w-[calc(100%+1rem)] rounded-none bg-white px-5'
+                    : 'hover:-mx-2 hover:w-[calc(100%+1rem)] hover:rounded-none hover:bg-white/60 hover:px-5',
                 )}
               >
+                {selected && (
+                  <>
+                    <span aria-hidden="true" className="absolute inset-x-0 top-0 h-px bg-[linear-gradient(to_right,color-mix(in_oklab,var(--color-success)_15%,transparent),var(--color-success))]" />
+                    <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-px bg-[linear-gradient(to_right,color-mix(in_oklab,var(--color-success)_15%,transparent),var(--color-success))]" />
+                    <span aria-hidden="true" className="absolute inset-y-0 right-0 w-1 bg-success" />
+                  </>
+                )}
                 <div
                   className="mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-medium"
                   style={{
@@ -461,8 +462,6 @@ export function QueueTaskListSidebar({
             const taskId = assignDialogTask.id
             try {
               const response = await assignAgent.mutateAsync({ taskId, agentId, reason })
-              const name = response.assigned_agent?.display_name || response.assigned_agent?.name || `#${agentId}`
-              showToast(t('ws.chat.queueAssignedToAgent', locale, { name }))
               setAssignDialogTask(null)
               onAssigned(response)
             } catch {
@@ -504,7 +503,14 @@ function QueueFilterMenuItem({
   )
 }
 
-export function QueueTaskPanel({ selectedId, agentStatus, socket, onAssigned }: QueueTaskPanelProps) {
+export function QueueTaskPanel({
+  selectedId,
+  agentStatus,
+  socket,
+  composerInputHeight,
+  onComposerInputHeightCommit,
+  onAssigned,
+}: QueueTaskPanelProps) {
   const { locale } = useLocaleStore()
   const { data, isLoading, refetch, dataUpdatedAt } = useQueueTask(selectedId)
   const assignSelf = useAssignQueueTaskToSelf()
@@ -516,6 +522,9 @@ export function QueueTaskPanel({ selectedId, agentStatus, socket, onAssigned }: 
   const liveNow = useLiveNow(Boolean(data && dataUpdatedAt > 0), dataUpdatedAt)
   const liveWaitSeconds = data ? getLiveWaitSeconds(data.wait_seconds, dataUpdatedAt, liveNow) : 0
   const isOffline = agentStatus?.status === 'offline'
+  const messageScroll = useBottomScrollAnchor<HTMLDivElement>(
+    `${data?.id ?? selectedId ?? 'none'}:${data?.messages.length ?? 0}`,
+  )
 
   useEffect(() => () => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
@@ -535,7 +544,6 @@ export function QueueTaskPanel({ selectedId, agentStatus, socket, onAssigned }: 
     }
     try {
       const response = await assignSelf.mutateAsync({ taskId: selectedId })
-      showToast(t('ws.chat.queueAssignedToMe', locale))
       onAssigned(response)
     } catch {
       showToast(t('ws.chat.queueAssignFailed', locale))
@@ -562,6 +570,9 @@ export function QueueTaskPanel({ selectedId, agentStatus, socket, onAssigned }: 
   const showQuickReply = data.can_assign_self && data.conversation_id !== null
   const quickReplyDisabled = assignSelf.isPending || isOffline
   const deferredConversation = queueTaskDraftConversation(data)
+  const imageGallery = data.messages
+    .filter((message) => message.content_type === 'image' && !message.is_recalled)
+    .map((message) => ({ id: String(message.id), content: message.content }))
   const resolveConversationForSend = async () => {
     if (!selectedId) throw new Error('Queue task is required')
     if (isOffline) {
@@ -633,19 +644,35 @@ export function QueueTaskPanel({ selectedId, agentStatus, socket, onAssigned }: 
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
+      <div
+        ref={messageScroll.scrollRef}
+        onScroll={messageScroll.onScroll}
+        className="min-h-0 flex-1 overflow-y-auto bg-[#FAFAFA] px-6 py-4"
+      >
         {data.messages.length === 0 ? (
           <div className="flex h-full items-center justify-center text-sm text-[#737373]">
             {t('ws.chat.queueNoMessages', locale)}
           </div>
         ) : (
-          <div className="space-y-3">
+          <div>
             {data.messages.map((message) => (
-              <QueueMessageRow
+              <WorkspaceMessageBubble
                 key={message.id}
                 message={message}
                 locale={locale}
+                mode="active"
+                inlinePlayableVideo
+                showTimestamp={false}
+                attachmentContext={{
+                  kind: 'conversation',
+                  conversationId: message.conversation_id,
+                  conversationPublicId: message.conversation_public_id ?? data.conversation_public_id,
+                }}
                 visitorName={data.visitor?.name || null}
+                visitorAvatarColor={VISITOR_AVATAR_BACKGROUND}
+                imageGallery={imageGallery}
+                allMessages={data.messages}
+                showAssistantAvatar={false}
               />
             ))}
           </div>
@@ -653,17 +680,21 @@ export function QueueTaskPanel({ selectedId, agentStatus, socket, onAssigned }: 
       </div>
 
       {showQuickReply ? (
-        <div className="shrink-0 border-t border-[#E5E5E5] bg-[#FAFAFA] pt-3">
-          <div className="mb-2 px-6 text-xs text-muted-foreground">
-            {isOffline ? t('ws.chat.queueQuickReplyOffline', locale) : t('ws.chat.queueQuickReplyHint', locale)}
-          </div>
+        <div className="shrink-0">
           <DeferredConversationComposer
             conversation={deferredConversation}
             socket={socket}
             locale={locale}
             disabled={quickReplyDisabled}
             disabledReason={isOffline ? t('ws.chat.queueQuickReplyOffline', locale) : null}
+            placeholder={t('ws.chat.queueQuickReplyHint', locale)}
+            inputHeight={composerInputHeight}
+            onInputHeightCommit={onComposerInputHeightCommit}
             resolveConversationForSend={resolveConversationForSend}
+            uploadDeferredRichTextImage={(file) => uploadAgentQueueTaskFile({
+              taskId: data.id,
+              file,
+            })}
             onResolved={(_conversation, result) => {
               const assignment = deferredAssignmentRef.current
               if (!assignment) return
@@ -687,8 +718,6 @@ export function QueueTaskPanel({ selectedId, agentStatus, socket, onAssigned }: 
         onSubmit={async (agentId, reason) => {
           try {
             const response = await assignAgent.mutateAsync({ taskId: selectedId, agentId, reason })
-            const name = response.assigned_agent?.display_name || response.assigned_agent?.name || `#${agentId}`
-            showToast(t('ws.chat.queueAssignedToAgent', locale, { name }))
             setAssignOpen(false)
             onAssigned(response)
           } catch {
@@ -799,8 +828,13 @@ function QueueAssignDialog({
                       selected && 'bg-primary/10 hover:bg-primary/10',
                     )}
                   >
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium">
-                      {displayAgentName(agent).charAt(0).toUpperCase()}
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted text-sm font-medium">
+                      {agent.avatar ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={agent.avatar} alt={displayAgentName(agent)} className="h-full w-full object-cover" />
+                      ) : (
+                        displayAgentName(agent).charAt(0).toUpperCase()
+                      )}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-medium">{displayAgentName(agent)}</div>
@@ -844,73 +878,6 @@ function QueueMeta({ label, value }: { label: string; value: string }) {
     <div className="min-w-0 rounded-md border border-[#E5E5E5] px-3 py-2">
       <div className="text-[11px] text-[#999999]">{label}</div>
       <div className="mt-1 truncate text-sm font-medium text-[#1a1a1a]">{value}</div>
-    </div>
-  )
-}
-
-function QueueMessageRow({
-  message,
-  locale,
-  visitorName,
-}: {
-  message: Message
-  locale: Locale
-  visitorName: string | null
-}) {
-  const isVisitor = message.sender_type === 'visitor'
-  const isSystem = message.sender_type === 'system'
-  const isBot = message.sender_type === 'bot'
-
-  if (isSystem) {
-    return (
-      <div className="flex justify-center">
-        <div className="max-w-[68%] rounded-lg bg-[#F5F5F5] px-3 py-2 text-xs text-[#737373]">
-          <div className="whitespace-pre-wrap break-words">{messagePreview(message, locale)}</div>
-        </div>
-      </div>
-    )
-  }
-
-  if (isVisitor) {
-    return (
-      <div className="flex justify-start">
-        <div className="flex min-w-0 max-w-[68%] flex-col items-start">
-          <span className="mb-1 text-[11px] text-[#737373]">
-            {visitorName || message.sender_name || t('ws.chat.queueVisitor', locale)}
-          </span>
-          <div className="rounded-lg bg-[#F5F5F5] px-3 py-2 text-sm text-[#1a1a1a]">
-            <div className="whitespace-pre-wrap break-words">{messagePreview(message, locale)}</div>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  const senderLabel = isBot
-    ? (message.sender_name || (locale === 'zh' ? '智能助手' : 'Assistant'))
-    : (message.sender_name || getWorkspaceHumanAgentLabel(locale))
-
-  return (
-    <div className="flex justify-end">
-      <div className="flex min-w-0 max-w-[68%] flex-col items-end">
-        {senderLabel && (
-          <span className="mb-1 text-[11px] text-[#737373]">{senderLabel}</span>
-        )}
-        <div
-          className={cn(
-            'rounded-lg px-3 py-2 text-sm',
-            isBot
-              ? cn('bg-[#DBEAFE] text-[#1a1a1a]', markdownTextRootClass, richTextListStyleClass)
-              : 'bg-[#1a1a1a] text-white',
-          )}
-        >
-          {isBot && message.content_type === 'text' ? (
-            <MarkdownText>{message.content}</MarkdownText>
-          ) : (
-            <div className="whitespace-pre-wrap break-words">{messagePreview(message, locale)}</div>
-          )}
-        </div>
-      </div>
     </div>
   )
 }

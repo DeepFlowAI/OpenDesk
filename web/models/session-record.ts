@@ -44,6 +44,7 @@ export type BotHandoffStatus =
   | 'waiting_confirmation'
   | 'handoff_in_progress'
   | 'in_queue'
+  | 'queue_offline_canceled'
   | 'succeeded'
   | 'failed'
   | 'dismissed'

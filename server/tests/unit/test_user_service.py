@@ -44,7 +44,7 @@ class TestUserServiceOrganizationAssociation:
 
     @pytest.mark.asyncio
     async def test_update_user_allows_clearing_organization(self, monkeypatch):
-        user = SimpleNamespace(id=1, tenant_id=10, organization_id=5)
+        user = SimpleNamespace(id=1, tenant_id=10, organization_id=5, agent_id=None, assignee_group_id=None)
         captured: dict[str, object] = {}
 
         async def fake_get_by_id(_db, user_id: int):

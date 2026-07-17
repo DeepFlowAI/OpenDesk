@@ -12,6 +12,14 @@ export type WorkspaceChatTab = 'messages' | 'offline' | 'queue'
 // server-side reset_unread commit.
 const RECENT_READ_WINDOW_MS = 10_000
 
+function mergeMessageWithoutReadRegression(current: Message, incoming: Message): Message {
+  const merged = { ...current, ...incoming }
+  if (current.status === 'read' && incoming.status !== 'read') {
+    merged.status = 'read'
+  }
+  return merged
+}
+
 type ChatState = {
   conversations: Conversation[]
   selectedConversationId: number | null
@@ -38,6 +46,7 @@ type ChatState = {
   addMessage: (conversationId: number, msg: Message) => void
   updateMessage: (conversationId: number, msg: Message) => void
   markAgentMessagesReadByVisitor: (conversationId: number, messageIds?: number[]) => void
+  markAgentMessagesDeliveredToVisitor: (conversationId: number, messageIds: number[]) => void
 
   setVisitorTyping: (conversationId: number, typing: boolean, content?: string) => void
 }
@@ -162,7 +171,18 @@ export const useChatStore = create<ChatState>()(
           const map = new Map(state.messages)
           const existing = map.get(conversationId) || []
           const isDuplicate = existing.some((m) => m.id === msg.id)
-          if (!isDuplicate) {
+          if (isDuplicate) return state
+          const clientMessageId = msg.metadata?.client_message_id
+          const optimisticIndex = clientMessageId
+            ? existing.findIndex((message) => (
+                message.id < 0 && message.metadata?.client_message_id === clientMessageId
+              ))
+            : -1
+          if (optimisticIndex >= 0) {
+            const next = [...existing]
+            next[optimisticIndex] = msg
+            map.set(conversationId, next)
+          } else {
             map.set(conversationId, [...existing, msg])
           }
           return { messages: map }
@@ -174,7 +194,9 @@ export const useChatStore = create<ChatState>()(
           const existing = map.get(conversationId) || []
           map.set(
             conversationId,
-            existing.map((message) => (message.id === msg.id ? { ...message, ...msg } : message)),
+            existing.map((message) => (
+              message.id === msg.id ? mergeMessageWithoutReadRegression(message, msg) : message
+            )),
           )
           return { messages: map }
         }),
@@ -191,6 +213,24 @@ export const useChatStore = create<ChatState>()(
               if (message.sender_type !== 'agent') return message
               if (idSet && !idSet.has(message.id)) return message
               return message.status === 'read' ? message : { ...message, status: 'read' }
+            }),
+          )
+          return { messages: map }
+        }),
+
+      markAgentMessagesDeliveredToVisitor: (conversationId, messageIds) =>
+        set((state) => {
+          if (messageIds.length === 0) return state
+          const map = new Map(state.messages)
+          const existing = map.get(conversationId) || []
+          const idSet = new Set(messageIds)
+          map.set(
+            conversationId,
+            existing.map((message) => {
+              if (message.sender_type !== 'agent' || !idSet.has(message.id) || message.status === 'read') {
+                return message
+              }
+              return { ...message, status: 'unread' }
             }),
           )
           return { messages: map }

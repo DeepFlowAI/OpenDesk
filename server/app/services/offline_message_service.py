@@ -12,6 +12,7 @@ import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError, ForbiddenError, NotFoundError, ValidationError
+from app.db.session import AsyncSessionLocal
 from app.enums import ConversationStatus, MessageContentType, MessageSenderType, QueueType
 from app.libs.realtime import get_realtime_transport
 from app.libs.conversation_metrics import compute_duration_seconds
@@ -1394,6 +1395,18 @@ class OfflineMessageService:
         row: OfflineMessage,
         file: UploadFile,
     ) -> dict:
+        return await OfflineMessageService._upload_file_for_offline_message(
+            tenant_id=row.tenant_id,
+            offline_message_id=row.id,
+            file=file,
+        )
+
+    @staticmethod
+    async def _upload_file_for_offline_message(
+        tenant_id: int,
+        offline_message_id: int,
+        file: UploadFile,
+    ) -> dict:
         raw_name = file.filename or "upload"
         ext = ConversationFileService._extension(raw_name)
         if ext in BLOCKED_CONVERSATION_FILE_EXTENSIONS:
@@ -1410,19 +1423,16 @@ class OfflineMessageService:
             ext,
             data,
         )
-        date_prefix = datetime.now().strftime("%Y%m%d")
-        key = f"offline-message-files/{row.tenant_id}/{row.id}/{date_prefix}/{uuid.uuid4().hex}.{safe_ext}"
+        date_prefix = datetime.now(timezone.utc).strftime("%Y%m%d")
+        key = f"offline-message-files/{tenant_id}/{offline_message_id}/{date_prefix}/{uuid.uuid4().hex}.{safe_ext}"
 
         storage = create_storage_client()
         await storage.upload(key, data, content_type=content_type)
 
         file_id = ConversationFileService.encode_file_id(key)
-        access_url = await OfflineMessageService.get_temporary_url(
-            db,
-            row,
-            file_id=file_id,
-            download_name=raw_name,
-            download=False,
+        access_url = await storage.get_temporary_url(
+            key,
+            expires_seconds=TEMPORARY_URL_EXPIRES_SECONDS,
         )
         return {
             "schema_version": 1,
@@ -1430,7 +1440,7 @@ class OfflineMessageService:
             "name": raw_name,
             "size": len(data),
             "mime_type": content_type,
-            "access_url": access_url["url"],
+            "access_url": access_url,
         }
 
     @staticmethod
@@ -1452,6 +1462,31 @@ class OfflineMessageService:
             raise
 
     @staticmethod
+    async def upload_agent_file_managed(
+        offline_message_id: int,
+        principal: EffectivePrincipal,
+        file: UploadFile,
+    ) -> dict:
+        if not principal.has_permission(OFFLINE_MESSAGE_ASSIGN_SELF_PERMISSION):
+            raise ForbiddenError("Permission denied")
+
+        async with AsyncSessionLocal() as db:
+            row = await OfflineMessageRepository.get_by_id(db, offline_message_id)
+            if not row:
+                raise NotFoundError("Offline message not found")
+            await OfflineMessageService._assert_view_access(db, principal, row)
+            if row.status != "pending":
+                raise BusinessError("Offline message has already been converted")
+            tenant_id = row.tenant_id
+            row_id = row.id
+
+        return await OfflineMessageService._upload_file_for_offline_message(
+            tenant_id=tenant_id,
+            offline_message_id=row_id,
+            file=file,
+        )
+
+    @staticmethod
     async def get_temporary_url(
         db: AsyncSession,
         row: OfflineMessage,
@@ -1459,6 +1494,7 @@ class OfflineMessageService:
         file_id: str,
         download_name: str | None = None,
         download: bool = False,
+        image_process: str | None = None,
     ) -> dict:
         key = ConversationFileService.decode_file_id(file_id)
         expected_prefix = f"offline-message-files/{row.tenant_id}/{row.id}/"
@@ -1470,6 +1506,7 @@ class OfflineMessageService:
             key,
             expires_seconds=TEMPORARY_URL_EXPIRES_SECONDS,
             download_name=ConversationFileService._safe_download_name(download_name or "download") if download else None,
+            image_process=ConversationFileService._safe_image_process(image_process, download),
         )
         return {"url": url, "expires_seconds": TEMPORARY_URL_EXPIRES_SECONDS}
 
@@ -1482,6 +1519,7 @@ class OfflineMessageService:
         file_id: str,
         download_name: str | None = None,
         download: bool = False,
+        image_process: str | None = None,
     ) -> dict:
         row = await OfflineMessageService._get_for_session(db, public_id, visitor_context)
         return await OfflineMessageService.get_temporary_url(
@@ -1490,6 +1528,7 @@ class OfflineMessageService:
             file_id=file_id,
             download_name=download_name,
             download=download,
+            image_process=image_process,
         )
 
     @staticmethod
@@ -1501,6 +1540,7 @@ class OfflineMessageService:
         file_id: str,
         download_name: str | None = None,
         download: bool = False,
+        image_process: str | None = None,
     ) -> dict:
         row = await OfflineMessageRepository.get_by_id(db, offline_message_id)
         if not row:
@@ -1512,6 +1552,7 @@ class OfflineMessageService:
             file_id=file_id,
             download_name=download_name,
             download=download,
+            image_process=image_process,
         )
 
     @staticmethod

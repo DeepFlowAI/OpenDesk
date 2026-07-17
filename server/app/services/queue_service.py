@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 # time, the queued task is canceled instead of assigned to an agent.
 QUEUE_NO_SHOW_REASON = "visitor_offline_no_show"
 QUEUE_NO_SHOW_ENDED_BY = "queue_no_show"
+QUEUE_OFFLINE_CANCELED_HANDOFF_STATE = "queue_offline_canceled"
 
 
 DEFAULT_QUEUE_POLICY = {
@@ -885,6 +886,11 @@ class QueueTaskService:
             )
             await QueueTaskService._record_event(db, task, "canceled", reason=QUEUE_NO_SHOW_REASON)
             await QueueTaskService._materialize_conversation_summary(db, task)
+            if task.task_type == QueueTaskType.OPEN_AGENT_HANDOFF.value:
+                conversation.open_agent_handoff_state = QUEUE_OFFLINE_CANCELED_HANDOFF_STATE
+                conversation.had_bot_session = True
+                conversation.bot_handoff_succeeded = False
+                conversation.bot_handoff_triggered = True
             await ConversationRepository.end_conversation(db, conversation, QUEUE_NO_SHOW_ENDED_BY)
             await db.refresh(task)
             await QueueTaskService._emit_queue_change(task, "canceled")

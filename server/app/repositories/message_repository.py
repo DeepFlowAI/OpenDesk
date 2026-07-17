@@ -24,6 +24,20 @@ class MessageRepository:
     }
 
     @staticmethod
+    async def get_by_id_for_tenant(
+        db: AsyncSession,
+        tenant_id: int,
+        message_id: int,
+    ) -> Message | None:
+        result = await db.execute(
+            select(Message).where(
+                Message.id == message_id,
+                Message.tenant_id == tenant_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
     async def get_by_conversation(
         db: AsyncSession,
         conversation_id: int,
@@ -219,6 +233,33 @@ class MessageRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def get_agent_unread_message_ids_by_conversations(
+        db: AsyncSession,
+        *,
+        tenant_id: int,
+        conversation_ids: list[int],
+    ) -> dict[int, list[int]]:
+        """Return agent message ids not yet read by the visitor, keyed by conversation id."""
+        if not conversation_ids:
+            return {}
+        result = await db.execute(
+            select(Message.conversation_id, Message.id)
+            .where(
+                Message.tenant_id == tenant_id,
+                Message.conversation_id.in_(conversation_ids),
+                Message.sender_type == MessageSenderType.AGENT.value,
+                Message.content_type.in_(MessageRepository.READ_STATUS_CONTENT_TYPES),
+                Message.visitor_read_at.is_(None),
+                Message.is_recalled.is_(False),
+            )
+            .order_by(Message.id.asc())
+        )
+        ids_by_conversation: dict[int, list[int]] = {}
+        for conversation_id, message_id in result.all():
+            ids_by_conversation.setdefault(conversation_id, []).append(message_id)
+        return ids_by_conversation
+
+    @staticmethod
     async def mark_agent_messages_visitor_read(
         db: AsyncSession,
         *,
@@ -239,6 +280,35 @@ class MessageRepository:
         result = await db.execute(
             query
             .values(visitor_read_at=read_at)
+            .returning(Message.id)
+        )
+        await db.commit()
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def mark_agent_messages_visitor_delivered(
+        db: AsyncSession,
+        *,
+        tenant_id: int,
+        conversation_id: int,
+        message_ids: list[int],
+        delivered_at: datetime,
+    ) -> list[int]:
+        """Mark eligible agent messages delivered once and return changed ids."""
+        if not message_ids:
+            return []
+        result = await db.execute(
+            update(Message)
+            .where(
+                Message.tenant_id == tenant_id,
+                Message.conversation_id == conversation_id,
+                Message.id.in_(message_ids),
+                Message.sender_type == MessageSenderType.AGENT.value,
+                Message.content_type.in_(MessageRepository.READ_STATUS_CONTENT_TYPES),
+                Message.visitor_online_at_send.is_not(None),
+                Message.visitor_delivered_at.is_(None),
+            )
+            .values(visitor_delivered_at=delivered_at)
             .returning(Message.id)
         )
         await db.commit()
@@ -403,6 +473,7 @@ class MessageRepository:
         conversation_id: int,
         client_message_id: str,
         sender_type: str = "visitor",
+        sender_id: int | None = None,
     ) -> Message | None:
         """Fetch an idempotent message by the client-provided turn key."""
         result = await db.execute(
@@ -410,7 +481,8 @@ class MessageRepository:
                 Message.tenant_id == tenant_id,
                 Message.conversation_id == conversation_id,
                 Message.sender_type == sender_type,
-                Message.metadata_["client_message_id"].astext == client_message_id,
+                Message.sender_id == sender_id,
+                Message.client_message_id == client_message_id,
             )
         )
         return result.scalar_one_or_none()

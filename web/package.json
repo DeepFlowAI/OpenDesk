@@ -3,10 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "prepare:pdfium": "node scripts/prepare-pdfium-wasm.mjs",
+    "predev": "npm run prepare:pdfium",
     "dev": "next dev --turbopack",
+    "prebuild": "npm run prepare:pdfium",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.14.7",
@@ -75,8 +80,10 @@
     "@types/turndown": "^5.0.6",
     "eslint": "^9",
     "eslint-config-next": "^15",
+    "jsdom": "^29.1.1",
     "sass": "^1.99.0",
     "tailwindcss": "^4",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
   }
 }

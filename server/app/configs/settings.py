@@ -152,6 +152,16 @@ class Settings(BaseSettings):
     # routing instead.
     CALL_CENTER_DEFAULT_TENANT_SLUG: str = Field(default="")
 
+    # ── SIP extension registration endpoint (shown to admins) ─────────────
+    # Address, port and transport a physical SIP phone uses to REGISTER a
+    # tenant extension. These are pure deployment facts surfaced verbatim in
+    # the one-time registration info; when unset the corresponding fields are
+    # returned empty so operators know to fill them from their own deployment
+    # rather than guessing.
+    SIP_REGISTRAR_HOST: str = Field(default="")
+    SIP_REGISTRAR_PORT: int | None = Field(default=None)
+    SIP_REGISTRAR_TRANSPORT: str = Field(default="")
+
     # ── FlowKit Telecom Catalog (multi-trunk) ─────────────────────────────
     # Optional: when set, OpenDesk acts as a "Provider" pushing its SipTrunk
     # table to FlowKit's Catalog. When empty, FlowKit falls back to its

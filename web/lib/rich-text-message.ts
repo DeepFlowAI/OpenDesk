@@ -16,6 +16,18 @@ function stripHtmlFallback(html: string): string {
     .trim()
 }
 
+function hasSendableImageSource(img: HTMLImageElement): boolean {
+  const rawSrc = img.getAttribute('src')?.trim()
+  if (!rawSrc) return false
+
+  try {
+    const url = new URL(rawSrc, window.location.href)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
 export function richTextToPlainText(html: string): string {
   const doc = parseHtml(html)
   if (!doc) return stripHtmlFallback(html)
@@ -39,11 +51,11 @@ export function prepareRichTextMessageHtml(html: string): string {
   if (!doc) return html
 
   doc.body.querySelectorAll('img').forEach((img) => {
-    if (!img.getAttribute('data-file-id')) {
+    if (!img.getAttribute('data-file-id') && !hasSendableImageSource(img)) {
       img.remove()
       return
     }
-    img.removeAttribute('src')
+    if (img.getAttribute('data-file-id')) img.removeAttribute('src')
   })
 
   return doc.body.innerHTML.trim()

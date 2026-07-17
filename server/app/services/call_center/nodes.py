@@ -23,6 +23,11 @@ from app.services.call_center.queue import get_queue_picker
 from app.services.call_center.variables import evaluate_group
 
 
+# Sentinel: the picked agent is a Web-phone (WebRTC) agent, so assign_queue
+# must fall through to the unchanged browser-offer path.
+_NOT_SIP_PHONE = object()
+
+
 # ─────────────────── Context + Step Types ───────────────────
 
 
@@ -80,6 +85,25 @@ def goto_or_end(ctx: ExecutionContext, node_id: str, handle: str) -> NextStep:
     return Goto(target) if target else End()
 
 
+# call.play_end can arrive a beat before the last audio drains from the jitter
+# buffer, so a following prompt or bridge clips the tail (e.g. the final
+# character of a prompt). A short pause lets the tail finish playing.
+_PLAY_TAIL_DRAIN_SECONDS = 0.4
+
+# When the agent answers while the "正在为您转接" prompt is still playing, wait up
+# to this long for the prompt to finish (its call.play_end) before bridging, so
+# the caller hears a complete phrase instead of a mid-word cut. Bounded so a fast
+# answer still connects promptly.
+_PROMPT_FINISH_MAX_SECONDS = 2.0
+
+
+async def _drain_tail() -> None:
+    import asyncio
+
+    if _PLAY_TAIL_DRAIN_SECONDS > 0:
+        await asyncio.sleep(_PLAY_TAIL_DRAIN_SECONDS)
+
+
 # ─────────────────── Base + per-type executors ───────────────────
 
 
@@ -103,6 +127,10 @@ class PlayExecutor(BaseNodeExecutor):
         await ctx.telephony.call_say(ctx.call_id, text)
 
         async def _on_play_end(ctx_: ExecutionContext, node_: dict, _data: dict) -> NextStep:
+            # call.play_end can fire a beat before the last audio drains from the
+            # jitter buffer; pause briefly so the next prompt doesn't clip the
+            # tail (e.g. the final character of the welcome).
+            await _drain_tail()
             return goto_or_end(ctx_, node_["id"], "next")
 
         return WaitForEvent(method="call.play_end", on_event=_on_play_end)
@@ -421,6 +449,86 @@ class AssignQueueExecutor(BaseNodeExecutor):
                     selected.queue_id,
                 )
 
+        # No agent is free right now: instead of dropping the caller, hold them
+        # in queue and keep retrying so a call can wait for an agent who is
+        # finishing wrap-up / currently busy. Bounded by queue_wait_seconds;
+        # aborts early if the caller hangs up.
+        if pick is None:
+            # Holding the caller only makes sense if an agent is on a call and
+            # about to free up. If none are, waiting just loops "正在为您转接" for a
+            # minute for nothing (a ready agent would already have been picked;
+            # busy/break agents and the caller's own open tab won't take it), so
+            # tell them no agent is available and end the call right away.
+            has_on_call = await picker.has_agent_on_call_for_queue(
+                db, ctx.tenant_id, selected.queue_type, selected.queue_id, redis
+            )
+            if has_on_call is False:
+                log.info(
+                    "assign_queue: no agent on-call to wait for in queue=%s/%s — immediate fallback call_id=%s",
+                    selected.queue_type, selected.queue_id, ctx.call_id,
+                )
+                self._set_failure_status(ctx, "agent_no_answer")
+                await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
+                node_id = node["id"]
+                fallback_target = edge_target(ctx, node_id, "timeout")
+
+                async def _after_fallback_prompt(
+                    ctx_: ExecutionContext, _node_: dict, _ev: dict, _target=fallback_target
+                ) -> NextStep:
+                    # Prompt finished playing. Route the wired `timeout` outlet
+                    # if the flow author connected one; otherwise hang up so the
+                    # caller isn't left on a dead, silent line.
+                    if _target is not None:
+                        return Goto(_target)
+                    await ctx_.telephony.call_hangup(ctx_.call_id, reason="no_agent_online")
+                    return End("no_agent_online")
+
+                return WaitForEvent(method="call.play_end", on_event=_after_fallback_prompt)
+
+            queue_wait_s = float(data.get("queue_wait_seconds") or 60)
+            retry_s = max(1.0, float(data.get("queue_wait_retry_seconds") or 5))
+            hold_prompt = data.get("queue_prompt_text") or "正在为您转接，请稍候。"
+            waited = 0.0
+            since_prompt = float("inf")  # play the hold prompt on the first pass
+            while (
+                pick is None
+                and waited < queue_wait_s
+                and not ctx.variables.get("sys._workflow_ended")
+            ):
+                if since_prompt >= 15.0:
+                    await self._say(ctx, hold_prompt)
+                    since_prompt = 0.0
+                await asyncio.sleep(retry_s)
+                waited += retry_s
+                since_prompt += retry_s
+                if ctx.variables.get("sys._workflow_ended"):
+                    break
+                async with AsyncSessionLocal() as db:
+                    pick = await picker.pick_ready_agent_for_queue(
+                        db,
+                        ctx.tenant_id,
+                        selected.queue_type,
+                        selected.queue_id,
+                        redis,
+                        call_id=ctx.call_id,
+                        offer_id=offer_id,
+                        ttl_seconds=timeout_s,
+                        preferred_employee_id=preferred_agent_id,
+                    )
+                    if pick:
+                        await CallRecordService.bind_queue(
+                            db,
+                            ctx.tenant_id,
+                            ctx.call_id,
+                            selected.queue_type,
+                            selected.queue_id,
+                        )
+            if pick:
+                log.info(
+                    "assign_queue: agent became ready after %.0fs wait agent=%s call_id=%s",
+                    waited, pick["employee_id"], ctx.call_id,
+                )
+
         if pick is None:
             log.info(
                 "assign_queue: no ready agent queue=%s/%s call_id=%s",
@@ -446,6 +554,16 @@ class AssignQueueExecutor(BaseNodeExecutor):
             self._set_failure_status(ctx, "agent_no_answer")
             await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
             return goto_or_end(ctx, node["id"], "timeout")
+
+        # SIP-phone agents ring their physical extension directly — no browser
+        # accept. WebRTC agents fall through to the unchanged browser-offer path
+        # below. Gating strictly on the picked agent's current device keeps the
+        # existing WebRTC inbound path byte-for-byte identical.
+        sip_agent_leg = await self._try_ring_sip_phone_agent(
+            ctx, data, node, pick, offer_id, timeout_s, redis, orchestrator, log,
+        )
+        if sip_agent_leg is not _NOT_SIP_PHONE:
+            return sip_agent_leg
 
         future = orchestrator.register_offer(offer_id)
         queue_type = ctx.variables.get("sys._assigned_queue_type")
@@ -513,6 +631,9 @@ class AssignQueueExecutor(BaseNodeExecutor):
             )
         else:
             await self._say(ctx, data.get("queue_prompt_text") or "正在为您转接，请稍候。")
+        # Let bridging wait (bounded) for this prompt to finish before cutting
+        # the caller off mid-word.
+        ctx.variables["sys._prompt_play_waiter"] = orchestrator.register_play_wait(ctx.call_id)
 
         # Record the in-flight offer so the orchestrator can withdraw it (stop
         # the agent's browser ringing + free the agent) if the caller hangs up
@@ -602,6 +723,219 @@ class AssignQueueExecutor(BaseNodeExecutor):
             redis=redis,
         )
 
+    async def _try_ring_sip_phone_agent(
+        self,
+        ctx: ExecutionContext,
+        data: dict,
+        node: dict,
+        pick: dict,
+        offer_id: str,
+        timeout_s: float,
+        redis: Any,
+        orchestrator: Any,
+        log: Any,
+    ) -> Any:
+        """Inbound path for a picked agent whose current device is a SIP phone.
+
+        Rings the physical extension directly and bridges the caller to it on
+        off-hook — the browser never has to accept. Returns a NextStep on
+        success/failure, or the ``_NOT_SIP_PHONE`` sentinel when the agent is a
+        Web-phone agent (caller then keeps the unchanged browser-offer path).
+
+        Any kernel error (extensions disabled / not registered) degrades to the
+        normal "no answer" failure branch so the caller still hears a prompt and
+        the reserved agent is freed — the WebRTC path is never affected.
+        """
+        import asyncio
+        from contextlib import suppress
+
+        from app.db.session import AsyncSessionLocal
+        from app.libs.telephony.base import (
+            TelephonyMethodNotFoundError,
+            TelephonyRPCError,
+        )
+        from app.services.agent_call_device_service import (
+            DEVICE_SIP_PHONE,
+            AgentCallDeviceService,
+        )
+        from app.services.call_record_service import CallRecordService
+        from app.services.cc_agent_resource_service import CcAgentResourceService
+
+        employee_id = pick["employee_id"]
+
+        async with AsyncSessionLocal() as db:
+            current = await AgentCallDeviceService.get_current_device(
+                db, ctx.tenant_id, employee_id
+            )
+            if current.get("device_type") != DEVICE_SIP_PHONE:
+                return _NOT_SIP_PHONE
+            from app.repositories.sip_extension_repository import (
+                SipExtensionRepository,
+            )
+
+            ext = await SipExtensionRepository.get_by_employee(
+                db, ctx.tenant_id, employee_id
+            )
+
+        # Set once the incoming was pushed to the agent's browser, so _fail only
+        # clears it when it was actually shown (an idle browser must not be
+        # nudged into wrap-up).
+        incoming_pushed = False
+
+        async def _fail(reason: str) -> NextStep:
+            if redis is not None:
+                await CcAgentResourceService.release(
+                    redis, ctx.tenant_id, employee_id,
+                    reason=reason, expected_offer_id=offer_id,
+                )
+            self._set_failure_status(ctx, "agent_no_answer")
+            # Handset didn't pick up: clear the ringing incoming in the agent's
+            # browser (→ idle) so it doesn't ring forever.
+            if incoming_pushed:
+                try:
+                    await orchestrator.notify_agent_call_ended(
+                        tenant_id=ctx.tenant_id, employee_id=employee_id,
+                        call_id=ctx.call_id, reason=reason,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("assign_queue: SIP-phone clear-incoming failed")
+            await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
+            return goto_or_end(ctx, node["id"], "timeout")
+
+        if ext is None or not ext.is_active or ext.registration_status != "registered":
+            log.warning(
+                "assign_queue: SIP-phone agent=%s extension unavailable; "
+                "freeing agent call_id=%s", employee_id, ctx.call_id,
+            )
+            return await _fail("sip_extension_unavailable")
+
+        # Reserve the physical phone as ringing so a concurrent call can't grab
+        # the same agent while their handset rings.
+        if redis is not None:
+            try:
+                await CcAgentResourceService.mark_ringing(
+                    redis, ctx.tenant_id, employee_id,
+                    offer_id=offer_id, call_id=ctx.call_id, ttl_seconds=timeout_s,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("assign_queue: SIP-phone mark ringing failed")
+                return await _fail("offer_push_failed")
+
+        try:
+            result = await ctx.telephony.call_originate(extension=ext.sip_user_id)
+        except TelephonyMethodNotFoundError:
+            log.warning(
+                "assign_queue: kernel has SIP extensions disabled; "
+                "freeing SIP-phone agent=%s call_id=%s", employee_id, ctx.call_id,
+            )
+            return await _fail("sip_extensions_disabled")
+        except TelephonyRPCError as exc:
+            log.warning(
+                "assign_queue: extension originate rejected code=%s call_id=%s",
+                exc.code, ctx.call_id,
+            )
+            return await _fail("sip_extension_unavailable")
+
+        agent_leg_call_id = result.get("call_id")
+        if not agent_leg_call_id:
+            return await _fail("sip_extension_unavailable")
+
+        # Register the answered/hangup waiter BEFORE anything awaits, so a fast
+        # off-hook can't fire before we're listening.
+        waiter = orchestrator.register_leg_wait(agent_leg_call_id)
+        # Track the ringing handset so a caller hangup can cancel it immediately
+        # (else the handset rings until the assign timeout). Cleared once the
+        # wait resolves below.
+        orchestrator.set_pending_sip_originate(ctx.call_id, agent_leg_call_id)
+
+        # Let the agent's workspace show the incoming call (physical phone is
+        # already ringing; no accept button is required).
+        try:
+            await orchestrator.notify_agent_incoming(
+                tenant_id=ctx.tenant_id, employee_id=employee_id,
+                payload={
+                    "offer_id": offer_id, "call_id": ctx.call_id,
+                    "from": ctx.variables.get("sys.caller_number", ""),
+                    "to": ctx.variables.get("sys.called_number", ""),
+                    "device_type": DEVICE_SIP_PHONE,
+                },
+            )
+            incoming_pushed = True
+        except Exception:  # noqa: BLE001
+            log.exception("assign_queue: SIP-phone incoming notify failed")
+        prompt_task: asyncio.Task | None = None
+        if data.get("prompt_play_mode") == "loop":
+            prompt_task = asyncio.create_task(
+                self._play_waiting_prompt(ctx, data),
+                name=f"assign-queue-prompt:{ctx.call_id}",
+            )
+        else:
+            await self._say(ctx, data.get("queue_prompt_text") or "正在为您转接，请稍候。")
+        # Let bridging wait (bounded) for this prompt to finish before cutting
+        # the caller off mid-word.
+        ctx.variables["sys._prompt_play_waiter"] = orchestrator.register_play_wait(ctx.call_id)
+        try:
+            decision = await asyncio.wait_for(waiter, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            decision = {"answered": False}
+            orchestrator.cancel_leg_wait(agent_leg_call_id)
+            try:
+                await ctx.telephony.call_hangup(agent_leg_call_id, reason="no_answer")
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            # No longer ringing (answered / declined / timed out / caller gone).
+            orchestrator.pop_pending_sip_originate(ctx.call_id)
+            if prompt_task is not None:
+                prompt_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await prompt_task
+
+        if not decision.get("answered"):
+            log.info(
+                "assign_queue: SIP-phone agent=%s did not answer call_id=%s",
+                employee_id, ctx.call_id,
+            )
+            return await _fail(decision.get("reason") or "offer_timeout")
+
+        # Off-hook: commit CDR + status, then bridge caller ↔ extension leg.
+        async with AsyncSessionLocal() as db:
+            from app.services.agent_webrtc_session_service import (
+                AgentWebRTCSessionService,
+            )
+            from app.services.cc_agent_status_service import CcAgentStatusService
+
+            await CallRecordService.mark_answered(
+                db, ctx.tenant_id, ctx.call_id, agent_id=employee_id,
+            )
+            await CcAgentStatusService.set_status(
+                db, ctx.tenant_id, employee_id, "busy", None,
+            )
+            await AgentWebRTCSessionService.set_busy(
+                db, ctx.tenant_id, employee_id, busy=True,
+            )
+
+        # The off-hook happened on the physical handset — move the agent's
+        # browser to 通话中 (spec 3.6.3: no second "接听" click in the workspace).
+        try:
+            await orchestrator.notify_agent_call_answered(
+                tenant_id=ctx.tenant_id, employee_id=employee_id, call_id=ctx.call_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("assign_queue: SIP-phone answered notify failed")
+
+        ctx.variables["sys._bridged_agent_id"] = employee_id
+        ctx.variables["sys._bridged_webrtc_call_id"] = agent_leg_call_id
+        ctx.variables.pop("sys.assign_queue_status", None)
+        ctx.variables.pop("sys.assign_queue_limit_reason", None)
+
+        return await self._bridge_to_agent(
+            ctx,
+            webrtc_call_id=agent_leg_call_id,
+            employee_id=employee_id,
+            redis=redis,
+        )
+
     async def _bridge_to_agent(
         self,
         ctx: ExecutionContext,
@@ -619,6 +953,7 @@ class AssignQueueExecutor(BaseNodeExecutor):
         bridged to a dead leg and stuck on 忙碌.
         """
 
+        import asyncio
         import logging
 
         from app.libs.telephony.base import TelephonyRPCError
@@ -634,6 +969,23 @@ class AssignQueueExecutor(BaseNodeExecutor):
             ctx.call_id, webrtc_call_id, transcribe,
         )
         try:
+            # Let the in-flight "正在为您转接" prompt finish its phrase before
+            # bridging so the caller isn't cut off mid-word. Bounded, so a fast
+            # answer still connects promptly; if the prompt already ended the
+            # waiter resolves immediately.
+            waiter = ctx.variables.pop("sys._prompt_play_waiter", None)
+            if waiter is not None:
+                try:
+                    await asyncio.wait_for(waiter, timeout=_PROMPT_FINISH_MAX_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    orchestrator = ctx.variables.get("__orchestrator__")
+                    if orchestrator is not None:
+                        orchestrator.cancel_play_wait(ctx.call_id)
+            # A short tail drain so the last word (still in the caller's jitter
+            # buffer) plays out before we stop + bridge.
+            await _drain_tail()
             await ctx.telephony.call_stop(ctx.call_id)
             await ctx.telephony.call_bridge(ctx.call_id, webrtc_call_id, transcribe=transcribe)
         except TelephonyRPCError as exc:

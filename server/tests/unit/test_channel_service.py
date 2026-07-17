@@ -28,6 +28,7 @@ from app.schemas.open_agent_settings import (
     OpenAgentAIDisclaimer,
     OpenAgentAgentListResponse,
     OpenAgentAgentSummary,
+    OpenAgentAttachmentHandoffStatus,
     OpenAgentVisitorRuntimeConfig,
     OpenAgentWelcomeMessage,
 )
@@ -72,6 +73,7 @@ def test_channel_config_uses_default_offline_message():
     assert config.open_agent_enabled is False
     assert config.open_agent_bot_strategy == "always"
     assert config.open_agent_avatar_url is None
+    assert config.open_agent_attachment_upload_enabled is False
     assert config.open_agent_handoff_label == DEFAULT_OPEN_AGENT_HANDOFF_LABEL
     assert config.open_agent_handoff_after_messages == 2
     assert config.open_agent_handoff_behavior == "confirm"
@@ -364,6 +366,38 @@ async def test_normalize_config_saves_active_open_agent(monkeypatch):
     assert result["open_agent_agent_id"] == 1
     assert result["open_agent_agent_name"] == "Support Agent"
     assert result["open_agent_bot_service_hours_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_normalize_config_rejects_attachment_upload_without_handoff_tool(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.channel_service.OpenAgentSettingsService.list_active_agents",
+        AsyncMock(return_value=OpenAgentAgentListResponse(
+            items=[OpenAgentAgentSummary(id=1, name="Support Agent", status="active")],
+            total=1,
+            page=1,
+            per_page=100,
+            pages=1,
+        )),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.OpenAgentSettingsService.get_attachment_handoff_status",
+        AsyncMock(return_value=OpenAgentAttachmentHandoffStatus(
+            ready=False,
+            reason="not_configured",
+        )),
+    )
+
+    with pytest.raises(ValidationError):
+        await ChannelService._normalize_config(
+            AsyncMock(),
+            7,
+            ChannelConfig(
+                open_agent_enabled=True,
+                open_agent_agent_id=1,
+                open_agent_attachment_upload_enabled=True,
+            ),
+        )
 
 
 @pytest.mark.asyncio

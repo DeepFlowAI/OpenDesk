@@ -1,8 +1,19 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type ReactNode } from 'react'
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type KeyboardEvent,
+  type ReactNode,
+} from 'react'
 import { EditorContent, useEditor, type Editor } from '@tiptap/react'
-import { Mark, Node, mergeAttributes } from '@tiptap/core'
+import { Node as TiptapNode, mergeAttributes } from '@tiptap/core'
+import type { Node as ProseMirrorNode } from '@tiptap/pm/model'
 import StarterKit from '@tiptap/starter-kit'
 import Placeholder from '@tiptap/extension-placeholder'
 import Link from '@tiptap/extension-link'
@@ -21,6 +32,7 @@ import {
 import { EmojiPicker } from './emoji-picker'
 import { cn } from '@/lib/utils'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
+import { TextColor } from '@/lib/tiptap-text-color'
 import { prepareRichTextMessageHtml } from '@/lib/rich-text-message'
 import type { ConversationFileUploadResponse } from '@/models/conversation-file'
 import type { EmojiTargetConfig } from '@/models/emoji-setting'
@@ -41,10 +53,18 @@ type RichTextComposerProps = {
   endSafeArea?: boolean
   autoFocusKey?: number | string | null
   onChange: (html: string) => void
+  onPlainTextChange?: (text: string) => void
+  onEditorKeyDown?: (event: KeyboardEvent<HTMLDivElement>) => void
   onImageUpload: (file: File) => Promise<ConversationFileUploadResponse>
   onAttachmentPaste?: (file: File) => void
   onUploadingChange?: (uploading: boolean) => void
   emojiConfig?: EmojiTargetConfig | null
+}
+
+export type RichTextComposerHandle = {
+  focus: () => void
+  getPlainText: () => string
+  insertHtmlAtTextPrefix: (html: string, replaceEnd: number) => boolean
 }
 
 type HtmlImageSource = {
@@ -70,32 +90,7 @@ const TEXT_COLOR_OPTIONS: TextColorOption[] = [
   { color: '#db2777', previewClass: 'bg-[#db2777]', zh: '粉色', en: 'Pink' },
 ]
 
-const TextColor = Mark.create({
-  name: 'textColor',
-
-  addAttributes() {
-    return {
-      color: {
-        default: null,
-        parseHTML: (element) => element.style.color || null,
-        renderHTML: (attributes) => {
-          if (!attributes.color) return {}
-          return { style: `color: ${attributes.color}` }
-        },
-      },
-    }
-  },
-
-  parseHTML() {
-    return [{ tag: 'span[style*=color]' }]
-  },
-
-  renderHTML({ HTMLAttributes }) {
-    return ['span', mergeAttributes(HTMLAttributes), 0]
-  },
-})
-
-const RichTextImage = Node.create({
+const RichTextImage = TiptapNode.create({
   name: 'image',
   group: 'block',
   inline: false,
@@ -348,7 +343,44 @@ function clampEditorHeight(height: number, maxHeight: number): number {
   return Math.min(maxHeight, Math.max(RICH_TEXT_EDITOR_DEFAULT_HEIGHT, height))
 }
 
-export function RichTextComposer({
+function findTextPrefixRange(doc: ProseMirrorNode, replaceEnd: number): { from: number; to: number } | null {
+  if (replaceEnd <= 0) return null
+
+  let from: number | null = null
+  let to: number | null = null
+  let remaining = replaceEnd
+
+  doc.descendants((node, pos) => {
+    if (remaining <= 0) return false
+    if (!node.isText) return true
+
+    const textLength = node.text?.length ?? 0
+    if (textLength <= 0) return false
+
+    if (from === null) from = pos
+    const consumed = Math.min(remaining, textLength)
+    remaining -= consumed
+    to = pos + consumed
+    return remaining > 0
+  })
+
+  if (from === null || to === null) return null
+  return { from, to }
+}
+
+function insertHtmlAtTextPrefix(editor: Editor, html: string, replaceEnd: number): boolean {
+  const content = html.trim()
+  const range = findTextPrefixRange(editor.state.doc, replaceEnd)
+  if (range) {
+    if (!content) return editor.chain().focus().deleteRange(range).run()
+    return editor.chain().focus().insertContentAt(range, content).run()
+  }
+
+  if (!content) return false
+  return editor.chain().focus().insertContent(content).run()
+}
+
+export const RichTextComposer = forwardRef<RichTextComposerHandle, RichTextComposerProps>(function RichTextComposer({
   value,
   disabled = false,
   uploading = false,
@@ -358,11 +390,13 @@ export function RichTextComposer({
   endSafeArea = false,
   autoFocusKey = null,
   onChange,
+  onPlainTextChange,
+  onEditorKeyDown,
   onImageUpload,
   onAttachmentPaste,
   onUploadingChange,
   emojiConfig,
-}: RichTextComposerProps) {
+}, ref) {
   const editorHeight = clampEditorHeight(editorHeightProp ?? RICH_TEXT_EDITOR_DEFAULT_HEIGHT, editorMaxHeight)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const editorRef = useRef<Editor | null>(null)
@@ -494,12 +528,31 @@ export function RichTextComposer({
         && nextEditor.state.doc.textBetween(from - 1, from) === '/',
       )
       onChange(nextEditor.getHTML())
+      onPlainTextChange?.(nextEditor.getText())
     },
   })
 
   useEffect(() => {
     editorRef.current = editor
   }, [editor])
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus: () => {
+        const currentEditor = editorRef.current
+        if (!currentEditor || currentEditor.isDestroyed) return
+        currentEditor.commands.focus('end')
+      },
+      getPlainText: () => editorRef.current?.getText() ?? '',
+      insertHtmlAtTextPrefix: (html, replaceEnd) => {
+        const currentEditor = editorRef.current
+        if (!currentEditor || currentEditor.isDestroyed || !currentEditor.isEditable) return false
+        return insertHtmlAtTextPrefix(currentEditor, html, replaceEnd)
+      },
+    }),
+    [],
+  )
 
   useEffect(() => {
     if (!editor || editor.isDestroyed) return
@@ -569,6 +622,8 @@ export function RichTextComposer({
   )
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    onEditorKeyDown?.(event)
+    if (event.defaultPrevented) return
     if (event.key === 'Escape') editor?.commands.blur()
   }
 
@@ -663,7 +718,7 @@ export function RichTextComposer({
       />
     </div>
   )
-}
+})
 
 export function editorHtmlToSendableRichText(editor: Editor | null): string {
   return prepareRichTextMessageHtml(editor?.getHTML() ?? '')

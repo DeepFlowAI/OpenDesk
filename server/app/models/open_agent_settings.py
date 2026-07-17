@@ -1,7 +1,7 @@
 """
 OpenAgentSettings model — per-tenant OpenAgent connection configuration.
 """
-from sqlalchemy import ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -25,3 +25,6 @@ class OpenAgentSettings(Base, TimestampMixin):
     api_key_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     voice_speed_base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     voice_speed_api_key_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    robot_qa_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    robot_qa_knowledge_base_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    robot_qa_knowledge_base_name: Mapped[str | None] = mapped_column(String(255), nullable=True)

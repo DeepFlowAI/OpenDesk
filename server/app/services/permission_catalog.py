@@ -5,6 +5,7 @@ from copy import deepcopy
 
 RESOURCE_PEER_CONVERSATION = "chat.conversation.peer.view"
 RESOURCE_CHAT_QUEUE = "chat.queue.view"
+RESOURCE_COLLABORATION_INVITE = "chat.conversation.collaboration.invite"
 
 DATA_SCOPE_KEYS = {
     "ticket",
@@ -13,6 +14,7 @@ DATA_SCOPE_KEYS = {
     "offline_message",
     RESOURCE_PEER_CONVERSATION,
     RESOURCE_CHAT_QUEUE,
+    RESOURCE_COLLABORATION_INVITE,
 }
 DATA_SCOPE_VALUES = {"all", "group", "self"}
 SYSTEM_ROLE_KEYS = {"admin", "agent"}
@@ -30,11 +32,30 @@ PERMISSION_TREE: list[dict] = [
                 "name_en": "Call Center",
                 "permissions": [
                     {"key": "call.workspace.use", "name": "启用呼叫中心工作台", "name_en": "Use call workspace", "type": "switch"},
+                    {"key": "call.operation.transfer", "name": "通话转接", "name_en": "Transfer calls", "type": "action", "requires": "call.workspace.use"},
+                    {"key": "call.operation.consult", "name": "通话咨询", "name_en": "Consult on calls", "type": "action", "requires": "call.workspace.use"},
+                    {"key": "call.operation.conference", "name": "多方通话", "name_en": "Conference calls", "type": "action", "requires": "call.workspace.use"},
                     {"key": "call.record.view", "name": "查看通话记录", "name_en": "View call records", "type": "menu", "requires": "call.workspace.use", "data_scope_resource": "call_record"},
                     {"key": "call.record.export", "name": "导出通话记录", "name_en": "Export call records", "type": "action", "requires": "call.record.view"},
-                    {"key": "call.monitor.view", "name": "查看呼叫监控", "name_en": "View call monitor", "type": "menu", "requires": "call.workspace.use"},
+                    {"key": "call.monitor.view", "name": "查看呼叫监控", "name_en": "View call monitor", "type": "menu", "requires": "call.workspace.use", "data_scope_resource": "call_record"},
+                    {"key": "call.monitor.listen", "name": "监听通话", "name_en": "Listen to calls", "type": "action", "requires": "call.monitor.view", "data_scope_resource": "call_record"},
+                    {"key": "call.monitor.whisper", "name": "耳语辅导", "name_en": "Whisper coaching", "type": "action", "requires": "call.monitor.listen", "data_scope_resource": "call_record"},
+                    {"key": "call.monitor.barge", "name": "强插通话", "name_en": "Barge into calls", "type": "action", "requires": "call.monitor.listen", "data_scope_resource": "call_record"},
+                    {"key": "call.monitor.takeover", "name": "接管通话", "name_en": "Take over calls", "type": "action", "requires": "call.monitor.listen", "data_scope_resource": "call_record"},
+                    {"key": "call.monitor.force_hangup", "name": "强制挂断通话", "name_en": "Force end calls", "type": "action", "requires": "call.monitor.listen", "data_scope_resource": "call_record"},
                     {"key": "call.report.view", "name": "查看通话报表", "name_en": "View call reports", "type": "menu", "requires": "call.workspace.use"},
                     {"key": "call.report.export", "name": "导出通话报表", "name_en": "Export call reports", "type": "action", "requires": "call.report.view"},
+                ],
+            },
+            {
+                "key": "engagement",
+                "name": "触达中心",
+                "name_en": "Engagement",
+                "permissions": [
+                    {"key": "engagement.outbound_task.manage", "name": "管理全部外呼任务", "name_en": "Manage all outbound tasks", "type": "manage"},
+                    {"key": "engagement.outbound_task.create", "name": "新建外呼任务", "name_en": "Create outbound tasks", "type": "action"},
+                    {"key": "engagement.outbound_task.execute", "name": "执行外呼任务", "name_en": "Execute outbound tasks", "type": "action", "requires": "call.workspace.use"},
+                    {"key": "engagement.outbound_task.template.manage", "name": "管理外呼任务模板", "name_en": "Manage outbound task templates", "type": "manage", "requires": "engagement.outbound_task.manage"},
                 ],
             },
             {
@@ -46,12 +67,13 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "chat.workspace.max_concurrent.edit", "name": "修改自己的最大接待人数", "name_en": "Edit own max concurrent sessions", "type": "action", "requires": "chat.workspace.use"},
                     {"key": "chat.conversation.transfer", "name": "会话转接", "name_en": "Transfer conversations", "type": "action", "requires": "chat.workspace.use"},
                     {"key": "chat.conversation.lock", "name": "锁定会话", "name_en": "Lock conversations", "type": "action", "requires": "chat.workspace.use"},
-                    {"key": "chat.conversation.collaboration.invite", "name": "邀请客服协作", "name_en": "Invite conversation collaborators", "type": "action", "requires": "chat.workspace.use", "data_scope_resource": "session_record"},
+                    {"key": "chat.conversation.collaboration.invite", "name": "邀请客服协作", "name_en": "Invite conversation collaborators", "type": "action", "requires": "chat.workspace.use", "data_scope_resource": RESOURCE_COLLABORATION_INVITE},
                     {"key": "chat.conversation.collaboration.respond", "name": "响应协作邀请", "name_en": "Respond to collaboration invites", "type": "action", "requires": "chat.workspace.use"},
                     {"key": "chat.conversation.collaboration.message.send", "name": "协作会话发送消息", "name_en": "Send messages as collaborator", "type": "action", "requires": "chat.conversation.collaboration.respond"},
                     {"key": "chat.conversation.peer.view", "name": "查看同事会话", "name_en": "View peer conversations", "type": "action", "requires": "chat.workspace.use", "data_scope_resource": RESOURCE_PEER_CONVERSATION},
                     {"key": "chat.conversation.peer_message.send", "name": "同事会话发送消息", "name_en": "Send messages in peer conversations", "type": "action", "requires": "chat.conversation.peer.view"},
                     {"key": "chat.conversation.internal_note.create", "name": "发送内部消息", "name_en": "Create internal notes", "type": "action", "requires": "chat.workspace.use"},
+                    {"key": "chat.conversation.robot_qa.create", "name": "新建机器人 QA", "name_en": "Create robot QA", "type": "action", "requires": "chat.workspace.use"},
                     {"key": "chat.offline_message.view", "name": "查看留言", "name_en": "View offline messages", "type": "menu", "requires": "chat.workspace.use", "data_scope_resource": "offline_message"},
                     {"key": "chat.queue.view", "name": "查看排队", "name_en": "View chat queue", "type": "menu", "requires": "chat.workspace.use", "data_scope_resource": RESOURCE_CHAT_QUEUE},
                     {"key": "chat.queue.assign_self", "name": "分配排队给自己", "name_en": "Assign queued visitor to self", "type": "action", "requires": "chat.queue.view"},
@@ -101,6 +123,9 @@ PERMISSION_TREE: list[dict] = [
                 "name_en": "Knowledge Base",
                 "permissions": [
                     {"key": "knowledge.workspace.view", "name": "查看知识库", "name_en": "View knowledge base", "type": "menu"},
+                    {"key": "knowledge.workspace.inspiration.view", "name": "查看知识灵感", "name_en": "View knowledge inspirations", "type": "menu", "requires": "knowledge.workspace.view"},
+                    {"key": "knowledge.workspace.inspiration.create", "name": "添加知识灵感", "name_en": "Create knowledge inspirations", "type": "action", "requires": "knowledge.workspace.inspiration.view"},
+                    {"key": "knowledge.workspace.inspiration.manage", "name": "管理知识灵感", "name_en": "Manage knowledge inspirations", "type": "action", "requires": "knowledge.workspace.inspiration.view"},
                     {"key": "knowledge.workspace.document.create", "name": "新建知识文档", "name_en": "Create knowledge documents", "type": "action", "requires": "knowledge.workspace.view"},
                     {"key": "knowledge.workspace.document.edit", "name": "编辑知识文档", "name_en": "Edit knowledge documents", "type": "action", "requires": "knowledge.workspace.view"},
                     {"key": "knowledge.workspace.document.delete", "name": "删除知识文档", "name_en": "Delete knowledge documents", "type": "action", "requires": "knowledge.workspace.view"},
@@ -145,6 +170,8 @@ PERMISSION_TREE: list[dict] = [
                 "permissions": [
                     {"key": "call.admin.flow.manage", "name": "管理流程设计", "name_en": "Manage flows", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.number.manage", "name": "管理号码", "name_en": "Manage phone numbers", "type": "manage", "requires": "admin.access"},
+                    {"key": "call.admin.extension.manage", "name": "管理 SIP 分机", "name_en": "Manage SIP extensions", "type": "manage", "requires": "admin.access"},
+                    {"key": "call.admin.settings.manage", "name": "管理呼叫中心设置", "name_en": "Manage call center settings", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.summary_config.manage", "name": "管理通话纪要配置", "name_en": "Manage call summaries", "type": "manage", "requires": "admin.access"},
                 ],
             },
@@ -247,6 +274,9 @@ AGENT_PERMISSION_KEYS = [
     "ticket.workspace.edit",
     "ticket.workspace.comment",
     "knowledge.workspace.view",
+    "knowledge.workspace.inspiration.view",
+    "knowledge.workspace.inspiration.create",
+    "knowledge.workspace.inspiration.manage",
     "crm.workspace.user.view",
     "crm.workspace.org.view",
     "chat.session_record.view",
@@ -254,11 +284,13 @@ AGENT_PERMISSION_KEYS = [
     "chat.queue.view",
     "chat.queue.assign_self",
     "call.record.view",
+    "engagement.outbound_task.execute",
     "chat.conversation.transfer",
     "chat.conversation.lock",
     "chat.conversation.collaboration.respond",
     "chat.conversation.collaboration.message.send",
     "chat.conversation.internal_note.create",
+    "chat.conversation.robot_qa.create",
 ]
 
 SYSTEM_ROLE_PRESETS = {

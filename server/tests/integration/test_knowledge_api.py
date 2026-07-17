@@ -133,6 +133,26 @@ async def knowledge_context() -> dict:
             f"knowledge-export-{suffix}",
             ["knowledge.workspace.view", "knowledge.workspace.export"],
         )
+        inspiration_view_role = await create_role(
+            f"knowledge-inspiration-view-{suffix}",
+            ["knowledge.workspace.view", "knowledge.workspace.inspiration.view"],
+        )
+        inspiration_create_role = await create_role(
+            f"knowledge-inspiration-create-{suffix}",
+            [
+                "knowledge.workspace.view",
+                "knowledge.workspace.inspiration.view",
+                "knowledge.workspace.inspiration.create",
+            ],
+        )
+        inspiration_manage_role = await create_role(
+            f"knowledge-inspiration-manage-{suffix}",
+            [
+                "knowledge.workspace.view",
+                "knowledge.workspace.inspiration.view",
+                "knowledge.workspace.inspiration.manage",
+            ],
+        )
 
         view_employee = await create_employee("Knowledge View")
         manage_employee = await create_employee("Knowledge Manage")
@@ -141,6 +161,9 @@ async def knowledge_context() -> dict:
         delete_employee = await create_employee("Knowledge Delete")
         import_employee = await create_employee("Knowledge Import")
         export_employee = await create_employee("Knowledge Export")
+        inspiration_view_employee = await create_employee("Knowledge Inspiration View")
+        inspiration_create_employee = await create_employee("Knowledge Inspiration Create")
+        inspiration_manage_employee = await create_employee("Knowledge Inspiration Manage")
         no_perm_employee = await create_employee("Knowledge None")
 
         for employee_id, role_id in [
@@ -151,6 +174,9 @@ async def knowledge_context() -> dict:
             (delete_employee, delete_role),
             (import_employee, import_role),
             (export_employee, export_role),
+            (inspiration_view_employee, inspiration_view_role),
+            (inspiration_create_employee, inspiration_create_role),
+            (inspiration_manage_employee, inspiration_manage_role),
         ]:
             await assign_role(employee_id, role_id)
 
@@ -165,6 +191,9 @@ async def knowledge_context() -> dict:
         "delete": _headers(delete_employee, tenant_id),
         "import": _headers(import_employee, tenant_id),
         "export": _headers(export_employee, tenant_id),
+        "inspiration_view": _headers(inspiration_view_employee, tenant_id),
+        "inspiration_create": _headers(inspiration_create_employee, tenant_id),
+        "inspiration_manage": _headers(inspiration_manage_employee, tenant_id),
         "none": _headers(no_perm_employee, tenant_id),
     }
 
@@ -419,3 +448,113 @@ async def test_knowledge_import_export_flow(
     duplicate_data = duplicate_preview.json()
     assert duplicate_data["has_errors"] is True
     assert duplicate_data["summary"]["error_rows"] == 1
+
+
+@pytest.mark.asyncio
+async def test_knowledge_inspiration_api_flow(
+    client: AsyncClient,
+    knowledge_context: dict,
+) -> None:
+    denied = await client.post(
+        "/api/v1/knowledge/inspirations",
+        json={"content": "退款流程"},
+        headers=knowledge_context["inspiration_view"],
+    )
+    assert denied.status_code == 403
+
+    created = await client.post(
+        "/api/v1/knowledge/inspirations",
+        json={
+            "content": "退款流程\n先核实订单",
+            "content_format": "text",
+            "source_conversation_id": 456,
+            "source_message_id": 123,
+        },
+        headers=knowledge_context["inspiration_create"],
+    )
+    assert created.status_code == 201
+    created_data = created.json()
+    assert created_data["content_html"] == "<p>退款流程</p><p>先核实订单</p>"
+    assert created_data["content_plain"] == "退款流程 先核实订单"
+    assert created_data["source_type"] == "chat_message"
+    assert created_data["source_conversation_id"] == 456
+    assert created_data["status"] == "pending"
+    inspiration_id = created_data["id"]
+
+    listed = await client.get(
+        "/api/v1/knowledge/inspirations?q=退款",
+        headers=knowledge_context["inspiration_view"],
+    )
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 1
+
+    counts = await client.get(
+        "/api/v1/knowledge/inspirations/counts?q=退款",
+        headers=knowledge_context["inspiration_view"],
+    )
+    assert counts.status_code == 200
+    assert counts.json() == {
+        "total": 1,
+        "pending": 1,
+        "archived": 0,
+        "document_created": 0,
+    }
+
+    denied_archive = await client.patch(
+        f"/api/v1/knowledge/inspirations/{inspiration_id}/archive",
+        headers=knowledge_context["inspiration_view"],
+    )
+    assert denied_archive.status_code == 403
+
+    archived = await client.patch(
+        f"/api/v1/knowledge/inspirations/{inspiration_id}/archive",
+        headers=knowledge_context["inspiration_manage"],
+    )
+    assert archived.status_code == 200
+    assert archived.json()["status"] == "archived"
+
+    repeated_archive = await client.patch(
+        f"/api/v1/knowledge/inspirations/{inspiration_id}/archive",
+        headers=knowledge_context["inspiration_manage"],
+    )
+    assert repeated_archive.status_code == 400
+
+    deleted = await client.delete(
+        f"/api/v1/knowledge/inspirations/{inspiration_id}",
+        headers=knowledge_context["inspiration_manage"],
+    )
+    assert deleted.status_code == 200
+
+    missing = await client.get(
+        f"/api/v1/knowledge/inspirations/{inspiration_id}",
+        headers=knowledge_context["inspiration_view"],
+    )
+    assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_knowledge_inspiration_mark_document_created_is_idempotent(
+    client: AsyncClient,
+    knowledge_context: dict,
+) -> None:
+    created = await client.post(
+        "/api/v1/knowledge/inspirations",
+        json={"content": "<p>订单退款</p>", "content_format": "rich_text"},
+        headers=knowledge_context["inspiration_create"],
+    )
+    assert created.status_code == 201
+    inspiration_id = created.json()["id"]
+
+    marked = await client.patch(
+        f"/api/v1/knowledge/inspirations/{inspiration_id}/document-created",
+        headers=knowledge_context["create"],
+    )
+    assert marked.status_code == 200
+    assert marked.json()["status"] == "document_created"
+
+    marked_again = await client.patch(
+        f"/api/v1/knowledge/inspirations/{inspiration_id}/document-created",
+        headers=knowledge_context["create"],
+    )
+    assert marked_again.status_code == 200
+    assert marked_again.json()["status"] == "document_created"

@@ -3,15 +3,24 @@ Agent-facing offline message APIs.
 """
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.encoders import jsonable_encoder
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, get_redis, get_current_principal, require_permission
+from app.db.deps import (
+    get_current_principal,
+    get_db,
+    get_redis,
+    require_permission,
+    require_permission_short_session,
+)
 from app.db.session import AsyncSessionLocal
 from app.libs.realtime import get_realtime_transport
-from app.schemas.conversation_file import ConversationFileAccessResponse
+from app.schemas.conversation_file import (
+    ConversationFileAccessResponse,
+    ConversationFileUploadResponse,
+)
 from app.schemas.offline_message import (
     OfflineMessageArchiveResponse,
     OfflineMessageAssignRequest,
@@ -173,6 +182,24 @@ async def assign_offline_message_to_agent(
     return result
 
 
+@router.post(
+    "/{offline_message_id}/files",
+    response_model=ConversationFileUploadResponse,
+)
+async def upload_offline_message_file(
+    offline_message_id: int,
+    file: UploadFile = File(...),
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("chat.queue.assign_self"),
+    ),
+):
+    return await OfflineMessageService.upload_agent_file_managed(
+        offline_message_id=offline_message_id,
+        principal=principal,
+        file=file,
+    )
+
+
 @router.get(
     "/{offline_message_id}/files/{file_id}/url",
     response_model=ConversationFileAccessResponse,
@@ -182,6 +209,7 @@ async def get_offline_message_file_url(
     file_id: str,
     download_name: str | None = Query(None),
     download: bool = Query(False),
+    image_process: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
     principal: EffectivePrincipal = Depends(get_current_principal),
 ):
@@ -192,6 +220,7 @@ async def get_offline_message_file_url(
         file_id=file_id,
         download_name=download_name,
         download=download,
+        image_process=image_process,
     )
 
 

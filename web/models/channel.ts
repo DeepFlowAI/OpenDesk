@@ -100,6 +100,7 @@ export type ChannelConfig = {
   open_agent_bot_service_hours_id: number | null
   open_agent_avatar_url: string | null
   open_agent_input_placeholder: string | null
+  open_agent_attachment_upload_enabled: boolean
   open_agent_handoff_enabled: boolean
   open_agent_handoff_label: string
   open_agent_handoff_after_messages: number

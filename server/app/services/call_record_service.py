@@ -89,10 +89,15 @@ class CallRecordService:
         from_number: str | None,
         to_number: str | None,
         agent_id: int | None = None,
+        device_type: str | None = None,
+        device_identifier: str | None = None,
     ) -> dict:
         """Same shape as create_for_incoming but direction=outbound and the
         agent who dialed is known immediately (no queue routing). Called
-        from OutboundDialService after FlowKit accepts the originate."""
+        from OutboundDialService after FlowKit accepts the originate.
+
+        ``device_type`` / ``device_identifier`` capture the agent's device at
+        establishment as a permanent attribution snapshot."""
 
         existing = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
         if existing:
@@ -110,6 +115,8 @@ class CallRecordService:
                 "from_number": from_number,  # outbound DID (caller_id)
                 "to_number": to_number,      # dialed number
                 "agent_id": agent_id,
+                "device_type": device_type,
+                "device_identifier": device_identifier,
                 "started_at": datetime.now(timezone.utc),
                 "extra_metadata": {},
             },

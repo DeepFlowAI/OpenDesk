@@ -6,6 +6,7 @@ import pytest
 from app.services.call_center.assign_queue import AssignQueueCandidate, AssignQueueSelector
 from app.services.call_center.nodes import AssignQueueExecutor, ExecutionContext
 from app.services.call_center.queue import QueuePicker
+from app.services.agent_status_service import AgentStatusService
 from app.services.cc_agent_resource_service import CcAgentResourceService
 
 
@@ -68,6 +69,7 @@ async def test_queue_picker_prioritizes_preferred_ready_agent(monkeypatch):
     monkeypatch.setattr(CcAgentResourceService, "ensure_from_visible", AsyncMock())
     monkeypatch.setattr(CcAgentResourceService, "reserve_inbound", reserve)
     monkeypatch.setattr(CcAgentResourceService, "next_queue_index", next_index)
+    monkeypatch.setattr(AgentStatusService, "is_connected", AsyncMock(return_value=True))
 
     pick = await picker.pick_ready_agent_for_queue(
         db,
@@ -86,6 +88,74 @@ async def test_queue_picker_prioritizes_preferred_ready_agent(monkeypatch):
     assert reserve.await_args.kwargs["call_id"] == "call-1"
     assert reserve.await_args.args[2] == 2
     next_index.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queue_picker_skips_disconnected_agents(monkeypatch):
+    """A stale-ready colleague whose browser is gone is not offered the call;
+    the genuinely-connected agent gets it instead."""
+
+    picker = QueuePicker()
+    employees = [
+        SimpleNamespace(id=1, display_name="Agent 1", nickname=None, name="Agent 1", username="a1"),
+        SimpleNamespace(id=2, display_name="Agent 2", nickname=None, name="Agent 2", username="a2"),
+    ]
+    db = _FakeDb(employees)
+
+    async def is_conn(_r, _tenant, emp):
+        return emp == 2  # only agent 2's browser is connected
+
+    monkeypatch.setattr(AgentStatusService, "is_connected", is_conn)
+    reserve = AsyncMock(return_value={"resource_state": "ringing"})
+    monkeypatch.setattr(CcAgentResourceService, "ensure_from_visible", AsyncMock())
+    monkeypatch.setattr(CcAgentResourceService, "reserve_inbound", reserve)
+    monkeypatch.setattr(
+        CcAgentResourceService, "next_queue_index", AsyncMock(return_value=0)
+    )
+
+    pick = await picker.pick_ready_agent_for_queue(
+        db,
+        tenant_id=7,
+        queue_type="employee_group",
+        queue_id=9,
+        r=object(),
+        call_id="call-1",
+        offer_id="offer-1",
+        ttl_seconds=30,
+    )
+
+    assert pick["employee_id"] == 2
+    # The disconnected agent 1 was never even reserved.
+    reserved_emps = {c.args[2] for c in reserve.await_args_list}
+    assert reserved_emps == {2}
+
+
+@pytest.mark.asyncio
+async def test_queue_picker_no_connected_agents_returns_none(monkeypatch):
+    """All candidates disconnected → no offer (call stays queued)."""
+
+    picker = QueuePicker()
+    employees = [
+        SimpleNamespace(id=1, display_name="A1", nickname=None, name="A1", username="a1"),
+    ]
+    monkeypatch.setattr(
+        AgentStatusService, "is_connected", AsyncMock(return_value=False)
+    )
+    reserve = AsyncMock(return_value={"resource_state": "ringing"})
+    monkeypatch.setattr(CcAgentResourceService, "reserve_inbound", reserve)
+
+    pick = await picker.pick_ready_agent_for_queue(
+        _FakeDb(employees),
+        tenant_id=7,
+        queue_type="employee_group",
+        queue_id=9,
+        r=object(),
+        call_id="call-1",
+        offer_id="offer-1",
+        ttl_seconds=30,
+    )
+    assert pick is None
+    reserve.assert_not_awaited()
 
 
 def _candidate(

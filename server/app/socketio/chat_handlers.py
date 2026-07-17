@@ -619,9 +619,12 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         content = data.get("content", "")
         content_type = data.get("content_type", "text")
         quoted_message_id = data.get("quoted_message_id")
+        client_message_id = str(data.get("client_message_id") or "").strip() or None
 
         if not conversation_id or not content:
             return {"error": "conversation_id and content required"}
+        if client_message_id and len(client_message_id) > 128:
+            return {"ok": False, "error": "Invalid client_message_id"}
 
         try:
             user_id = int(user_id)
@@ -659,7 +662,19 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                     db,
                     {"user_id": user_id, "tenant_id": tenant_id},
                 )
-                msg = await ConversationService.send_message(
+                existing_message = None
+                if client_message_id:
+                    from app.repositories.message_repository import MessageRepository
+
+                    existing_message = await MessageRepository.get_by_client_message_id(
+                        db,
+                        tenant_id,
+                        conversation_id,
+                        client_message_id,
+                        sender_type=MessageSenderType.AGENT.value,
+                        sender_id=user_id,
+                    )
+                msg = existing_message or await ConversationService.send_message(
                     db,
                     conversation_id=conversation_id,
                     sender_type=MessageSenderType.AGENT.value,
@@ -669,6 +684,7 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                     tenant_id=tenant_id,
                     principal=principal,
                     quoted_message_id=quoted_message_id,
+                    **({"metadata": {"client_message_id": client_message_id}} if client_message_id else {}),
                 )
 
                 # Fetch agent info for the message payload

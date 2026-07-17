@@ -16,6 +16,7 @@ import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { cn } from '@/lib/utils'
 import { hasPermission } from '@/utils/permissions'
 import { useDeleteKnowledgeDocument, useKnowledgeDocument } from '@/service/use-knowledge'
+import { KnowledgeAttachmentList } from '@/app/components/features/knowledge/knowledge-attachment-list'
 import {
   buildKnowledgeReturnQuery,
   formatKnowledgeDate,
@@ -26,6 +27,7 @@ import {
   knowledgeStatusClass,
   knowledgeStatusLabel,
   readKnowledgeError,
+  stripKnowledgeHtml,
 } from '@/app/components/features/knowledge/knowledge-utils'
 
 export default function KnowledgeDocumentReadPage() {
@@ -114,10 +116,20 @@ export default function KnowledgeDocumentReadPage() {
                 <span>{isZh ? '更新时间' : 'Updated'}: {formatKnowledgeDate(document.updated_at)}</span>
               </div>
             </div>
-            <SafeHtml
-              html={document.content_html}
-              className={cn('text-sm leading-7 text-[#1A1A1A]', richTextListStyleClass)}
-            />
+            {stripKnowledgeHtml(document.content_html) && (
+              <SafeHtml
+                html={document.content_html}
+                className={cn('text-sm leading-7 text-[#1A1A1A]', richTextListStyleClass)}
+              />
+            )}
+            {document.attachments.length > 0 && (
+              <section className={cn(stripKnowledgeHtml(document.content_html) && 'mt-8 border-t border-[#E5E5E5] pt-6')}>
+                <h3 className="mb-3 text-sm font-medium text-[#404040]">
+                  {isZh ? `附件（${document.attachments.length}）` : `Attachments (${document.attachments.length})`}
+                </h3>
+                <KnowledgeAttachmentList attachments={document.attachments} isZh={isZh} />
+              </section>
+            )}
           </article>
         ) : (
           <div className="mx-auto flex h-80 max-w-[920px] items-center justify-center rounded-lg border border-[#E5E5E5] text-sm text-[#737373]">

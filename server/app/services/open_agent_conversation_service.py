@@ -22,6 +22,7 @@ from app.repositories.conversation_repository import ConversationRepository
 from app.repositories.message_repository import MessageRepository
 from app.schemas.channel import ChannelConfig
 from app.schemas.open_agent_conversation import OpenAgentChatRequest, OpenAgentFeedbackRequest
+from app.services.conversation_file_service import ConversationFileService
 from app.services.conversation_service import ConversationService
 from app.services.open_agent_settings_service import OpenAgentSettingsService
 
@@ -91,6 +92,8 @@ class OpenAgentConversationService:
         config = ChannelConfig.model_validate(conversation.channel.config or {})
         if not config.open_agent_enabled or not config.open_agent_agent_id:
             raise ValidationError("OpenAgent bot is not enabled")
+        if body.attachments and not config.open_agent_attachment_upload_enabled:
+            raise ValidationError("OpenAgent attachment upload is not enabled")
 
         credentials = await OpenAgentSettingsService.get_credentials(db, conversation.tenant_id)
         if not credentials or not credentials[1]:
@@ -103,20 +106,50 @@ class OpenAgentConversationService:
             conversation.tenant_id,
             conversation.id,
             client_message_id,
+            sender_id=conversation.visitor.id if conversation.visitor else None,
         )
+        attachment = body.attachments[0] if body.attachments else None
+        if attachment is not None:
+            ConversationFileService.validate_conversation_file_id(
+                attachment.file_id,
+                tenant_id=conversation.tenant_id,
+                conversation_id=conversation.id,
+            )
         if existing_message is None and (not body.resume or body.client_message_id):
             visitor = conversation.visitor
+            content_type = (
+                MessageContentType.IMAGE.value
+                if attachment and attachment.type == "image"
+                else MessageContentType.FILE.value
+                if attachment
+                else MessageContentType.TEXT.value
+            )
+            content = (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "file_id": attachment.file_id,
+                        "name": attachment.name,
+                        "size": attachment.size,
+                        "mime_type": attachment.mime_type,
+                    },
+                    ensure_ascii=False,
+                )
+                if attachment
+                else body.message or ""
+            )
             await ConversationService.send_message(
                 db,
                 conversation_id=conversation.id,
                 sender_type=MessageSenderType.VISITOR.value,
                 sender_id=visitor.id if visitor else None,
-                content_type=MessageContentType.TEXT.value,
-                content=body.message,
+                content_type=content_type,
+                content=content,
                 tenant_id=conversation.tenant_id,
                 metadata={
                     "client_message_id": client_message_id,
                     "open_agent": True,
+                    **({"open_agent_attachment": True} if attachment else {}),
                 },
                 quoted_message_id=body.quoted_message_id,
             )
@@ -1979,6 +2012,7 @@ class OpenAgentConversationService:
             conversation.tenant_id,
             conversation.id,
             client_message_id,
+            sender_id=conversation.visitor.id if conversation.visitor else None,
         )
         if existing_message is None and (not body.resume or body.client_message_id):
             visitor = conversation.visitor
@@ -2594,6 +2628,20 @@ class OpenAgentConversationService:
                 visitor_context,
                 body,
             )
+
+        if body.attachments:
+            attachment = body.attachments[0]
+            payload["attachments"] = [
+                await ConversationFileService.build_open_agent_attachment(
+                    tenant_id=conversation.tenant_id,
+                    conversation_id=conversation.id,
+                    file_id=attachment.file_id,
+                    attachment_type=attachment.type,
+                    name=attachment.name,
+                    mime_type=attachment.mime_type,
+                    size=attachment.size,
+                )
+            ]
 
         logger.info(
             "open_agent_stream_started tenant_id=%s conversation_id=%s conversation_public_id=%s "

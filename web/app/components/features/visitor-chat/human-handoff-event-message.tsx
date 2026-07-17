@@ -157,6 +157,7 @@ function HumanHandoffConfirmCard({
       <div className="grid grid-cols-2 gap-2">
         <button
           type="button"
+          data-action="request-handoff"
           disabled={isDisabled}
           className="h-10 rounded-md bg-[var(--opendesk-send-button-bg)] px-3 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
           onClick={onConfirm}
@@ -167,6 +168,7 @@ function HumanHandoffConfirmCard({
         </button>
         <button
           type="button"
+          data-action="dismiss-handoff"
           disabled={isDisabled}
           className={
             isDismissed
@@ -222,6 +224,7 @@ export function HandoffQueueFullCard({
         {showLeaveMessageButton && (
           <button
             type="button"
+            data-action="queue-full-leave-message"
             className="h-10 rounded-md bg-[var(--opendesk-send-button-bg)] px-3 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
             onClick={onLeaveMessage}
           >
@@ -230,6 +233,7 @@ export function HandoffQueueFullCard({
         )}
         <button
           type="button"
+          data-action="continue-bot"
           className="h-10 rounded-md border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:bg-muted"
           onClick={onContinueBot}
         >

@@ -10,9 +10,12 @@ import {
   type ReactNode,
 } from 'react'
 import { toast } from 'sonner'
+import { useQueryClient } from '@tanstack/react-query'
 
+import { agentDeviceKeys } from '@/service/use-agent-devices'
 import { mapOutboundFailure } from '@/app/components/features/call-center/outbound-failure-message'
 import { callRecordCustomerNumber } from '@/app/components/features/call-center/call-record-utils'
+import { useCallControl, type CallControlApi } from '@/app/components/features/call-center/use-call-control'
 import { useMicrophone } from '@/app/components/features/call-center/use-microphone'
 import { useRingtone } from '@/app/components/features/call-center/use-ringtone'
 import { useWebRTCLeg } from '@/app/components/features/call-center/use-webrtc-leg'
@@ -48,8 +51,12 @@ export type IncomingCall = {
   from: string
   to: string
   queue_id: number | null
+  /** 'internal_consult' / 'internal_transfer' for agent-to-agent calls; absent for real inbound. */
+  call_type?: string
   startedAt: number
   direction?: 'inbound' | 'outbound'
+  /** Current call device: 'sip_phone' rings/answers on the physical handset (no browser accept). */
+  device_type?: string
 }
 
 type DialStartedInfo = {
@@ -80,6 +87,7 @@ export function formatCallDuration(ms: number | null): string {
 type CallCenterRuntimeValue = {
   mic: ReturnType<typeof useMicrophone>
   leg: ReturnType<typeof useWebRTCLeg>
+  callControl: CallControlApi
   phase: CallCenterPhase
   incoming: IncomingCall | null
   callStart: number | null
@@ -122,9 +130,18 @@ export function CallCenterProvider({
 }: CallCenterProviderProps) {
   const mic = useMicrophone({ autoRequestOnGranted: false })
   const { data: status, refetch: refetchStatus } = useMyAgentStatus()
+  const queryClient = useQueryClient()
   const setStatusMutation = useSetAgentStatus()
   const closeSession = useCloseWebRTCSession()
   const leg = useWebRTCLeg()
+  const callControl = useCallControl(leg.setMuted)
+  // Stable references to the two control-result handlers so the socket effect
+  // (which subscribes to cc.consult_result / cc.transfer_result) doesn't
+  // re-run on every render — callControl itself is a fresh object each render.
+  const handleConsultResult = callControl.onConsultResult
+  const handleTransferResult = callControl.onTransferResult
+  const handleConferenceResult = callControl.onConferenceResult
+  const handleConferenceParticipantLeft = callControl.onConferenceParticipantLeft
   const ringtone = useRingtone()
   const { socket } = useSocketStore()
   const { data: records, refetch: refetchRecords } = useCallRecords(
@@ -184,6 +201,8 @@ export function CallCenterProvider({
       from: string
       to: string
       queue_id: number | null
+      call_type?: string
+      device_type?: string
     }) => {
       setIncoming({
         offer_id: data.offer_id,
@@ -191,6 +210,8 @@ export function CallCenterProvider({
         from: data.from || '',
         to: data.to || '',
         queue_id: data.queue_id ?? null,
+        call_type: data.call_type,
+        device_type: data.device_type,
         startedAt: Date.now(),
       })
       setCallStart(Date.now())
@@ -198,6 +219,21 @@ export function CallCenterProvider({
       setPhase('incoming')
       ringtone.start()
       refetchCallRecords()
+    }
+
+    // SIP-phone inbound: the call is answered on the physical handset, so the
+    // backend tells the browser to move to 通话中 (no browser "接听" click).
+    const onCallAnswered = (data: { call_id: string }) => {
+      void data
+      ringtone.stop()
+      setPhase((curr) => (curr === 'incoming' ? 'on_call' : curr))
+    }
+
+    // SIP-phone registration went up/down (kernel event or reconnect reconcile)
+    // — refresh the device list so the heartbeat dot updates live, not on the
+    // 15s poll.
+    const onDeviceRegistrationChanged = () => {
+      void queryClient.invalidateQueries({ queryKey: agentDeviceKeys.list() })
     }
 
     const onRemoteIce = (data: { call_id: string; candidate: RTCIceCandidateInit }) => {
@@ -208,7 +244,16 @@ export function CallCenterProvider({
       void data
       ringtone.stop()
       leg.goOffline()
-      setPhase('wrap_up')
+      // A hangup while the call was only ringing (never answered — e.g. a SIP
+      // handset that didn't pick up, or the caller giving up) returns to idle;
+      // wrap-up is only for a call that was actually on air.
+      setPhase((curr) => {
+        if (curr === 'incoming' || curr === 'outbound_ringing') {
+          setIncoming(null)
+          return 'idle'
+        }
+        return 'wrap_up'
+      })
       void refetchStatus()
       refetchCallRecords()
     }
@@ -261,27 +306,86 @@ export function CallCenterProvider({
       refetchCallRecords()
     }
 
+    // Result of a browser-ring consult to a Web-phone colleague. Drives the
+    // initiator's UI out of "咨询呼叫中": active on accept, or back to the
+    // single-customer call (with a toast) on decline / no-answer / error.
+    const onConsultResult = (data: {
+      ok: boolean
+      reason?: string
+      target_name?: string
+    }) => {
+      handleConsultResult(data)
+    }
+
+    // Result of a browser-ring transfer to a Web-phone colleague. On failure
+    // the initiator returns to "单人通话" (customer preserved); on success the
+    // customer is handed over and the initiator's own leg hangs up (which the
+    // cc.call_hangup handler turns into wrap-up), so here we only clear state.
+    const onTransferResult = (data: { ok: boolean; reason?: string }) => {
+      handleTransferResult(data)
+    }
+
+    // A ringing conference participant answered (→ live) or failed to connect.
+    const onConferenceResult = (data: { ok: boolean; reason?: string }) => {
+      handleConferenceResult(data)
+    }
+
+    // The added participant left/hung up → collapse the 3-way to the 1:1 call.
+    const onConferenceParticipantLeft = () => {
+      handleConferenceParticipantLeft()
+    }
+
     socket.on('cc.call_incoming', onIncoming)
+    socket.on('cc.call_answered', onCallAnswered)
+    socket.on('cc.device_registration_changed', onDeviceRegistrationChanged)
     socket.on('cc.webrtc.ice', onRemoteIce)
     socket.on('cc.call_hangup', onHangup)
     socket.on('cc.outbound_ringing', onOutboundRinging)
     socket.on('cc.outbound_answered', onOutboundAnswered)
     socket.on('cc.outbound_hangup', onOutboundHangup)
+    socket.on('cc.consult_result', onConsultResult)
+    socket.on('cc.transfer_result', onTransferResult)
+    socket.on('cc.conference_result', onConferenceResult)
+    socket.on('cc.conference_participant_left', onConferenceParticipantLeft)
     return () => {
       socket.off('cc.call_incoming', onIncoming)
+      socket.off('cc.call_answered', onCallAnswered)
+      socket.off('cc.device_registration_changed', onDeviceRegistrationChanged)
       socket.off('cc.webrtc.ice', onRemoteIce)
       socket.off('cc.call_hangup', onHangup)
       socket.off('cc.outbound_ringing', onOutboundRinging)
       socket.off('cc.outbound_answered', onOutboundAnswered)
       socket.off('cc.outbound_hangup', onOutboundHangup)
+      socket.off('cc.consult_result', onConsultResult)
+      socket.off('cc.transfer_result', onTransferResult)
+      socket.off('cc.conference_result', onConferenceResult)
+      socket.off('cc.conference_participant_left', onConferenceParticipantLeft)
     }
-  }, [socket, leg, ringtone, refetchCallRecords, refetchStatus])
+  }, [
+    socket,
+    leg,
+    ringtone,
+    handleConsultResult,
+    handleTransferResult,
+    handleConferenceResult,
+    handleConferenceParticipantLeft,
+    refetchCallRecords,
+    refetchStatus,
+    queryClient,
+  ])
 
   useEffect(() => {
     if (leg.state !== 'failed') return
     closeSession.mutate(undefined)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leg.state])
+
+  // Any in-call control state (hold/consult/conference/mute) only makes sense
+  // during an active call; clear it once the call leaves the on_call phase.
+  useEffect(() => {
+    if (phase !== 'on_call') callControl.reset()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase])
 
   useEffect(() => {
     if (leg.state === 'failed') {
@@ -314,6 +418,9 @@ export function CallCenterProvider({
 
   const accept = useCallback(async () => {
     if (!incoming) return
+    // SIP-phone calls are answered on the physical handset; there is no browser
+    // WebRTC leg to accept. The backend's cc.call_answered moves us to 通话中.
+    if (incoming.device_type === 'sip_phone') return
     ringtone.stop()
     if (mic.state !== 'granted') {
       const ok = await mic.request()
@@ -417,6 +524,7 @@ export function CallCenterProvider({
   const value = useMemo<CallCenterRuntimeValue>(() => ({
     mic,
     leg,
+    callControl,
     phase,
     incoming,
     callStart,
@@ -447,6 +555,7 @@ export function CallCenterProvider({
   }), [
     mic,
     leg,
+    callControl,
     phase,
     incoming,
     callStart,

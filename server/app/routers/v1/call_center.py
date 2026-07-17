@@ -15,6 +15,14 @@ from app.core.exceptions import NotFoundError
 from app.db.deps import get_current_user, get_current_principal, get_db, get_redis, require_permission
 from app.schemas.permission import EffectivePrincipal
 from app.libs.telephony import get_telephony_client
+from app.schemas.call_control import (
+    CallControlResult,
+    ConferenceAddRequest,
+    ConsultRequest,
+    DtmfRequest,
+    MuteRequest,
+    TransferRequest,
+)
 from app.schemas.call_center import (
     AcceptOfferRequest,
     AcceptOfferResponse,
@@ -26,6 +34,7 @@ from app.schemas.call_center import (
     CallUserAssociationResponse,
     CallRecordListResponse,
     CancelOutboundRequest,
+    ConsultableAgent,
     DialOutboundRequest,
     DialOutboundResponse,
     DialWebRTCOfferRequest,
@@ -41,6 +50,7 @@ from app.schemas.call_center import (
 from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
 from app.services.call_center.outbound_dial_service import OutboundDialService
 from app.services.call_center.outbound_webrtc_service import OutboundWebRTCService
+from app.repositories.call_record_repository import CallRecordRepository
 from app.services.call_record_service import CallRecordService
 from app.services.call_transcript_service import CallTranscriptService
 from app.services.call_user_association_service import CallUserAssociationService
@@ -85,6 +95,14 @@ async def set_my_agent_status(
     db: AsyncSession = Depends(get_db),
     r: aioredis.Redis = Depends(get_redis),
 ):
+    # Going "ready" requires an available current call device — enforced
+    # server-side so it can't be bypassed by the client.
+    if body.status == "ready":
+        from app.services.agent_call_device_service import AgentCallDeviceService
+
+        await AgentCallDeviceService.ensure_ready_allowed(
+            db, current_user["tenant_id"], current_user["user_id"]
+        )
     return await CcAgentStatusService.set_status(
         db,
         current_user["tenant_id"],
@@ -93,6 +111,66 @@ async def set_my_agent_status(
         body.reason,
         r,
     )
+
+
+@router.post(
+    "/agent-status/me/reset",
+    response_model=AgentStatusResponse,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
+async def reset_my_agent_call_resource(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    r: aioredis.Redis = Depends(get_redis),
+):
+    """Escape hatch for a stranded agent: one-click force-clean every place a
+    stuck call can hide — WebRTC session + lingering kernel leg, all active call
+    records, in-memory conference/consult legs, and the Redis call resource — so
+    the agent can switch status again without any DB surgery."""
+    from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
+    from app.services.call_center.call_control_service import _clear_legs
+
+    tenant_id = current_user["tenant_id"]
+    employee_id = current_user["user_id"]
+    telephony = get_telephony_client()
+
+    # 1. Best-effort tear down the agent's kernel WebRTC leg, then close the
+    #    session — otherwise a stale session could rebuild the in_call resource.
+    session = await AgentWebRTCSessionService.get_active(db, tenant_id, employee_id)
+    if session:
+        if session.get("webrtc_call_id"):
+            try:
+                await telephony.call_hangup(
+                    session["webrtc_call_id"], reason="manual_reset"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await AgentWebRTCSessionService.close(db, tenant_id, employee_id)
+        except Exception:  # noqa: BLE001 — best-effort; may already be closed
+            pass
+
+    # 2. Close EVERY lingering active call record (not just the latest) — else
+    #    the status read below (recover_from_sources) rebuilds in_call from it.
+    for _ in range(10):
+        active = await CallRecordRepository.get_latest_active_for_agent(
+            db, tenant_id, employee_id
+        )
+        if not active:
+            break
+        await CallRecordService.mark_completed(
+            db, tenant_id, active.call_id, hangup_reason="manual_reset"
+        )
+    await db.commit()
+
+    # 3. Drop any conference / consult legs held for this agent.
+    await _clear_legs(tenant_id, employee_id)
+
+    # 4. Force-free the Redis call resource.
+    await CcAgentResourceService.force_release(
+        r, tenant_id, employee_id, reason="manual_reset"
+    )
+    return await CcAgentStatusService.get_for_employee(db, tenant_id, employee_id, r)
 
 
 @router.get(
@@ -107,6 +185,29 @@ async def list_online_agents_for_group(
 ):
     return await CcAgentStatusService.list_online_for_group(
         db, current_user["tenant_id"], group_id
+    )
+
+
+@router.get(
+    "/agents/consultable",
+    response_model=list[ConsultableAgent],
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
+async def list_consultable_agents(
+    keyword: str | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    r: aioredis.Redis = Depends(get_redis),
+):
+    """Workspace agents (excluding the caller) that can be a consult /
+    transfer / conference target, each with their live call-center status.
+    Used by the in-call target picker."""
+    return await CcAgentStatusService.list_consultable_agents(
+        db,
+        current_user["tenant_id"],
+        current_user["user_id"],
+        keyword,
+        r,
     )
 
 
@@ -384,6 +485,242 @@ async def hangup_current_call(
     )
 
 
+# ─────────── In-call control (hold / dtmf / transfer / consult / conference) ───────────
+
+
+@router.post(
+    "/agents/me/current-call/hold",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
+async def hold_current_call(current_user: dict = Depends(get_current_user)):
+    """Put the current agent's customer on hold."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.hold(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+    )
+
+
+@router.post(
+    "/agents/me/current-call/unhold",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
+async def unhold_current_call(current_user: dict = Depends(get_current_user)):
+    """Resume the current agent's held customer."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.unhold(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+    )
+
+
+@router.post(
+    "/agents/me/current-call/dtmf",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
+async def send_dtmf(
+    body: DtmfRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Send DTMF digits into the current agent's live call."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.dtmf(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+        digits=body.digits,
+    )
+
+
+@router.post(
+    "/agents/me/current-call/mute",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.workspace.use"))],
+)
+async def set_mute(
+    body: MuteRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Record the agent's local mute state for the operation trail.
+
+    The actual microphone mute happens in the browser WebRTC layer; this only
+    persists the state-change event.
+    """
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.mute(
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+        muted=body.muted,
+    )
+
+
+@router.post(
+    "/agents/me/current-call/transfer",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.operation.transfer"))],
+)
+async def transfer_current_call(
+    body: TransferRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Blind-transfer the current call to an employee, queue or external number."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.transfer(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+        target_type=body.target_type,
+        target_id=body.target_id,
+        number=body.number,
+    )
+
+
+@router.post(
+    "/agents/me/current-call/consult",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.operation.consult"))],
+)
+async def start_consult(
+    body: ConsultRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Start a consultation: auto-hold the customer and call a third party."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.consult_start(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+        target_type=body.target_type,
+        target_id=body.target_id,
+        number=body.number,
+    )
+
+
+@router.post(
+    "/agents/me/current-call/consult/end",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.operation.consult"))],
+)
+async def end_consult(current_user: dict = Depends(get_current_user)):
+    """End the consultation: drop the third party and resume the customer."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.consult_end(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+    )
+
+
+@router.post(
+    "/agents/me/current-call/conference/add",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.operation.conference"))],
+)
+async def conference_add(
+    body: ConferenceAddRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Call a new participant to (later) merge into a 3-way call."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.conference_add(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+        target_type=body.target_type,
+        target_id=body.target_id,
+        number=body.number,
+    )
+
+
+@router.post(
+    "/agents/me/current-call/conference/merge",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.operation.conference"))],
+)
+async def conference_merge(current_user: dict = Depends(get_current_user)):
+    """Merge the held customer, agent and participant into one 3-way call."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.conference_merge(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+    )
+
+
+@router.post(
+    "/agents/me/current-call/conference/remove",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.operation.conference"))],
+)
+async def conference_remove(current_user: dict = Depends(get_current_user)):
+    """Remove the added participant from the conference."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.conference_remove(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+    )
+
+
+@router.post(
+    "/agents/me/current-call/conference/leave",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.operation.conference"))],
+)
+async def conference_leave(current_user: dict = Depends(get_current_user)):
+    """Leave the conference; the customer and participant keep talking."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.conference_leave(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+    )
+
+
+@router.post(
+    "/agents/me/current-call/conference/end-all",
+    response_model=CallControlResult,
+    dependencies=[Depends(require_permission("call.operation.conference"))],
+)
+async def conference_end_all(current_user: dict = Depends(get_current_user)):
+    """End the call for everyone in the conference."""
+
+    from app.services.call_center.call_control_service import CallControlService
+
+    return await CallControlService.conference_end_all(
+        get_telephony_client(),
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+    )
+
+
 @router.post(
     "/agents/me/current-call/accept",
     response_model=AcceptOfferResponse,
@@ -411,6 +748,14 @@ async def accept_offer(
 
     If the offer expired (timeout / already resolved), step 1's call_id is
     abandoned by best-effort cleanup; the response carries `ok=false`.
+
+    FLOWKIT GAP: this endpoint is the Web-phone accept path (browser SDP →
+    webrtc.offer → bridge). When the agent's current device is a SIP phone the
+    inbound leg must ring the physical phone directly and auto-enter the call on
+    off-hook — no browser accept. FlowKit exposes no "ring a registered
+    extension endpoint" RPC yet, so that media path is not wired here. Until it
+    lands, agents on a SIP phone should keep using the Web phone for inbound;
+    the current-device selection is persisted and ready to drive this branch.
     """
 
     import logging
@@ -430,7 +775,7 @@ async def accept_offer(
             reason=reason,
             expected_offer_id=body.offer_id,
         )
-        get_orchestrator().resolve_offer(
+        await get_orchestrator().deliver_offer_decision(
             body.offer_id, {"accept": False, "reason": reason}
         )
 
@@ -477,7 +822,7 @@ async def accept_offer(
         )
 
         orchestrator = get_orchestrator()
-        resolved = orchestrator.resolve_offer(
+        resolved = await orchestrator.deliver_offer_decision(
             body.offer_id, {"accept": True, "webrtc_call_id": call_id},
         )
         if not resolved:
@@ -548,7 +893,9 @@ async def reject_offer(
         return {"ok": False, "error": "offer_expired"}
 
     orchestrator = get_orchestrator()
-    orchestrator.resolve_offer(body.offer_id, {"accept": False, "reason": "rejected"})
+    await orchestrator.deliver_offer_decision(
+        body.offer_id, {"accept": False, "reason": "rejected"}
+    )
     return {"ok": True}
 
 

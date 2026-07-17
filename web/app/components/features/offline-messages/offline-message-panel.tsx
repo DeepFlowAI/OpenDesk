@@ -51,14 +51,16 @@ import {
   useOfflineMessages,
   type OfflineMessageListStatus,
 } from '@/service/use-offline-messages'
+import { uploadAgentOfflineMessageFile } from '@/service/use-conversation-files'
 import { useAssignableAgents } from '@/service/use-queue-workspace'
 import { useUnifiedFields } from '@/service/use-field-definitions'
 import { useUser } from '@/service/use-users'
-import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
+import { useBottomScrollAnchor } from '@/hooks/use-bottom-scroll-anchor'
+import { WorkspaceMessageBubble } from '@/app/components/features/chat/workspace-message-bubble'
 import { DeferredConversationComposer } from '@/app/components/features/chat/deferred-conversation-composer'
 import { FieldValueDisplay } from '@/app/components/features/field-system/field-value-display'
+import { getDataScope, hasPermission } from '@/utils/permissions'
 import { t } from '@/utils/i18n'
-import { isLeaveMessagePromptMessage } from '@/lib/offline-message-event'
 import type { Socket } from 'socket.io-client'
 
 type OfflineAssignedOptions = { openConversation?: boolean; messageSent?: boolean }
@@ -91,6 +93,9 @@ type OfflineMessageListSidebarProps = {
   onSelect: (id: number) => void
   loading: boolean
   onRefresh: () => void
+  onAssigned?: OfflineAssignedHandler
+  readOnly?: boolean
+  agentStatus?: AgentStatus | null
   showTitle?: boolean
 }
 
@@ -103,6 +108,8 @@ type OfflineMessageDetailPanelProps = {
   socket?: Socket | null
   auxiliaryPanelWidth?: number
   resizeHandle?: ReactNode
+  composerInputHeight?: number
+  onComposerInputHeightCommit?: (height: number) => void
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -192,76 +199,6 @@ function entryToMessage(entry: OfflineMessageEntry): Message {
   }
 }
 
-function OfflineMessageBubble({
-  entry,
-  offlineMessageId,
-  visitorName,
-}: {
-  entry: OfflineMessageEntry
-  offlineMessageId: number
-  visitorName: string | null
-}) {
-  const { locale } = useLocaleStore()
-  const message = entryToMessage(entry)
-  const attachmentType =
-    message.content_type === 'image' ? 'image' : message.content_type === 'file' ? 'file' : null
-  const isVisitor = message.sender_type === 'visitor'
-  const isLeaveMessagePrompt = isLeaveMessagePromptMessage(message)
-  const senderLabel = visitorName || message.sender_name || t('ws.chat.queueVisitor', locale)
-
-  return (
-    <div
-      className={cn(
-        'mb-4 flex gap-2.5',
-        isVisitor ? 'flex-row' : isLeaveMessagePrompt ? 'flex-row-reverse' : 'justify-center',
-      )}
-    >
-      {isVisitor ? (
-        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#4A8C5C] text-sm font-medium text-white">
-          {senderLabel.charAt(0)}
-        </div>
-      ) : isLeaveMessagePrompt ? (
-        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#D6E6F9] text-sm font-medium text-[#4A80B5]">
-          s
-        </div>
-      ) : null}
-      <div
-        className={cn(
-          'flex min-w-0 max-w-[70%] flex-col',
-          isVisitor ? 'items-start' : isLeaveMessagePrompt ? 'items-end' : 'items-center',
-        )}
-      >
-        {isVisitor && (
-          <span className="mb-1 text-[11px] text-[#737373]">
-            {senderLabel}
-          </span>
-        )}
-        {attachmentType ? (
-          <MessageAttachment
-            offlineMessageId={offlineMessageId}
-            contentType={attachmentType}
-            content={message.content}
-          />
-        ) : (
-          <div
-            className={cn(
-              'max-w-full rounded-[18px] px-3.5 py-2.5 text-sm leading-normal break-words break-all whitespace-pre-wrap',
-              isVisitor && 'border border-[#E0E0E0] bg-[#F0F0F0] text-[#1a1a1a]',
-              isLeaveMessagePrompt && 'bg-[#DBEAFE] text-[#1a1a1a]',
-              !isVisitor && !isLeaveMessagePrompt && 'text-[#999999]',
-            )}
-          >
-            {message.content}
-          </div>
-        )}
-        <span className={cn('mt-1 text-[11px] text-[#999999]', isLeaveMessagePrompt && 'text-right')}>
-          {formatTime(message.created_at, locale)}
-        </span>
-      </div>
-    </div>
-  )
-}
-
 export function OfflineMessageListSidebar({
   status,
   items,
@@ -269,12 +206,62 @@ export function OfflineMessageListSidebar({
   onSelect,
   loading,
   onRefresh,
+  onAssigned,
+  readOnly = false,
+  agentStatus = null,
   showTitle = true,
 }: OfflineMessageListSidebarProps) {
   const { locale } = useLocaleStore()
+  const { user } = useAuthStore()
+  const assignSelf = useAssignOfflineMessageToSelf()
+  const assignAgent = useAssignOfflineMessageToAgent()
+  const [assigningSelfId, setAssigningSelfId] = useState<number | null>(null)
+  const [assignDialogItem, setAssignDialogItem] = useState<OfflineMessage | null>(null)
+  const [toast, setToast] = useState<string | null>(null)
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const canAssignSelf = hasPermission(user, 'chat.queue.assign_self')
+  const canAssignOther =
+    hasPermission(user, 'chat.queue.assign_other') && getDataScope(user, 'offline_message') !== 'self'
+
+  useEffect(() => () => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+  }, [])
+
+  const showToast = (text: string) => {
+    setToast(text)
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = setTimeout(() => setToast(null), 2500)
+  }
+
+  const handleAssignSelf = async (item: OfflineMessage) => {
+    if (agentStatus?.status === 'offline') {
+      showToast(t('ws.chat.queueAssignSelfOffline', locale))
+      return
+    }
+    setAssigningSelfId(item.id)
+    try {
+      const result = await assignSelf.mutateAsync({ id: item.id })
+      onAssigned?.(result, item.id)
+    } catch (err) {
+      const backendMessage = await readBackendErrorMessage(err)
+      showToast(
+        backendMessage === ACTIVE_CONVERSATION_ERROR
+          ? t('ws.chat.queueAssignActiveConversation', locale)
+          : t('ws.chat.queueAssignFailed', locale),
+      )
+    } finally {
+      setAssigningSelfId(null)
+    }
+  }
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[#FAFAFA]">
+    <div className="relative flex h-full min-h-0 flex-col bg-[#FAFAFA]">
+      {toast && (
+        <div className="pointer-events-none absolute left-1/2 top-3 z-40 -translate-x-1/2 rounded-md border border-[#D8D8D8] bg-white px-3 py-1.5 text-xs text-[#1a1a1a] shadow-sm">
+          {toast}
+        </div>
+      )}
       {showTitle && (
         <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
           <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
@@ -305,43 +292,132 @@ export function OfflineMessageListSidebar({
           </div>
         ) : (
           <div className="flex flex-col gap-1.5">
-            {items.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => onSelect(item.id)}
-                className={cn(
-                  'w-full rounded-md border px-3 py-2.5 text-left transition-colors',
-                  selectedId === item.id
-                    ? 'border-[#E0E0E0] bg-white shadow-sm'
-                    : 'border-transparent hover:border-[#E0E0E0] hover:bg-white',
-                )}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <span className="min-w-0 truncate text-sm font-medium text-foreground">
-                    {visitorLabel(item, locale)}
-                  </span>
-                  <span
-                    className={cn(
-                      'shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium',
-                      statusBadgeClass(item.status),
+            {items.map((item) => {
+              const selected = selectedId === item.id
+              const assigningSelf = assigningSelfId === item.id
+              const showAssignActions = !readOnly && item.status === 'pending' && (canAssignSelf || canAssignOther)
+              const assignDisabled = item.message_count === 0
+              return (
+                <div
+                  key={item.id}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => onSelect(item.id)}
+                  onKeyDown={(event) => {
+                    if (event.target !== event.currentTarget) return
+                    if (event.key !== 'Enter' && event.key !== ' ') return
+                    event.preventDefault()
+                    onSelect(item.id)
+                  }}
+                  className={cn(
+                    'relative w-full cursor-pointer overflow-hidden rounded-[9px] px-3 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    selected
+                      ? '-mx-2 w-[calc(100%+1rem)] rounded-none bg-white px-5'
+                      : 'hover:-mx-2 hover:w-[calc(100%+1rem)] hover:rounded-none hover:bg-white/60 hover:px-5',
+                  )}
+                >
+                  {selected && (
+                    <>
+                      <span aria-hidden="true" className="absolute inset-x-0 top-0 h-px bg-[linear-gradient(to_right,color-mix(in_oklab,var(--color-success)_15%,transparent),var(--color-success))]" />
+                      <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-px bg-[linear-gradient(to_right,color-mix(in_oklab,var(--color-success)_15%,transparent),var(--color-success))]" />
+                      <span aria-hidden="true" className="absolute inset-y-0 right-0 w-1 bg-success" />
+                    </>
+                  )}
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="min-w-0 truncate text-sm font-medium text-foreground">
+                      {visitorLabel(item, locale)}
+                    </span>
+                    <span
+                      className={cn(
+                        'shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium',
+                        statusBadgeClass(item.status),
+                      )}
+                    >
+                      {statusLabel(item.status, locale)}
+                    </span>
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">
+                    {previewText(item, locale)}
+                  </p>
+                  <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                    <span className="min-w-0 truncate">{item.channel?.name || '-'}</span>
+                    {showAssignActions ? (
+                      <div className="flex shrink-0 items-center gap-1">
+                        {canAssignSelf && (
+                          <button
+                            type="button"
+                            data-action="offline-assign-self"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              void handleAssignSelf(item)
+                            }}
+                            disabled={assigningSelf || assignDisabled}
+                            className="flex h-7 w-7 items-center justify-center rounded-md border border-[#E5E5E5] bg-white text-[#737373] transition-colors hover:border-primary hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
+                            aria-label={t('ws.chat.queueAssignSelf', locale)}
+                            title={t('ws.chat.queueAssignSelf', locale)}
+                          >
+                            {assigningSelf ? (
+                              <IconLoader2 size={15} stroke={1.8} className="animate-spin" />
+                            ) : (
+                              <IconUserCheck size={15} stroke={1.8} />
+                            )}
+                          </button>
+                        )}
+                        {canAssignOther && (
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              setAssignDialogItem(item)
+                            }}
+                            disabled={assignDisabled}
+                            className="flex h-7 w-7 items-center justify-center rounded-md border border-[#E5E5E5] bg-white text-[#737373] transition-colors hover:border-primary hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
+                            aria-label={t('ws.chat.queueAssignOther', locale)}
+                            title={t('ws.chat.queueAssignOther', locale)}
+                          >
+                            <IconUsers size={15} stroke={1.8} />
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="shrink-0">{formatTime(item.last_message_at || item.created_at, locale)}</span>
                     )}
-                  >
-                    {statusLabel(item.status, locale)}
-                  </span>
+                  </div>
                 </div>
-                <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">
-                  {previewText(item, locale)}
-                </p>
-                <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
-                  <span className="truncate">{item.channel?.name || '-'}</span>
-                  <span className="shrink-0">{formatTime(item.last_message_at || item.created_at, locale)}</span>
-                </div>
-              </button>
-            ))}
+              )
+            })}
           </div>
         )}
       </div>
+
+      {assignDialogItem && (
+        <OfflineMessageAssignDialog
+          open
+          offlineMessageId={assignDialogItem.id}
+          detail={assignDialogItem}
+          submitting={assignAgent.isPending}
+          onClose={() => setAssignDialogItem(null)}
+          onSubmit={async (agentId, reason) => {
+            const offlineMessageId = assignDialogItem.id
+            try {
+              const result = await assignAgent.mutateAsync({
+                id: offlineMessageId,
+                agentId,
+                reason,
+              })
+              setAssignDialogItem(null)
+              onAssigned?.(result, offlineMessageId)
+            } catch (err) {
+              const backendMessage = await readBackendErrorMessage(err)
+              showToast(
+                backendMessage === ACTIVE_CONVERSATION_ERROR
+                  ? t('ws.chat.queueAssignActiveConversation', locale)
+                  : t('ws.chat.queueAssignFailed', locale),
+              )
+            }
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -377,6 +453,8 @@ export function OfflineMessageDetailPanel({
   socket = null,
   auxiliaryPanelWidth,
   resizeHandle,
+  composerInputHeight,
+  onComposerInputHeightCommit,
 }: OfflineMessageDetailPanelProps) {
   const { locale } = useLocaleStore()
   const detailQuery = useOfflineMessage(selectedId)
@@ -411,7 +489,6 @@ export function OfflineMessageDetailPanel({
     try {
       const result = await assignSelf.mutateAsync({ id: detail.id })
       onAssigned?.(result, detail.id)
-      showToast(t('ws.chat.queueAssignedToMe', locale))
     } catch (err) {
       const backendMessage = await readBackendErrorMessage(err)
       showToast(
@@ -447,6 +524,9 @@ export function OfflineMessageDetailPanel({
     || assignSelf.isPending
     || assignAgent.isPending
   const deferredConversation = detail ? offlineMessageDraftConversation(detail) : null
+  const messageScroll = useBottomScrollAnchor<HTMLDivElement>(
+    `${detail?.id ?? 'none'}:${detail?.messages.length ?? 0}`,
+  )
   const resolveConversationForSend = async () => {
     if (!detail || detail.status !== 'pending') throw new Error('Offline message is required')
     if (isOffline) {
@@ -473,7 +553,7 @@ export function OfflineMessageDetailPanel({
 
   return (
     <>
-      <main className="relative flex min-w-0 flex-1 flex-col">
+      <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         {toast && (
           <div className="pointer-events-none absolute left-1/2 top-4 z-30 -translate-x-1/2 rounded-md border border-[#D8D8D8] bg-white px-3 py-1.5 text-xs text-[#1a1a1a] shadow-sm">
             {toast}
@@ -552,7 +632,11 @@ export function OfflineMessageDetailPanel({
               </div>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto bg-[#FAFAFA] px-6 py-5">
+            <div
+              ref={messageScroll.scrollRef}
+              onScroll={messageScroll.onScroll}
+              className="min-h-0 flex-1 overflow-y-auto bg-[#FAFAFA] px-6 py-5"
+            >
               {detail.messages.length === 0 ? (
                 <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
                   {locale === 'zh' ? '暂无留言内容' : 'No message content'}
@@ -560,10 +644,13 @@ export function OfflineMessageDetailPanel({
               ) : (
                 <div className="flex flex-col">
                   {detail.messages.map((entry) => (
-                    <OfflineMessageBubble
+                    <WorkspaceMessageBubble
                       key={entry.id}
-                      entry={entry}
-                      offlineMessageId={detail.id}
+                      message={entryToMessage(entry)}
+                      locale={locale}
+                      mode="preview"
+                      showTimestamp
+                      attachmentContext={{ kind: 'offline_message', offlineMessageId: detail.id }}
                       visitorName={detail.visitor?.name || detail.visitor_name || null}
                     />
                   ))}
@@ -572,17 +659,21 @@ export function OfflineMessageDetailPanel({
             </div>
 
             {!readOnly && detail.status === 'pending' && detail.can_assign_self && detail.messages.length > 0 && deferredConversation && (
-              <div className="shrink-0 border-t border-[#E5E5E5] bg-[#FAFAFA] pt-3">
-                <div className="mb-2 px-6 text-xs text-muted-foreground">
-                  {isOffline ? t('ws.chat.queueQuickReplyOffline', locale) : t('ws.chat.queueQuickReplyHint', locale)}
-                </div>
+              <div className="shrink-0">
                 <DeferredConversationComposer
                   conversation={deferredConversation}
                   socket={socket}
                   locale={locale}
                   disabled={isProcessing || isOffline}
                   disabledReason={isOffline ? t('ws.chat.queueQuickReplyOffline', locale) : null}
+                  placeholder={t('ws.chat.queueQuickReplyHint', locale)}
+                  inputHeight={composerInputHeight}
+                  onInputHeightCommit={onComposerInputHeightCommit}
                   resolveConversationForSend={resolveConversationForSend}
+                  uploadDeferredRichTextImage={(file) => uploadAgentOfflineMessageFile({
+                    offlineMessageId: detail.id,
+                    file,
+                  })}
                   onResolved={(_conversation, result) => {
                     const assignment = deferredAssignmentRef.current
                     if (!assignment || !detail) return
@@ -608,11 +699,6 @@ export function OfflineMessageDetailPanel({
                     agentId,
                     reason,
                   })
-                  const name =
-                    result.assigned_agent?.display_name
-                    || result.assigned_agent?.name
-                    || `#${agentId}`
-                  showToast(t('ws.chat.queueAssignedToAgent', locale, { name }))
                   setAssignOpen(false)
                   onAssigned?.(result, detail.id)
                 } catch (err) {
@@ -654,7 +740,7 @@ function OfflineMessageAssignDialog({
 }: {
   open: boolean
   offlineMessageId: number
-  detail: OfflineMessageDetail
+  detail: OfflineMessage
   submitting: boolean
   onClose: () => void
   onSubmit: (agentId: number, reason: string) => Promise<void>
@@ -742,8 +828,13 @@ function OfflineMessageAssignDialog({
                       selected && 'bg-primary/10 hover:bg-primary/10',
                     )}
                   >
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium">
-                      {displayAgentName(agent).charAt(0).toUpperCase()}
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted text-sm font-medium">
+                      {agent.avatar ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={agent.avatar} alt={displayAgentName(agent)} className="h-full w-full object-cover" />
+                      ) : (
+                        displayAgentName(agent).charAt(0).toUpperCase()
+                      )}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-medium">{displayAgentName(agent)}</div>
@@ -1072,6 +1163,9 @@ export function OfflineMessagePanel({
           onSelect={setSelectedId}
           loading={listQuery.isLoading}
           onRefresh={() => void listQuery.refetch()}
+          onAssigned={handleAssigned}
+          readOnly={readOnly}
+          agentStatus={agentStatus}
         />
       </aside>
       <OfflineMessageDetailPanel

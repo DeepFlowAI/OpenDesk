@@ -8,15 +8,19 @@ online-chat workspace in Redis. The two are intentionally separate:
     used by orchestrator (queue assignment) and by call history reports.
   - That one: high-frequency Socket.IO presence (per second), Redis-only.
 """
+import logging
+
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import ConflictError, NotFoundError
 from app.repositories.agent_status_repository import AgentStatusRepository
 from app.repositories.agent_webrtc_session_repository import AgentWebRTCSessionRepository
 from app.repositories.call_record_repository import CallRecordRepository
 from app.services.cc_agent_resource_service import CcAgentResourceService
 
+
+logger = logging.getLogger(__name__)
 
 VALID_STATUS = {"ready", "busy", "break", "after_call_work", "offline"}
 
@@ -70,9 +74,102 @@ class CcAgentStatusService:
                     active_call_state=active_call.state if active_call else None,
                     webrtc_state=active_session.state if active_session else None,
                 )
+            else:
+                # Self-heal a ghost in_call left by a lost call-end event, so a
+                # stranded agent recovers on the next status poll instead of
+                # being locked out for the 4h lease.
+                snapshot = await CcAgentStatusService.reconcile_agent(
+                    db, r, tenant_id, employee_id,
+                    snapshot=snapshot, chosen_status=base["status"],
+                )
         except Exception:  # noqa: BLE001
             return base | _empty_resource_fields()
         return base | _resource_fields(snapshot)
+
+    @staticmethod
+    async def reconcile_agent(
+        db: AsyncSession,
+        r: aioredis.Redis,
+        tenant_id: int,
+        employee_id: int,
+        *,
+        snapshot: dict | None = None,
+        chosen_status: str | None = None,
+    ) -> dict | None:
+        """Single reconcile point: heal a call resource that has drifted from
+        reality. Two drifts are healed:
+
+        1. **Ghost in_call** — stuck ``in_call`` with **no** active call record
+           and **no** active WebRTC session (its kernel call-end event was lost).
+           It would otherwise hold the 4h in_call lease and lock the agent out.
+           Released.
+        2. **Stale-offline presence** — the agent chose ``ready`` and their
+           browser is connected, but the Redis resource drifted to ``offline``
+           while idle (e.g. left behind by a release). It would wrongly make the
+           agent unreservable for inbound / consult / transfer. Restored to
+           ready. (``chosen_status`` is the durable PG status; passing it lets
+           this run on the ordinary status poll without an extra DB read.)
+
+        Cheap in the common case: the extra DB reads only run for an ``in_call``
+        snapshot, and the presence heal only for an ``offline`` snapshot — so a
+        healthy ready/idle agent (the vast majority of polls) does neither.
+        Gated strictly to ``in_call`` for (1) — a genuine in_call always has an
+        ``in_progress`` call record, so it can't race a live ringing offer.
+        """
+        if snapshot is None:
+            snapshot = await CcAgentResourceService.get_snapshot(
+                r, tenant_id, employee_id
+            )
+        if not snapshot:
+            return snapshot
+        state = snapshot.get("resource_state")
+
+        if state == "in_call":
+            active_call = await CallRecordRepository.get_latest_active_for_agent(
+                db, tenant_id, employee_id
+            )
+            active_session = await AgentWebRTCSessionRepository.get_active(
+                db, tenant_id, employee_id
+            )
+            if active_call or active_session:
+                return snapshot  # a real call backs the in_call state — leave it
+            logger.info(
+                "reconcile_agent: releasing ghost in_call for agent=%s/%s "
+                "(no active call record or WebRTC session)",
+                tenant_id, employee_id,
+            )
+            try:
+                await CcAgentResourceService.force_release(
+                    r, tenant_id, employee_id, reason="reconcile_ghost",
+                )
+            except Exception:  # noqa: BLE001
+                return snapshot
+            return await CcAgentResourceService.get_snapshot(
+                r, tenant_id, employee_id
+            )
+
+        # Stale-offline presence: the agent chose ready and is connected, but
+        # the resource drifted offline while idle → restore so they're reservable.
+        if (
+            chosen_status == "ready"
+            and snapshot.get("visible_status") == "offline"
+            and state in {"idle", "unavailable"}
+        ):
+            from app.services.agent_status_service import AgentStatusService
+
+            if await AgentStatusService.is_connected(r, tenant_id, employee_id):
+                logger.info(
+                    "reconcile_agent: restoring ready presence for agent=%s/%s "
+                    "(chose ready, connected, resource drifted offline)",
+                    tenant_id, employee_id,
+                )
+                try:
+                    return await CcAgentResourceService.set_visible_status(
+                        r, tenant_id, employee_id, "ready"
+                    )
+                except Exception:  # noqa: BLE001
+                    return snapshot
+        return snapshot
 
     @staticmethod
     async def get_resource_snapshot(
@@ -126,13 +223,81 @@ class CcAgentStatusService:
             raise NotFoundError(f"Invalid status: {status}")
         snapshot = None
         if r is not None:
-            snapshot = await CcAgentResourceService.set_visible_status(
-                r, tenant_id, employee_id, status
-            )
+            try:
+                snapshot = await CcAgentResourceService.set_visible_status(
+                    r, tenant_id, employee_id, status
+                )
+            except ConflictError:
+                # The resource is flagged occupied, but this is a *manual* status
+                # change the agent explicitly requested. Occupation left behind by
+                # a failed accept / stale in_call lease would otherwise lock them
+                # out of changing status forever. Honor the explicit action:
+                # force-release the stuck resource and apply the new status.
+                logger.info(
+                    "set_status: force-releasing stuck resource for manual change "
+                    "agent=%s/%s -> %s",
+                    tenant_id, employee_id, status,
+                )
+                await CcAgentResourceService.force_release(
+                    r, tenant_id, employee_id, reason="manual_status_change",
+                )
+                snapshot = await CcAgentResourceService.set_visible_status(
+                    r, tenant_id, employee_id, status
+                )
         base = await CcAgentStatusService.sync_pg_status(
             db, tenant_id, employee_id, status, reason
         )
         return base | (_resource_fields(snapshot) if snapshot else _empty_resource_fields())
+
+    @staticmethod
+    async def list_consultable_agents(
+        db: AsyncSession,
+        tenant_id: int,
+        actor_employee_id: int,
+        keyword: str | None,
+        r: aioredis.Redis | None = None,
+    ) -> list[dict]:
+        """Agents an in-call operator may consult / transfer / conference to.
+
+        Returns every active agent in the tenant holding ``call.workspace.use``
+        (the caller themselves excluded), each annotated with their current
+        call-center status (ready / busy / break / after_call_work / offline).
+
+        The DB ``agent_status`` only records the status an agent last *chose* —
+        it is never flipped to offline when their browser disconnects. So the
+        reported status is downgraded to ``offline`` for any agent whose
+        Socket.IO connection is gone, otherwise a colleague who closed their tab
+        would still appear "就绪" here and be picked as an unreachable target.
+        """
+        from app.repositories.sip_extension_repository import SipExtensionRepository
+        from app.services.agent_status_service import AgentStatusService
+
+        employees = await SipExtensionRepository.list_workspace_agents(
+            db, tenant_id, keyword, exclude_employee_id=actor_employee_id
+        )
+        status_rows = await AgentStatusRepository.list_for_employees(
+            db, tenant_id, [e.id for e in employees]
+        )
+        status_by_id = {row.employee_id: row.status for row in status_rows}
+
+        async def _effective_status(employee_id: int) -> str:
+            status = status_by_id.get(employee_id, "offline")
+            if status == "offline" or r is None:
+                return status
+            # A live status only counts if the browser is actually connected.
+            if not await AgentStatusService.is_connected(r, tenant_id, employee_id):
+                return "offline"
+            return status
+
+        return [
+            {
+                "employee_id": emp.id,
+                "name": emp.display_name or emp.name or emp.username,
+                "avatar": emp.avatar,
+                "status": await _effective_status(emp.id),
+            }
+            for emp in employees
+        ]
 
     @staticmethod
     async def list_online_for_group(

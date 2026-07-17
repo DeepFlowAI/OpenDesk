@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { ThreadPrimitive, type MessageState } from '@assistant-ui/react'
 import {
   useVisitorChatConfig,
+  isOpenAgentMessageStreaming,
   type VisitorMessageMeta,
 } from './visitor-chat-runtime'
 import { useVisitorChatStore } from '@/context/visitor-chat-store'
@@ -100,6 +101,21 @@ function shouldShowAvatar(cur: Message, next: Message | null): boolean {
   return next.sender_type !== cur.sender_type
 }
 
+function visitorMessageDomAttrs(
+  msg: Pick<Message, 'id' | 'sender_type' | 'status' | 'metadata'>,
+  options?: { messageStatus?: string },
+) {
+  const messageStatus = options?.messageStatus ?? msg.status
+  return {
+    'data-visitor-message-id': msg.id,
+    'data-sender-type': msg.sender_type,
+    ...(messageStatus ? { 'data-message-status': messageStatus } : {}),
+    ...(msg.sender_type === 'bot'
+      ? { 'data-agent-streaming': isOpenAgentMessageStreaming(msg.metadata) ? 'true' : 'false' }
+      : {}),
+  }
+}
+
 function isCurrentNavigationReload(): boolean {
   if (typeof performance === 'undefined') return false
   const nav = performance.getEntriesByType('navigation')[0]
@@ -151,11 +167,22 @@ function toOriginalMessage(
   }
 }
 
-function ConversationDivider({ label }: { label: string }) {
+function ConversationDivider({
+  label,
+  unreadLabel,
+}: {
+  label: string
+  unreadLabel?: string | null
+}) {
   return (
     <div className="flex items-center gap-3 px-5 py-2 text-xs text-muted-foreground">
       <div className="h-px flex-1 bg-border" />
       <span className="shrink-0">{label}</span>
+      {unreadLabel && (
+        <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-foreground">
+          {unreadLabel}
+        </span>
+      )}
       <div className="h-px flex-1 bg-border" />
     </div>
   )
@@ -205,7 +232,7 @@ function QueueStatusNotice({
 
   return (
     <div className="px-5 py-1">
-      <div className="flex items-start gap-3 border-l-2 border-primary/60 bg-primary/5 px-3 py-2">
+      <div className="flex items-start gap-3 border-l-2 border-primary/30 bg-primary/5 px-3 py-2">
         {showDefaultCopy ? (
           <div className="min-w-0 text-sm leading-6">
             <p className="font-medium text-foreground">
@@ -240,7 +267,9 @@ function UnreadReplyDivider({
         <div className="h-px flex-1 bg-border" />
         <div className="flex max-w-[80%] items-center gap-2">
           <span className="truncate">
-            {locale === 'zh' ? '客服已回复你的留言' : 'Support replied to your message'}
+            {locale === 'zh'
+              ? '你的留言已进入在线会话，可直接沟通'
+              : 'Your message is now an online conversation. You can reply here.'}
           </span>
           {unread && (
             <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-foreground">
@@ -259,6 +288,7 @@ function isUnreadOfflineReply(
   conversation: VisitorConversationHistoryItem | VisitorUnreadOfflineReplyItem,
 ): conversation is VisitorUnreadOfflineReplyItem {
   return 'offline_message_public_id' in conversation
+    && Boolean(conversation.offline_message_public_id)
 }
 
 function HistoryActionButton({
@@ -349,6 +379,7 @@ function HistoryConversationBlock({
     : locale === 'zh'
       ? '历史会话'
       : 'Past conversation'
+  const hasAgentUnread = (conversation.agent_unread_message_ids?.length ?? 0) > 0
 
   return (
     <div className="space-y-2">
@@ -359,7 +390,12 @@ function HistoryConversationBlock({
           timestamp={conversation.customer_unread_at || conversation.last_message_at}
         />
       ) : (
-        <ConversationDivider label={dividerLabel} />
+        <ConversationDivider
+          label={dividerLabel}
+          unreadLabel={
+            hasAgentUnread ? (locale === 'zh' ? '有新回复' : 'New replies') : null
+          }
+        />
       )}
       {conversation.messages_truncated && (
         <SystemMessage
@@ -378,32 +414,35 @@ function HistoryConversationBlock({
         }
 
         if (msg.sender_type === 'system') {
-          if (isOpenAgentHandoffEventMessage(msg)) {
-            return (
-              <HumanHandoffEventMessage
-                key={msg.id}
-                content={msg.content}
-                config={config}
-                locale={locale}
-                handoffEventType={resolveHandoffEventType(msg.metadata)}
-              />
-            )
-          }
-          return isWelcomeLikeContentType(msg.content_type) || isLeaveMessagePromptMessage(msg) ? (
-            <VisitorWelcomeBubble
+          return (
+            <div
               key={msg.id}
-              message={msg}
-              config={config}
-            />
-          ) : (
-            <SystemMessage key={msg.id} content={displaySystemMessageContent(msg.content, msg.metadata, locale)} />
+              {...visitorMessageDomAttrs(msg)}
+              className="rounded-2xl transition-colors duration-300"
+            >
+              {isOpenAgentHandoffEventMessage(msg) ? (
+                <HumanHandoffEventMessage
+                  content={msg.content}
+                  config={config}
+                  locale={locale}
+                  handoffEventType={resolveHandoffEventType(msg.metadata)}
+                />
+              ) : isWelcomeLikeContentType(msg.content_type) || isLeaveMessagePromptMessage(msg) ? (
+                <VisitorWelcomeBubble
+                  message={msg}
+                  config={config}
+                />
+              ) : (
+                <SystemMessage content={displaySystemMessageContent(msg.content, msg.metadata, locale)} />
+              )}
+            </div>
           )
         }
 
         return (
           <div
             key={msg.id}
-            data-visitor-message-id={msg.id}
+            {...visitorMessageDomAttrs(msg)}
             className="rounded-2xl transition-colors duration-300"
           >
             {shouldShowTimestamp(msg, prev) && (
@@ -497,6 +536,8 @@ export function VisitorThread({
     onQueueLeaveMessage,
     onHandoffQueueFullContinueBot,
     onAssistSendMessage,
+    onRetryOfflineMessage,
+    onRetryOpenAgentAttachment,
     onRequestHumanHandoff,
     onDismissHumanHandoff,
     onSatisfactionInitiate,
@@ -559,6 +600,7 @@ export function VisitorThread({
     [messages],
   )
   const conversationEnded = ended || conversationStatus === 'closed'
+  const threadConversationStatus = conversationEnded ? 'closed' : conversationStatus
   const showQueueLeaveMessageButton = isQueued
     && !offlineMode
     && !conversationEnded
@@ -567,12 +609,13 @@ export function VisitorThread({
   const queueLeaveMessageButtonLabel = config.queue_leave_message_button_label
     || (locale === 'zh' ? '留言' : 'Leave a message')
   const queueLeaveMessageButton = showQueueLeaveMessageButton ? (
-    <div className="px-5 pb-1">
+    <div className="flex justify-center px-5 pb-1">
       <button
         type="button"
+        data-action="queue-leave-message"
         onClick={() => void onQueueLeaveMessage()}
         disabled={queueLeaveMessageLoading}
-        className="inline-flex min-h-7 items-center gap-1.5 rounded-full bg-primary px-3 py-1 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-60"
+        className="inline-flex min-h-7 items-center justify-center gap-1.5 rounded-md border border-[#D4D4D4] bg-white px-3 py-1 text-xs font-medium text-[#404040] transition-colors hover:bg-[#F5F5F5] disabled:pointer-events-none disabled:opacity-60"
       >
         {queueLeaveMessageLoading && <IconLoader2 size={13} className="animate-spin" />}
         {queueLeaveMessageButtonLabel}
@@ -616,6 +659,19 @@ export function VisitorThread({
   const showComposerSatisfactionButton =
     !botMode && (satisfactionCanInitiate || satisfactionInvitation?.invitation_source === 'visitor')
   const currentUnreadReplyKey = currentUnreadReplyNotice?.conversationPublicId ?? null
+  // Once a conversation appears in the loaded history (full transcript), drop it
+  // from the proactive unread teasers so it is not duplicated and its full
+  // context stays visible under "view history".
+  const loadedHistoryIds = useMemo(
+    () => new Set(historyConversations.map((conversation) => conversation.conversation_public_id)),
+    [historyConversations],
+  )
+  const visibleUnreadReplyConversations = useMemo(
+    () => unreadReplyConversations.filter(
+      (conversation) => !loadedHistoryIds.has(conversation.conversation_public_id),
+    ),
+    [loadedHistoryIds, unreadReplyConversations],
+  )
   const visibleUnreadReplyKey = useMemo(() => {
     const ids = unreadReplyConversations
       .filter((conversation) => conversation.offline_reply_unread)
@@ -707,7 +763,10 @@ export function VisitorThread({
   }, [onUnreadReplyVisible, visibleUnreadReplyKey])
 
   return (
-    <ThreadPrimitive.Root className="relative flex h-full flex-col">
+    <ThreadPrimitive.Root
+      className="relative flex h-full flex-col"
+      {...(threadConversationStatus ? { 'data-conversation-status': threadConversationStatus } : {})}
+    >
       {showHeader && (
         <ChatHeader
           channel={channel}
@@ -757,7 +816,7 @@ export function VisitorThread({
           />
         )}
 
-        {!initializing && unreadReplyConversations.map((conversation) => (
+        {!initializing && visibleUnreadReplyConversations.map((conversation) => (
           <HistoryConversationBlock
             key={`unread-${conversation.conversation_public_id}`}
             conversation={conversation}
@@ -965,7 +1024,7 @@ export function VisitorThread({
 
                   return (
                     <div
-                      data-visitor-message-id={original.id}
+                      {...visitorMessageDomAttrs(original, { messageStatus: meta?.messageStatus })}
                       className="rounded-2xl transition-colors duration-300"
                     >
                       {meta?.showTimestamp && message.createdAt && (
@@ -1039,6 +1098,15 @@ export function VisitorThread({
                           renderAssistantParts
                           allMessages={messages}
                           onEditRecalledMessage={requestComposerInsert}
+                          onRetryMessage={
+                            offlineMode && original.status === 'failed'
+                              ? (failedMessage) => void onRetryOfflineMessage(failedMessage)
+                              : botMode
+                                && original.status === 'failed'
+                                && original.metadata?.open_agent_attachment === true
+                                ? (failedMessage) => void onRetryOpenAgentAttachment(failedMessage)
+                              : undefined
+                          }
                         />
                       )}
                     </div>

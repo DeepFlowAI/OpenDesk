@@ -47,6 +47,23 @@ class AgentStatusRepository:
         return row
 
     @staticmethod
+    async def list_for_employees(
+        db: AsyncSession, tenant_id: int, employee_ids: list[int]
+    ) -> list[AgentStatus]:
+        """Fetch status rows for a set of employees in one query (avoids N+1).
+
+        Employees with no row yet are simply absent from the result; callers
+        should treat a missing row as ``offline``.
+        """
+        if not employee_ids:
+            return []
+        q = select(AgentStatus).where(
+            AgentStatus.tenant_id == tenant_id,
+            AgentStatus.employee_id.in_(employee_ids),
+        )
+        return list((await db.execute(q)).scalars().all())
+
+    @staticmethod
     async def list_by_status(
         db: AsyncSession, tenant_id: int, status: str
     ) -> list[AgentStatus]:

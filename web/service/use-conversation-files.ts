@@ -9,10 +9,11 @@ import type {
   PublicOfflineMessageSendResponse,
   VisitorEnvironmentPayload,
 } from '@/service/use-visitor-chat'
-import { get, postForm } from './base'
+import { get, post, postForm } from './base'
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? ''
 const publicClient = ky.create({ prefixUrl: API_BASE, timeout: 60000 })
+export const CONVERSATION_IMAGE_DISPLAY_PROCESS = 'image/resize,w_720/quality,q_80'
 
 const authHeaders = (token: string) => ({ Authorization: `Bearer ${token}` })
 
@@ -95,6 +96,41 @@ export async function uploadAgentConversationFile(params: {
   )
 }
 
+export async function prepareKnowledgeAttachmentForConversation(params: {
+  conversationId: number
+  attachmentId: number
+}): Promise<ConversationFileUploadResponse> {
+  return post<ConversationFileUploadResponse>(
+    `v1/conversations/${params.conversationId}/knowledge-attachments/${params.attachmentId}/prepare`,
+  )
+}
+
+export async function uploadAgentQueueTaskFile(params: {
+  taskId: number
+  file: File
+}): Promise<ConversationFileUploadResponse> {
+  const formData = new FormData()
+  formData.append('file', params.file)
+
+  return postForm<ConversationFileUploadResponse>(
+    `v1/workspace/queue/tasks/${params.taskId}/files`,
+    formData,
+  )
+}
+
+export async function uploadAgentOfflineMessageFile(params: {
+  offlineMessageId: number
+  file: File
+}): Promise<ConversationFileUploadResponse> {
+  const formData = new FormData()
+  formData.append('file', params.file)
+
+  return postForm<ConversationFileUploadResponse>(
+    `v1/offline-messages/${params.offlineMessageId}/files`,
+    formData,
+  )
+}
+
 export async function getConversationFileUrl(params: {
   conversationId?: number
   conversationPublicId?: string
@@ -104,6 +140,7 @@ export async function getConversationFileUrl(params: {
   fileId: string
   downloadName?: string
   download?: boolean
+  imageProcess?: string
 }): Promise<ConversationFileAccessResponse> {
   if (params.offlineMessagePublicId && params.visitorSessionToken) {
     return publicClient
@@ -113,6 +150,7 @@ export async function getConversationFileUrl(params: {
           offline_message_public_id: params.offlineMessagePublicId,
           ...(params.downloadName ? { download_name: params.downloadName } : {}),
           ...(params.download ? { download: 'true' } : {}),
+          ...(params.imageProcess ? { image_process: params.imageProcess } : {}),
         },
       })
       .json<ConversationFileAccessResponse>()
@@ -126,6 +164,7 @@ export async function getConversationFileUrl(params: {
           conversation_public_id: params.conversationPublicId,
           ...(params.downloadName ? { download_name: params.downloadName } : {}),
           ...(params.download ? { download: 'true' } : {}),
+          ...(params.imageProcess ? { image_process: params.imageProcess } : {}),
         },
       })
       .json<ConversationFileAccessResponse>()
@@ -138,6 +177,7 @@ export async function getConversationFileUrl(params: {
         searchParams: {
           ...(params.downloadName ? { download_name: params.downloadName } : {}),
           ...(params.download ? { download: 'true' } : {}),
+          ...(params.imageProcess ? { image_process: params.imageProcess } : {}),
         },
       },
     )
@@ -153,6 +193,7 @@ export async function getConversationFileUrl(params: {
       searchParams: {
         ...(params.downloadName ? { download_name: params.downloadName } : {}),
         ...(params.download ? { download: 'true' } : {}),
+        ...(params.imageProcess ? { image_process: params.imageProcess } : {}),
       },
     },
   )

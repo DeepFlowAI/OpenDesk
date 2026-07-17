@@ -102,6 +102,10 @@ class TestKnowledgeRecommendationService:
                 "app.services.knowledge_recommendation_service.KnowledgeDirectoryRepository.list_all",
                 new=AsyncMock(return_value=[]),
             ),
+            patch(
+                "app.services.knowledge_recommendation_service.KnowledgeDocumentAttachmentRepository.list_for_document_ids",
+                new=AsyncMock(return_value={}),
+            ),
             patch.object(KnowledgeRecommendationService, "_document_response", return_value=response_item),
         ):
             response = await KnowledgeRecommendationService.list_recommendations(

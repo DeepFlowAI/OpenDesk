@@ -155,6 +155,17 @@ class OpenAgentAgentSummary(BaseModel):
     status: str
 
 
+class OpenAgentAttachmentHandoffStatus(BaseModel):
+    ready: bool
+    reason: Literal[
+        "ready",
+        "not_configured",
+        "tool_unavailable",
+        "agent_unavailable",
+    ]
+    tool_id: int | None = None
+
+
 class OpenAgentWelcomeMessageBlock(BaseModel):
     type: Literal["markdown", "embed"]
     content: str | None = None

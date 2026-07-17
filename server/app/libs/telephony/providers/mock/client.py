@@ -20,6 +20,7 @@ from app.libs.telephony.base import (
     CallEvent,
     EventHandler,
     ReconnectHandler,
+    TelephonyRPCError,
 )
 
 
@@ -43,6 +44,28 @@ class MockTelephonyClient(BaseTelephonyClient):
             "conversation_id": "mock-conv",
             "status": "originating",
         }
+        # Test injection slots for the SIP-extension RPCs. Set `*_error` to an
+        # exception (e.g. TelephonyMethodNotFoundError) to simulate a kernel
+        # with extensions disabled.
+        self.extension_query_response: dict = {"extension": "", "registered": False}
+        self.extension_query_error: Exception | None = None
+        self.extension_list_response: list[dict] = []
+        self.extension_list_error: Exception | None = None
+        self.registrar_info_response: dict | None = None
+        self.registrar_info_error: Exception | None = None
+        # Test injection slots for the multi-party room RPCs. Set `room_error`
+        # to an exception (e.g. TelephonyMethodNotFoundError) to simulate a
+        # kernel with rooms disabled. `room_create_response` seeds the room_id.
+        self.room_create_response: dict = {"room_id": "mock-room", "legs": []}
+        self.room_error: Exception | None = None
+        # Tracks which legs are in each room so the mock can reject re-adding a
+        # leg already in the room — the real kernel raises RPC -32003 "leg
+        # already in room", which a record-only mock would silently pass.
+        self._room_legs: dict[str, set[str]] = {}
+        # `call.play` returns a play_id; `play_error` simulates a rejected play
+        # (e.g. unsupported audio container) so callers can prove they degrade.
+        self.play_response: dict = {"play_id": "mock-play", "status": "playing"}
+        self.play_error: Exception | None = None
 
     # ── Lifecycle ──
 
@@ -105,6 +128,31 @@ class MockTelephonyClient(BaseTelephonyClient):
 
     async def call_stop(self, call_id: str, *, target: str = "all") -> None:
         self.recorded.append(("call.stop", {"call_id": call_id, "target": target}))
+
+    async def call_play(
+        self,
+        call_id: str,
+        *,
+        text: str | None = None,
+        audio_url: str | None = None,
+        loop: bool = False,
+        interval_ms: int | None = None,
+        voice: str | None = None,
+    ) -> dict:
+        self.recorded.append((
+            "call.play",
+            {
+                "call_id": call_id,
+                "text": text,
+                "audio_url": audio_url,
+                "loop": loop,
+                "interval_ms": interval_ms,
+                "voice": voice,
+            },
+        ))
+        if self.play_error is not None:
+            raise self.play_error
+        return self.play_response
 
     async def call_dtmf(
         self, call_id: str, digits: str, *, duration_ms: int | None = None,
@@ -178,6 +226,71 @@ class MockTelephonyClient(BaseTelephonyClient):
     async def call_unbridge(self, call_id: str, other_call_id: str) -> None:
         self.recorded.append(("call.unbridge", {"call_id": call_id, "other_call_id": other_call_id}))
 
+    # ── Multi-party rooms ──
+
+    async def room_create(self, *, leg_call_ids: list[str] | None = None) -> dict:
+        self.recorded.append(("room.create", {"leg_call_ids": leg_call_ids}))
+        if self.room_error is not None:
+            raise self.room_error
+        room_id = self.room_create_response.get("room_id", "mock-room")
+        self._room_legs[room_id] = set(leg_call_ids or [])
+        return self.room_create_response
+
+    async def room_add_leg(self, room_id: str, call_id: str) -> dict:
+        self.recorded.append(("room.add_leg", {"room_id": room_id, "call_id": call_id}))
+        if self.room_error is not None:
+            raise self.room_error
+        legs = self._room_legs.setdefault(room_id, set())
+        if call_id in legs:
+            raise TelephonyRPCError(-32003, "call state invalid: leg already in room")
+        legs.add(call_id)
+        return {"room_id": room_id}
+
+    async def room_remove_leg(self, room_id: str, call_id: str) -> dict:
+        self.recorded.append(("room.remove_leg", {"room_id": room_id, "call_id": call_id}))
+        if self.room_error is not None:
+            raise self.room_error
+        self._room_legs.setdefault(room_id, set()).discard(call_id)
+        return {"room_id": room_id}
+
+    async def room_replace_leg(
+        self, room_id: str, old_call_id: str, new_call_id: str
+    ) -> dict:
+        self.recorded.append((
+            "room.replace_leg",
+            {"room_id": room_id, "old_call_id": old_call_id, "new_call_id": new_call_id},
+        ))
+        if self.room_error is not None:
+            raise self.room_error
+        legs = self._room_legs.setdefault(room_id, set())
+        if new_call_id in legs:
+            raise TelephonyRPCError(-32003, "call state invalid: leg already in room")
+        legs.discard(old_call_id)
+        legs.add(new_call_id)
+        return {"room_id": room_id}
+
+    async def room_set_mix_gain(
+        self, room_id: str, *, listener_call_id: str, speaker_call_id: str, gain: float
+    ) -> dict:
+        self.recorded.append((
+            "room.set_mix_gain",
+            {
+                "room_id": room_id,
+                "listener_call_id": listener_call_id,
+                "speaker_call_id": speaker_call_id,
+                "gain": gain,
+            },
+        ))
+        if self.room_error is not None:
+            raise self.room_error
+        return {"room_id": room_id}
+
+    async def room_close(self, room_id: str, *, reason: str | None = None) -> dict:
+        self.recorded.append(("room.close", {"room_id": room_id, "reason": reason}))
+        if self.room_error is not None:
+            raise self.room_error
+        return {"room_id": room_id}
+
     async def call_hold(self, call_id: str) -> None:
         self.recorded.append(("call.hold", {"call_id": call_id}))
 
@@ -186,14 +299,19 @@ class MockTelephonyClient(BaseTelephonyClient):
 
     async def call_originate(
         self,
-        uri: str,
+        uri: str | None = None,
         *,
+        extension: str | None = None,
         caller_id: str | None = None,
         trunk_id: str | None = None,
         timeout_ms: int | None = None,
         headers: dict[str, str] | None = None,
     ) -> dict:
-        params: dict[str, Any] = {"uri": uri}
+        params: dict[str, Any] = {}
+        if uri:
+            params["uri"] = uri
+        if extension:
+            params["extension"] = extension
         if caller_id:
             params["caller_id"] = caller_id
         if trunk_id:
@@ -204,6 +322,24 @@ class MockTelephonyClient(BaseTelephonyClient):
             params["headers"] = headers
         self.recorded.append(("call.originate", params))
         return self.originate_response
+
+    async def extension_query(self, extension: str) -> dict:
+        self.recorded.append(("extension.query", {"extension": extension}))
+        if self.extension_query_error is not None:
+            raise self.extension_query_error
+        return self.extension_query_response
+
+    async def extension_list(self) -> list[dict]:
+        self.recorded.append(("extension.list", {}))
+        if self.extension_list_error is not None:
+            raise self.extension_list_error
+        return self.extension_list_response
+
+    async def registrar_info(self) -> dict | None:
+        self.recorded.append(("system.registrar_info", {}))
+        if self.registrar_info_error is not None:
+            raise self.registrar_info_error
+        return self.registrar_info_response
 
     async def call_list(self) -> list[dict]:
         self.recorded.append(("call.list", {}))

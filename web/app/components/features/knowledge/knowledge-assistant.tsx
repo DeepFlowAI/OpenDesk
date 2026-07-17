@@ -34,19 +34,27 @@ import {
 } from '@/service/use-knowledge'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
+import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import {
   flattenKnowledgeDirectories,
+  knowledgeDocumentHasComposerBody,
   knowledgeDirectoryPath,
-  knowledgeHasUnsupportedSendContent,
+  knowledgeHtmlToComposerText,
   knowledgeHtmlToMessageText,
+  stripKnowledgeHtml,
+  type KnowledgeComposerContentType,
 } from './knowledge-utils'
+import { KnowledgeAttachmentList } from './knowledge-attachment-list'
 
 const PER_PAGE = 20
 const SEND_MAX_LENGTH = 4000
 
 export type KnowledgeAssistantActionContext = {
   document: KnowledgeDocument
+  composerText: string
+  messageHtml: string
   messageText: string
+  requestId: string
 }
 
 type KnowledgeAssistantProps = {
@@ -54,6 +62,7 @@ type KnowledgeAssistantProps = {
   mode?: 'chat' | 'drawer'
   conversationId?: number | null
   canUse?: boolean
+  useContentType?: KnowledgeComposerContentType
   useDisabledReason?: string
   canSend?: boolean
   sendDisabledReason?: string
@@ -78,11 +87,30 @@ function messageTextFor(document: KnowledgeDocument): string {
   return knowledgeHtmlToMessageText(document.content_html)
 }
 
-function actionBlockReason(document: KnowledgeDocument, action: 'use' | 'send'): string | null {
+function messageHtmlFor(document: KnowledgeDocument): string {
+  return document.content_html.trim()
+}
+
+function sendHasContent(document: KnowledgeDocument): boolean {
+  return Boolean(
+    messageTextFor(document)
+    || /<img\b/i.test(messageHtmlFor(document))
+    || document.attachments.length > 0,
+  )
+}
+
+function actionBlockReason(
+  document: KnowledgeDocument,
+  action: 'use' | 'send',
+  useContentType: KnowledgeComposerContentType,
+): string | null {
   const messageText = messageTextFor(document)
-  if (!messageText) return 'empty'
-  if (action === 'send' && messageText.length > SEND_MAX_LENGTH) return 'too-long'
-  if (action === 'send' && knowledgeHasUnsupportedSendContent(document.content_html)) return 'unsupported'
+  if (action === 'send') {
+    if (!sendHasContent(document)) return 'empty'
+    if (messageText.length > SEND_MAX_LENGTH) return 'too-long'
+    return null
+  }
+  if (!knowledgeDocumentHasComposerBody(document, useContentType)) return 'empty'
   return null
 }
 
@@ -91,6 +119,7 @@ export function KnowledgeAssistant({
   mode = 'chat',
   conversationId = null,
   canUse = false,
+  useContentType = 'text',
   useDisabledReason,
   canSend = false,
   sendDisabledReason,
@@ -105,6 +134,7 @@ export function KnowledgeAssistant({
   const [page, setPage] = useState(1)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [confirmDoc, setConfirmDoc] = useState<KnowledgeDocument | null>(null)
+  const [confirmRequestId, setConfirmRequestId] = useState<string | null>(null)
   const [sending, setSending] = useState(false)
   const query = useDebouncedValue(search)
   const isRecommendedCategory = showRecommendations && category === 'recommended'
@@ -162,7 +192,6 @@ export function KnowledgeAssistant({
     if (!reason) return ''
     if (reason === 'empty') return t('ws.knowledge.emptyContent', locale)
     if (reason === 'too-long') return t('ws.knowledge.contentTooLong', locale)
-    if (reason === 'unsupported') return t('ws.knowledge.unsupportedContent', locale)
     return reason
   }
 
@@ -177,28 +206,41 @@ export function KnowledgeAssistant({
   }
 
   const handleUse = async (document: KnowledgeDocument) => {
-    const block = actionBlockReason(document, 'use')
+    const block = actionBlockReason(document, 'use', useContentType)
     if (block || !canUse || !onUse) {
       toast.error(reasonText(block) || useDisabledReason || t('ws.knowledge.selectConversation', locale))
       return
     }
-    await onUse({ document, messageText: messageTextFor(document) })
+    await onUse({
+      document,
+      composerText: knowledgeHtmlToComposerText(document.content_html),
+      messageHtml: messageHtmlFor(document),
+      messageText: messageTextFor(document),
+      requestId: crypto.randomUUID(),
+    })
   }
 
   const handleConfirmSend = async () => {
-    if (!confirmDoc || !onSend) return
-    const block = actionBlockReason(confirmDoc, 'send')
+    if (!confirmDoc || !confirmRequestId || !onSend) return
+    const block = actionBlockReason(confirmDoc, 'send', useContentType)
     if (block || !canSend) {
       toast.error(reasonText(block) || sendDisabledReason || t('ws.knowledge.selectConversation', locale))
       return
     }
     setSending(true)
     try {
-      await onSend({ document: confirmDoc, messageText: messageTextFor(confirmDoc) })
+      await onSend({
+        document: confirmDoc,
+        composerText: knowledgeHtmlToComposerText(confirmDoc.content_html),
+        messageHtml: messageHtmlFor(confirmDoc),
+        messageText: messageTextFor(confirmDoc),
+        requestId: confirmRequestId,
+      })
       toast.success(t('ws.knowledge.sent', locale))
       setConfirmDoc(null)
-    } catch {
-      toast.error(t('ws.knowledge.sendFailed', locale))
+      setConfirmRequestId(null)
+    } catch (error) {
+      toast.error(error instanceof Error && error.message ? error.message : t('ws.knowledge.sendFailed', locale))
     } finally {
       setSending(false)
     }
@@ -213,8 +255,8 @@ export function KnowledgeAssistant({
   }
 
   const renderActions = (document: KnowledgeDocument, compact = false) => {
-    const useReason = reasonText(actionBlockReason(document, 'use')) || (!canUse ? useDisabledReason : '')
-    const sendReason = reasonText(actionBlockReason(document, 'send')) || (!canSend ? sendDisabledReason : '')
+    const useReason = reasonText(actionBlockReason(document, 'use', useContentType)) || (!canUse ? useDisabledReason : '')
+    const sendReason = reasonText(actionBlockReason(document, 'send', useContentType)) || (!canSend ? sendDisabledReason : '')
     const buttonSize = compact ? 'xs' : 'sm'
 
     return (
@@ -243,7 +285,10 @@ export function KnowledgeAssistant({
             size={buttonSize}
             disabled={Boolean(sendReason)}
             title={sendReason}
-            onClick={() => setConfirmDoc(document)}
+            onClick={() => {
+              setConfirmRequestId(crypto.randomUUID())
+              setConfirmDoc(document)
+            }}
           >
             <IconSend size={14} />
             {t('ws.knowledge.send', locale)}
@@ -341,7 +386,12 @@ export function KnowledgeAssistant({
             >
               <h3 className="line-clamp-2 text-sm font-semibold text-foreground">{document.title}</h3>
               <p className="mt-1 truncate text-xs text-muted-foreground">{knowledgeDirectoryPath(document) || '-'}</p>
-              <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted-foreground">{messageTextFor(document)}</p>
+              <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted-foreground">
+                {messageTextFor(document)
+                  || (document.attachments.length > 0
+                    ? (locale === 'zh' ? `${document.attachments.length} 个附件` : `${document.attachments.length} attachments`)
+                    : '')}
+              </p>
             </button>
             <div className="mt-3">{renderActions(document, true)}</div>
           </article>
@@ -350,8 +400,8 @@ export function KnowledgeAssistant({
     )
   }
 
-  const confirmText = confirmDoc ? messageTextFor(confirmDoc) : ''
-  const confirmBlock = confirmDoc ? actionBlockReason(confirmDoc, 'send') : null
+  const confirmHtml = confirmDoc ? messageHtmlFor(confirmDoc) : ''
+  const confirmBlock = confirmDoc ? actionBlockReason(confirmDoc, 'send', useContentType) : null
   const confirmDisabledReason = reasonText(confirmBlock) || (!canSend ? sendDisabledReason : '')
 
   return (
@@ -477,15 +527,22 @@ export function KnowledgeAssistant({
               </div>
             ) : (
               <>
-                {knowledgeHasUnsupportedSendContent(selectedDocument.content_html) && (
-                  <div className="mb-3 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-foreground">
-                    {t('ws.knowledge.unsupportedContent', locale)}
+                {stripKnowledgeHtml(selectedDocument.content_html) && (
+                  <SafeHtml
+                    html={selectedDocument.content_html}
+                    className="text-sm leading-6 text-foreground [&_a]:text-primary [&_blockquote]:border-l [&_blockquote]:border-border [&_blockquote]:pl-3 [&_li]:ml-5 [&_ol]:list-decimal [&_p]:mb-3 [&_ul]:list-disc"
+                  />
+                )}
+                {selectedDocument.attachments.length > 0 && (
+                  <div className={cn(stripKnowledgeHtml(selectedDocument.content_html) && 'mt-4 border-t border-border pt-4')}>
+                    <p className="mb-2 text-xs font-medium text-muted-foreground">
+                      {locale === 'zh'
+                        ? `附件（${selectedDocument.attachments.length}）`
+                        : `Attachments (${selectedDocument.attachments.length})`}
+                    </p>
+                    <KnowledgeAttachmentList attachments={selectedDocument.attachments} isZh={locale === 'zh'} compact />
                   </div>
                 )}
-                <SafeHtml
-                  html={selectedDocument.content_html}
-                  className="text-sm leading-6 text-foreground [&_a]:text-primary [&_blockquote]:border-l [&_blockquote]:border-border [&_blockquote]:pl-3 [&_li]:ml-5 [&_ol]:list-decimal [&_p]:mb-3 [&_ul]:list-disc"
-                />
               </>
             )}
           </div>
@@ -493,26 +550,58 @@ export function KnowledgeAssistant({
         </div>
       )}
 
-      <Dialog open={confirmDoc != null} onOpenChange={(open) => !open && setConfirmDoc(null)}>
+      <Dialog
+        open={confirmDoc != null}
+        onOpenChange={(open) => {
+          if (!open && !sending) {
+            setConfirmDoc(null)
+            setConfirmRequestId(null)
+          }
+        }}
+      >
         <DialogContent
-          className="w-[500px] max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white p-0 shadow-lg ring-0"
+          className="max-h-[calc(100vh-2rem)] min-w-0 w-[560px] max-w-[calc(100vw-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white p-0 shadow-lg ring-0"
           showCloseButton={!sending}
         >
           {confirmDoc && (
             <>
-              <DialogHeader className="px-5 pt-5">
+              <DialogHeader className="min-w-0 px-5 pt-5">
                 <DialogTitle>{t('ws.knowledge.confirmTitle', locale)}</DialogTitle>
               </DialogHeader>
-              <div className="px-5 pb-2">
-                <pre className="max-h-56 whitespace-pre-wrap rounded-lg border border-border bg-background p-3 text-xs leading-5 text-foreground">
-                  {confirmText}
-                </pre>
+              <div className="min-w-0 overflow-hidden px-5 pb-2 pt-3">
+                {stripKnowledgeHtml(confirmHtml) && (
+                  <SafeHtml
+                    html={confirmHtml}
+                    className={cn(
+                      richTextListStyleClass,
+                      'max-h-56 min-w-0 overflow-auto rounded-lg border border-border bg-background p-3 text-sm leading-6 text-foreground [overflow-wrap:anywhere] [&_*]:max-w-full [&_*]:break-words [&_*]:[overflow-wrap:anywhere]',
+                    )}
+                  />
+                )}
+                {confirmDoc.attachments.length > 0 && (
+                  <div className={cn(stripKnowledgeHtml(confirmHtml) && 'mt-3')}>
+                    <p className="mb-2 text-xs font-medium text-muted-foreground">
+                      {locale === 'zh'
+                        ? `附件将逐个发送（${confirmDoc.attachments.length}）`
+                        : `Attachments will be sent separately (${confirmDoc.attachments.length})`}
+                    </p>
+                    <KnowledgeAttachmentList attachments={confirmDoc.attachments} isZh={locale === 'zh'} compact />
+                  </div>
+                )}
                 {confirmDisabledReason && (
                   <p className="mt-2 text-xs text-destructive">{confirmDisabledReason}</p>
                 )}
               </div>
-              <DialogFooter className="rounded-b-2xl border-t border-[#E5E5E5] px-5">
-                <Button type="button" variant="outline" onClick={() => setConfirmDoc(null)} disabled={sending}>
+              <DialogFooter className="min-w-0 rounded-b-2xl border-t border-[#E5E5E5] px-5">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setConfirmDoc(null)
+                    setConfirmRequestId(null)
+                  }}
+                  disabled={sending}
+                >
                   {t('ws.common.cancel', locale)}
                 </Button>
                 <Button

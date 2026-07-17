@@ -72,6 +72,7 @@ const botHandoffClassName: Record<BotHandoffStatus, string> = {
   waiting_confirmation: 'bg-warning/10 text-warning',
   handoff_in_progress: 'bg-warning/10 text-warning',
   in_queue: 'bg-warning/10 text-warning',
+  queue_offline_canceled: 'bg-muted text-muted-foreground',
   succeeded: 'bg-success/10 text-success',
   failed: 'bg-destructive/10 text-destructive',
   dismissed: 'bg-muted text-muted-foreground',
@@ -196,6 +197,7 @@ export function SessionInfoPanel({ record, onSummaryDirtyChange, activeTab: cont
         {showReceptionTab && (
           <button
             type="button"
+            data-testid="session-record-tab-reception"
             onClick={() => switchTab('reception')}
             className={cn('flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors', resolvedActiveTab === 'reception' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
           >

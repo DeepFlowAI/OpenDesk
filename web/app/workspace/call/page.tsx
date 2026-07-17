@@ -14,12 +14,13 @@
  *   mic_check → granted → idle → incoming → on_call → wrap_up
  */
 import { useEffect, useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
+import Link from 'next/link'
 import {
   IconCheck,
   IconChevronDown,
+  IconClipboardList,
   IconDownload,
-  IconMicrophone,
   IconMicrophoneOff,
   IconPhone,
   IconPhoneIncoming,
@@ -29,7 +30,10 @@ import {
 } from '@tabler/icons-react'
 import { toast } from 'sonner'
 
+import { AgentCallBar } from '@/app/components/features/call-center/agent-call-bar'
+import { CallDeviceSelector } from '@/app/components/features/call-center/call-device-selector'
 import { DialBar } from '@/app/components/features/call-center/dial-bar'
+import { MyOutboundTargetsView } from '@/app/components/features/call-center/my-outbound-targets-view'
 import {
   CallTranscriptHistory,
   CallTranscriptPanel,
@@ -47,7 +51,8 @@ import {
 } from '@/context/call-center-runtime'
 import { useAuthStore } from '@/context/auth-store'
 import { cn } from '@/lib/utils'
-import { useCallRecord } from '@/service/use-call-center'
+import { useCallRecord, useResetAgentStatus } from '@/service/use-call-center'
+import { useMyCallDevices, useMyCurrentCallDevice } from '@/service/use-agent-devices'
 import { useSystemInfo } from '@/service/use-system'
 import type { AgentStatus } from '@/models/call-center'
 import { hasPermission } from '@/utils/permissions'
@@ -77,6 +82,7 @@ function formatDuration(ms: number | null): string {
 
 export default function CallWorkspacePage() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const currentUser = useAuthStore((state) => state.user)
   const { data: systemInfo } = useSystemInfo()
   const {
@@ -107,10 +113,16 @@ export default function CallWorkspacePage() {
     completeWrapUp,
     handleDialStarted,
   } = useCallCenterRuntime()
+  const { data: devicesData } = useMyCallDevices({ refetchInterval: 15_000 })
+  const { data: currentDevice } = useMyCurrentCallDevice()
+  const resetStatus = useResetAgentStatus()
   const [statusDropdownOpen, setStatusDropdownOpen] = useState(false)
   const [callCenterNoticeDismissed, setCallCenterNoticeDismissed] = useState(false)
   const statusDropdownRef = useRef<HTMLDivElement>(null)
   const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
+  const canExecuteOutboundTasks = hasPermission(currentUser, 'engagement.outbound_task.execute')
+  const showingOutboundTasks =
+    canExecuteOutboundTasks && searchParams.get('view') === 'outbound-tasks'
 
   useEffect(() => {
     if (!canCreateTicket && callSummaryTab === 'ticket') {
@@ -134,6 +146,13 @@ export default function CallWorkspacePage() {
   const currentStatus = phase === 'wrap_up' ? 'after_call_work' : (status?.status ?? 'offline')
   const currentStatusOption = STATUS_OPTIONS.find((o) => o.value === currentStatus) ?? STATUS_OPTIONS[4]
   const statusSelectorDisabled = statusChangePending || mic.state === 'checking'
+
+  // A usable current device is required before the agent can go "ready" or dial.
+  // The server enforces the same rule (409); the UI disables it as a first line.
+  const activeDevice = (devicesData?.items ?? []).find(
+    (device) => device.device_type === currentDevice?.device_type,
+  )
+  const hasUsableDevice = !!currentDevice?.device_type && !!activeDevice?.available
 
   return (
     <div className="flex h-full flex-col">
@@ -176,17 +195,21 @@ export default function CallWorkspacePage() {
               >
                 {STATUS_OPTIONS.map((option) => {
                   const active = currentStatus === option.value
+                  const readyBlocked = option.value === 'ready' && !hasUsableDevice
                   return (
                     <button
                       key={option.value}
                       type="button"
                       role="menuitem"
+                      disabled={readyBlocked}
+                      title={readyBlocked ? '请先选择可用呼叫设备' : undefined}
                       onClick={() => {
                         setStatusDropdownOpen(false)
                         if (option.value !== currentStatus) void setAgentStatus(option.value)
                       }}
                       className={cn(
-                        'flex w-full items-center gap-2 px-3 py-2 text-[13px] text-[#1a1a1a] transition-colors hover:bg-[#F5F5F5]',
+                        'flex w-full items-center gap-2 px-3 py-2 text-[13px] text-[#1a1a1a] transition-colors',
+                        readyBlocked ? 'cursor-not-allowed opacity-50' : 'hover:bg-[#F5F5F5]',
                         active && 'font-semibold',
                       )}
                     >
@@ -196,6 +219,27 @@ export default function CallWorkspacePage() {
                     </button>
                   )
                 })}
+                {/* Escape hatch: force-free a stranded call resource when a
+                    lost call-end event leaves the agent stuck (409 occupied). */}
+                <div className="my-1 border-t border-[#EEE]" />
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={resetStatus.isPending}
+                  onClick={async () => {
+                    setStatusDropdownOpen(false)
+                    try {
+                      await resetStatus.mutateAsync()
+                      toast.success('已重置通话状态，可重新切换')
+                    } catch {
+                      toast.error('重置失败，请重试')
+                    }
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-[13px] text-muted-foreground transition-colors hover:bg-[#F5F5F5] disabled:opacity-50"
+                >
+                  <span className="h-2.5 w-2.5 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate text-left">重置通话状态</span>
+                </button>
               </div>
             )}
           </div>
@@ -225,6 +269,22 @@ export default function CallWorkspacePage() {
               麦克风权限未授权，请在浏览器中允许后刷新。
             </p>
           )}
+          <CallDeviceSelector />
+          {canExecuteOutboundTasks && (
+            <Link
+              href="/workspace/call?view=outbound-tasks"
+              aria-current={showingOutboundTasks ? 'page' : undefined}
+              className={cn(
+                'mt-3 flex h-9 items-center justify-center gap-2 rounded-md border text-sm font-medium transition-colors',
+                showingOutboundTasks
+                  ? 'border-primary/30 bg-primary/10 text-primary'
+                  : 'border-border bg-white hover:bg-muted/50',
+              )}
+            >
+              <IconClipboardList size={16} />
+              我的外呼对象
+            </Link>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto px-2 py-2">
@@ -233,12 +293,15 @@ export default function CallWorkspacePage() {
             <p className="px-2 py-4 text-xs text-muted-foreground">暂无通话记录</p>
           ) : (
             (records?.items ?? []).slice(0, 20).map((r) => {
-              const active = r.id === selectedRecordId
+              const active = !showingOutboundTasks && r.id === selectedRecordId
               return (
                 <button
                   type="button"
                   key={r.id}
-                  onClick={() => setSelectedRecordId(r.id)}
+                  onClick={() => {
+                    setSelectedRecordId(r.id)
+                    if (showingOutboundTasks) router.push('/workspace/call')
+                  }}
                   className={`my-1 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${
                     active ? 'bg-primary/10 ring-1 ring-primary/40' : 'hover:bg-muted'
                   }`}
@@ -293,8 +356,10 @@ export default function CallWorkspacePage() {
           )}
           {phase === 'idle' && (
             <DialBar
-              disabled={mic.state === 'checking'}
-              statusHint={leg.state === 'ready' ? '等待来电' : undefined}
+              disabled={mic.state === 'checking' || !hasUsableDevice}
+              statusHint={
+                !hasUsableDevice ? '请先选择可用呼叫设备' : leg.state === 'ready' ? '等待来电' : undefined
+              }
               onDialNumberChange={setDraftDialNumber}
               onOutboundNumberChange={(_, phoneNumber) => setDraftOutboundNumber(phoneNumber)}
               onDialStarted={(info) => void handleDialStarted(info)}
@@ -306,11 +371,37 @@ export default function CallWorkspacePage() {
                 <span className="grid h-9 w-9 place-items-center rounded-full bg-amber-100">
                   <IconPhoneIncoming size={16} className="animate-pulse text-amber-700" />
                 </span>
-                <span className="font-bold text-amber-800">来电</span>
+                <span className="font-bold text-amber-800">
+                  {incoming.call_type === 'internal_consult'
+                    ? '咨询请求'
+                    : incoming.call_type === 'internal_transfer'
+                      ? '转接请求'
+                      : incoming.call_type === 'internal_conference'
+                        ? '会议邀请'
+                        : '来电'}
+                </span>
               </div>
-              <Field label="通话类型" value="呼入" />
-              <Field label="用户号码" value={incoming.from || '未知号码'} strong />
-              <Field label="服务号码" value={incoming.to || '—'} />
+              {incoming.call_type === 'internal_consult' ||
+              incoming.call_type === 'internal_transfer' ||
+              incoming.call_type === 'internal_conference' ? (
+                <Field
+                  label={
+                    incoming.call_type === 'internal_transfer'
+                      ? '转接自'
+                      : incoming.call_type === 'internal_conference'
+                        ? '邀请自'
+                        : '咨询自'
+                  }
+                  value={incoming.from || '同事'}
+                  strong
+                />
+              ) : (
+                <>
+                  <Field label="通话类型" value="呼入" />
+                  <Field label="用户号码" value={incoming.from || '未知号码'} strong />
+                  <Field label="服务号码" value={incoming.to || '—'} />
+                </>
+              )}
               <Field
                 label="响铃时长"
                 value={formatDuration(callStart ? now - callStart : 0)}
@@ -368,43 +459,7 @@ export default function CallWorkspacePage() {
               </div>
             </div>
           )}
-          {phase === 'on_call' && incoming && (
-            <div className="flex items-center gap-6">
-              <div className="flex items-center gap-2">
-                <span className="grid h-9 w-9 place-items-center rounded-full bg-green-100">
-                  <IconPhone size={16} className="text-green-700" />
-                </span>
-                <span className="font-bold text-green-800">通话中</span>
-              </div>
-              <Field
-                label="通话类型"
-                value={incoming.direction === 'outbound' ? '呼出' : '呼入'}
-              />
-              <Field
-                label={incoming.direction === 'outbound' ? '被叫号码' : '用户号码'}
-                value={
-                  incoming.direction === 'outbound'
-                    ? incoming.to || '—'
-                    : incoming.from || '未知号码'
-                }
-                strong
-              />
-              <Field
-                label="通话时长"
-                value={formatDuration(callStart ? now - callStart : 0)}
-                strong
-                color="text-green-700"
-              />
-              <div className="ml-auto flex gap-2">
-                <button type="button" className="rounded-full border border-border p-2 text-foreground/70">
-                  <IconMicrophone size={16} />
-                </button>
-                <button type="button" onClick={hangup} className="rounded-full bg-red-500 p-2.5 text-white">
-                  <IconPhoneOff size={16} />
-                </button>
-              </div>
-            </div>
-          )}
+          {phase === 'on_call' && incoming && <AgentCallBar />}
           {phase === 'wrap_up' && (
             <div className="flex items-center gap-6">
               <div className="flex items-center gap-2">
@@ -426,7 +481,12 @@ export default function CallWorkspacePage() {
         </div>
 
         {/* Aux info area */}
-        <div className={`flex-1 overflow-y-auto ${showEmptyCallState ? 'bg-white' : 'bg-muted p-5'}`}>
+        {showingOutboundTasks ? (
+          <div className="min-h-0 flex-1">
+            <MyOutboundTargetsView onStartCall={() => router.push('/workspace/call')} />
+          </div>
+        ) : (
+          <div className={`flex-1 overflow-y-auto ${showEmptyCallState ? 'bg-white' : 'bg-muted p-5'}`}>
           {showEmptyCallState ? (
             <CallWorkspaceEmptyState />
           ) : (
@@ -527,15 +587,13 @@ export default function CallWorkspacePage() {
                       if (type === 'success') {
                         const ticket = payload?.ticket
                         if (ticket) {
-                          let toastId: string | number | undefined
-                          const openTicket = () => {
-                            if (toastId !== undefined) toast.dismiss(toastId)
-                            router.push(`/workspace/tickets/${ticket.id}?from=list`)
-                          }
-                          toastId = toast.success(
+                          const toastId = toast.success(
                             <button
                               type="button"
-                              onClick={openTicket}
+                              onClick={() => {
+                                toast.dismiss(toastId)
+                                router.push(`/workspace/tickets/${ticket.id}?from=list`)
+                              }}
                               className="block w-full cursor-pointer appearance-none border-0 bg-transparent p-0 text-left font-medium text-inherit underline-offset-2 hover:underline"
                             >
                               {text}
@@ -555,7 +613,8 @@ export default function CallWorkspacePage() {
               </section>
             </div>
           )}
-        </div>
+          </div>
+        )}
       </main>
       </div>
     </div>

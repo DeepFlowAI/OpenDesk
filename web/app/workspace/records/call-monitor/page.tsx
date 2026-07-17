@@ -2,11 +2,13 @@
 
 import { IconRefresh } from '@tabler/icons-react'
 import { EmployeeCallMonitorTable } from '@/app/components/features/call-monitor/employee-call-monitor-table'
+import { LiveCallsSection } from '@/app/components/features/call-monitor/live-calls-section'
 import { CallMonitorTodayCards } from '@/app/components/features/call-monitor/today-cards'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
 import { cn } from '@/lib/utils'
 import { useCallMonitor } from '@/service/use-call-monitor'
+import { useSystemInfo } from '@/service/use-system'
 import { t } from '@/utils/i18n'
 import { hasPermission } from '@/utils/permissions'
 
@@ -33,6 +35,8 @@ export default function CallMonitorPage() {
   const { locale } = useLocaleStore()
   const user = useAuthStore((state) => state.user)
   const canView = hasPermission(user, 'call.monitor.view')
+  const { data: systemInfo } = useSystemInfo()
+  const reportsEnabled = systemInfo?.reports_enabled ?? false
   const { data, isFetching, isError, failureCount, refetch } = useCallMonitor(canView)
 
   if (!canView) {
@@ -86,6 +90,8 @@ export default function CallMonitorPage() {
             {t('ws.records.callMonitor.errorLoad', locale)}
           </div>
         )}
+
+        <LiveCallsSection reportsEnabled={reportsEnabled} />
 
         <CallMonitorTodayCards data={data?.today} loading={!data && isFetching} />
         <EmployeeCallMonitorTable rows={data?.employees ?? []} loading={!data && isFetching} />

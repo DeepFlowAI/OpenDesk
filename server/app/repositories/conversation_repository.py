@@ -981,3 +981,50 @@ class ConversationRepository:
             .limit(limit)
         )
         return list(result.scalars().all())
+
+    @staticmethod
+    async def get_closed_with_agent_unread_for_visitor(
+        db: AsyncSession,
+        *,
+        tenant_id: int,
+        channel_id: int,
+        visitor_id: int,
+        exclude_conversation_ids: list[int] | None = None,
+        limit: int = 3,
+    ) -> tuple[list[Conversation], bool]:
+        """Get closed conversations that still contain agent messages unread by the visitor."""
+        from app.repositories.message_repository import MessageRepository
+
+        conditions = [
+            Conversation.tenant_id == tenant_id,
+            Conversation.channel_id == channel_id,
+            Conversation.visitor_id == visitor_id,
+            Conversation.status == ConversationStatus.CLOSED.value,
+            exists().where(
+                Message.tenant_id == tenant_id,
+                Message.conversation_id == Conversation.id,
+                Message.sender_type == MessageSenderType.AGENT.value,
+                Message.content_type.in_(MessageRepository.READ_STATUS_CONTENT_TYPES),
+                Message.visitor_read_at.is_(None),
+                Message.is_recalled.is_(False),
+            ),
+        ]
+        if exclude_conversation_ids:
+            conditions.append(Conversation.id.notin_(exclude_conversation_ids))
+
+        result = await db.execute(
+            select(Conversation)
+            .options(
+                selectinload(Conversation.visitor),
+                selectinload(Conversation.agent),
+            )
+            .where(*conditions)
+            .order_by(
+                func.coalesce(Conversation.last_message_at, Conversation.created_at).desc(),
+                Conversation.id.desc(),
+            )
+            .limit(limit + 1)
+        )
+        rows = list(result.scalars().all())
+        has_more = len(rows) > limit
+        return rows[:limit], has_more

@@ -3,6 +3,7 @@ Unit tests for online chat message recall rules.
 """
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -141,3 +142,67 @@ def test_recalled_message_preview_uses_actor_type():
     assert ConversationService.build_recalled_message_preview(
         _message(sender_type=MessageSenderType.AGENT.value, is_recalled=True),
     ) == "客服撤回了一条消息"
+
+
+@pytest.mark.asyncio
+async def test_recall_agent_message_updates_message_and_last_preview(monkeypatch):
+    db = SimpleNamespace()
+    conversation = _conversation()
+    message = _message(created_at=datetime.now(timezone.utc) - timedelta(seconds=30))
+    recalled = _message(is_recalled=True)
+    principal = SimpleNamespace(user_id=10, tenant_id=1)
+    employee = SimpleNamespace(id=10, display_name="Alice", name="alice")
+    assert_send_access = AsyncMock()
+    mark_quotes_recalled = AsyncMock()
+    update_last_message = AsyncMock()
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_by_id_for_conversation",
+        AsyncMock(return_value=message),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationService._assert_conversation_send_access",
+        assert_send_access,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.EmployeeRepository.get_by_id",
+        AsyncMock(return_value=employee),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.recall_message",
+        AsyncMock(return_value=recalled),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationService._mark_message_quotes_recalled",
+        mark_quotes_recalled,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_latest_by_conversation_id",
+        AsyncMock(return_value=recalled),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.update_last_message",
+        update_last_message,
+    )
+
+    result_msg, result_conversation, conversation_update = await ConversationService.recall_agent_message(
+        db,
+        conversation_id=100,
+        message_id=200,
+        tenant_id=1,
+        principal=principal,
+    )
+
+    assert result_msg is recalled
+    assert result_conversation is conversation
+    assert conversation_update is not None
+    assert conversation_update["conversation_id"] == 100
+    assert conversation_update["last_message_preview"] == "客服撤回了一条消息"
+    assert_send_access.assert_awaited_once_with(db, principal, conversation, MessageContentType.TEXT.value)
+    mark_quotes_recalled.assert_awaited_once_with(db, conversation, recalled.id)
+    update_last_message.assert_awaited_once()
+    assert update_last_message.await_args.args[:3] == (db, 100, "客服撤回了一条消息")

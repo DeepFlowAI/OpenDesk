@@ -466,6 +466,49 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             **({"context_sync": result["context_sync"]} if result.get("context_sync") else {}),
         }
 
+    @rt.on("join_conversation", namespace=NAMESPACE)  # type: ignore
+    async def on_join_conversation(sid: str, data: dict):
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        tenant_id = session.get("tenant_id")
+        channel_id = session.get("channel_id")
+        visitor_external_id = session.get("visitor_external_id")
+        if not tenant_id or not channel_id or not visitor_external_id:
+            return {"ok": False, "error": "visitor_session_required"}
+
+        conversation_public_id = str((data or {}).get("conversation_public_id") or "").strip()
+        if not conversation_public_id:
+            return {"ok": False, "error": "conversation_public_id required"}
+
+        try:
+            async with AsyncSessionLocal() as db:
+                conversation = await ConversationService.get_conversation_for_visitor_session(
+                    db,
+                    conversation_public_id=conversation_public_id,
+                    tenant_id=tenant_id,
+                    channel_id=channel_id,
+                    visitor_external_id=visitor_external_id,
+                )
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
+        except Exception:
+            logger.exception(
+                "visitor_join_conversation_failed sid=%s tenant_id=%s channel_id=%s "
+                "visitor_external_id=%s conversation_public_id=%s",
+                sid,
+                tenant_id,
+                channel_id,
+                visitor_external_id,
+                conversation_public_id,
+            )
+            return {"ok": False, "error": "INTERNAL"}
+
+        await rt.join_room(sid, f"conv:{conversation.id}", namespace=NAMESPACE)
+        return {
+            "ok": True,
+            "conversation_id": conversation.id,
+            "conversation_public_id": conversation.public_id,
+        }
+
     @rt.on("send_message", namespace=NAMESPACE)  # type: ignore
     async def on_send_message(sid: str, data: dict):
         session = await rt.get_session(sid, namespace=NAMESPACE)
@@ -683,6 +726,56 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                 room=f"agent:{result['tenant_id']}:{agent_id}",
                 namespace="/chat",
             )
+        return {"ok": True, "message_ids": result["message_ids"]}
+
+    @rt.on("messages_delivered", namespace=NAMESPACE)  # type: ignore
+    async def on_messages_delivered(sid: str, data: dict):
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        conversation_public_id = data.get("conversation_public_id") or data.get("conversation_id")
+        raw_message_ids = data.get("message_ids")
+        if not conversation_public_id or not isinstance(raw_message_ids, list):
+            return {"ok": False, "error": "conversation_public_id and message_ids required"}
+        try:
+            message_ids = [int(message_id) for message_id in raw_message_ids]
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Invalid message_ids"}
+        if len(message_ids) > 500:
+            return {"ok": False, "error": "Too many message_ids"}
+
+        async with AsyncSessionLocal() as db:
+            result = await ConversationService.mark_agent_messages_visitor_delivered_for_session(
+                db,
+                visitor_context=session,
+                conversation_public_id=str(conversation_public_id),
+                message_ids=message_ids,
+            )
+
+        delivered_payload = {
+            "conversation_id": result["conversation_id"],
+            "conversation_public_id": result["conversation_public_id"],
+            "message_ids": result["message_ids"],
+        }
+        if result["message_ids"]:
+            await rt.emit(
+                "messages_delivered",
+                delivered_payload,
+                room=f"conv:{result['conversation_id']}",
+                namespace="/chat",
+            )
+            for agent_id in result["recipient_agent_ids"]:
+                await rt.emit(
+                    "messages_delivered",
+                    delivered_payload,
+                    room=f"agent:{result['tenant_id']}:{agent_id}",
+                    namespace="/chat",
+                )
+        logger.info(
+            "visitor_messages_delivered tenant_id=%s conversation_id=%s submitted_count=%s changed_count=%s",
+            result["tenant_id"],
+            result["conversation_id"],
+            len(message_ids),
+            len(result["message_ids"]),
+        )
         return {"ok": True, "message_ids": result["message_ids"]}
 
     @rt.on("request_human_handoff", namespace=NAMESPACE)  # type: ignore

@@ -24,6 +24,7 @@ import {
   useDeleteKnowledgeDocument,
   useKnowledgeDirectories,
   useKnowledgeDocuments,
+  useKnowledgeInspirationCounts,
   useMoveKnowledgeDirectory,
   useUpdateKnowledgeDirectory,
 } from '@/service/use-knowledge'
@@ -83,8 +84,10 @@ export default function KnowledgeWorkspacePage() {
   const canManageDirectory = hasPermission(user, 'knowledge.workspace.directory.manage')
   const canImportKnowledge = hasPermission(user, 'knowledge.workspace.import')
   const canExportKnowledge = hasPermission(user, 'knowledge.workspace.export')
+  const canViewInspirations = hasPermission(user, 'knowledge.workspace.inspiration.view')
 
   const { data: directoryData, isLoading: directoriesLoading } = useKnowledgeDirectories()
+  const { data: inspirationCounts } = useKnowledgeInspirationCounts({}, { enabled: canViewInspirations })
   const directories = useMemo(() => directoryData?.items ?? [], [directoryData])
   const selectedDirectory = useMemo(
     () => findKnowledgeDirectory(directories, selectedDirectoryId),
@@ -185,9 +188,13 @@ export default function KnowledgeWorkspacePage() {
       <DirectorySidebar
         directories={directories}
         selectedDirectoryId={selectedDirectoryId}
+        activeView="documents"
         canManage={canManageDirectory}
+        canViewInspirations={canViewInspirations}
+        pendingInspirations={inspirationCounts?.pending ?? 0}
         isZh={isZh}
         onSelect={(directoryId) => updateQuery({ directory: directoryId, page: 1 })}
+        onSelectInspirations={() => router.push('/workspace/knowledge/inspirations')}
         onCreate={(parentId) => setDirectoryModal({ mode: 'create', parentId })}
         onEdit={(directory) => setDirectoryModal({ mode: 'edit', directory })}
         onDelete={setDirectoryToDelete}

@@ -2,6 +2,7 @@ export type WorkspaceNavIconKey =
   | 'tickets'
   | 'chat'
   | 'call'
+  | 'engagement'
   | 'records'
   | 'contacts'
   | 'knowledge'
@@ -57,6 +58,12 @@ export const WORKSPACE_NAV_ITEMS: WorkspaceNavItem[] = [
     href: '/workspace/call',
     iconKey: 'call',
     permissions: ['call.workspace.use'],
+  },
+  {
+    labelKey: 'ws.nav.engagement',
+    href: '/workspace/engagement/outbound-tasks',
+    iconKey: 'engagement',
+    permissions: ['engagement.outbound_task.manage', 'engagement.outbound_task.create'],
   },
   {
     labelKey: 'ws.nav.records',
@@ -164,6 +171,9 @@ export const WORKSPACE_ROUTE_RULES: WorkspaceRouteRule[] = [
     ],
   },
   { prefix: '/workspace/chat', permissions: ['chat.workspace.use'] },
+  { prefix: '/workspace/engagement/outbound-task-templates', permissions: ['engagement.outbound_task.template.manage'] },
+  { prefix: '/workspace/engagement', permissions: ['engagement.outbound_task.manage', 'engagement.outbound_task.create'] },
+  { prefix: '/workspace/call/outbound-tasks', permissions: ['engagement.outbound_task.execute'] },
   { prefix: '/workspace/call', permissions: ['call.workspace.use'] },
   { prefix: '/workspace/tickets', permissions: ['ticket.workspace.view'] },
   { prefix: '/workspace/knowledge', permissions: ['knowledge.workspace.view'] },

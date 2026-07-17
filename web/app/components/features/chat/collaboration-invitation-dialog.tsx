@@ -82,7 +82,7 @@ export function CollaborationInvitationDialog({ invitation, onAccepted, onDeclin
           <Button variant="outline" disabled={respond.isPending} onClick={() => void handleRespond('decline')}>
             {t('ws.chat.collabDecline', locale)}
           </Button>
-          <Button disabled={respond.isPending} onClick={() => void handleRespond('accept')}>
+          <Button data-action="collab-accept" disabled={respond.isPending} onClick={() => void handleRespond('accept')}>
             {respond.isPending ? <IconLoader2 size={16} className="animate-spin" /> : <IconUserPlus size={16} />}
             {t('ws.chat.collabJoin', locale)}
           </Button>

@@ -1,6 +1,7 @@
 import type {
   KnowledgeDirectoryNode,
   KnowledgeDocument,
+  KnowledgeDocumentAttachment,
   KnowledgeDocumentDisplayStatus,
   KnowledgeValidityType,
 } from '@/models/knowledge'
@@ -10,6 +11,59 @@ export type FlatKnowledgeDirectory = {
   node: KnowledgeDirectoryNode
   depth: number
   path: string
+}
+
+export type KnowledgeSendPlanItem =
+  | { kind: 'body'; clientMessageId: string; content: string }
+  | { kind: 'attachment'; clientMessageId: string; attachment: KnowledgeDocumentAttachment }
+
+export type KnowledgeComposerContentType = 'text' | 'rich_text'
+
+export function knowledgeDocumentHasMessageBody(document: KnowledgeDocument): boolean {
+  return knowledgeHtmlToMessageText(document.content_html).length > 0
+}
+
+export function knowledgeDocumentHasSendableContent(document: KnowledgeDocument): boolean {
+  return knowledgeDocumentHasMessageBody(document) || document.attachments.length > 0
+}
+
+export function knowledgeDocumentHasComposerBody(
+  document: KnowledgeDocument,
+  contentType: KnowledgeComposerContentType,
+): boolean {
+  if (contentType === 'rich_text') return knowledgeDocumentHasMessageBody(document)
+  return knowledgeHtmlToComposerText(document.content_html).length > 0
+}
+
+export function knowledgeDocumentHasComposerSendableContent(
+  document: KnowledgeDocument,
+  contentType: KnowledgeComposerContentType,
+): boolean {
+  return knowledgeDocumentHasComposerBody(document, contentType) || document.attachments.length > 0
+}
+
+export function buildKnowledgeSendPlan(params: {
+  messageHtml: string
+  messageText: string
+  attachments: KnowledgeDocumentAttachment[]
+  requestId: string
+}): KnowledgeSendPlanItem[] {
+  const plan: KnowledgeSendPlanItem[] = []
+  if (params.messageText || /<img\b/i.test(params.messageHtml)) {
+    plan.push({
+      kind: 'body',
+      clientMessageId: `knowledge:${params.requestId}:body`,
+      content: params.messageHtml,
+    })
+  }
+  for (const attachment of params.attachments) {
+    plan.push({
+      kind: 'attachment',
+      clientMessageId: `knowledge:${params.requestId}:attachment:${attachment.id}`,
+      attachment,
+    })
+  }
+  return plan
 }
 
 export function flattenKnowledgeDirectories(
@@ -108,6 +162,18 @@ export function stripKnowledgeHtml(html: string): string {
   return knowledgeHtmlToMessageText(html)
 }
 
+function knowledgeHtmlAttribute(tag: string, name: string): string {
+  const pattern = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i')
+  const match = tag.match(pattern)
+  return match?.[1] ?? match?.[2] ?? match?.[3] ?? ''
+}
+
+function knowledgeImageText(tag: string): string {
+  if (!knowledgeHtmlAttribute(tag, 'src').trim()) return ' '
+  const label = knowledgeHtmlAttribute(tag, 'alt').trim() || knowledgeHtmlAttribute(tag, 'title').trim() || '[image]'
+  return `\n${label}\n`
+}
+
 function decodeKnowledgeHtmlEntities(text: string): string {
   if (typeof window === 'undefined') return text
   const textarea = document.createElement('textarea')
@@ -115,8 +181,9 @@ function decodeKnowledgeHtmlEntities(text: string): string {
   return textarea.value
 }
 
-export function knowledgeHtmlToMessageText(html: string): string {
+function knowledgeHtmlToText(html: string, imageText: (tag: string) => string): string {
   const withBreaks = html
+    .replace(/<\s*img\b[^>]*>/gi, imageText)
     .replace(/<\s*br\s*\/?\s*>/gi, '\n')
     .replace(/<\s*li[^>]*>/gi, '\n- ')
     .replace(/<\s*\/(p|div|h[1-6]|blockquote|pre|li|ul|ol|tr)\s*>/gi, '\n')
@@ -132,13 +199,17 @@ export function knowledgeHtmlToMessageText(html: string): string {
     .trim()
 }
 
-export function knowledgeHasUnsupportedSendContent(html: string): boolean {
-  return /<(img|picture|video|audio|table|iframe|object|embed|figure)\b/i.test(html)
+export function knowledgeHtmlToMessageText(html: string): string {
+  return knowledgeHtmlToText(html, knowledgeImageText)
+}
+
+export function knowledgeHtmlToComposerText(html: string): string {
+  return knowledgeHtmlToText(html, () => ' ')
 }
 
 export function buildKnowledgeReturnQuery(params: URLSearchParams): string {
   const keep = new URLSearchParams()
-  for (const key of ['directory', 'q', 'page']) {
+  for (const key of ['directory', 'q', 'page', 'status', 'source']) {
     const value = params.get(key)
     if (value) keep.set(key, value)
   }
@@ -147,7 +218,11 @@ export function buildKnowledgeReturnQuery(params: URLSearchParams): string {
 }
 
 export function knowledgeListHref(params: URLSearchParams): string {
-  return `/workspace/knowledge${buildKnowledgeReturnQuery(params)}`
+  const returnQuery = buildKnowledgeReturnQuery(params)
+  if (params.get('source') === 'inspirations' || params.has('status')) {
+    return `/workspace/knowledge/inspirations${returnQuery}`
+  }
+  return `/workspace/knowledge${returnQuery}`
 }
 
 export async function readKnowledgeError(error: unknown, fallback: string): Promise<string> {

@@ -11,6 +11,7 @@ from html import unescape
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from pydantic import ValidationError as PydanticValidationError
 import redis.asyncio as aioredis
 
@@ -404,10 +405,22 @@ class ConversationService:
         if visitor_facing:
             if msg.sender_type != MessageSenderType.VISITOR.value:
                 return None
+            metadata = getattr(msg, "metadata_", None) or {}
+            if metadata.get("open_agent") is True:
+                return None
             return "read" if getattr(msg, "agent_read_at", None) else "unread"
         if msg.sender_type != MessageSenderType.AGENT.value:
             return None
-        return "read" if getattr(msg, "visitor_read_at", None) else "unread"
+        if getattr(msg, "visitor_read_at", None):
+            return "read"
+        if getattr(msg, "visitor_delivered_at", None):
+            return "unread"
+        visitor_online_at_send = getattr(msg, "visitor_online_at_send", None)
+        if visitor_online_at_send is False:
+            return "offline"
+        if visitor_online_at_send is True:
+            return "sending"
+        return None
 
     @staticmethod
     def _message_read_status_overlay(msg, *, visitor_facing: bool) -> dict:
@@ -2013,6 +2026,12 @@ class ConversationService:
         normalized_content = ConversationService.validate_message_content(content_type, content)
         now = datetime.now(timezone.utc)
         message_metadata = dict(metadata or {})
+        client_message_id_value = message_metadata.get("client_message_id")
+        client_message_id = (
+            client_message_id_value
+            if isinstance(client_message_id_value, str) and client_message_id_value
+            else None
+        )
         if ConversationService._is_internal_note(content_type):
             if quoted_message_id is not None:
                 raise ValidationError("Internal notes cannot quote public messages")
@@ -2024,15 +2043,59 @@ class ConversationService:
                 quoted_message_id=quoted_message_id,
                 visitor_facing=sender_type == MessageSenderType.VISITOR.value,
             )
-        msg = await MessageRepository.create(db, {
-            "tenant_id": tenant_id,
-            "conversation_id": conversation_id,
-            "sender_type": sender_type,
-            "sender_id": sender_id,
-            "content_type": content_type,
-            "content": normalized_content,
-            "metadata_": message_metadata,
-        })
+        visitor_online_at_send: bool | None = None
+        if (
+            sender_type == MessageSenderType.AGENT.value
+            and not ConversationService._is_internal_note(content_type)
+            and content_type in READ_STATUS_MESSAGE_CONTENT_TYPES
+        ):
+            from app.db.redis import redis_client
+            from app.services.visitor_web_status_service import VisitorWebStatusService
+
+            if getattr(conv, "visitor", None) and getattr(conv, "channel", None) and VisitorWebStatusService.can_display(conv):
+                try:
+                    visitor_status = await VisitorWebStatusService.get_status(
+                        redis_client.client,
+                        tenant_id=conv.tenant_id,
+                        channel_id=conv.channel_id,
+                        visitor_external_id=conv.visitor.external_id,
+                    )
+                    visitor_online_at_send = visitor_status == "online"
+                except Exception:
+                    visitor_online_at_send = None
+                    logger.exception(
+                        "conversation_message_visitor_status_failed tenant_id=%s conversation_id=%s",
+                        tenant_id,
+                        conversation_id,
+                    )
+
+        try:
+            msg = await MessageRepository.create(db, {
+                "tenant_id": tenant_id,
+                "conversation_id": conversation_id,
+                "sender_type": sender_type,
+                "sender_id": sender_id,
+                "content_type": content_type,
+                "content": normalized_content,
+                "metadata_": message_metadata,
+                "client_message_id": client_message_id,
+                "visitor_online_at_send": visitor_online_at_send,
+            })
+        except IntegrityError:
+            await db.rollback()
+            if client_message_id is None:
+                raise
+            existing_message = await MessageRepository.get_by_client_message_id(
+                db,
+                tenant_id,
+                conversation_id,
+                client_message_id,
+                sender_type=sender_type,
+                sender_id=sender_id,
+            )
+            if existing_message is None:
+                raise
+            return existing_message
 
         preview = ConversationService.build_message_preview(content_type, normalized_content)
         increment_unread = sender_type == MessageSenderType.VISITOR.value
@@ -3195,6 +3258,11 @@ class ConversationService:
             per_conversation_limit=VISITOR_HISTORY_MESSAGE_LIMIT,
             include_internal=False,
         )
+        unread_ids_by_conversation = await MessageRepository.get_agent_unread_message_ids_by_conversations(
+            db,
+            tenant_id=visitor_context["tenant_id"],
+            conversation_ids=conversation_ids,
+        )
 
         agent_ids: set[int] = set()
         for messages in messages_by_conversation.values():
@@ -3259,6 +3327,7 @@ class ConversationService:
                 "created_at": conversation.created_at,
                 "agent_name": agent_name,
                 "agent_avatar": agent_avatar,
+                "agent_unread_message_ids": unread_ids_by_conversation.get(conversation.id, []),
                 "messages": message_items,
                 "messages_truncated": (
                     len(visible_messages) >= VISITOR_HISTORY_MESSAGE_LIMIT
@@ -3274,24 +3343,70 @@ class ConversationService:
         visitor_context: dict,
         limit: int = VISITOR_UNREAD_OFFLINE_REPLY_LIMIT,
     ) -> dict:
-        """Fetch converted offline-message conversations that still need customer display."""
+        """Fetch conversations to proactively surface to the visitor on open.
+
+        Includes converted offline-message conversations that still need customer
+        display, plus closed conversations that still contain agent messages the
+        visitor has not read (e.g. replies sent while the visitor was offline
+        before the agent ended the conversation).
+        """
         safe_limit = min(max(limit, 1), VISITOR_UNREAD_OFFLINE_REPLY_LIMIT)
-        rows, has_more = await OfflineMessageRepository.list_customer_unread_replies(
+        rows, offline_has_more = await OfflineMessageRepository.list_customer_unread_replies(
             db,
             tenant_id=visitor_context["tenant_id"],
             channel_id=visitor_context["channel_id"],
             visitor_external_id=visitor_context["visitor_external_id"],
             limit=safe_limit,
         )
-        rows = list(reversed(rows))
-        conversations = [row.conversation for row in rows if row.conversation is not None]
-        conversation_ids = [conversation.id for conversation in conversations]
+        offline_rows = [row for row in rows if row.conversation is not None]
+        offline_conversation_ids = [row.conversation.id for row in offline_rows]
+
+        session_visitor = await UserRepository.get_by_external_id(
+            db,
+            visitor_context["tenant_id"],
+            visitor_context["visitor_external_id"],
+        )
+        unread_conversations: list = []
+        unread_has_more = False
+        if session_visitor:
+            unread_conversations, unread_has_more = await ConversationRepository.get_closed_with_agent_unread_for_visitor(
+                db,
+                tenant_id=visitor_context["tenant_id"],
+                channel_id=visitor_context["channel_id"],
+                visitor_id=session_visitor.id,
+                exclude_conversation_ids=offline_conversation_ids,
+                limit=safe_limit,
+            )
+
+        def _entry_sort_key(entry):
+            row, conversation = entry
+            reference = (
+                (row.customer_unread_at if row is not None else None)
+                or conversation.last_message_at
+                or conversation.created_at
+            )
+            reference = ConversationService._aware_utc(reference) or datetime.min.replace(tzinfo=timezone.utc)
+            return (reference, conversation.id)
+
+        entries = [(row, row.conversation) for row in offline_rows]
+        entries += [(None, conversation) for conversation in unread_conversations]
+        entries.sort(key=_entry_sort_key)
+        has_more = offline_has_more or unread_has_more or len(entries) > safe_limit
+        # Keep only the most recent entries, in chronological order for display.
+        entries = entries[-safe_limit:]
+
+        conversation_ids = [conversation.id for _row, conversation in entries]
         messages_by_conversation = await MessageRepository.get_recent_by_conversations(
             db,
             tenant_id=visitor_context["tenant_id"],
             conversation_ids=conversation_ids,
             per_conversation_limit=VISITOR_HISTORY_MESSAGE_LIMIT,
             include_internal=False,
+        )
+        unread_ids_by_conversation = await MessageRepository.get_agent_unread_message_ids_by_conversations(
+            db,
+            tenant_id=visitor_context["tenant_id"],
+            conversation_ids=conversation_ids,
         )
 
         agent_ids: set[int] = set()
@@ -3309,17 +3424,22 @@ class ConversationService:
 
         items = []
         consumed_messages = 0
-        for row in rows:
-            conversation = row.conversation
-            if conversation is None:
-                continue
-
+        for row, conversation in entries:
             raw_messages = messages_by_conversation.get(conversation.id, [])
             visible_messages = ConversationService._visitor_visible_messages(raw_messages)
+            is_offline_reply = row is not None
+            if not is_offline_reply:
+                # For a closed conversation surfaced purely because it still has
+                # unread agent messages, show only those unread messages — not the
+                # full transcript. The full context stays reachable via history.
+                unread_set = set(unread_ids_by_conversation.get(conversation.id, []))
+                visible_messages = [
+                    message for message in visible_messages if message.id in unread_set
+                ]
             remaining = max(VISITOR_HISTORY_TOTAL_MESSAGE_LIMIT - consumed_messages, 0)
             messages = visible_messages[:remaining]
             consumed_messages += len(messages)
-            visitor = row.visitor or conversation.visitor
+            visitor = (row.visitor if row is not None else None) or conversation.visitor
 
             message_items = []
             for msg in messages:
@@ -3355,7 +3475,7 @@ class ConversationService:
 
             items.append({
                 "conversation_public_id": conversation.public_id,
-                "offline_message_public_id": row.public_id,
+                "offline_message_public_id": row.public_id if row is not None else None,
                 "status": conversation.status,
                 "started_at": conversation.started_at,
                 "ended_at": conversation.ended_at,
@@ -3363,13 +3483,16 @@ class ConversationService:
                 "created_at": conversation.created_at,
                 "agent_name": agent_name,
                 "agent_avatar": agent_avatar,
-                "customer_unread_at": row.customer_unread_at,
-                "customer_unread_message_id": row.customer_unread_first_message_id,
-                "offline_reply_unread": True,
+                "customer_unread_at": row.customer_unread_at if row is not None else None,
+                "customer_unread_message_id": row.customer_unread_first_message_id if row is not None else None,
+                "offline_reply_unread": is_offline_reply,
+                "agent_unread_message_ids": unread_ids_by_conversation.get(conversation.id, []),
                 "messages": message_items,
                 "messages_truncated": (
-                    len(visible_messages) >= VISITOR_HISTORY_MESSAGE_LIMIT
-                    or len(visible_messages) > len(messages)
+                    False if not is_offline_reply else (
+                        len(visible_messages) >= VISITOR_HISTORY_MESSAGE_LIMIT
+                        or len(visible_messages) > len(messages)
+                    )
                 ),
             })
 
@@ -3701,5 +3824,46 @@ class ConversationService:
             "conversation_id": conversation.id,
             "conversation_public_id": conversation.public_id,
             "message_ids": read_message_ids,
+            "recipient_agent_ids": sorted(recipient_agent_ids),
+        }
+
+    @staticmethod
+    async def mark_agent_messages_visitor_delivered_for_session(
+        db: AsyncSession,
+        *,
+        visitor_context: dict,
+        conversation_public_id: str,
+        message_ids: list[int],
+    ) -> dict:
+        conversation = await ConversationService.get_conversation_for_visitor_session(
+            db,
+            conversation_public_id=conversation_public_id,
+            tenant_id=visitor_context["tenant_id"],
+            channel_id=visitor_context["channel_id"],
+            visitor_external_id=visitor_context["visitor_external_id"],
+        )
+        normalized_ids = sorted({message_id for message_id in message_ids if message_id > 0})
+        delivered_message_ids = await MessageRepository.mark_agent_messages_visitor_delivered(
+            db,
+            tenant_id=conversation.tenant_id,
+            conversation_id=conversation.id,
+            message_ids=normalized_ids,
+            delivered_at=datetime.now(timezone.utc),
+        )
+        recipient_agent_ids = set()
+        if conversation.agent_id:
+            recipient_agent_ids.add(int(conversation.agent_id))
+        recipient_agent_ids.update(
+            await ConversationCollaborationRepository.get_active_collaborator_agent_ids(
+                db,
+                tenant_id=conversation.tenant_id,
+                conversation_id=conversation.id,
+            )
+        )
+        return {
+            "tenant_id": conversation.tenant_id,
+            "conversation_id": conversation.id,
+            "conversation_public_id": conversation.public_id,
+            "message_ids": delivered_message_ids,
             "recipient_agent_ids": sorted(recipient_agent_ids),
         }

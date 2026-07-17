@@ -33,6 +33,7 @@ from app.libs.telephony.base import (
     CallEvent,
     EventHandler,
     ReconnectHandler,
+    TelephonyMethodNotFoundError,
     TelephonyNotConnectedError,
     TelephonyRPCError,
 )
@@ -175,9 +176,14 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
             return
         if "error" in msg:
             err = msg["error"]
-            fut.set_exception(
-                TelephonyRPCError(err.get("code", -1), err.get("message", ""), err.get("data"))
+            code = err.get("code", -1)
+            # -32601 "method not found" means the kernel lacks this optional
+            # capability (e.g. SIP extensions not enabled); surface a distinct
+            # type so callers can degrade gracefully.
+            err_cls = (
+                TelephonyMethodNotFoundError if code == -32601 else TelephonyRPCError
             )
+            fut.set_exception(err_cls(code, err.get("message", ""), err.get("data")))
         else:
             fut.set_result(msg.get("result", {}))
 
@@ -254,6 +260,29 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
 
     async def call_stop(self, call_id: str, *, target: str = "all") -> None:
         await self._rpc("call.stop", {"call_id": call_id, "target": target})
+
+    async def call_play(
+        self,
+        call_id: str,
+        *,
+        text: str | None = None,
+        audio_url: str | None = None,
+        loop: bool = False,
+        interval_ms: int | None = None,
+        voice: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"call_id": call_id}
+        if text is not None:
+            params["text"] = text
+        if audio_url is not None:
+            params["audio_url"] = audio_url
+        if loop:
+            params["loop"] = True
+        if interval_ms is not None:
+            params["interval_ms"] = interval_ms
+        if voice:
+            params["voice"] = voice
+        return await self._rpc("call.play", params)
 
     async def call_dtmf(
         self, call_id: str, digits: str, *, duration_ms: int | None = None,
@@ -336,6 +365,49 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
     async def call_unbridge(self, call_id: str, other_call_id: str) -> None:
         await self._rpc("call.unbridge", {"call_id": call_id, "other_call_id": other_call_id})
 
+    # ── Multi-party rooms ──
+
+    async def room_create(self, *, leg_call_ids: list[str] | None = None) -> dict:
+        params: dict[str, Any] = {}
+        if leg_call_ids:
+            params["leg_call_ids"] = leg_call_ids
+        return await self._rpc("room.create", params)
+
+    async def room_add_leg(self, room_id: str, call_id: str) -> dict:
+        return await self._rpc("room.add_leg", {"room_id": room_id, "call_id": call_id})
+
+    async def room_remove_leg(self, room_id: str, call_id: str) -> dict:
+        return await self._rpc(
+            "room.remove_leg", {"room_id": room_id, "call_id": call_id}
+        )
+
+    async def room_replace_leg(
+        self, room_id: str, old_call_id: str, new_call_id: str
+    ) -> dict:
+        return await self._rpc(
+            "room.replace_leg",
+            {"room_id": room_id, "old_call_id": old_call_id, "new_call_id": new_call_id},
+        )
+
+    async def room_set_mix_gain(
+        self, room_id: str, *, listener_call_id: str, speaker_call_id: str, gain: float
+    ) -> dict:
+        return await self._rpc(
+            "room.set_mix_gain",
+            {
+                "room_id": room_id,
+                "listener_call_id": listener_call_id,
+                "speaker_call_id": speaker_call_id,
+                "gain": gain,
+            },
+        )
+
+    async def room_close(self, room_id: str, *, reason: str | None = None) -> dict:
+        params: dict[str, Any] = {"room_id": room_id}
+        if reason:
+            params["reason"] = reason
+        return await self._rpc("room.close", params)
+
     async def call_hold(self, call_id: str) -> None:
         await self._rpc("call.hold", {"call_id": call_id})
 
@@ -344,14 +416,19 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
 
     async def call_originate(
         self,
-        uri: str,
+        uri: str | None = None,
         *,
+        extension: str | None = None,
         caller_id: str | None = None,
         trunk_id: str | None = None,
         timeout_ms: int | None = None,
         headers: dict[str, str] | None = None,
     ) -> dict:
-        params: dict[str, Any] = {"uri": uri}
+        params: dict[str, Any] = {}
+        if uri:
+            params["uri"] = uri
+        if extension:
+            params["extension"] = extension
         if caller_id:
             params["caller_id"] = caller_id
         if trunk_id:
@@ -361,6 +438,19 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         if headers:
             params["headers"] = headers
         return await self._rpc("call.originate", params)
+
+    async def extension_query(self, extension: str) -> dict:
+        return await self._rpc("extension.query", {"extension": extension})
+
+    async def extension_list(self) -> list[dict]:
+        result = await self._rpc("extension.list", {})
+        return result.get("extensions", [])
+
+    async def registrar_info(self) -> dict | None:
+        result = await self._rpc("system.registrar_info", {})
+        # The kernel returns null (→ empty dict here) when no registrar is
+        # configured; normalize to None so callers can fall back to settings.
+        return result or None
 
     async def call_list(self) -> list[dict]:
         result = await self._rpc("call.list", {})

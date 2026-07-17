@@ -23,6 +23,7 @@ class SessionRecordService:
         "pending": "waiting_confirmation",
         "requested": "handoff_in_progress",
         "queued": "in_queue",
+        "queue_offline_canceled": "queue_offline_canceled",
         "success": "succeeded",
         "failed": "failed",
         "dismissed": "dismissed",

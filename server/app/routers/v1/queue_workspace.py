@@ -1,11 +1,18 @@
 """
 Workspace queue API.
 """
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
-from app.db.deps import get_current_principal, get_db, get_redis, require_permission
+from app.db.deps import (
+    get_current_principal,
+    get_db,
+    get_redis,
+    require_permission,
+    require_permission_short_session,
+)
+from app.schemas.conversation_file import ConversationFileUploadResponse
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.queue_workspace import (
     QueueAssignAndSendRequest,
@@ -128,6 +135,26 @@ async def assign_workspace_queue_task_to_self_and_send(
 ):
     """Assign a visible queue task to the current agent and send a text reply."""
     return await QueueWorkspaceService.assign_self_and_send(db, r, principal, task_id, body)
+
+
+@router.post(
+    "/tasks/{task_id}/files",
+    response_model=ConversationFileUploadResponse,
+    dependencies=[Depends(require_permission("chat.queue.assign_self"))],
+)
+async def upload_workspace_queue_task_file(
+    task_id: int,
+    file: UploadFile = File(...),
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("chat.queue.assign_self"),
+    ),
+):
+    """Upload a file for a visible queued conversation without assigning it."""
+    return await QueueWorkspaceService.upload_task_file_managed(
+        task_id=task_id,
+        principal=principal,
+        file=file,
+    )
 
 
 @router.post(

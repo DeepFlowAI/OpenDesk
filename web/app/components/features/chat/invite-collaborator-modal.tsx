@@ -151,7 +151,7 @@ export function InviteCollaboratorModal({ conversation, open, onClose, onInvited
         />
         <DialogFooter className="pb-0">
           <Button variant="outline" onClick={onClose} disabled={createInvitation.isPending}>{t('ws.common.cancel', locale)}</Button>
-          <Button onClick={handleSubmit} disabled={!selectedTarget?.available || createInvitation.isPending}>
+          <Button data-action="confirm-invite" onClick={handleSubmit} disabled={!selectedTarget?.available || createInvitation.isPending}>
             {createInvitation.isPending ? <IconLoader2 size={16} className="animate-spin" /> : <IconUserPlus size={16} />}
             {t('ws.chat.collabSendInvite', locale)}
           </Button>

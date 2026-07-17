@@ -9,7 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.models.knowledge import KnowledgeDirectory, KnowledgeDocument
+from app.models.knowledge import (
+    KnowledgeDirectory,
+    KnowledgeDocument,
+    KnowledgeDocumentAttachment,
+    KnowledgeInspiration,
+)
 
 
 class KnowledgeDirectoryRepository:
@@ -383,4 +388,189 @@ class KnowledgeDocumentRepository:
     @staticmethod
     async def delete(db: AsyncSession, document: KnowledgeDocument) -> None:
         await db.delete(document)
+        await db.commit()
+
+
+class KnowledgeDocumentAttachmentRepository:
+    @staticmethod
+    async def get_by_id(db: AsyncSession, attachment_id: int) -> KnowledgeDocumentAttachment | None:
+        return await db.get(KnowledgeDocumentAttachment, attachment_id)
+
+    @staticmethod
+    async def get_by_ids_for_update(
+        db: AsyncSession,
+        tenant_id: int,
+        attachment_ids: list[int],
+    ) -> list[KnowledgeDocumentAttachment]:
+        if not attachment_ids:
+            return []
+        result = await db.execute(
+            select(KnowledgeDocumentAttachment)
+            .where(
+                KnowledgeDocumentAttachment.tenant_id == tenant_id,
+                KnowledgeDocumentAttachment.id.in_(attachment_ids),
+            )
+            .with_for_update()
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def list_for_document(
+        db: AsyncSession,
+        tenant_id: int,
+        document_id: int,
+    ) -> list[KnowledgeDocumentAttachment]:
+        result = await db.execute(
+            select(KnowledgeDocumentAttachment)
+            .where(
+                KnowledgeDocumentAttachment.tenant_id == tenant_id,
+                KnowledgeDocumentAttachment.document_id == document_id,
+            )
+            .order_by(KnowledgeDocumentAttachment.sort_order.asc(), KnowledgeDocumentAttachment.id.asc())
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def list_for_document_ids(
+        db: AsyncSession,
+        tenant_id: int,
+        document_ids: list[int],
+    ) -> dict[int, list[KnowledgeDocumentAttachment]]:
+        if not document_ids:
+            return {}
+        result = await db.execute(
+            select(KnowledgeDocumentAttachment)
+            .where(
+                KnowledgeDocumentAttachment.tenant_id == tenant_id,
+                KnowledgeDocumentAttachment.document_id.in_(document_ids),
+            )
+            .order_by(
+                KnowledgeDocumentAttachment.document_id.asc(),
+                KnowledgeDocumentAttachment.sort_order.asc(),
+                KnowledgeDocumentAttachment.id.asc(),
+            )
+        )
+        items: dict[int, list[KnowledgeDocumentAttachment]] = {}
+        for attachment in result.scalars().all():
+            if attachment.document_id is not None:
+                items.setdefault(attachment.document_id, []).append(attachment)
+        return items
+
+    @staticmethod
+    async def create(db: AsyncSession, data: dict) -> KnowledgeDocumentAttachment:
+        attachment = KnowledgeDocumentAttachment(**data)
+        db.add(attachment)
+        await db.commit()
+        await db.refresh(attachment)
+        return attachment
+
+    @staticmethod
+    async def list_expired_unbound(
+        db: AsyncSession,
+        tenant_id: int,
+        now: datetime,
+        limit: int = 100,
+    ) -> list[KnowledgeDocumentAttachment]:
+        result = await db.execute(
+            select(KnowledgeDocumentAttachment)
+            .where(
+                KnowledgeDocumentAttachment.tenant_id == tenant_id,
+                KnowledgeDocumentAttachment.document_id.is_(None),
+                KnowledgeDocumentAttachment.expires_at.is_not(None),
+                KnowledgeDocumentAttachment.expires_at <= now,
+            )
+            .order_by(KnowledgeDocumentAttachment.expires_at.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def delete(db: AsyncSession, attachment: KnowledgeDocumentAttachment) -> None:
+        await db.delete(attachment)
+        await db.commit()
+
+
+class KnowledgeInspirationRepository:
+    @staticmethod
+    def _keyword_terms(search: str | None) -> list[str]:
+        if not search:
+            return []
+        return [part.casefold() for part in re.split(r"\s+", search.strip()) if part]
+
+    @staticmethod
+    def _apply_search_filter(query: Select, search: str | None) -> Select:
+        terms = KnowledgeInspirationRepository._keyword_terms(search)
+        if not terms:
+            return query
+        return query.where(or_(*(KnowledgeInspiration.content_plain.ilike(f"%{term}%") for term in terms)))
+
+    @staticmethod
+    async def get_by_id(db: AsyncSession, inspiration_id: int) -> KnowledgeInspiration | None:
+        return await db.get(KnowledgeInspiration, inspiration_id)
+
+    @staticmethod
+    async def query_paginated(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        search: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        per_page: int = 20,
+    ) -> tuple[list[KnowledgeInspiration], int]:
+        query = select(KnowledgeInspiration).where(KnowledgeInspiration.tenant_id == tenant_id)
+        query = KnowledgeInspirationRepository._apply_search_filter(query, search)
+        if status:
+            query = query.where(KnowledgeInspiration.status == status)
+
+        total = int((await db.execute(select(func.count()).select_from(query.subquery()))).scalar_one())
+        offset = (page - 1) * per_page
+        result = await db.execute(
+            query.order_by(KnowledgeInspiration.created_at.desc(), KnowledgeInspiration.id.desc())
+            .offset(offset)
+            .limit(per_page)
+        )
+        return list(result.scalars().all()), total
+
+    @staticmethod
+    async def count_by_status(
+        db: AsyncSession,
+        tenant_id: int,
+        *,
+        search: str | None = None,
+    ) -> dict[str, int]:
+        query = (
+            select(KnowledgeInspiration.status, func.count(KnowledgeInspiration.id))
+            .where(KnowledgeInspiration.tenant_id == tenant_id)
+            .group_by(KnowledgeInspiration.status)
+        )
+        query = KnowledgeInspirationRepository._apply_search_filter(query, search)
+        result = await db.execute(query)
+        return {str(status): int(count) for status, count in result.all()}
+
+    @staticmethod
+    async def create(db: AsyncSession, data: dict) -> KnowledgeInspiration:
+        inspiration = KnowledgeInspiration(**data)
+        db.add(inspiration)
+        await db.commit()
+        await db.refresh(inspiration)
+        return inspiration
+
+    @staticmethod
+    async def update(
+        db: AsyncSession,
+        inspiration: KnowledgeInspiration,
+        data: dict,
+    ) -> KnowledgeInspiration:
+        for key, value in data.items():
+            if hasattr(inspiration, key):
+                setattr(inspiration, key, value)
+        await db.commit()
+        await db.refresh(inspiration)
+        return inspiration
+
+    @staticmethod
+    async def delete(db: AsyncSession, inspiration: KnowledgeInspiration) -> None:
+        await db.delete(inspiration)
         await db.commit()

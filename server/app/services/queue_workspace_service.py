@@ -9,9 +9,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import redis.asyncio as aioredis
+from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError, ForbiddenError, NotFoundError
+from app.db.session import AsyncSessionLocal
 from app.enums import (
     AgentOnlineStatus,
     MessageContentType,
@@ -45,6 +47,7 @@ from app.schemas.queue_workspace import (
 )
 from app.services.agent_status_service import AgentStatusService
 from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
+from app.services.conversation_file_service import ConversationFileService
 from app.services.conversation_realtime_service import ConversationRealtimeService
 from app.services.conversation_service import AGENT_ASSIGNED_EVENT_TYPE, ConversationService
 from app.services.data_scope_service import DataScopeService, RESOURCE_CHAT_QUEUE
@@ -363,6 +366,26 @@ class QueueWorkspaceService:
             **assignment.model_dump(),
             message=QueueWorkspaceService._message_response_item(message, conversation, display_mode),
             message_sent=True,
+        )
+
+    @staticmethod
+    async def upload_task_file_managed(
+        task_id: int,
+        principal: EffectivePrincipal,
+        file: UploadFile,
+    ) -> dict:
+        if not principal.has_permission(QUEUE_ASSIGN_SELF_PERMISSION):
+            raise ForbiddenError("Permission denied")
+
+        async with AsyncSessionLocal() as db:
+            _task, conversation = await QueueWorkspaceService._get_visible_task(db, principal, task_id)
+            tenant_id = conversation.tenant_id
+            conversation_id = conversation.id
+
+        return await ConversationFileService._upload_file(
+            conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            file=file,
         )
 
     @staticmethod

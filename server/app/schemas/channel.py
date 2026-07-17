@@ -145,6 +145,7 @@ class ChannelConfig(BaseModel):
     open_agent_bot_service_hours_id: int | None = None
     open_agent_avatar_url: str | None = None
     open_agent_input_placeholder: str | None = None
+    open_agent_attachment_upload_enabled: bool = False
     open_agent_handoff_enabled: bool = True
     open_agent_handoff_label: str = DEFAULT_OPEN_AGENT_HANDOFF_LABEL
     open_agent_handoff_after_messages: int = DEFAULT_OPEN_AGENT_HANDOFF_AFTER_MESSAGES

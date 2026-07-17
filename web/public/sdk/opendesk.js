@@ -217,12 +217,14 @@
         maxWidth: Number.isFinite(Number(windowOptions.maxWidth)) ? Number(windowOptions.maxWidth) : null,
         maxHeight: Number.isFinite(Number(windowOptions.maxHeight)) ? Number(windowOptions.maxHeight) : null,
       },
+      testMode: options.testMode === true,
       callbacks: {
         onReady: options.onReady,
         onOpen: options.onOpen,
         onClose: options.onClose,
         onError: options.onError,
         onWarning: options.onWarning,
+        onTestEvent: options.onTestEvent,
       },
     }
   }
@@ -414,6 +416,7 @@
       this.launcher = document.createElement('button')
       this.launcher.type = 'button'
       this.launcher.className = 'od-launcher'
+      this.launcher.setAttribute('data-testid', 'launcher')
       this.launcher.setAttribute('aria-label', 'Open chat')
       this.launcher.innerHTML = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M18 3a4 4 0 0 1 4 4v8a4 4 0 0 1-4 4h-4.724l-4.762 2.857a1 1 0 0 1-1.508-.743l-.006-.114v-2h-1a4 4 0 0 1-3.995-3.8l-.005-.2v-8a4 4 0 0 1 4-4zm-4 9h-6a1 1 0 0 0 0 2h6a1 1 0 0 0 0-2m2-4h-8a1 1 0 1 0 0 2h8a1 1 0 0 0 0-2" fill="currentColor"/></svg>'
       this.launcher.addEventListener('click', this.toggle.bind(this))
@@ -514,6 +517,7 @@
 
     this.iframe = document.createElement('iframe')
     this.iframe.className = 'od-frame'
+    this.iframe.setAttribute('data-testid', 'chat-frame')
     this.iframe.title = this.channel ? this.channel.name + ' chat' : 'OpenDesk chat'
     this.iframe.allow = 'clipboard-write'
     this.iframe.referrerPolicy = 'strict-origin-when-cross-origin'
@@ -531,6 +535,9 @@
       url.searchParams.set('embed', '1')
       url.searchParams.set('opendesk_instance', this.instanceId)
       url.searchParams.set('preload', '1')
+      if (this.options.testMode) {
+        url.searchParams.set('opendesk_test', '1')
+      }
       if (this.options.locale && this.options.locale !== 'auto') {
         url.searchParams.set('locale', this.options.locale)
       }
@@ -687,6 +694,23 @@
         code: data.code || 'CONTEXT_PARTIAL_ACCEPTED',
       }, 'warn')
       this.emitWarning(createSdkError(data.code || 'CONTEXT_PARTIAL_ACCEPTED', data.message || 'OpenDesk chat iframe reported a warning.', data))
+      return
+    }
+    if (data.type === 'test-event') {
+      if (!this.options.testMode) return
+      var record = {
+        event: data.event || '',
+        payload: data.payload || {},
+        ts: Date.now(),
+      }
+      if (!window.__openDeskTestEvents) window.__openDeskTestEvents = []
+      window.__openDeskTestEvents.push(record)
+      try {
+        window.dispatchEvent(new CustomEvent('opendesk:test-event', { detail: record }))
+      } catch (e) {
+        // CustomEvent may be unavailable in very old browsers.
+      }
+      callSafely(this.options.callbacks.onTestEvent, record)
     }
   }
 

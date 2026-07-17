@@ -536,13 +536,13 @@ async def submit_conversation_satisfaction_public(
 )
 async def upload_conversation_file_public(
     conversation_public_id: str,
+    request: Request,
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    visitor_context: dict = Depends(get_visitor_context),
+    authorization: str | None = Header(None),
 ):
     """Upload a visitor file bound to a conversation."""
-    return await ConversationFileService.upload_visitor_file_for_session(
-        db,
+    visitor_context = await get_visitor_context_short_session(request, authorization)
+    return await ConversationFileService.upload_visitor_file_for_session_managed(
         conversation_public_id=conversation_public_id,
         visitor_context=visitor_context,
         file=file,
@@ -603,6 +603,7 @@ async def get_conversation_file_url_public(
     conversation_public_id: str = Query(...),
     download_name: str | None = Query(None),
     download: bool = Query(False),
+    image_process: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
     visitor_context: dict = Depends(get_visitor_context),
 ):
@@ -614,6 +615,7 @@ async def get_conversation_file_url_public(
         file_id=file_id,
         download_name=download_name,
         download=download,
+        image_process=image_process,
     )
 
 
@@ -626,6 +628,7 @@ async def get_offline_message_file_url_public(
     offline_message_public_id: str = Query(...),
     download_name: str | None = Query(None),
     download: bool = Query(False),
+    image_process: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
     visitor_context: dict = Depends(get_visitor_context),
 ):
@@ -637,6 +640,7 @@ async def get_offline_message_file_url_public(
         file_id=file_id,
         download_name=download_name,
         download=download,
+        image_process=image_process,
     )
 
 

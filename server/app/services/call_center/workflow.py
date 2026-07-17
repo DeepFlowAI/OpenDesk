@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
@@ -274,9 +275,25 @@ class VoiceFlowWorkflow:
         await self._end("unknown_step")
         return True
 
-    async def _end(self, reason: str) -> None:
+    # End reasons that mean the caller was handed to an agent (the agent owns
+    # the call now); every other terminal reason leaves the caller unbridged.
+    _HANDOFF_END_REASONS = frozenset({"bridged"})
+
+    async def _end(self, reason: str | None) -> None:
         self._cancel_timeout()
         self.ended_reason = reason
+        # Let long-running executors (e.g. the assign_queue hold loop) notice
+        # the caller is gone and stop waiting.
+        self.ctx.variables["sys._workflow_ended"] = True
+        # If the workflow finished WITHOUT handing the caller to an agent (no
+        # queue available, agent in wrap-up / all busy, timeout, error), the
+        # caller's SIP leg is still up and would sit in dead air. Hang it up.
+        # Best-effort: if the caller already hung up, the kernel just no-ops.
+        if reason not in self._HANDOFF_END_REASONS:
+            with suppress(Exception):
+                await self.telephony.call_hangup(
+                    self.call_id, reason=f"workflow_end:{reason or 'end'}"
+                )
         self.done.set()
 
     # ─────────────────── Hangup signal ───────────────────

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, ANY
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.services.conversation_service import ConversationService
 from app.core.exceptions import BusinessError, ForbiddenError, ValidationError
@@ -1232,13 +1233,15 @@ async def test_get_visitor_history_assembles_messages_and_has_more(monkeypatch):
         "app.services.conversation_service.EmployeeRepository.get_by_ids",
         get_agents,
     )
+    get_display_mode = AsyncMock(return_value="nickname")
     monkeypatch.setattr(
         "app.services.conversation_service.ConversationAgentDisplaySettingService.get_display_mode",
-        AsyncMock(return_value="nickname"),
+        get_display_mode,
     )
 
+    db = AsyncMock()
     result = await ConversationService.get_visitor_history(
-        AsyncMock(),
+        db,
         channel_id=1,
         visitor_external_id="visitor-1",
         current_conversation_id=4,
@@ -1256,6 +1259,7 @@ async def test_get_visitor_history_assembles_messages_and_has_more(monkeypatch):
     assert get_history.await_args.kwargs["current_conversation_id"] == 4
     assert get_history.await_args.kwargs["before_id"] == 3
     assert get_messages.await_args.kwargs["include_internal"] is False
+    get_display_mode.assert_awaited_once_with(db, 10)
 
 
 @pytest.mark.asyncio
@@ -1329,8 +1333,20 @@ async def test_get_unread_offline_replies_for_session_assembles_customer_unread_
         list_unread,
     )
     monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_by_external_id",
+        AsyncMock(return_value=visitor),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_closed_with_agent_unread_for_visitor",
+        AsyncMock(return_value=([], False)),
+    )
+    monkeypatch.setattr(
         "app.services.conversation_service.MessageRepository.get_recent_by_conversations",
         AsyncMock(return_value=messages_by_conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_agent_unread_message_ids_by_conversations",
+        AsyncMock(return_value={2: [201], 3: [301]}),
     )
     monkeypatch.setattr(
         "app.services.conversation_service.EmployeeRepository.get_by_ids",
@@ -1353,11 +1369,223 @@ async def test_get_unread_offline_replies_for_session_assembles_customer_unread_
     assert result["has_more"] is True
     assert [item["conversation_public_id"] for item in result["items"]] == ["cv_2", "cv_3"]
     assert result["items"][0]["offline_message_public_id"] == "om_2"
+    assert result["items"][0]["offline_reply_unread"] is True
+    assert result["items"][0]["agent_unread_message_ids"] == [201]
     assert result["items"][1]["customer_unread_message_id"] == 301
     assert result["items"][1]["messages"][0]["sender_name"] == "小艾"
     list_unread.assert_awaited_once()
     assert list_unread.await_args.kwargs["tenant_id"] == 10
     assert list_unread.await_args.kwargs["limit"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_unread_offline_replies_for_session_includes_closed_agent_unread_conversations(monkeypatch):
+    """Closed conversations with unread agent messages surface even without an offline-message row."""
+    visitor = SimpleNamespace(id=20, name="访客")
+    agent = SimpleNamespace(id=30, display_name="Alice", nickname="小艾", name="alice", avatar="avatar.png")
+    offline_conversation = SimpleNamespace(
+        id=2,
+        public_id="cv_2",
+        status="closed",
+        started_at=_dt(2),
+        ended_at=_dt(2),
+        last_message_at=_dt(2),
+        created_at=_dt(2),
+        agent=agent,
+        visitor=visitor,
+    )
+    offline_row = SimpleNamespace(
+        public_id="om_2",
+        conversation=offline_conversation,
+        visitor=visitor,
+        customer_unread_at=_dt(2),
+        customer_unread_first_message_id=201,
+    )
+    closed_unread_conversation = SimpleNamespace(
+        id=3,
+        public_id="cv_3",
+        status="closed",
+        started_at=_dt(3),
+        ended_at=_dt(3),
+        last_message_at=_dt(3),
+        created_at=_dt(3),
+        agent=agent,
+        visitor=visitor,
+    )
+    messages_by_conversation = {
+        2: [
+            SimpleNamespace(
+                id=201,
+                conversation_id=2,
+                sender_type="agent",
+                sender_id=30,
+                content_type="text",
+                content="offline reply",
+                created_at=_dt(2),
+            )
+        ],
+        3: [
+            SimpleNamespace(
+                id=300,
+                conversation_id=3,
+                sender_type="visitor",
+                sender_id=20,
+                content_type="text",
+                content="already read context",
+                created_at=_dt(3),
+            ),
+            SimpleNamespace(
+                id=301,
+                conversation_id=3,
+                sender_type="agent",
+                sender_id=30,
+                content_type="text",
+                content="reply before close",
+                created_at=_dt(3),
+            ),
+        ],
+    }
+
+    get_closed_unread = AsyncMock(return_value=([closed_unread_conversation], False))
+    monkeypatch.setattr(
+        "app.services.conversation_service.OfflineMessageRepository.list_customer_unread_replies",
+        AsyncMock(return_value=([offline_row], False)),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_by_external_id",
+        AsyncMock(return_value=visitor),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_closed_with_agent_unread_for_visitor",
+        get_closed_unread,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_recent_by_conversations",
+        AsyncMock(return_value=messages_by_conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_agent_unread_message_ids_by_conversations",
+        AsyncMock(return_value={3: [301]}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.EmployeeRepository.get_by_ids",
+        AsyncMock(return_value=[agent]),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationAgentDisplaySettingService.get_display_mode",
+        AsyncMock(return_value="nickname"),
+    )
+
+    result = await ConversationService.get_unread_offline_replies_for_session(
+        AsyncMock(),
+        visitor_context={
+            "tenant_id": 10,
+            "channel_id": 5,
+            "visitor_external_id": "visitor-1",
+        },
+    )
+
+    assert result["has_more"] is False
+    assert [item["conversation_public_id"] for item in result["items"]] == ["cv_2", "cv_3"]
+    closed_item = result["items"][1]
+    assert closed_item["offline_message_public_id"] is None
+    assert closed_item["offline_reply_unread"] is False
+    assert closed_item["customer_unread_at"] is None
+    assert closed_item["agent_unread_message_ids"] == [301]
+    # Only the unread agent message is surfaced, not the full transcript.
+    assert [message["id"] for message in closed_item["messages"]] == [301]
+    assert closed_item["messages_truncated"] is False
+    get_closed_unread.assert_awaited_once()
+    assert get_closed_unread.await_args.kwargs["visitor_id"] == 20
+    assert get_closed_unread.await_args.kwargs["exclude_conversation_ids"] == [2]
+
+
+@pytest.mark.asyncio
+async def test_get_visitor_history_for_session_resolves_public_ids_and_filters_internal(monkeypatch):
+    visitor = SimpleNamespace(id=20, name="访客")
+    agent = SimpleNamespace(id=30, display_name="Alice", nickname="小艾", name="alice", avatar="avatar.png")
+    current = SimpleNamespace(id=4, public_id="cv_current", tenant_id=10)
+    before = SimpleNamespace(id=3, public_id="cv_before", tenant_id=10)
+    history_conversation = SimpleNamespace(
+        id=2,
+        public_id="cv_2",
+        status="closed",
+        started_at=_dt(2),
+        ended_at=_dt(2),
+        last_message_at=_dt(2),
+        created_at=_dt(2),
+        agent=agent,
+    )
+    messages_by_conversation = {
+        2: [
+            SimpleNamespace(
+                id=201,
+                conversation_id=2,
+                sender_type="agent",
+                sender_id=30,
+                content_type="text",
+                content="reply",
+                created_at=_dt(2),
+                metadata_={},
+            )
+        ]
+    }
+    get_history = AsyncMock(return_value=[history_conversation])
+    get_display_mode = AsyncMock(return_value="nickname")
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.UserRepository.get_by_external_id",
+        AsyncMock(return_value=visitor),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_by_public_id",
+        AsyncMock(side_effect=[current, before]),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_visitor_history",
+        get_history,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_recent_by_conversations",
+        AsyncMock(return_value=messages_by_conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_agent_unread_message_ids_by_conversations",
+        AsyncMock(return_value={2: [201]}),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.EmployeeRepository.get_by_ids",
+        AsyncMock(return_value=[agent]),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationAgentDisplaySettingService.get_display_mode",
+        get_display_mode,
+    )
+
+    db = AsyncMock()
+    result = await ConversationService.get_visitor_history_for_session(
+        db,
+        visitor_context={
+            "tenant_id": 10,
+            "channel_id": 5,
+            "visitor_external_id": "visitor-1",
+        },
+        current_conversation_public_id="cv_current",
+        before_public_id="cv_before",
+        limit=2,
+    )
+
+    assert result["has_more"] is False
+    assert result["items"][0]["conversation_public_id"] == "cv_2"
+    assert result["items"][0]["agent_unread_message_ids"] == [201]
+    assert result["items"][0]["agent_name"] == "小艾"
+    assert result["items"][0]["messages"][0]["sender_name"] == "小艾"
+    get_history.assert_awaited_once()
+    assert get_history.await_args.kwargs["channel_id"] == 5
+    assert get_history.await_args.kwargs["visitor_id"] == 20
+    assert get_history.await_args.kwargs["current_conversation_id"] == 4
+    assert get_history.await_args.kwargs["before_id"] == 3
+    get_display_mode.assert_awaited_once_with(db, 10)
 
 
 @pytest.mark.asyncio
@@ -1442,6 +1670,193 @@ async def test_agent_message_marks_offline_reply_customer_unread(monkeypatch):
     assert mark_unread.await_args.kwargs["conversation_id"] == 3
     assert mark_unread.await_args.kwargs["message_id"] == 301
     reset_outbound.assert_awaited_once_with(ANY, conversation, message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("visitor_status", "expected_online_at_send"),
+    [("online", True), ("offline", False)],
+)
+async def test_agent_public_message_snapshots_visitor_status(
+    monkeypatch,
+    visitor_status,
+    expected_online_at_send,
+):
+    conversation = _workspace_conversation(status="active")
+    message = SimpleNamespace(
+        id=301,
+        conversation_id=3,
+        sender_type="agent",
+        sender_id=30,
+        content_type="text",
+        content="reply",
+        created_at=_dt(3),
+        metadata_={},
+    )
+    create_message = AsyncMock(return_value=message)
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.create",
+        create_message,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.update_last_message",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.OfflineMessageRepository.mark_customer_unread_by_conversation",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_web_status_service.VisitorWebStatusService.get_status",
+        AsyncMock(return_value=visitor_status),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.reset_on_outbound_message",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.db.redis.redis_client",
+        SimpleNamespace(client=SimpleNamespace()),
+    )
+
+    await ConversationService.send_message(
+        AsyncMock(),
+        conversation_id=3,
+        sender_type="agent",
+        sender_id=30,
+        content_type="text",
+        content="reply",
+        tenant_id=10,
+    )
+
+    assert create_message.await_args.args[1]["visitor_online_at_send"] is expected_online_at_send
+
+
+@pytest.mark.asyncio
+async def test_agent_public_message_keeps_unknown_status_when_presence_lookup_fails(monkeypatch):
+    conversation = _workspace_conversation(status="active")
+    message = SimpleNamespace(
+        id=301,
+        conversation_id=3,
+        sender_type="agent",
+        sender_id=30,
+        content_type="text",
+        content="reply",
+        created_at=_dt(3),
+        metadata_={},
+    )
+    create_message = AsyncMock(return_value=message)
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr("app.services.conversation_service.MessageRepository.create", create_message)
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.update_last_message",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.OfflineMessageRepository.mark_customer_unread_by_conversation",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_web_status_service.VisitorWebStatusService.get_status",
+        AsyncMock(side_effect=RuntimeError("redis unavailable")),
+    )
+    monkeypatch.setattr(
+        "app.services.visitor_timeout_close_service.VisitorTimeoutCloseService.reset_on_outbound_message",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.db.redis.redis_client",
+        SimpleNamespace(client=SimpleNamespace()),
+    )
+
+    await ConversationService.send_message(
+        AsyncMock(),
+        conversation_id=3,
+        sender_type="agent",
+        sender_id=30,
+        content_type="text",
+        content="reply",
+        tenant_id=10,
+    )
+
+    assert create_message.await_args.args[1]["visitor_online_at_send"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_message_returns_existing_message_after_concurrent_duplicate(monkeypatch):
+    conversation = SimpleNamespace(id=3, tenant_id=10, status="active", agent_id=30)
+    existing_message = SimpleNamespace(
+        id=301,
+        tenant_id=10,
+        conversation_id=3,
+        sender_type="agent",
+        sender_id=30,
+        content_type="text",
+        content="reply",
+        metadata_={"client_message_id": "client-301"},
+        client_message_id="client-301",
+    )
+    db = AsyncMock()
+    create_message = AsyncMock(
+        side_effect=IntegrityError("INSERT INTO messages", {}, Exception("duplicate key"))
+    )
+    get_existing = AsyncMock(return_value=existing_message)
+    update_last_message = AsyncMock()
+    mark_unread = AsyncMock()
+
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.get_by_id",
+        AsyncMock(return_value=conversation),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.create",
+        create_message,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.MessageRepository.get_by_client_message_id",
+        get_existing,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.ConversationRepository.update_last_message",
+        update_last_message,
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_service.OfflineMessageRepository.mark_customer_unread_by_conversation",
+        mark_unread,
+    )
+
+    result = await ConversationService.send_message(
+        db,
+        conversation_id=3,
+        sender_type="agent",
+        sender_id=30,
+        content_type="text",
+        content="reply",
+        tenant_id=10,
+        metadata={"client_message_id": "client-301"},
+    )
+
+    assert result is existing_message
+    db.rollback.assert_awaited_once()
+    get_existing.assert_awaited_once_with(
+        db,
+        10,
+        3,
+        "client-301",
+        sender_type="agent",
+        sender_id=30,
+    )
+    message_data = create_message.await_args.args[1]
+    assert message_data["client_message_id"] == "client-301"
+    update_last_message.assert_not_awaited()
+    mark_unread.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1591,13 +2006,15 @@ async def test_get_workspace_visitor_history_assembles_channel_and_agent(monkeyp
         "app.services.conversation_service.EmployeeRepository.get_by_ids",
         AsyncMock(return_value=[]),
     )
+    get_display_mode = AsyncMock(return_value="name")
     monkeypatch.setattr(
         "app.services.conversation_service.ConversationAgentDisplaySettingService.get_display_mode",
-        AsyncMock(return_value="name"),
+        get_display_mode,
     )
 
+    db = AsyncMock()
     result = await ConversationService.get_workspace_visitor_history(
-        AsyncMock(),
+        db,
         conversation_id=4,
         tenant_id=10,
         agent_id=30,
@@ -1613,6 +2030,7 @@ async def test_get_workspace_visitor_history_assembles_channel_and_agent(monkeyp
     assert get_history.await_args.kwargs["channel_id"] is None
     assert get_history.await_args.kwargs["agent_id"] == 30
     assert get_history.await_args.kwargs["keyword"] == "question"
+    get_display_mode.assert_awaited_once_with(db, 10)
 
 
 @pytest.mark.asyncio

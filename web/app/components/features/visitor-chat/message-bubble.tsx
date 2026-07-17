@@ -20,6 +20,11 @@ import {
   type ToolCallMessagePartProps,
 } from '@assistant-ui/react'
 import { MessageAttachment } from '@/app/components/features/chat/message-attachment'
+import { LinkifiedText } from '@/app/components/features/chat/linkified-text'
+import {
+  MessageStatusIcon,
+  resolveVisibleMessageStatus,
+} from '@/app/components/features/chat/message-status-icon'
 import { MessageQuoteBlock } from '@/app/components/features/chat/message-quote'
 import { OpenAgentFeedback } from '@/app/components/features/chat/open-agent-feedback'
 import { RichTextMessageContent } from '@/app/components/features/chat/rich-text-message-content'
@@ -58,74 +63,33 @@ type MessageBubbleProps = {
   renderAssistantParts?: boolean
   allMessages?: Message[]
   onEditRecalledMessage?: (request: { text: string; contentType?: 'text' | 'rich_text'; quotedMessage?: Message | null }) => void
+  onRetryMessage?: (message: Message) => void
+}
+
+export function resolveVisitorVisibleMessageStatus(
+  status: string | undefined,
+  options: {
+    readStatusEnabled: boolean
+    offlineMessagePublicId?: string
+    openAgent?: boolean
+  },
+) {
+  if (options.openAgent) return null
+  const isOfflineMessage = Boolean(options.offlineMessagePublicId)
+  return resolveVisibleMessageStatus(status, {
+    enabled: options.readStatusEnabled && !isOfflineMessage,
+    deliveredAsUnread: true,
+    alwaysShowOffline: !isOfflineMessage,
+  })
 }
 
 const MESSAGE_RECALL_WINDOW_MS = 2 * 60 * 1000
 const MESSAGE_ACTION_MENU_WIDTH = 112
 const MESSAGE_ACTION_MENU_VERTICAL_PADDING = 8
 const MESSAGE_ACTION_MENU_ITEM_HEIGHT = 32
-const HTTP_URL_PATTERN = /https?:\/\/[^\s<>"'`]+/gi
-const TRAILING_URL_PUNCTUATION_PATTERN = /[.,!?;:)\]}，。！？；：、）】》]+$/
-
-type TextLinkSegment = {
-  type: 'link'
-  text: string
-  href: string
-} | {
-  type: 'text'
-  text: string
-}
 
 function isRecallableContentType(contentType: string): boolean {
   return contentType === 'text' || contentType === 'rich_text' || contentType === 'image' || contentType === 'file'
-}
-
-function splitHttpLinks(content: string): TextLinkSegment[] {
-  const segments: TextLinkSegment[] = []
-  let lastIndex = 0
-
-  for (const match of content.matchAll(HTTP_URL_PATTERN)) {
-    const matchedText = match[0]
-    const matchIndex = match.index ?? 0
-    const linkText = matchedText.replace(TRAILING_URL_PUNCTUATION_PATTERN, '')
-    const trailingText = matchedText.slice(linkText.length)
-
-    if (matchIndex > lastIndex) {
-      segments.push({ type: 'text', text: content.slice(lastIndex, matchIndex) })
-    }
-
-    segments.push({ type: 'link', text: linkText, href: linkText })
-    if (trailingText) segments.push({ type: 'text', text: trailingText })
-    lastIndex = matchIndex + matchedText.length
-  }
-
-  if (lastIndex < content.length) {
-    segments.push({ type: 'text', text: content.slice(lastIndex) })
-  }
-
-  return segments.length > 0 ? segments : [{ type: 'text', text: content }]
-}
-
-function LinkifiedText({ content }: { content: string }) {
-  return (
-    <>
-      {splitHttpLinks(content).map((segment, index) => (
-        segment.type === 'link' ? (
-          <a
-            key={`${segment.href}-${index}`}
-            href={segment.href}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-current underline underline-offset-2 hover:opacity-80"
-          >
-            {segment.text}
-          </a>
-        ) : (
-          <span key={`text-${index}`}>{segment.text}</span>
-        )
-      ))}
-    </>
-  )
 }
 
 function isWithinRecallWindow(createdAt: string): boolean {
@@ -225,15 +189,6 @@ function formatTime(dateStr: string, locale: string): string {
   const month = String(date.getMonth() + 1).padStart(2, '0')
   const day = String(date.getDate()).padStart(2, '0')
   return `${year}-${month}-${day} ${time}`
-}
-
-function statusLabel(status: string | undefined, locale: string): string | null {
-  if (!status) return null
-  if (status === 'sending') return locale === 'zh' ? '发送中' : 'Sending'
-  if (status === 'delivered') return locale === 'zh' ? '已送达' : 'Delivered'
-  if (status === 'unread') return locale === 'zh' ? '未读' : 'Unread'
-  if (status === 'read') return locale === 'zh' ? '已读' : 'Read'
-  return null
 }
 
 function OpenAgentAIDisclaimerNotice({
@@ -603,6 +558,7 @@ export function MessageBubble({
   renderAssistantParts = false,
   allMessages = [],
   onEditRecalledMessage,
+  onRetryMessage,
 }: MessageBubbleProps) {
   const isUser = message.sender_type === 'visitor'
   const isAssistant = message.sender_type === 'agent' || message.sender_type === 'bot'
@@ -703,9 +659,14 @@ export function MessageBubble({
       ? message.metadata.offline_message_public_id
       : undefined
   const webSdkReadStatusEnabled = visitorChat.channel.read_status?.web_sdk_enabled ?? true
-  const canShowReadStatus = isUser && webSdkReadStatusEnabled && !offlineMessagePublicId
   const effectiveStatus = messageStatus || message.status
-  const statusText = canShowReadStatus ? statusLabel(effectiveStatus, locale) : null
+  const visibleStatus = isUser
+    ? resolveVisitorVisibleMessageStatus(effectiveStatus, {
+        readStatusEnabled: webSdkReadStatusEnabled,
+        offlineMessagePublicId,
+        openAgent: message.metadata?.open_agent === true,
+      })
+    : null
   const quote = messageQuoteFromMetadata(message.metadata)
   const quotedOriginal = quote
     ? allMessages.find((item) => item.id === quote.message_id) ?? null
@@ -881,6 +842,16 @@ export function MessageBubble({
       className="mb-2"
     />
   ) : null
+  const assistantHeader = !isUser && (showTime || (showName && message.sender_name)) ? (
+    <div className="mb-1 flex max-w-full items-center gap-1.5 text-muted-foreground">
+      {showTime && (
+        <span className="shrink-0 text-[10px]">{formatTime(message.created_at, locale)}</span>
+      )}
+      {showName && message.sender_name && (
+        <span className="truncate text-xs font-medium">{message.sender_name}</span>
+      )}
+    </div>
+  ) : null
 
   if (message.is_recalled) {
     if (!shouldShowVisitorRecalledNotice(message)) return null
@@ -927,11 +898,7 @@ export function MessageBubble({
         )}
 
         <div className="flex w-full min-w-0 max-w-[75%] flex-col items-start">
-          {showName && message.sender_name && (
-            <span className="mb-1 text-xs font-medium text-muted-foreground">
-              {message.sender_name}
-            </span>
-          )}
+          {assistantHeader}
 
           <div className="w-full min-w-0 space-y-2">
             {quoteBlock}
@@ -939,11 +906,6 @@ export function MessageBubble({
           </div>
 
           {aiDisclaimerNotice}
-          {showTime && (
-            <div className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground">
-              <span>{formatTime(message.created_at, locale)}</span>
-            </div>
-          )}
           <OpenAgentFeedback
             messageId={message.id}
             senderType={message.sender_type}
@@ -981,11 +943,7 @@ export function MessageBubble({
         )}
 
         <div className="flex w-full min-w-0 max-w-[75%] flex-col items-start">
-          {showName && message.sender_name && (
-            <span className="mb-1 text-xs font-medium text-muted-foreground">
-              {message.sender_name}
-            </span>
-          )}
+          {assistantHeader}
 
           <div className="w-full min-w-0 space-y-2">
             {quoteBlock}
@@ -1006,11 +964,6 @@ export function MessageBubble({
           </div>
 
           {aiDisclaimerNotice}
-          {showTime && (
-            <div className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground">
-              <span>{formatTime(message.created_at, locale)}</span>
-            </div>
-          )}
           <OpenAgentFeedback
             messageId={message.id}
             senderType={message.sender_type}
@@ -1045,75 +998,91 @@ export function MessageBubble({
 
       {/* Bubble */}
       <div className={`flex min-w-0 max-w-[75%] flex-col ${isUser ? 'items-end' : 'items-start'}`}>
-        {showName && isAssistant && message.sender_name && (
-          <span className="mb-1 text-xs font-medium text-muted-foreground">
-            {message.sender_name}
-          </span>
-        )}
+        {assistantHeader}
 
-        {attachmentContentType ? (
-          <>
-            {quoteBlock}
-            <MessageAttachment
-              conversationId={message.conversation_id}
-              conversationPublicId={message.conversation_public_id}
-              offlineMessagePublicId={offlineMessagePublicId}
-              visitorSessionToken={visitorChat.visitorSessionToken}
-              contentType={attachmentContentType}
-              content={message.content}
-            />
-          </>
-        ) : isRichText ? (
-          quote ? (
-            <div
-              className={cn('max-w-full px-3 py-2 text-sm break-words break-all', !isUser && 'min-h-[42px]')}
-              style={bubbleStyle}
-            >
-              {embeddedQuoteBlock}
+        <div className={cn(visibleStatus ? 'flex min-w-0 max-w-full items-end gap-1' : 'contents')}>
+          {visibleStatus && (
+            <MessageStatusIcon status={visibleStatus} locale={locale as Locale} tone="gray" />
+          )}
+          {attachmentContentType ? (
+            <div className="flex min-w-0 max-w-full flex-col">
+              {quoteBlock}
+              <MessageAttachment
+                conversationId={message.conversation_id}
+                conversationPublicId={message.conversation_public_id}
+                offlineMessagePublicId={offlineMessagePublicId}
+                visitorSessionToken={visitorChat.visitorSessionToken}
+                contentType={attachmentContentType}
+                content={message.content}
+                inlinePlayableVideo
+              />
+            </div>
+          ) : isRichText ? (
+            quote ? (
+              <div
+                className={cn('max-w-full px-3 py-2 text-sm break-words break-all', !isUser && 'min-h-[42px]')}
+                style={bubbleStyle}
+              >
+                {embeddedQuoteBlock}
+                <RichTextMessageContent
+                  html={message.content}
+                  conversationId={message.conversation_id}
+                  conversationPublicId={message.conversation_public_id}
+                  visitorSessionToken={visitorChat.visitorSessionToken}
+                  className="max-w-full text-sm break-words break-all"
+                />
+              </div>
+            ) : (
               <RichTextMessageContent
                 html={message.content}
                 conversationId={message.conversation_id}
                 conversationPublicId={message.conversation_public_id}
                 visitorSessionToken={visitorChat.visitorSessionToken}
-                className="max-w-full text-sm break-words break-all"
+                className={cn('max-w-full px-3 py-2 text-sm break-words break-all', !isUser && 'min-h-[42px]')}
+                style={bubbleStyle}
               />
-            </div>
+            )
           ) : (
-            <RichTextMessageContent
-              html={message.content}
-              conversationId={message.conversation_id}
-              conversationPublicId={message.conversation_public_id}
-              visitorSessionToken={visitorChat.visitorSessionToken}
-              className={cn('max-w-full px-3 py-2 text-sm break-words break-all', !isUser && 'min-h-[42px]')}
+            <div
+              className={cn(
+                'min-h-[42px] max-w-full px-3 py-2 text-sm',
+                !isBot && !quote && 'flex items-center',
+                isBot && 'break-words break-all whitespace-pre-wrap',
+                isBot && [markdownTextRootClass, richTextListStyleClass],
+              )}
               style={bubbleStyle}
-            />
-          )
-        ) : (
-          <div
-            className={cn(
-              'min-h-[42px] max-w-full px-3 py-2 text-sm',
-              !isBot && !quote && 'flex items-center',
-              isBot && 'break-words break-all whitespace-pre-wrap',
-              isBot && [markdownTextRootClass, richTextListStyleClass],
-            )}
-            style={bubbleStyle}
-          >
-            {embeddedQuoteBlock}
-            {isBot ? (
-              <MarkdownText>{message.content}</MarkdownText>
-            ) : (
-              <span className="min-w-0 break-words break-all whitespace-pre-wrap leading-5">
-                <LinkifiedText content={message.content} />
-              </span>
-            )}
-          </div>
-        )}
+            >
+              {embeddedQuoteBlock}
+              {isBot ? (
+                <MarkdownText>{message.content}</MarkdownText>
+              ) : (
+                <span className="min-w-0 break-words break-all whitespace-pre-wrap leading-5">
+                  <LinkifiedText content={message.content} />
+                </span>
+              )}
+            </div>
+          )}
+        </div>
 
         {aiDisclaimerNotice}
-        {(showTime || statusText) && (
+        {isUser && message.status === 'failed' && onRetryMessage && (
+          <div
+            className="mt-1 flex items-center gap-2 text-xs text-destructive"
+            data-message-send-failed
+          >
+            <span>{locale === 'zh' ? '发送失败' : 'Failed to send'}</span>
+            <button
+              type="button"
+              className="font-medium underline-offset-2 hover:underline"
+              onClick={() => onRetryMessage(message)}
+            >
+              {locale === 'zh' ? '重新发送' : 'Retry'}
+            </button>
+          </div>
+        )}
+        {showTime && isUser && (
           <div className={`mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground ${isUser ? 'flex-row-reverse' : ''}`}>
-            {showTime && <span>{formatTime(message.created_at, locale)}</span>}
-            {statusText && <span>{statusText}</span>}
+            <span>{formatTime(message.created_at, locale)}</span>
           </div>
         )}
         {isBot && (

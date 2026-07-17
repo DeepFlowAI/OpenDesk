@@ -66,9 +66,12 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(offline_messages.router, prefix="/api/v1")
     app.include_router(queue_workspace.router, prefix="/api/v1")
 
-    from app.routers.v1 import form_layouts, interaction_rules, session_summary, call_summary, user_views, ticket_views, organization_views, users, organizations, tickets, call_center, queue
+    from app.routers.v1 import form_layouts, interaction_rules, session_summary, call_summary, user_views, ticket_views, organization_views, users, organizations, tickets, call_center, queue, engagement, sip_extensions
     app.include_router(call_center.router, prefix="/api/v1")
+    app.include_router(sip_extensions.router, prefix="/api/v1")
+    app.include_router(sip_extensions.device_router, prefix="/api/v1")
     app.include_router(queue.router, prefix="/api/v1")
+    app.include_router(engagement.router, prefix="/api/v1")
     app.include_router(form_layouts.router, prefix="/api/v1")
     app.include_router(interaction_rules.router, prefix="/api/v1")
     app.include_router(session_summary.router, prefix="/api/v1")

@@ -87,6 +87,25 @@ class QueuePicker:
             }
             for emp in employees
         ]
+        # Only offer to agents whose browser is actually connected. The DB
+        # "ready" status records the status an agent last *chose* and is never
+        # cleared on disconnect, so without this a call gets offered to a
+        # colleague who closed their tab — it rings a dead browser until the
+        # caller gives up, while a genuinely-connected agent never gets a turn.
+        # An agent inside the brief disconnect grace window still counts as
+        # connected, so ordinary socket flaps don't drop them from rotation.
+        if r is not None:
+            from app.services.agent_status_service import AgentStatusService
+
+            connected: list[dict] = []
+            for candidate in candidates:
+                if await AgentStatusService.is_connected(
+                    r, tenant_id, candidate["employee_id"]
+                ):
+                    connected.append(candidate)
+            candidates = connected
+            if not candidates:
+                return None
         if r is not None and call_id and offer_id:
             preferred = next(
                 (candidate for candidate in candidates if candidate["employee_id"] == preferred_employee_id),
@@ -208,6 +227,63 @@ class QueuePicker:
                 return None
             return pick | {"resource_state": reserved["resource_state"]}
         return pick
+
+    async def has_agent_on_call_for_queue(
+        self,
+        db: AsyncSession,
+        tenant_id: int,
+        queue_type: str,
+        queue_id: int,
+        r: aioredis.Redis | None = None,
+    ) -> bool | None:
+        """Whether the queue has an agent currently *engaged on a call* (resource
+        reserved / ringing / in_call) who will free up soon — the only case where
+        holding the caller in queue is worthwhile.
+
+        A genuinely available agent would already have been picked; this runs
+        only after that failed. So a `ready` agent left here is unreachable
+        (e.g. a SIP extension that's down) or reserved elsewhere, a `busy`/`break`
+        agent chose to stop taking calls, and the caller's own open workspace tab
+        is idle — none of those will take this call, so we do NOT wait for them.
+
+        Returns None when resource state can't be read (no Redis) so callers keep
+        their existing wait behavior rather than dropping a caller blindly.
+        """
+        if r is None:
+            return None
+
+        from sqlalchemy import select
+        from app.models.employee import Employee
+        from app.models.employee_group import EmployeeGroupMember
+        from app.services.cc_agent_resource_service import (
+            ACTIVE_RESOURCE_STATES,
+            CcAgentResourceService,
+        )
+
+        if queue_type == "employee_group":
+            q = (
+                select(EmployeeGroupMember.employee_id)
+                .join(Employee, Employee.id == EmployeeGroupMember.employee_id)
+                .where(
+                    EmployeeGroupMember.group_id == queue_id,
+                    Employee.tenant_id == tenant_id,
+                    Employee.is_active.is_(True),
+                )
+            )
+        else:
+            q = (
+                select(Employee.id).where(
+                    Employee.id == queue_id,
+                    Employee.tenant_id == tenant_id,
+                    Employee.is_active.is_(True),
+                )
+            )
+        employee_ids = list((await db.execute(q)).scalars().all())
+        for employee_id in employee_ids:
+            snapshot = await CcAgentResourceService.get_snapshot(r, tenant_id, employee_id)
+            if snapshot and snapshot.get("resource_state") in ACTIVE_RESOURCE_STATES:
+                return True
+        return False
 
     def reset(self) -> None:
         """Test helper."""

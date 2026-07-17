@@ -25,6 +25,7 @@ RESOURCE_CALL_RECORD = "call_record"
 RESOURCE_OFFLINE_MESSAGE = "offline_message"
 RESOURCE_PEER_CONVERSATION = "chat.conversation.peer.view"
 RESOURCE_CHAT_QUEUE = "chat.queue.view"
+RESOURCE_COLLABORATION_INVITE = "chat.conversation.collaboration.invite"
 
 
 class DataScopeService:

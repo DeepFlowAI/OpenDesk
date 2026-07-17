@@ -50,11 +50,17 @@ import {
   stopVisitorMessageAlert,
   unlockVisitorMessageAlert,
 } from '@/lib/visitor-message-alert'
+import { emitTestEvent, initTestEventChannel } from '@/lib/e2e-test-events'
+import { buildMessageDeliveryBatches } from '@/lib/message-delivery'
 
 const HISTORY_PAGE_SIZE = 10
 const HISTORY_CLIENT_LIMIT = 200
 const READ_RECEIPT_ACK_TIMEOUT_MS = 5000
 const READ_RECEIPT_RETRY_DELAY_MS = 1200
+const CONVERSATION_JOIN_ACK_TIMEOUT_MS = 2500
+const CONVERSATION_JOIN_RETRY_DELAYS_MS = [0, 600, 1800] as const
+
+type ConversationSubscriptionStatus = 'idle' | 'joining' | 'joined' | 'degraded'
 
 // ─── Utilities ───────────────────────────────────────────────────
 
@@ -103,6 +109,14 @@ type MarkReadAck = {
   ok?: boolean
   message_ids?: number[]
   error?: string
+}
+
+type JoinConversationAck = {
+  ok?: boolean
+  error?: string
+  message?: string
+  conversation_id?: number
+  conversation_public_id?: string
 }
 
 type NavigatorWithUserAgentData = Navigator & {
@@ -475,6 +489,7 @@ const defaultConfig: ChannelConfig = {
   open_agent_bot_service_hours_id: null,
   open_agent_avatar_url: null,
   open_agent_input_placeholder: null,
+  open_agent_attachment_upload_enabled: false,
   open_agent_handoff_enabled: true,
   open_agent_handoff_label: '转人工',
   open_agent_handoff_after_messages: 2,
@@ -592,12 +607,16 @@ export default function VisitorChatPage() {
     failures: 0,
   })
   const [contextSyncRetryNonce, setContextSyncRetryNonce] = useState(0)
+  const [conversationSubscriptionStatus, setConversationSubscriptionStatus] =
+    useState<ConversationSubscriptionStatus>('idle')
+  const [conversationSubscriptionRetryNonce, setConversationSubscriptionRetryNonce] = useState(0)
 
   const {
     socket,
     connected,
     connecting,
     authFailed,
+    connectionEpoch,
     conversationPublicId,
     messages,
     messageAlertNonce,
@@ -608,6 +627,7 @@ export default function VisitorChatPage() {
     clearAuthFailed,
     setConversationPublicId,
     setMessages,
+    reconcileConversationMessages,
     prependMessages,
     setHasMore,
     setSatisfactionInvitation,
@@ -644,6 +664,8 @@ export default function VisitorChatPage() {
   const [socketOfflineMessage, setSocketOfflineMessage] = useState('')
   const [queueFullMessage, setQueueFullMessage] = useState('')
   const [startConversationError, setStartConversationError] = useState<string | null>(null)
+  const deliveryReceiptAcknowledgedRef = useRef(new Set<string>())
+  const deliveryReceiptPendingRef = useRef(new Set<string>())
   const [queueFullShowLeaveMessageButton, setQueueFullShowLeaveMessageButton] = useState(true)
   const [queueFullLeaveMessageButtonLabel, setQueueFullLeaveMessageButtonLabel] = useState('')
   // When a bot→human handoff overflows the queue, surface an inline confirm-style
@@ -665,9 +687,13 @@ export default function VisitorChatPage() {
   const lastCustomerReadMessageRef = useRef<string | null>(null)
   const readReceiptConfirmedIdsRef = useRef<Map<string, Set<number>>>(new Map())
   const readReceiptInFlightKeysRef = useRef<Set<string>>(new Set())
+  const historyReadReceiptSentRef = useRef<Set<string>>(new Set())
+  const historyReadReceiptPendingRef = useRef<Set<string>>(new Set())
   const readReceiptRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const conversationPublicIdRef = useRef<string | null>(null)
   const handledMessageAlertNonceRef = useRef<number | null>(null)
+  const prevLastMessageIdRef = useRef<number | null>(null)
+  const prevConversationStatusRef = useRef<string | null>(null)
   // Offline UI is driven purely by the server's start_conversation response so
   // that a visitor with an unfinished conversation can always re-enter it,
   // regardless of whether any agent is currently online. The channel-level
@@ -684,6 +710,37 @@ export default function VisitorChatPage() {
     setMessageSoundEnabled(readVisitorMessageAlertEnabled())
     return bindVisitorMessageAlertUnlock()
   }, [])
+
+  useEffect(() => {
+    initTestEventChannel()
+  }, [])
+
+  useEffect(() => {
+    if (messages.length === 0) return
+    const last = messages[messages.length - 1]
+    if (last.id === prevLastMessageIdRef.current) return
+    prevLastMessageIdRef.current = last.id
+    emitTestEvent('message:received', {
+      message_id: last.id,
+      sender_type: last.sender_type,
+      content_type: last.content_type,
+    })
+  }, [messages])
+
+  useEffect(() => {
+    const from = prevConversationStatusRef.current
+    const to = conversationStatus
+    if (from === to) return
+    prevConversationStatusRef.current = to
+    emitTestEvent('status:changed', { from, to })
+    if (from && (from === 'bot' || from === 'handoff_pending')) {
+      if (to === 'active') {
+        emitTestEvent('handoff:completed', { result: 'agent' })
+      } else if (to === 'queued') {
+        emitTestEvent('handoff:completed', { result: 'queued' })
+      }
+    }
+  }, [conversationStatus])
 
   useEffect(() => {
     if (handledMessageAlertNonceRef.current === null) {
@@ -1108,7 +1165,10 @@ export default function VisitorChatPage() {
                 },
               })
               const currentMessages = data.items.map(mapPublicMessage)
-              setMessages(currentMessages)
+              reconcileConversationMessages(
+                res.conversation.conversation_public_id,
+                currentMessages,
+              )
               setHasMore(data.has_more)
               if (
                 res.conversation.status === 'handoff_pending'
@@ -1136,8 +1196,6 @@ export default function VisitorChatPage() {
                 conversation_external_id: res.conversation.conversation_public_id,
                 props: { source: 'start_conversation' },
               })
-              setMessages([])
-              setHasMore(false)
               setPendingHumanHandoff(null)
               setSatisfactionCanInitiate(false)
             }
@@ -1335,7 +1393,7 @@ export default function VisitorChatPage() {
     connected,
     conversationPublicId,
     setConversationPublicId,
-    setMessages,
+    reconcileConversationMessages,
     setHasMore,
     setSatisfactionInvitation,
     setPendingHumanHandoff,
@@ -1473,6 +1531,52 @@ export default function VisitorChatPage() {
     [conversationPublicId, messages],
   )
 
+  const deliveryReceiptBatches = useMemo(
+    () => buildMessageDeliveryBatches([
+      { conversationPublicId, messages },
+      ...historyConversations.map((item) => ({
+        conversationPublicId: item.conversation_public_id,
+        messages: item.messages,
+      })),
+      ...unreadReplyConversations.map((item) => ({
+        conversationPublicId: item.conversation_public_id,
+        messages: item.messages,
+      })),
+    ]),
+    [conversationPublicId, historyConversations, messages, unreadReplyConversations],
+  )
+
+  useEffect(() => {
+    if (!socket || !connected) return
+
+    for (const batch of deliveryReceiptBatches) {
+      const pendingIds = batch.messageIds.filter((messageId) => {
+        const key = `${batch.conversationPublicId}:${messageId}`
+        return !deliveryReceiptAcknowledgedRef.current.has(key)
+          && !deliveryReceiptPendingRef.current.has(key)
+      })
+      if (pendingIds.length === 0) continue
+
+      const keys = pendingIds.map((messageId) => `${batch.conversationPublicId}:${messageId}`)
+      keys.forEach((key) => deliveryReceiptPendingRef.current.add(key))
+      socket.timeout(READ_RECEIPT_ACK_TIMEOUT_MS).emit(
+        'messages_delivered',
+        {
+          conversation_public_id: batch.conversationPublicId,
+          message_ids: pendingIds,
+        },
+        (error: Error | null, response?: MarkReadAck) => {
+          keys.forEach((key) => deliveryReceiptPendingRef.current.delete(key))
+          if (error || response?.ok === false) {
+            scheduleReadReceiptRetry()
+            return
+          }
+          keys.forEach((key) => deliveryReceiptAcknowledgedRef.current.add(key))
+        },
+      )
+    }
+  }, [connected, deliveryReceiptBatches, readReceiptVisibilityNonce, scheduleReadReceiptRetry, socket])
+
   useEffect(() => {
     if (!socket || !connected || !conversationPublicId || agentReadableMessageIds.length === 0) return
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
@@ -1541,6 +1645,55 @@ export default function VisitorChatPage() {
     scheduleReadReceiptRetry,
     socket,
     trackEvent,
+  ])
+
+  // Conversations shown inline (unread replies / loaded history) that still
+  // contain agent messages the visitor has not read. Once these blocks are
+  // displayed, mark them read so agents get the read receipt.
+  const inlineUnreadConversationIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const item of [...unreadReplyConversations, ...historyConversations]) {
+      if (
+        item.conversation_public_id !== conversationPublicId
+        && (item.agent_unread_message_ids?.length ?? 0) > 0
+      ) {
+        ids.add(item.conversation_public_id)
+      }
+    }
+    return Array.from(ids)
+  }, [conversationPublicId, historyConversations, unreadReplyConversations])
+
+  useEffect(() => {
+    if (!socket || !connected || inlineUnreadConversationIds.length === 0) return
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+
+    for (const inlineConversationId of inlineUnreadConversationIds) {
+      if (
+        historyReadReceiptSentRef.current.has(inlineConversationId)
+        || historyReadReceiptPendingRef.current.has(inlineConversationId)
+      ) {
+        continue
+      }
+      historyReadReceiptPendingRef.current.add(inlineConversationId)
+      socket.timeout(READ_RECEIPT_ACK_TIMEOUT_MS).emit(
+        'mark_read',
+        { conversation_public_id: inlineConversationId },
+        (error: Error | null, response?: MarkReadAck) => {
+          historyReadReceiptPendingRef.current.delete(inlineConversationId)
+          if (error || response?.ok === false) {
+            scheduleReadReceiptRetry()
+            return
+          }
+          historyReadReceiptSentRef.current.add(inlineConversationId)
+        },
+      )
+    }
+  }, [
+    connected,
+    inlineUnreadConversationIds,
+    readReceiptVisibilityNonce,
+    scheduleReadReceiptRetry,
+    socket,
   ])
 
   const handleSatisfactionInitiate = useCallback(async () => {
@@ -1766,6 +1919,7 @@ export default function VisitorChatPage() {
   }, [])
 
   const handleHandoffLeaveMessage = useCallback((prompt?: string) => {
+    emitTestEvent('handoff:completed', { result: 'leave_message' })
     setQueueFullMessage('')
     setQueueFullShowLeaveMessageButton(true)
     setQueueFullLeaveMessageButtonLabel('')
@@ -1939,6 +2093,114 @@ export default function VisitorChatPage() {
     }
   }, [socket, trackEvent])
 
+  // Room membership belongs to a concrete Socket.IO connection. Re-establish it
+  // whenever either the active conversation or the underlying connection changes.
+  useEffect(() => {
+    if (!socket || !connected || !conversationPublicId || !visitorSessionToken) {
+      setConversationSubscriptionStatus('idle')
+      return
+    }
+
+    let cancelled = false
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    const permanentErrors = new Set([
+      'NOT_FOUND',
+      'UNAUTHORIZED',
+      'FORBIDDEN',
+      'visitor_session_required',
+    ])
+
+    const reconcileMessages = () => {
+      fetchPublicMessages({
+        conversationPublicId,
+        visitorSessionToken,
+        limit: 50,
+      })
+        .then((res) => {
+          if (cancelled) return
+          reconcileConversationMessages(
+            conversationPublicId,
+            res.items.map(mapPublicMessage),
+          )
+          setHasMore(res.has_more)
+        })
+        .catch(() => {
+          if (cancelled) return
+          trackEvent('conversation_messages_load_failed', {
+            level: 'warn',
+            conversation_external_id: conversationPublicId,
+            props: { source: 'conversation_subscription' },
+          })
+        })
+    }
+
+    const join = (attempt: number) => {
+      if (cancelled || !socket.connected) return
+      setConversationSubscriptionStatus('joining')
+      socket.timeout(CONVERSATION_JOIN_ACK_TIMEOUT_MS).emit(
+        'join_conversation',
+        { conversation_public_id: conversationPublicId },
+        (timeoutError: Error | null, response?: JoinConversationAck) => {
+          if (cancelled) return
+          if (!timeoutError && response?.ok === true) {
+            setConversationSubscriptionStatus('joined')
+            trackEvent('conversation_subscription_succeeded', {
+              conversation_external_id: conversationPublicId,
+              props: { attempt: attempt + 1, connection_epoch: connectionEpoch },
+            })
+            reconcileMessages()
+            return
+          }
+
+          const error = response?.error || timeoutError?.message || 'unknown'
+          const nextAttempt = attempt + 1
+          if (
+            permanentErrors.has(error)
+            || nextAttempt >= CONVERSATION_JOIN_RETRY_DELAYS_MS.length
+          ) {
+            setConversationSubscriptionStatus('degraded')
+            trackEvent('conversation_subscription_failed', {
+              level: 'error',
+              conversation_external_id: conversationPublicId,
+              props: {
+                error,
+                attempts: nextAttempt,
+                connection_epoch: connectionEpoch,
+              },
+            })
+            return
+          }
+
+          trackEvent('conversation_subscription_retry', {
+            level: 'warn',
+            conversation_external_id: conversationPublicId,
+            props: { error, attempt: nextAttempt + 1 },
+          })
+          retryTimer = setTimeout(
+            () => join(nextAttempt),
+            CONVERSATION_JOIN_RETRY_DELAYS_MS[nextAttempt],
+          )
+        },
+      )
+    }
+
+    join(0)
+    return () => {
+      cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
+    }
+  }, [
+    connected,
+    connectionEpoch,
+    conversationPublicId,
+    conversationSubscriptionRetryNonce,
+    reconcileConversationMessages,
+    setHasMore,
+    socket,
+    trackEvent,
+    visitorSessionToken,
+  ])
+
   useEffect(() => {
     if (!socket) return
     const handler = (data: { conversation_public_id?: string }) => {
@@ -1971,7 +2233,8 @@ export default function VisitorChatPage() {
       conversation_public_id?: string
       status?: string
     }) => {
-      if (!data.conversation_public_id) return
+      const convertedConversationPublicId = data.conversation_public_id
+      if (!convertedConversationPublicId) return
       if (
         offlineMessagePublicId
         && data.offline_message_public_id
@@ -1991,25 +2254,31 @@ export default function VisitorChatPage() {
       setQueueFullLeaveMessageButtonLabel('')
       setHandoffQueueFullInline(false)
       setCurrentQueueCount(null)
-      setConversationPublicId(data.conversation_public_id)
+      setConversationPublicId(convertedConversationPublicId)
       setConversationStatus(data.status || 'active')
       setEnded(false)
       trackEvent('offline_message_conversation_created', {
-        conversation_external_id: data.conversation_public_id,
+        conversation_external_id: convertedConversationPublicId,
         props: { status: data.status || 'active' },
       })
       fetchPublicMessages({
-        conversationPublicId: data.conversation_public_id,
+        conversationPublicId: convertedConversationPublicId,
         visitorSessionToken,
         limit: 50,
       })
         .then((res) => {
-          setMessages(res.items.map(mapPublicMessage))
+          reconcileConversationMessages(
+            convertedConversationPublicId,
+            res.items.map(mapPublicMessage),
+          )
           setHasMore(res.has_more)
         })
         .catch(() => {
-          setMessages([])
-          setHasMore(false)
+          trackEvent('conversation_messages_load_failed', {
+            level: 'warn',
+            conversation_external_id: convertedConversationPublicId,
+            props: { source: 'offline_message_conversion' },
+          })
         })
     }
     socket.on('offline_message_conversation_created', handler)
@@ -2018,10 +2287,11 @@ export default function VisitorChatPage() {
     }
   }, [
     offlineMessagePublicId,
+    reconcileConversationMessages,
     setConversationPublicId,
     setHasMore,
-    setMessages,
     socket,
+    trackEvent,
     visitorSessionToken,
   ])
 
@@ -2157,6 +2427,12 @@ export default function VisitorChatPage() {
   const offlineTitle = socketOfflineTitle || channel?.availability?.offline_title || config.offline_title
   const offlineMessage = socketOfflineMessage || channel?.availability?.offline_message || config.offline_message
   const showConnectionStatus = Boolean(socket) && !connected && !connecting && !isOffline
+  const showSubscriptionRecovery = Boolean(
+    socket
+    && connected
+    && conversationPublicId
+    && conversationSubscriptionStatus === 'degraded',
+  )
   const showAssistPanel = Boolean(
     !isEmbed
     && !isMobile
@@ -2267,6 +2543,18 @@ export default function VisitorChatPage() {
           {locale === 'zh'
             ? '连接断开，正在重连...'
             : 'Connection lost, reconnecting...'}
+        </div>
+      )}
+      {showSubscriptionRecovery && (
+        <div className="absolute left-0 right-0 top-0 z-50 border-b border-amber-200/50 bg-[#f4ebd4] px-4 py-1 text-center text-xs text-stone-800">
+          {locale === 'zh' ? '实时消息连接异常。' : 'Real-time message connection failed. '}
+          <button
+            type="button"
+            className="font-medium underline underline-offset-2"
+            onClick={() => setConversationSubscriptionRetryNonce((value) => value + 1)}
+          >
+            {locale === 'zh' ? '重新连接' : 'Retry'}
+          </button>
         </div>
       )}
 

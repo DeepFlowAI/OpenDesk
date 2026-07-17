@@ -23,6 +23,7 @@ import {
   IconListSearch,
   IconSortAscending,
   IconPhone,
+  IconDeviceLandlinePhone,
   IconFilePhone,
   IconShieldCheck,
 } from '@tabler/icons-react'
@@ -52,6 +53,7 @@ const ADMIN_NAV_ICONS: Record<AdminNavIconKey, ComponentType<{ size?: number; cl
   queueSettings: IconSortAscending,
   flowStudio: IconGitBranch,
   phoneNumbers: IconPhone,
+  sipExtensions: IconDeviceLandlinePhone,
   callSummary: IconFilePhone,
   callSettings: IconSettings,
   conversationSettings: IconMessageCircleCog,

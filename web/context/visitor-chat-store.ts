@@ -13,6 +13,12 @@ let presencePingTimer: ReturnType<typeof setInterval> | null = null
 function mergeMessageUpdate(current: Message, incoming: Message): Message {
   const merged: Message = { ...current, ...incoming }
 
+  // A stale history response or a delayed delivery event must not move a
+  // message back to unread after the live read receipt already won locally.
+  if (current.status === 'read' && incoming.status !== 'read') {
+    merged.status = 'read'
+  }
+
   if (
     incoming.is_recalled
     && current.sender_type === 'visitor'
@@ -37,6 +43,24 @@ function mergeMessageUpdate(current: Message, incoming: Message): Message {
   return merged
 }
 
+function mergeMessageLists(current: Message[], incoming: Message[]): Message[] {
+  const next = [...current]
+  const indexes = new Map(next.map((message, index) => [message.id, index]))
+  for (const message of incoming) {
+    const index = indexes.get(message.id)
+    if (index === undefined) {
+      indexes.set(message.id, next.length)
+      next.push(message)
+    } else {
+      next[index] = mergeMessageUpdate(next[index], message)
+    }
+  }
+  return next.sort((left, right) => {
+    const createdAtDiff = Date.parse(left.created_at) - Date.parse(right.created_at)
+    return createdAtDiff || left.id - right.id
+  })
+}
+
 function stopPresencePing() {
   if (presencePingTimer) {
     clearInterval(presencePingTimer)
@@ -58,6 +82,7 @@ type VisitorChatState = {
   connected: boolean
   connecting: boolean
   authFailed: boolean
+  connectionEpoch: number
 
   conversationPublicId: string | null
   messages: Message[]
@@ -84,6 +109,7 @@ type VisitorChatState = {
 
   setConversationPublicId: (id: string | null) => void
   setMessages: (msgs: Message[]) => void
+  reconcileConversationMessages: (conversationPublicId: string, msgs: Message[]) => void
   prependMessages: (msgs: Message[]) => void
   addMessage: (msg: Message) => void
   updateMessage: (msg: Message) => void
@@ -257,6 +283,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
   connected: false,
   connecting: false,
   authFailed: false,
+  connectionEpoch: 0,
 
   conversationPublicId: null,
   messages: [],
@@ -299,7 +326,12 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
 
     socket.on('connect', () => {
       startPresencePing(socket)
-      set({ connected: true, connecting: false, authFailed: false })
+      set((state) => ({
+        connected: true,
+        connecting: false,
+        authFailed: false,
+        connectionEpoch: state.connectionEpoch + 1,
+      }))
     })
 
     socket.on('disconnect', () => {
@@ -460,6 +492,12 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
 
   setConversationPublicId: (id) => set({ conversationPublicId: id }),
   setMessages: (msgs) => set({ messages: msgs }),
+  reconcileConversationMessages: (conversationPublicId, msgs) => {
+    const current = get().messages.filter(
+      (message) => message.conversation_public_id === conversationPublicId,
+    )
+    set({ messages: mergeMessageLists(current, msgs) })
+  },
   prependMessages: (msgs) => set({ messages: [...msgs, ...get().messages] }),
 
   addMessage: (msg) => {

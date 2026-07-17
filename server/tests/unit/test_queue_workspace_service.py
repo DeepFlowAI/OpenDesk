@@ -23,6 +23,14 @@ from app.services.queue_workspace_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mock_agent_display_mode(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.queue_workspace_service.ConversationAgentDisplaySettingService.get_display_mode",
+        AsyncMock(return_value="name"),
+    )
+
+
 def _principal(
     *,
     permissions: list[str],

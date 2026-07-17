@@ -48,6 +48,7 @@ type TicketCreateFormProps = {
   onSuccess: (ticket: Ticket) => void
   onError?: () => void
   onValuesChange?: (values: Record<string, unknown>) => void
+  onDirtyChange?: (dirty: boolean) => void
 }
 
 const DEFAULT_CREATE_VALUES: Record<string, unknown> = {
@@ -97,6 +98,7 @@ export function TicketCreateForm({
   onSuccess,
   onError,
   onValuesChange,
+  onDirtyChange,
 }: TicketCreateFormProps) {
   const { locale } = useLocaleStore()
   const isZh = locale === 'zh'
@@ -141,6 +143,7 @@ export function TicketCreateForm({
   const [activeTab, setActiveTab] = useState(0)
   const [collapsedSections, setCollapsedSections] = useState<Set<number>>(new Set())
   const [submitting, setSubmitting] = useState(false)
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
 
   const tabs = useMemo(() => {
     if (!layout?.tabs) return []
@@ -159,6 +162,7 @@ export function TicketCreateForm({
     })
     setActiveTab(0)
     setCollapsedSections(new Set())
+    onDirtyChange?.(false)
   }, [resetKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -173,7 +177,14 @@ export function TicketCreateForm({
 
   const setFieldValue = useCallback((key: string, value: unknown) => {
     setFormValues((prev) => ({ ...prev, [key]: value }))
-  }, [])
+    onDirtyChange?.(true)
+    setFieldErrors((prev) => {
+      if (!prev[key]) return prev
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+  }, [onDirtyChange])
 
   const toggleSection = useCallback((sectionId: number) => {
     setCollapsedSections((prev) => {
@@ -238,6 +249,40 @@ export function TicketCreateForm({
 
   const handleSubmit = useCallback(async () => {
     if (submitting) return
+
+    const errors: Record<string, string> = {}
+    let firstInvalid: { key: string; tabIndex: number } | null = null
+    tabs.forEach((tab, tabIndex) => {
+      for (const section of tab.sections ?? []) {
+        for (const field of section.fields ?? []) {
+          const key = getFieldKey(field)
+          if (computedFieldStates.get(key) !== 'required') continue
+          const value = formValues[key]
+          if (value == null || value === '' || (Array.isArray(value) && value.length === 0)) {
+            errors[key] = isZh ? '此字段为必填项' : 'This field is required'
+            firstInvalid ??= { key, tabIndex }
+          }
+        }
+      }
+    })
+    if (!formValues.title) {
+      errors.title = isZh ? '请输入工单标题' : 'Enter a ticket title'
+      firstInvalid ??= { key: 'title', tabIndex: 0 }
+    }
+    if (firstInvalid) {
+      const invalid = firstInvalid
+      setFieldErrors(errors)
+      setActiveTab(invalid.tabIndex)
+      window.requestAnimationFrame(() => {
+        document.getElementById(`ticket-create-field-${invalid.key}`)?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'center',
+        })
+      })
+      return
+    }
+
+    setFieldErrors({})
     setSubmitting(true)
 
     try {
@@ -257,11 +302,6 @@ export function TicketCreateForm({
         }
       }
 
-      if (!payload.title) {
-        setSubmitting(false)
-        return
-      }
-
       if (layout?.id) {
         payload.layout_id = layout.id
       }
@@ -279,13 +319,14 @@ export function TicketCreateForm({
         assignee_group_id: payload.assignee_group_id as number | undefined,
         custom_fields: customFields as Record<string, CustomFieldValue>,
       })
+      onDirtyChange?.(false)
       onSuccess(ticket)
     } catch {
       onError?.()
     } finally {
       setSubmitting(false)
     }
-  }, [submitting, formValues, allowedFormKeys, layout, createTicket, onSuccess, onError])
+  }, [submitting, tabs, getFieldKey, computedFieldStates, formValues, isZh, allowedFormKeys, layout, createTicket, onDirtyChange, onSuccess, onError])
 
   const columnsPerRow = columnsPerRowOverride ?? layout?.columns_per_row ?? 1
   const labelPosition = labelPositionOverride ?? layout?.label_position ?? 'left'
@@ -339,6 +380,7 @@ export function TicketCreateForm({
               getFieldDef={getFieldDef}
               collapsedSections={collapsedSections}
               toggleSection={toggleSection}
+              fieldErrors={fieldErrors}
               isZh={isZh}
             />
           ) : null}
@@ -371,6 +413,7 @@ function TabContent({
   getFieldDef,
   collapsedSections,
   toggleSection,
+  fieldErrors,
   isZh,
 }: {
   tab: FdFormLayoutTab
@@ -383,6 +426,7 @@ function TabContent({
   getFieldDef: (f: FdFormLayoutField) => UnifiedField | undefined
   collapsedSections: Set<number>
   toggleSection: (id: number) => void
+  fieldErrors: Record<string, string>
   isZh: boolean
 }) {
   const sections = useMemo(
@@ -405,6 +449,7 @@ function TabContent({
           getFieldDef={getFieldDef}
           collapsed={collapsedSections.has(section.id)}
           onToggle={() => toggleSection(section.id)}
+          fieldErrors={fieldErrors}
           isZh={isZh}
         />
       ))}
@@ -425,6 +470,7 @@ function SectionContent({
   getFieldDef,
   collapsed,
   onToggle,
+  fieldErrors,
   isZh,
 }: {
   section: FdFormLayoutSection
@@ -437,6 +483,7 @@ function SectionContent({
   getFieldDef: (f: FdFormLayoutField) => UnifiedField | undefined
   collapsed: boolean
   onToggle: () => void
+  fieldErrors: Record<string, string>
   isZh: boolean
 }) {
   const fields = useMemo(
@@ -489,6 +536,7 @@ function SectionContent({
                     onChange={(val) => setFieldValue(key, val)}
                     formValues={formValues}
                     labelPosition={labelPosition}
+                    error={fieldErrors[key]}
                     isZh={isZh}
                   />
                 </div>
@@ -512,6 +560,7 @@ function FieldInput({
   onChange,
   formValues,
   labelPosition,
+  error,
   isZh,
 }: {
   field: FdFormLayoutField
@@ -522,6 +571,7 @@ function FieldInput({
   onChange: (val: unknown) => void
   formValues: Record<string, unknown>
   labelPosition: string
+  error?: string
   isZh: boolean
 }) {
   const label = fieldDef?.name ?? field.field_key ?? `Field ${field.id}`
@@ -591,7 +641,10 @@ function FieldInput({
     fieldType === FieldType.FILE
 
   return (
-    <div className={cn(isLabelLeft ? 'flex items-start gap-3' : 'flex flex-col gap-1.5')}>
+    <div
+      id={`ticket-create-field-${fieldKey}`}
+      className={cn(isLabelLeft ? 'flex items-start gap-3' : 'flex flex-col gap-1.5')}
+    >
       <Label
         className={cn(
           'whitespace-nowrap text-muted-foreground',
@@ -613,6 +666,7 @@ function FieldInput({
           disabled={isReadonly}
           dropdownPlacement="top"
         />
+        {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
       </div>
     </div>
   )

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, type CSSProperties } from 'react'
+import { useState, type CSSProperties, type ReactNode } from 'react'
 import { IconChevronRight } from '@tabler/icons-react'
 import type { ChannelConfig, OpenAgentFAQ, OpenAgentWelcomeMessageBlock } from '@/models/channel'
 import { MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
@@ -23,6 +23,8 @@ type OpenAgentWelcomeMessageProps = {
   config?: ChannelConfig
   showAvatar?: boolean
   avatarSrc?: string | null
+  /** Custom avatar node rendered in place of the image avatar (e.g. a letter placeholder). */
+  avatarNode?: ReactNode
   align?: 'start' | 'end'
 }
 
@@ -96,17 +98,20 @@ export function OpenAgentWelcomeMessage({
   config,
   showAvatar = false,
   avatarSrc,
+  avatarNode,
   align = 'start',
 }: OpenAgentWelcomeMessageProps) {
   return (
     <div className={cn('flex items-end gap-2 px-5', align === 'end' ? 'flex-row-reverse' : 'flex-row')}>
-      {showAvatar && avatarSrc && (
-        <img
-          src={avatarSrc}
-          alt=""
-          className="h-9 w-9 shrink-0 rounded-full object-cover"
-        />
-      )}
+      {avatarNode
+        ? avatarNode
+        : showAvatar && avatarSrc && (
+            <img
+              src={avatarSrc}
+              alt=""
+              className="h-9 w-9 shrink-0 rounded-full object-cover"
+            />
+          )}
       <div
         className={cn(
           'min-h-[42px] max-w-[75%] min-w-0 break-words break-all px-3 py-2 text-sm leading-6',

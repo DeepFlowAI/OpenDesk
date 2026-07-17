@@ -18,6 +18,7 @@ FlowKit kernel keeps it disabled so the app boots cleanly.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from app.configs.settings import settings
 from app.core.trace import (
@@ -49,6 +50,32 @@ from app.services.cc_agent_status_service import CcAgentStatusService
 
 
 logger = logging.getLogger(__name__)
+
+# One-time pause after answering an inbound call, before the first prompt, so
+# the SIP media path is established before we start playing. The carrier drops
+# the opening RTP right after answer; without this the caller misses the start
+# of the welcome (the kernel-side recording is unaffected). Only the first
+# prompt needs it — once media is flowing, later prompts play normally.
+_RTP_WARMUP_SECONDS = 0.8
+
+
+@dataclass(frozen=True)
+class SipOutboundDialParams:
+    """Everything the extension-answer handler needs to originate the customer
+    leg once the SIP-phone agent's physical extension goes off-hook. Captured in
+    the `/dial` request (which returns immediately) and consumed off the request
+    path by the orchestrator's background dial task — so no ORM objects or DB
+    session are carried across the ring wait."""
+
+    tenant_pk: int
+    employee_id: int
+    reservation_id: str
+    dialed: str          # destination with per-DID prefix applied
+    destination: str     # what the agent typed (pre-prefix), stored on the CDR
+    caller_id: str       # outbound DID
+    trunk_id: str
+    device_type: str
+    device_identifier: str | None
 
 
 class CallCenterOrchestrator:
@@ -87,6 +114,19 @@ class CallCenterOrchestrator:
         # dial. Consumed by _on_outbound_answered to fire call.bridge so
         # audio flows the instant the carrier picks up. Cleared in _on_hangup.
         self._outbound_webrtc_pairs: dict[str, str] = {}
+        # Legs whose answered/hangup a caller is awaiting (SIP-phone agent leg
+        # in the two-stage originate). call_id → Future resolved with
+        # {"answered": bool} on call.answered / call.hangup. Only used for the
+        # extension-leg wait; WebRTC-only outbound never populates this.
+        self._leg_waiters: dict[str, "_asyncio.Future[dict]"] = {}
+        # call_id → Future resolved on the next call.play_end for that call. Lets
+        # the assign path let an in-flight prompt (e.g. "正在为您转接") finish
+        # cleanly before bridging, instead of cutting it mid-word.
+        self._play_waiters: dict[str, "_asyncio.Future[dict]"] = {}
+        # customer call_id → the agent extension leg being rung for it, while a
+        # SIP-phone assign is still ringing the handset. Lets a caller hangup
+        # cancel the ring immediately instead of waiting out the assign timeout.
+        self._pending_sip_originate: dict[str, str] = {}
         # Per-call trace context: call_id → (trace_id, trace_call_id). Lets any
         # async handler that did NOT go through _route_event (hangup, recording,
         # outbound lifecycle, agent-side finalize) re-bind the call's trace_id
@@ -94,6 +134,28 @@ class CallCenterOrchestrator:
         # Outlives the workflow (recording.completed can arrive after hangup);
         # cleaned up on a delay after hangup.
         self._call_traces: dict[str, tuple[str, str]] = {}
+
+        import os
+        import socket
+        # Unique per orchestrator process. FlowKit broadcasts call.incoming to
+        # every connected node; this id is written to the per-call owner lock so
+        # exactly one node handles each call in a multi-node deployment.
+        self._node_id = f"{socket.gethostname()}:{os.getpid()}"
+        # Background subscriber that resolves agent offer decisions forwarded
+        # from other nodes (an agent's accept can hit any node, but the offer's
+        # Future lives on the call's owner node).
+        self._offer_sub_task: _asyncio.Task | None = None
+
+    # A call is owned by exactly one orchestrator node. TTL only needs to
+    # outlive event delivery for the call; the owner clears it on hangup.
+    _CALL_OWNER_TTL_SEC = 6 * 60 * 60
+
+    # Pub/sub channel carrying cross-node agent offer decisions.
+    _OFFER_RESOLVE_CHANNEL = "cc:offer:resolve"
+
+    @staticmethod
+    def _call_owner_key(call_id: str) -> str:
+        return f"cc:call:owner:{call_id}"
 
     # Time we keep an ended call_id around so late /dial-webrtc/offer
     # requests can be answered with 410 Gone instead of a confusing 404.
@@ -127,6 +189,139 @@ class CallCenterOrchestrator:
 
         self._pending_offers.pop(offer_id, None)
 
+    # ────────────────── Per-call ownership (multi-node) ──────────────────
+
+    async def _claim_call(self, call_id: str) -> bool:
+        """Claim ownership of an inbound call for this node.
+
+        Returns True if we own it (proceed), False if another node already does
+        (skip). Single-node deployments (or Redis unavailable) always own it.
+        """
+        r = _get_redis_client()
+        if r is None:
+            return True
+        try:
+            acquired = await r.set(
+                self._call_owner_key(call_id),
+                self._node_id,
+                ex=self._CALL_OWNER_TTL_SEC,
+                nx=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "call owner claim failed call_id=%s; handling locally", call_id
+            )
+            return True
+        return bool(acquired)
+
+    async def _owns_call(self, call_id: str) -> bool:
+        """Whether this node owns the call. Non-owner nodes skip its events."""
+        r = _get_redis_client()
+        if r is None:
+            return True
+        try:
+            owner = await r.get(self._call_owner_key(call_id))
+        except Exception:  # noqa: BLE001
+            return True
+        if isinstance(owner, bytes):
+            owner = owner.decode()
+        # Unknown owner (lock expired / never claimed): fall back to whether we
+        # have local state for the call, so a lone node still works.
+        if owner is None:
+            return call_id in self._workflows or call_id in self._call_traces
+        return owner == self._node_id
+
+    async def _release_call(self, call_id: str) -> None:
+        r = _get_redis_client()
+        if r is None:
+            return
+        try:
+            owner = await r.get(self._call_owner_key(call_id))
+            if isinstance(owner, bytes):
+                owner = owner.decode()
+            if owner == self._node_id:
+                await r.delete(self._call_owner_key(call_id))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ─────────── Cross-node agent offer resolution (multi-node) ───────────
+
+    async def deliver_offer_decision(self, offer_id: str, decision: dict) -> bool:
+        """Resolve an agent's accept/reject decision.
+
+        The offer's Future lives on the call's owner node, but the agent's HTTP
+        request can land on any node. Resolve locally when we hold the offer;
+        otherwise forward the decision over Redis and wait for the owner to ack.
+        """
+        # Fast path: the offer was registered on this node.
+        if self.resolve_offer(offer_id, decision):
+            return True
+        r = _get_redis_client()
+        if r is None:
+            return False  # single-node and not found → genuinely gone
+        import asyncio
+        import json
+        import uuid
+
+        reply_key = f"cc:offer:reply:{uuid.uuid4().hex}"
+        try:
+            await r.publish(
+                self._OFFER_RESOLVE_CHANNEL,
+                json.dumps(
+                    {"offer_id": offer_id, "decision": decision, "reply_key": reply_key}
+                ),
+            )
+            got = await r.blpop(reply_key, timeout=5)
+        except Exception:  # noqa: BLE001
+            logger.exception("cross-node offer resolve failed offer_id=%s", offer_id)
+            return False
+        if not got:
+            return False
+        value = got[1]
+        if isinstance(value, bytes):
+            value = value.decode()
+        return value == "1"
+
+    async def _offer_resolve_loop(self) -> None:
+        """Resolve offer decisions forwarded from other nodes. Only the node
+        that holds the offer's Future resolves it and acks the caller."""
+        import asyncio
+        import json
+
+        r = _get_redis_client()
+        if r is None:
+            return
+        while True:
+            try:
+                pubsub = r.pubsub()
+                await pubsub.subscribe(self._OFFER_RESOLVE_CHANNEL)
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    try:
+                        data = msg["data"]
+                        if isinstance(data, bytes):
+                            data = data.decode()
+                        payload = json.loads(data)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    offer_id = payload.get("offer_id")
+                    if not offer_id or offer_id not in self._pending_offers:
+                        continue  # not our offer — another node holds it
+                    resolved = self.resolve_offer(offer_id, payload.get("decision") or {})
+                    reply_key = payload.get("reply_key")
+                    if reply_key:
+                        try:
+                            await r.rpush(reply_key, "1" if resolved else "0")
+                            await r.expire(reply_key, 30)
+                        except Exception:  # noqa: BLE001
+                            pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("offer-resolve subscriber error; retrying")
+                await asyncio.sleep(1.0)
+
     async def start(self) -> None:
         if self._started:
             return
@@ -159,14 +354,26 @@ class CallCenterOrchestrator:
         self.telephony.on_event("call.answered", self._on_outbound_answered)
         self.telephony.on_event("call.early_media", self._on_outbound_ringing)
         self.telephony.on_event("webrtc.ice", self._on_webrtc_ice)
+        # SIP extension registration lifecycle (kernel registrar). Kept behind
+        # the same event bus; no-ops on kernels that don't emit them (extensions
+        # disabled), so WebRTC-only deployments are unaffected.
+        self.telephony.on_event("extension.registered", self._on_extension_registered)
+        self.telephony.on_event("extension.unregistered", self._on_extension_unregistered)
         self.telephony.on_reconnected(self._on_reconnect)
         await self._start_catalog_sync()
+        import asyncio as _aio_offer
+        self._offer_sub_task = _aio_offer.create_task(
+            self._offer_resolve_loop(), name="cc-offer-resolve"
+        )
         self._started = True
         logger.info("Call center orchestrator started")
 
     async def stop(self) -> None:
         if not self._started:
             return
+        if self._offer_sub_task is not None:
+            self._offer_sub_task.cancel()
+            self._offer_sub_task = None
         if self._catalog_sync is not None:
             await self._catalog_sync.stop()
             self._catalog_sync = None
@@ -284,6 +491,42 @@ class CallCenterOrchestrator:
                 return self._cached_tenant_id
         return None
 
+    async def _resolve_tenant_id_for_did(self, to_number: str) -> int | None:
+        """Resolve the tenant that owns a dialed number (DID).
+
+        Looks the inbound `to` number up in the platform phone-number catalog
+        and returns its assigned tenant's numeric id, or None when the number is
+        unknown or unassigned — in which case the caller falls back to the
+        single default tenant (so single-tenant deployments keep working).
+        """
+        if not to_number:
+            return None
+
+        from sqlalchemy import select
+
+        from app.models.tenant import Tenant
+        from app.repositories.phone_number_repository import PhoneNumberRepository
+        from app.services.call_user_association_service import normalize_phone_digits
+
+        async with AsyncSessionLocal() as db:
+            phone = await PhoneNumberRepository.get_by_phone_number(db, to_number)
+            if phone is None:
+                normalized = normalize_phone_digits(to_number)
+                if normalized and normalized != to_number:
+                    phone = await PhoneNumberRepository.get_by_phone_number(db, normalized)
+            if phone is None or not phone.tenant_id:
+                return None
+            tenant = (
+                await db.execute(select(Tenant).where(Tenant.tenant_id == phone.tenant_id))
+            ).scalar_one_or_none()
+            if tenant is None:
+                return None
+            logger.info(
+                "Inbound DID %s routed to tenant id=%s slug=%s",
+                to_number, tenant.id, phone.tenant_id,
+            )
+            return int(tenant.id)
+
     async def _on_incoming(self, event: CallEvent) -> None:
         data = event.data
         call_id = data.get("call_id")
@@ -305,6 +548,15 @@ class CallCenterOrchestrator:
             )
             return
 
+        # Multi-node safety: FlowKit broadcasts call.incoming to every connected
+        # orchestrator. Exactly one node owns each call — the rest skip — so we
+        # don't answer/route the same call more than once.
+        if not await self._claim_call(call_id):
+            logger.info(
+                "Skipping call.incoming call_id=%s — owned by another node", call_id
+            )
+            return
+
         # Continue the W3C trace started by the kernel on the real phone entry
         # so all OpenDesk logs/spans for this call share one trace_id; also bind
         # the business call_id for log queries. When the kernel didn't send a
@@ -321,14 +573,19 @@ class CallCenterOrchestrator:
         if trace_call_id != call_id:
             self._register_call_trace(trace_call_id, trace_id, trace_call_id)
 
-        tenant_id = await self._resolve_tenant_id()
+        from_number = data.get("from", "").replace("sip:", "").split("@")[0]
+        to_number = data.get("to", "").replace("sip:", "").split("@")[0]
+
+        # Per-DID tenant routing: bind the call to the tenant that owns the
+        # dialed number. Fall back to the single default tenant when the DID
+        # isn't in the catalog (keeps single-tenant deployments working).
+        tenant_id = await self._resolve_tenant_id_for_did(to_number)
+        if tenant_id is None:
+            tenant_id = await self._resolve_tenant_id()
         if tenant_id is None:
             logger.warning("Inbound call %s: no tenant resolved; hanging up", call_id)
             await self.telephony.call_hangup(call_id, reason="no_tenant")
             return
-
-        from_number = data.get("from", "").replace("sip:", "").split("@")[0]
-        to_number = data.get("to", "").replace("sip:", "").split("@")[0]
 
         async with AsyncSessionLocal() as db:
             matched = await match_routing_rule(
@@ -389,6 +646,11 @@ class CallCenterOrchestrator:
         self._workflows[call_id] = workflow
 
         await self.telephony.call_answer(call_id)
+        # Warm up the media path once before the first prompt (see above).
+        if _RTP_WARMUP_SECONDS > 0:
+            import asyncio
+
+            await asyncio.sleep(_RTP_WARMUP_SECONDS)
         try:
             await workflow.start()
         except Exception:  # noqa: BLE001
@@ -427,6 +689,11 @@ class CallCenterOrchestrator:
 
     async def _route_event(self, event: CallEvent) -> None:
         call_id = event.data.get("call_id")
+        # An in-flight prompt finished — wake any assign path waiting to bridge
+        # only after the prompt completes (kept separate from the workflow's own
+        # WaitForEvent routing below).
+        if call_id and event.method == "call.play_end":
+            self._resolve_play_wait(call_id, event.data)
         wf = self._workflows.get(call_id) if call_id else None
         if wf is None:
             return
@@ -536,16 +803,117 @@ class CallCenterOrchestrator:
         except Exception:  # noqa: BLE001
             logger.exception("webrtc.ice emit failed")
 
+    async def _on_extension_registered(self, event: CallEvent) -> None:
+        await self._apply_extension_registration(event.data, registered=True)
+
+    async def _on_extension_unregistered(self, event: CallEvent) -> None:
+        await self._apply_extension_registration(event.data, registered=False)
+
+    async def _apply_extension_registration(
+        self, data: dict, *, registered: bool
+    ) -> None:
+        """Persist a kernel extension.registered/unregistered event.
+
+        The event's ``extension`` field is the AOR user-part, which is the
+        extension's registration-domain-unique ``sip_user_id``. We open a fresh
+        short session (this handler runs on its own task and holds no session
+        across I/O), update the row, then push a best-effort refresh to the
+        bound agent's browser so their device-availability view updates live.
+        """
+
+        from app.services.sip_extension_service import SipExtensionService
+
+        sip_user_id = (data.get("extension") or "").strip()
+        if not sip_user_id:
+            return
+        updated = None
+        try:
+            async with AsyncSessionLocal() as db:
+                updated = await SipExtensionService.apply_registration_event(
+                    db, sip_user_id=sip_user_id, registered=registered,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "extension registration writeback failed sip_user_id=%s", sip_user_id,
+            )
+            return
+        if updated is None:
+            logger.info(
+                "extension %s event ignored (no matching extension) registered=%s",
+                sip_user_id, registered,
+            )
+            return
+        logger.info(
+            "extension %s registration → %s",
+            sip_user_id, "registered" if registered else "unregistered",
+        )
+        if updated.bound_employee_id is None:
+            return
+        try:
+            rt = get_realtime_transport()
+            room = f"agent:{updated.tenant_id}:{updated.bound_employee_id}"
+            await rt.emit(
+                "cc.device_registration_changed",
+                {
+                    "extension_number": updated.extension_number,
+                    "registration_status": updated.registration_status,
+                },
+                room=room,
+                namespace="/chat",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cc.device_registration_changed push failed")
+
     async def _on_hangup(self, event: CallEvent) -> None:
         call_id = event.data.get("call_id")
         if not call_id:
             return
+        # Free the per-call ownership lock (owner-only; non-owners no-op). The
+        # rest of this handler operates on in-memory state that only the owner
+        # populated, so non-owner nodes fall through harmlessly.
+        await self._release_call(call_id)
+        # Drop any prompt-completion waiter for this call so it can't linger.
+        self.cancel_play_wait(call_id)
+        # Caller hung up while their SIP handset was still ringing (assign
+        # originate not yet answered): tear the handset leg down now so it stops
+        # ringing, and resolve the assign wait, instead of ringing out the full
+        # assign timeout.
+        pending_ext = self.pop_pending_sip_originate(call_id)
+        if pending_ext:
+            try:
+                await self.telephony.call_hangup(pending_ext, reason="caller_hangup")
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "caller hangup: cancel ringing handset leg=%s failed",
+                    pending_ext, exc_info=True,
+                )
+            self._resolve_leg_wait(
+                pending_ext, {"answered": False, "reason": "caller_hangup"}
+            )
+        # SIP-phone two-stage: agent extension leg ended (declined / no answer /
+        # unregistered) before answering. Wake the dialer so it aborts and does
+        # NOT dial the customer.
+        self._resolve_leg_wait(
+            call_id, {"answered": False, "reason": event.data.get("reason")}
+        )
         self.bind_call_trace(call_id)
         # Keep the trace mapping alive briefly so a trailing
         # call.recording.completed can still bind this call's trace_id, then
         # drop it to bound memory.
         import asyncio as _aio_trace
         _aio_trace.create_task(self._delayed_trace_cleanup(call_id))
+
+        # If this hung-up leg was a conference participant, collapse the host's
+        # 3-way back to the two-party call (else the host stays stuck at "3人").
+        # No-op for any non-participant leg (customer / agent / outbound).
+        try:
+            from app.services.call_center.call_control_service import CallControlService
+            await CallControlService.on_conference_participant_departed(call_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "conference participant-departed handling failed call=%s",
+                call_id, exc_info=True,
+            )
 
         # Outbound originator path: if this call_id was an agent-initiated
         # outbound, notify the agent's browser. We MARK the entry as ended
@@ -805,12 +1173,52 @@ class CallCenterOrchestrator:
                     .limit(1)
                 )
             ).scalar_one_or_none()
-            if row is None:
-                return {"ok": False, "error": "no_active_call"}
-            target_call_id = row.root_call_id or row.call_id
-            record_id = row.id
             session = await AgentWebRTCSessionService.get_active(db, tenant_id, employee_id)
             webrtc_call_id = session["webrtc_call_id"] if session else None
+            target_call_id = (row.root_call_id or row.call_id) if row is not None else None
+            record_id = row.id if row is not None else None
+
+        # An internal-ring participant (a consult / conference target reached in
+        # their browser) holds a WebRTC leg but has no CDR of their own, so the
+        # lookup above finds nothing. Let them hang up that leg and reset instead
+        # of returning "no_active_call" and stranding them "通话中".
+        if row is None:
+            if webrtc_call_id is None:
+                return {"ok": False, "error": "no_active_call"}
+            self.bind_call_trace(webrtc_call_id)
+            logger.info(
+                "Agent %s hangup of internal leg=%s (no CDR)",
+                employee_id, webrtc_call_id,
+            )
+            try:
+                await self.telephony.call_hangup(webrtc_call_id, reason="agent_hangup")
+            except TelephonyRPCError as exc:
+                if exc.code != -32002:
+                    logger.warning(
+                        "agent hangup: internal leg %s rejected code=%s",
+                        webrtc_call_id, exc.code,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("agent hangup: internal leg hangup raised", exc_info=True)
+            redis = _get_redis_client()
+            if redis is not None:
+                try:
+                    await CcAgentResourceService.force_release(
+                        redis, tenant_id, employee_id, reason="agent_hangup",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "internal participant release failed agent=%s/%s",
+                        tenant_id, employee_id, exc_info=True,
+                    )
+            await self.finalize_agent_call(
+                tenant_id=tenant_id,
+                employee_id=employee_id,
+                call_id=webrtc_call_id,
+                reason="agent_hangup",
+                mark_cdr_completed=False,
+            )
+            return {"ok": True, "note": "left_internal_call", "call_id": webrtc_call_id}
 
         self.bind_call_trace(target_call_id)
         logger.info(
@@ -865,6 +1273,10 @@ class CallCenterOrchestrator:
                 "call.recording.completed missing call_id/oss_url: %s", data,
             )
             return
+        # Broadcast to every node; only the call's owner persists it (others
+        # would double-write the same CDR).
+        if not await self._owns_call(call_id):
+            return
         self.bind_call_trace(call_id)
         try:
             async with AsyncSessionLocal() as db:
@@ -896,8 +1308,79 @@ class CallCenterOrchestrator:
         try:
             calls = await self.telephony.call_list()
             logger.info("Reconnect: %d active calls in kernel", len(calls))
+            # Any agent left in_call whose call is no longer in the kernel lost
+            # its end event while the WS was down — free it so the agent isn't
+            # stranded on "busy" forever.
+            active_ids = {c.get("call_id") for c in calls if c.get("call_id")}
+            released = await CcAgentResourceService.reconcile_in_call(
+                _get_redis_client(), active_ids
+            )
+            if released:
+                logger.info(
+                    "Reconnect reconcile: freed %d stranded agent resource(s)",
+                    len(released),
+                )
+                # Close the stale call records too, otherwise the next status
+                # poll would resurrect the in_call resource from them.
+                from app.services.call_record_service import CallRecordService
+
+                async with AsyncSessionLocal() as db:
+                    for tenant_id, _employee_id, call_id in released:
+                        try:
+                            await CallRecordService.mark_completed(
+                                db, tenant_id, call_id,
+                                hangup_reason="reconnect_reconcile",
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "reconcile: mark_completed failed call_id=%s", call_id
+                            )
+                    await db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("call_list after reconnect failed")
+
+        # Reconcile SIP-extension registrations against the kernel's live
+        # registrar. A kernel restart clears its in-memory bindings without
+        # emitting per-AOR unregister events, so an agent's heartbeat dot would
+        # stay green while their handset is actually offline. Re-query the live
+        # AOR set and flip any stale-registered extension to unregistered.
+        try:
+            from app.libs.telephony.base import TelephonyMethodNotFoundError
+            from app.services.sip_extension_service import SipExtensionService
+
+            live = await self.telephony.extension_list()
+            live_ids = {
+                (e.get("extension") or "").strip()
+                for e in live
+                if e.get("extension")
+            }
+            async with AsyncSessionLocal() as db:
+                flipped = await SipExtensionService.reconcile_registrations(db, live_ids)
+                await db.commit()
+            if flipped:
+                logger.info(
+                    "Reconnect reconcile: %d extension(s) → unregistered", len(flipped),
+                )
+                rt = get_realtime_transport()
+                for ext in flipped:
+                    if ext.bound_employee_id is None:
+                        continue
+                    try:
+                        await rt.emit(
+                            "cc.device_registration_changed",
+                            {
+                                "extension_number": ext.extension_number,
+                                "registration_status": ext.registration_status,
+                            },
+                            room=f"agent:{ext.tenant_id}:{ext.bound_employee_id}",
+                            namespace="/chat",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("device_registration_changed push failed")
+        except TelephonyMethodNotFoundError:
+            pass  # kernel build without extension registrar
+        except Exception:  # noqa: BLE001
+            logger.exception("extension reconcile after reconnect failed")
 
     # ────────────────── Outbound (agent-initiated) tracking ──────────────────
 
@@ -959,10 +1442,318 @@ class CallCenterOrchestrator:
             logger.warning("cancel_outbound: call_hangup raised", exc_info=True)
 
     def pair_outbound_webrtc(self, *, outbound_call_id: str, webrtc_call_id: str) -> None:
-        """Bind the outbound SIP leg to the agent's WebRTC leg. The pairing
-        is consumed in _on_outbound_answered to fire call.bridge."""
+        """Bind the outbound SIP leg to the agent's media leg. The pairing is
+        consumed in _on_outbound_answered to fire call.bridge.
+
+        `webrtc_call_id` is the agent's leg to bridge the customer to — a
+        browser WebRTC leg for Web-phone agents, or the physical SIP-extension
+        leg for SIP-phone agents. The bridge logic is identical either way."""
 
         self._outbound_webrtc_pairs[outbound_call_id] = webrtc_call_id
+
+    def register_leg_wait(self, call_id: str) -> "_asyncio.Future[dict]":
+        """Await a leg's first answered/hangup. Returns a Future resolved with
+        {"answered": True} on call.answered or {"answered": False, "reason":...}
+        on call.hangup. Used by the SIP-phone two-stage originate to know when
+        the agent's physical phone goes off-hook before dialing the customer."""
+
+        import asyncio
+        fut: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+        self._leg_waiters[call_id] = fut
+        return fut
+
+    def register_play_wait(self, call_id: str) -> "_asyncio.Future[dict]":
+        """Await the next ``call.play_end`` on this call. Used so the assign path
+        can let an in-flight prompt finish before bridging. Register it right
+        after starting the prompt; if the prompt has already ended, the returned
+        future simply resolves at that point instead of blocking."""
+
+        import asyncio
+        fut: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
+        self._play_waiters[call_id] = fut
+        return fut
+
+    def _resolve_play_wait(self, call_id: str, data: dict) -> None:
+        fut = self._play_waiters.pop(call_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(data)
+
+    def cancel_play_wait(self, call_id: str) -> None:
+        self._play_waiters.pop(call_id, None)
+
+    def set_pending_sip_originate(self, call_id: str, agent_leg_call_id: str) -> None:
+        """Record that a SIP-phone handset is being rung for this caller, so a
+        caller hangup can cancel the ring."""
+        self._pending_sip_originate[call_id] = agent_leg_call_id
+
+    def pop_pending_sip_originate(self, call_id: str) -> str | None:
+        return self._pending_sip_originate.pop(call_id, None)
+
+    def start_sip_outbound_dial(
+        self,
+        *,
+        extension_leg_call_id: str,
+        params: "SipOutboundDialParams",
+        timeout_sec: float,
+    ) -> None:
+        """Own the SIP-phone extension-answer wait entirely off the request path.
+
+        The `/dial` request originates the agent's physical extension leg
+        synchronously and returns immediately (status ``ringing_extension``); it
+        never awaits the phone going off-hook. This method spawns a background
+        task that waits on the extension leg's first answered/hangup event (via
+        `register_leg_wait`) and:
+
+          * on **answer** → originates the customer leg on a fresh short DB
+            session, pairs it to the extension leg, and registers it as an
+            outbound originator so the shared `_on_outbound_answered` path
+            bridges the two the instant the customer picks up;
+          * on **hangup / decline / timeout** → tears down the extension leg,
+            releases the agent's reserved resource, and notifies the agent's
+            browser — the customer is never dialed.
+
+        No DB session is held across the wait; every persistence step opens its
+        own short session. This is the event-driven replacement for the old
+        in-request `asyncio.wait_for(...)` that held a pooled connection for up
+        to the full ring timeout.
+        """
+
+        import asyncio
+
+        waiter = self.register_leg_wait(extension_leg_call_id)
+        asyncio.create_task(
+            self._run_sip_outbound_dial(
+                extension_leg_call_id=extension_leg_call_id,
+                waiter=waiter,
+                params=params,
+                timeout_sec=timeout_sec,
+            ),
+            name=f"sip-outbound-dial:{extension_leg_call_id}",
+        )
+
+    async def _run_sip_outbound_dial(
+        self,
+        *,
+        extension_leg_call_id: str,
+        waiter: "_asyncio.Future[dict]",
+        params: "SipOutboundDialParams",
+        timeout_sec: float,
+    ) -> None:
+        import asyncio
+
+        self.bind_call_trace(extension_leg_call_id)
+        try:
+            decision = await asyncio.wait_for(waiter, timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            self.cancel_leg_wait(extension_leg_call_id)
+            await self._abort_sip_outbound_dial(
+                extension_leg_call_id, params, reason="no_answer",
+            )
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "sip outbound dial wait failed ext_leg=%s", extension_leg_call_id,
+            )
+            await self._abort_sip_outbound_dial(
+                extension_leg_call_id, params, reason="wait_error",
+            )
+            return
+
+        if not decision.get("answered"):
+            # Declined / hung up before answering — the extension leg is already
+            # gone, so only release the reserved agent and notify the browser.
+            await self._abort_sip_outbound_dial(
+                extension_leg_call_id,
+                params,
+                reason=decision.get("reason") or "extension_declined",
+                teardown_leg=False,
+            )
+            return
+
+        await self._originate_sip_outbound_customer(extension_leg_call_id, params)
+
+    async def _originate_sip_outbound_customer(
+        self, extension_leg_call_id: str, params: "SipOutboundDialParams",
+    ) -> None:
+        """Extension answered → dial the customer and pair the legs.
+
+        Runs off the request path on a fresh short session. On originate failure
+        the extension leg is torn down, the agent resource released, and the
+        browser told the outbound failed.
+        """
+
+        from app.libs.telephony.base import TelephonyRPCError
+
+        try:
+            result = await self.telephony.call_originate(
+                uri=params.dialed,
+                caller_id=params.caller_id,
+                trunk_id=params.trunk_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reason = "originate_rejected"
+            if isinstance(exc, TelephonyRPCError):
+                logger.warning(
+                    "sip outbound customer originate rejected code=%s trunk_id=%s",
+                    exc.code, params.trunk_id,
+                )
+            else:
+                logger.exception(
+                    "sip outbound customer originate failed ext_leg=%s",
+                    extension_leg_call_id,
+                )
+            await self._abort_sip_outbound_dial(
+                extension_leg_call_id, params, reason=reason,
+            )
+            return
+
+        call_id = result.get("call_id")
+        if not call_id:
+            logger.warning(
+                "sip outbound customer originate returned no call_id ext_leg=%s",
+                extension_leg_call_id,
+            )
+            await self._abort_sip_outbound_dial(
+                extension_leg_call_id, params, reason="no_call_id",
+            )
+            return
+
+        redis = _get_redis_client()
+        if redis is not None:
+            try:
+                await CcAgentResourceService.bind_outbound_call(
+                    redis,
+                    params.tenant_pk,
+                    params.employee_id,
+                    reservation_id=params.reservation_id,
+                    call_id=call_id,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "sip outbound bind_outbound_call failed call_id=%s", call_id,
+                )
+
+        # Register the customer leg so its ringing/answered/hangup events route
+        # back to the agent, and pair it to the already-answered extension leg so
+        # _on_outbound_answered bridges them when the customer picks up.
+        self.register_outbound_call(
+            call_id=call_id,
+            tenant_id=params.tenant_pk,
+            employee_id=params.employee_id,
+            outbound_did=params.caller_id,
+        )
+        self.pair_outbound_webrtc(
+            outbound_call_id=call_id, webrtc_call_id=extension_leg_call_id,
+        )
+
+        try:
+            async with AsyncSessionLocal() as db:
+                await CcAgentStatusService.sync_pg_status(
+                    db, params.tenant_pk, params.employee_id, "busy", None,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "sip outbound status busy sync failed call_id=%s", call_id,
+            )
+
+        try:
+            async with AsyncSessionLocal() as db:
+                await CallRecordService.create_for_outbound(
+                    db, params.tenant_pk,
+                    call_id=call_id,
+                    conversation_id=result.get("conversation_id"),
+                    root_call_id=result.get("root_call_id") or call_id,
+                    from_number=params.caller_id,
+                    to_number=params.destination,
+                    agent_id=params.employee_id,
+                    device_type=params.device_type,
+                    device_identifier=params.device_identifier,
+                )
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "sip outbound CDR create_for_outbound failed call_id=%s", call_id,
+            )
+
+        await self.notify_agent_outbound_event(
+            tenant_id=params.tenant_pk, employee_id=params.employee_id,
+            method="cc.outbound_customer_dialing",
+            payload={"call_id": call_id, "extension_call_id": extension_leg_call_id},
+        )
+        logger.info(
+            "sip outbound: extension %s answered → customer leg %s (dialed=%s)",
+            extension_leg_call_id, call_id, params.dialed,
+        )
+
+    async def _abort_sip_outbound_dial(
+        self,
+        extension_leg_call_id: str,
+        params: "SipOutboundDialParams",
+        *,
+        reason: str,
+        teardown_leg: bool = True,
+    ) -> None:
+        """Failure path for a SIP-phone outbound dial before the customer leg
+        exists: tear down the extension leg (unless already gone), release the
+        agent's reserved resource, and notify the browser. Holds no DB session
+        across the RPC/Redis/Socket.IO calls."""
+
+        if teardown_leg:
+            try:
+                await self.telephony.call_hangup(
+                    extension_leg_call_id, reason="outbound_aborted",
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "sip outbound abort: extension leg teardown failed ext_leg=%s",
+                    extension_leg_call_id, exc_info=True,
+                )
+
+        redis = _get_redis_client()
+        if redis is not None:
+            try:
+                released = await CcAgentResourceService.release(
+                    redis,
+                    params.tenant_pk,
+                    params.employee_id,
+                    reason=reason,
+                    expected_call_id=params.reservation_id,
+                )
+                async with AsyncSessionLocal() as db:
+                    await CcAgentStatusService.sync_pg_status(
+                        db,
+                        params.tenant_pk,
+                        params.employee_id,
+                        released["visible_status"],
+                        None,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "sip outbound abort: resource release failed agent=%s/%s",
+                    params.tenant_pk, params.employee_id,
+                )
+
+        await self.notify_agent_outbound_event(
+            tenant_id=params.tenant_pk, employee_id=params.employee_id,
+            method="cc.outbound_hangup",
+            payload={
+                "call_id": extension_leg_call_id,
+                "reason": reason,
+                "stage": "extension",
+            },
+        )
+        logger.info(
+            "sip outbound aborted ext_leg=%s reason=%s (customer not dialed)",
+            extension_leg_call_id, reason,
+        )
+
+    def cancel_leg_wait(self, call_id: str) -> None:
+        self._leg_waiters.pop(call_id, None)
+
+    def _resolve_leg_wait(self, call_id: str, result: dict) -> None:
+        fut = self._leg_waiters.pop(call_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(result)
 
     def _pop_outbound_webrtc(self, outbound_call_id: str) -> str | None:
         return self._outbound_webrtc_pairs.pop(outbound_call_id, None)
@@ -990,6 +1781,9 @@ class CallCenterOrchestrator:
 
     async def _on_outbound_answered(self, event: CallEvent) -> None:
         call_id = event.data.get("call_id") or ""
+        # SIP-phone two-stage: the agent's extension leg answered. Wake the
+        # dialer waiting on it so it proceeds to originate the customer.
+        self._resolve_leg_wait(call_id, {"answered": True})
         info = self._peek_outbound_originator(call_id)
         if info is None:
             return
@@ -1090,6 +1884,43 @@ class CallCenterOrchestrator:
         except Exception:  # noqa: BLE001
             logger.exception("cc.call_hangup push failed")
 
+    async def notify_agent_call_answered(
+        self, *, tenant_id: int, employee_id: int, call_id: str
+    ) -> None:
+        """Tell an agent's browser the call was answered on their physical phone.
+
+        For SIP-phone agents the off-hook happens on the handset, not in the
+        browser, so the workspace must be moved to 通话中 by this push instead of
+        by a browser "接听" click.
+        """
+        try:
+            rt = get_realtime_transport()
+            room = f"agent:{tenant_id}:{employee_id}"
+            await rt.emit(
+                "cc.call_answered",
+                {"call_id": call_id},
+                room=room,
+                namespace="/chat",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cc.call_answered push failed")
+
+    async def notify_conference_participant_left(
+        self, *, tenant_id: int, employee_id: int
+    ) -> None:
+        """Tell a conference host their participant left → collapse the 3-way."""
+        try:
+            rt = get_realtime_transport()
+            room = f"agent:{tenant_id}:{employee_id}"
+            await rt.emit(
+                "cc.conference_participant_left", {}, room=room, namespace="/chat",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "cc.conference_participant_left push failed agent=%s/%s",
+                tenant_id, employee_id,
+            )
+
     async def notify_agent_outbound_event(
         self,
         *,
@@ -1102,6 +1933,28 @@ class CallCenterOrchestrator:
 
         Used for cc.outbound_ringing / cc.outbound_answered / cc.outbound_hangup.
         Same room/namespace convention as the inbound notifications.
+        """
+        try:
+            rt = get_realtime_transport()
+            room = f"agent:{tenant_id}:{employee_id}"
+            await rt.emit(method, payload, room=room, namespace="/chat")
+        except Exception:  # noqa: BLE001
+            logger.exception("%s push failed agent=%s/%s", method, tenant_id, employee_id)
+
+    async def notify_agent_control_result(
+        self,
+        *,
+        tenant_id: int,
+        employee_id: int,
+        method: str,
+        payload: dict,
+    ) -> None:
+        """Push a consult / transfer result to the initiating agent's browser.
+
+        Used for cc.consult_result / cc.transfer_result so the initiator's UI
+        leaves the "咨询中/转接中" state once the background ring resolves
+        (target answered, declined, timed out, or errored). Same room/namespace
+        convention as the inbound notifications.
         """
         try:
             rt = get_realtime_transport()

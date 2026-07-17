@@ -12,6 +12,7 @@ from app.libs.open_agent.base import (
     OpenAgentAgentDetail,
     OpenAgentAgentListResult,
     OpenAgentAgentSummary,
+    OpenAgentAgentTool,
     OpenAgentConnectionResult,
 )
 from app.core.exceptions import ForbiddenError
@@ -47,6 +48,7 @@ class FakeOpenAgentClient:
         self.calls: list[tuple[str, str]] = []
         self.agent_calls: list[tuple[str, str, str, int, int]] = []
         self.agent_detail_calls: list[tuple[str, str, int]] = []
+        self.agent_tool_calls: list[tuple[str, str, int, int]] = []
         self.ai_disclaimer = {
             "enabled": True,
             "content": "本内容由AI生成，仅供参考",
@@ -106,6 +108,17 @@ class FakeOpenAgentClient:
                 ],
             },
             ai_disclaimer=self.ai_disclaimer,
+            attachment_handoff_tool_id=42,
+        )
+
+    async def get_agent_tool(self, base_url: str, api_key: str, agent_id: int, tool_id: int):
+        self.agent_tool_calls.append((base_url, api_key, agent_id, tool_id))
+        return OpenAgentAgentTool(
+            id=tool_id,
+            agent_id=agent_id,
+            name="Attachment handoff",
+            tool_type="human_handoff",
+            is_enabled=True,
         )
 
 
@@ -309,6 +322,35 @@ async def test_list_active_agents_requires_saved_credentials(monkeypatch):
 
     with pytest.raises(ValidationError):
         await OpenAgentSettingsService.list_active_agents(object(), 1)
+
+
+@pytest.mark.asyncio
+async def test_attachment_handoff_status_requires_enabled_human_handoff_tool(monkeypatch):
+    existing = FakeOpenAgentSettings(
+        tenant_id=1,
+        base_url="https://new.example.com/api/v1",
+        api_key_ciphertext=encrypt_secret("sk-saved"),
+    )
+    client = FakeOpenAgentClient()
+
+    async def fake_get(_db, _tenant_id):
+        return existing
+
+    monkeypatch.setattr(OpenAgentSettingsRepository, "get_by_tenant_id", fake_get)
+
+    response = await OpenAgentSettingsService.get_attachment_handoff_status(
+        object(),
+        1,
+        10,
+        open_agent_client=client,
+    )
+
+    assert response.ready is True
+    assert response.reason == "ready"
+    assert response.tool_id == 42
+    assert client.agent_tool_calls == [
+        ("https://new.example.com/api/v1", "sk-saved", 10, 42)
+    ]
 
 
 @pytest.mark.asyncio

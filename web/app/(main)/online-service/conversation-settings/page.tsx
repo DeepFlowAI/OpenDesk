@@ -67,6 +67,7 @@ import type {
   ConversationAnnouncementCondition,
   ConversationAnnouncementListItem,
 } from '@/models/conversation-announcement'
+import { RobotQaSettingSection } from '@/app/components/features/conversation-settings/robot-qa-setting-section'
 
 function formatDate(iso: string | null, locale: Locale): string {
   if (!iso) return '—'
@@ -1211,6 +1212,8 @@ export default function ConversationSettingsPage() {
           </div>
         ) : null}
       </section>
+
+      <RobotQaSettingSection />
 
       <section className="flex flex-col gap-4 border-t border-border pt-6">
         <div>

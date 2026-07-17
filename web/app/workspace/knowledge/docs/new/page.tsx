@@ -1,11 +1,17 @@
 'use client'
 
+import { useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { toast } from 'sonner'
 import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
 import { hasPermission } from '@/utils/permissions'
-import { useCreateKnowledgeDocument, useKnowledgeDirectories } from '@/service/use-knowledge'
+import {
+  useCreateKnowledgeDocument,
+  useKnowledgeDirectories,
+  useKnowledgeInspiration,
+  useMarkKnowledgeInspirationDocumentCreated,
+} from '@/service/use-knowledge'
 import { KnowledgeDocumentForm } from '@/app/components/features/knowledge/document-form'
 import {
   buildKnowledgeReturnQuery,
@@ -29,7 +35,15 @@ export default function NewKnowledgeDocumentPage() {
   const canCreate = hasPermission(user, 'knowledge.workspace.document.create')
   const { data: directoryData } = useKnowledgeDirectories()
   const createDocument = useCreateKnowledgeDocument()
+  const inspirationId = parsePositiveInt(searchParams.get('inspiration'))
+  const { data: inspiration, isError: inspirationError } = useKnowledgeInspiration(inspirationId)
+  const markInspirationDocumentCreated = useMarkKnowledgeInspirationDocumentCreated()
   const returnQuery = buildKnowledgeReturnQuery(searchParams)
+
+  useEffect(() => {
+    if (!inspirationId || !inspirationError) return
+    toast.error(isZh ? '关联知识灵感不存在或无权访问' : 'Linked inspiration does not exist or is not accessible')
+  }, [inspirationError, inspirationId, isZh])
 
   if (!canCreate) {
     return (
@@ -42,6 +56,13 @@ export default function NewKnowledgeDocumentPage() {
   const handleSubmit = async (payload: KnowledgeDocumentPayload) => {
     try {
       const created = await createDocument.mutateAsync(payload)
+      if (inspirationId) {
+        try {
+          await markInspirationDocumentCreated.mutateAsync(inspirationId)
+        } catch {
+          toast.error(isZh ? '关联知识灵感标记失败' : 'Failed to update linked inspiration')
+        }
+      }
       toast.success(isZh ? '文档已创建' : 'Article created')
       router.push(`/workspace/knowledge/docs/${created.id}${returnQuery}`)
     } catch (error) {
@@ -55,7 +76,8 @@ export default function NewKnowledgeDocumentPage() {
       mode="create"
       directories={directoryData?.items ?? []}
       initialDirectoryId={parsePositiveInt(searchParams.get('directory'))}
-      saving={createDocument.isPending}
+      initialContentHtml={inspiration?.content_html}
+      saving={createDocument.isPending || markInspirationDocumentCreated.isPending}
       isZh={isZh}
       onCancel={() => router.push(knowledgeListHref(searchParams))}
       onSubmit={handleSubmit}

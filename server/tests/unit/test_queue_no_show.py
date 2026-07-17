@@ -156,6 +156,35 @@ class TestVoidTaskIfVisitorOffline:
         assert mock_end.call_args.args[2] == qs.QUEUE_NO_SHOW_ENDED_BY
 
     @pytest.mark.asyncio
+    async def test_offline_open_agent_handoff_marks_handoff_canceled(self):
+        db = AsyncMock()
+        conv = _conversation()
+        conv.open_agent_handoff_state = "queued"
+        task = _task(task_type="open_agent_handoff")
+        with patch.object(QueueNoShowSettingService, "is_enabled", AsyncMock(return_value=True)), patch.object(
+            ConversationRepository, "get_by_id", AsyncMock(return_value=conv)
+        ), patch.object(VisitorWebStatusService, "get_status", AsyncMock(return_value="offline")), patch.object(
+            QueueTaskRepository, "mark_terminal", AsyncMock()
+        ), patch.object(
+            ConversationRepository, "end_conversation", AsyncMock(return_value=conv)
+        ), patch.object(
+            QueueTaskService, "_record_event", AsyncMock()
+        ), patch.object(
+            QueueTaskService, "_materialize_conversation_summary", AsyncMock()
+        ), patch.object(
+            QueueTaskService, "_emit_queue_change", AsyncMock()
+        ), patch.object(
+            QueueTaskService, "_emit_no_show_conversation_ended", AsyncMock()
+        ):
+            result = await QueueTaskService._void_task_if_visitor_offline(db, AsyncMock(), 1, task)
+
+        assert result is True
+        assert conv.open_agent_handoff_state == qs.QUEUE_OFFLINE_CANCELED_HANDOFF_STATE
+        assert conv.had_bot_session is True
+        assert conv.bot_handoff_succeeded is False
+        assert conv.bot_handoff_triggered is True
+
+    @pytest.mark.asyncio
     async def test_conversation_not_queued_returns_false(self):
         db = AsyncMock()
         with patch.object(QueueNoShowSettingService, "is_enabled", AsyncMock(return_value=True)), patch.object(

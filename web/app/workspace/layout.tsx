@@ -11,6 +11,7 @@ import {
   IconHistory,
   IconMessageCircle,
   IconPhone,
+  IconSend,
   IconSettings,
   IconTicket,
 } from '@tabler/icons-react'
@@ -48,6 +49,7 @@ import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 import { logAuthEvent } from '@/utils/auth-log'
 import { redirectToSessionReplacedLogin } from '@/utils/session-replacement'
 import { useWorkspaceNotificationAlert } from '@/hooks/use-workspace-notification-alert'
+import { useWorkspaceTitleBlink } from '@/hooks/use-workspace-title-blink'
 import { CollaborationInvitationDialog } from '@/app/components/features/chat/collaboration-invitation-dialog'
 import {
   conversationCollaborationKeys,
@@ -67,6 +69,7 @@ const WORKSPACE_NAV_ICONS: Record<WorkspaceNavIconKey, ComponentType<{ size?: nu
   tickets: IconTicket,
   chat: IconMessageCircle,
   call: IconPhone,
+  engagement: IconSend,
   records: IconHistory,
   contacts: IconAddressBook,
   knowledge: IconBook2,
@@ -135,9 +138,16 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   } = useChatStore()
   const { playSessionAlert } = useWorkspaceNotificationAlert()
   const totalUnreadCount = useMemo(
-    () => conversations.reduce((sum, conv) => sum + Math.max(0, conv.unread_count || 0), 0),
+    () => conversations
+      .filter((conv) => conv.viewer_relation !== 'peer')
+      .reduce((sum, conv) => sum + Math.max(0, conv.unread_count || 0), 0),
     [conversations],
   )
+  useWorkspaceTitleBlink({
+    enabled: mounted && canUseChat,
+    unreadCount: totalUnreadCount,
+    locale,
+  })
   const visibleNavItems: NavItem[] = useMemo(
     () => WORKSPACE_NAV_ITEMS.filter((item) => hasAnyPermission(user, item.permissions)),
     [user],

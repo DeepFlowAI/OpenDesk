@@ -189,7 +189,7 @@ export function TransferConversationModal({
           >
             {t('ws.common.cancel', locale)}
           </Button>
-          <Button onClick={handleSubmit} disabled={!canSubmit}>
+          <Button onClick={handleSubmit} disabled={!canSubmit} data-action="confirm-transfer">
             {transferMutation.isPending && (
               <IconLoader2 size={14} className="mr-1 animate-spin" />
             )}

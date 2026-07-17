@@ -15,8 +15,20 @@ import { ComposerPrimitive, useComposerRuntime } from '@assistant-ui/react'
 import { toast } from 'sonner'
 import { useAgentChatConfig } from './agent-chat-runtime'
 import { EmojiPicker } from './emoji-picker'
-import { RichTextComposer } from './rich-text-composer'
-import { IconLoader2, IconLock, IconMessageCircle, IconPaperclip, IconSearch, IconStar, IconTypography } from '@tabler/icons-react'
+import { RichTextComposer, type RichTextComposerHandle } from './rich-text-composer'
+import {
+  IconFile,
+  IconFileTypePdf,
+  IconLoader2,
+  IconLock,
+  IconMessageCircle,
+  IconPaperclip,
+  IconPhoto,
+  IconSearch,
+  IconStar,
+  IconTypography,
+  IconX,
+} from '@tabler/icons-react'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
@@ -33,11 +45,16 @@ import { t } from '@/utils/i18n'
 import { hasPermission } from '@/utils/permissions'
 import { useKnowledgeDocuments } from '@/service/use-knowledge'
 import { useAgentKnowledgeInputSuggestionSetting } from '@/service/use-knowledge-input-suggestion-setting'
-import { knowledgeHtmlToMessageText } from '@/app/components/features/knowledge/knowledge-utils'
+import {
+  knowledgeDocumentHasComposerBody,
+  knowledgeDocumentHasComposerSendableContent,
+  knowledgeHtmlToComposerText,
+} from '@/app/components/features/knowledge/knowledge-utils'
+import { formatKnowledgeAttachmentSize } from '@/app/components/features/knowledge/knowledge-attachment-list'
 import { MessageQuotePreview } from '@/app/components/features/chat/message-quote'
 import type { Socket } from 'socket.io-client'
 import type { Message } from '@/models/conversation'
-import type { KnowledgeDocument } from '@/models/knowledge'
+import type { KnowledgeDocument, KnowledgeDocumentAttachment } from '@/models/knowledge'
 
 function focusComposerTextareaIn(root: ParentNode | null) {
   const ta =
@@ -67,18 +84,22 @@ type AgentComposerProps = {
   disabled: boolean
   disabledReason?: string | null
   socket: Socket | null
+  placeholder?: string
   insertRequest?: ComposerInsertRequest | null
   inputHeight?: number
   onInputHeightCommit?: (height: number) => void
+  onContentTypeChange?: (contentType: ComposerContentType) => void
   messageSearchOpen?: boolean
   onOpenMessageSearch?: () => void
 }
+
+export type ComposerContentType = 'text' | 'rich_text'
 
 export type ComposerInsertRequest = {
   id: number
   conversationId: number
   text: string
-  contentType?: 'text' | 'rich_text'
+  contentType?: ComposerContentType
   quotedMessage?: Message | null
 }
 
@@ -94,6 +115,13 @@ type PastedAttachmentPreview = {
 type SuggestionPrefix = {
   text: string
   replaceEnd: number
+}
+
+type KnowledgeSuggestionDraft = {
+  documentId: number
+  documentTitle: string
+  requestId: string
+  attachments: KnowledgeDocumentAttachment[]
 }
 
 type NavigatorWithUserAgentData = Navigator & {
@@ -249,13 +277,28 @@ function formatAttachmentSize(size: number): string {
   return `${value.toFixed(digits)} ${units[unitIndex]}`
 }
 
+function createKnowledgeDraftRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `draft-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function KnowledgeDraftFileIcon({ mimeType }: { mimeType: string }) {
+  if (mimeType === 'application/pdf') return <IconFileTypePdf size={17} stroke={1.7} />
+  if (mimeType.startsWith('image/')) return <IconPhoto size={17} stroke={1.7} />
+  return <IconFile size={17} stroke={1.7} />
+}
+
 export function AgentComposer({
   disabled,
   disabledReason,
   socket,
+  placeholder,
   insertRequest,
   inputHeight: storedInputHeight,
   onInputHeightCommit,
+  onContentTypeChange,
   messageSearchOpen = false,
   onOpenMessageSearch,
 }: AgentComposerProps) {
@@ -272,6 +315,7 @@ export function AgentComposer({
     emojiConfig,
     onRichTextImageUpload,
     onRichTextSend,
+    onKnowledgeDraftSend,
     composerMode,
     setComposerMode,
     canSendPublicReply,
@@ -283,12 +327,14 @@ export function AgentComposer({
     onClearQuote,
   } = useAgentChatConfig()
   const rootRef = useRef<HTMLDivElement>(null)
+  const richTextComposerRef = useRef<RichTextComposerHandle>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastInsertIdRef = useRef<number | null>(null)
   const appliedStoredInputHeightRef = useRef<number | undefined>(undefined)
   const activeConversationIdRef = useRef(conversation.id)
   const composerDraftsRef = useRef<Map<number, string>>(new Map())
+  const knowledgeDraftsRef = useRef<Map<number, KnowledgeSuggestionDraft>>(new Map())
   const [uploading, setUploading] = useState(false)
   const [sentToast, setSentToast] = useState(false)
   const [inputHeight, setInputHeight] = useState(COMPOSER_INPUT_DEFAULT_HEIGHT)
@@ -300,6 +346,9 @@ export function AgentComposer({
   const [richTextUploading, setRichTextUploading] = useState(false)
   const [richTextSending, setRichTextSending] = useState(false)
   const [composerText, setComposerText] = useState('')
+  const [knowledgeDraft, setKnowledgeDraft] = useState<KnowledgeSuggestionDraft | null>(null)
+  const [knowledgeDraftSending, setKnowledgeDraftSending] = useState(false)
+  const [knowledgeAttachmentPreparingId, setKnowledgeAttachmentPreparingId] = useState<number | null>(null)
   // -1 means no suggestion is actively selected: pressing Enter sends the
   // message. Arrow keys or mouse hover set a concrete index to opt in.
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1)
@@ -311,6 +360,11 @@ export function AgentComposer({
     !isInternalMode
     && canSendPublicReply
     && String(conversation.channel?.channel_type || 'web').toLowerCase() === 'web'
+
+  useEffect(() => {
+    onContentTypeChange?.(richTextMode ? 'rich_text' : 'text')
+  }, [onContentTypeChange, richTextMode])
+
   const isDeferredConversation = Boolean(resolveConversationForSend)
   const showSatisfactionInvite =
     !isInternalMode
@@ -331,7 +385,7 @@ export function AgentComposer({
     && !disabled
     && !composerReadOnlyReason
     && !isInternalMode
-    && !richTextMode
+    && !knowledgeDraft?.attachments.length
     && suggestionConfigQuery.data?.enabled
     && suggestionPrefix
     && dismissedSuggestionPrefix !== suggestionPrefix.text,
@@ -348,6 +402,12 @@ export function AgentComposer({
     per_page: 5,
   }, { enabled: shouldFetchSuggestions })
   const suggestionDocuments = suggestionsQuery.data?.items ?? []
+  const sendableSuggestionIndexes = useMemo(
+    () => suggestionDocuments.flatMap((document, index) => (
+      knowledgeDocumentHasComposerSendableContent(document, richTextMode ? 'rich_text' : 'text') ? [index] : []
+    )),
+    [richTextMode, suggestionDocuments],
+  )
   const showSuggestionPopover = suggestionPopoverEligible && Boolean(suggestionPrefix?.text)
   const messageSearchButton = onOpenMessageSearch ? (
     <button
@@ -383,6 +443,7 @@ export function AgentComposer({
     }
 
     activeConversationIdRef.current = conversation.id
+    setKnowledgeDraft(knowledgeDraftsRef.current.get(conversation.id) ?? null)
     const nextText = composerDraftsRef.current.get(conversation.id) ?? ''
     if (currentText !== nextText) composer.setText(nextText)
     setComposerText(nextText)
@@ -694,55 +755,199 @@ export function AgentComposer({
     }
   }, [locale, onFileSend, pastedAttachment, uploading])
 
+  const storeKnowledgeDraft = useCallback((draft: KnowledgeSuggestionDraft | null) => {
+    const conversationId = activeConversationIdRef.current
+    if (draft?.attachments.length) {
+      knowledgeDraftsRef.current.set(conversationId, draft)
+      setKnowledgeDraft(draft)
+      return
+    }
+    knowledgeDraftsRef.current.delete(conversationId)
+    setKnowledgeDraft(null)
+  }, [])
+
+  const handleKnowledgeAttachmentRemove = useCallback((attachmentId: number) => {
+    if (!knowledgeDraft || knowledgeDraftSending) return
+    storeKnowledgeDraft({
+      ...knowledgeDraft,
+      attachments: knowledgeDraft.attachments.filter((attachment) => attachment.id !== attachmentId),
+    })
+  }, [knowledgeDraft, knowledgeDraftSending, storeKnowledgeDraft])
+
   const handleKnowledgeSuggestionUse = useCallback(
     (document: KnowledgeDocument) => {
       const prefix = suggestionPrefix
-      const messageText = knowledgeHtmlToMessageText(document.content_html)
-      if (!messageText) {
-        toast.error(t('ws.knowledge.emptyContent', locale))
+      const contentType = richTextMode ? 'rich_text' : 'text'
+      const messageText = knowledgeHtmlToComposerText(document.content_html)
+      const messageHtml = document.content_html.trim()
+      const hasMessageBody = knowledgeDocumentHasComposerBody(document, contentType)
+      const attachments = [...document.attachments].sort(
+        (left, right) => left.sort_order - right.sort_order || left.id - right.id,
+      )
+      if (!knowledgeDocumentHasComposerSendableContent(document, contentType)) {
+        toast.error(t('knowledgeInputSuggestion.draft.noSendableContent', locale))
         return
       }
-      const currentText = composer.getState().text
-      const replaceEnd = prefix?.replaceEnd ?? 0
-      const nextText = replaceEnd > 0
-        ? `${messageText}${currentText.slice(replaceEnd)}`
-        : `${currentText}${currentText.trim() ? '\n\n' : ''}${messageText}`
-      const cursor = replaceEnd > 0 ? messageText.length : nextText.length
-      const textarea =
-        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
-        rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
+      if (richTextMode) {
+        const inserted = richTextComposerRef.current?.insertHtmlAtTextPrefix(
+          hasMessageBody ? messageHtml : '',
+          prefix?.replaceEnd ?? 0,
+        )
+        if (!inserted) return
+        setDismissedSuggestionPrefix(prefix?.text ?? null)
+      } else {
+        const currentText = composer.getState().text
+        const replaceEnd = prefix?.replaceEnd ?? 0
+        const nextText = replaceEnd > 0
+          ? `${hasMessageBody ? messageText : ''}${currentText.slice(replaceEnd)}`
+          : `${currentText}${currentText.trim() && hasMessageBody ? '\n\n' : ''}${hasMessageBody ? messageText : ''}`
+        const cursor = replaceEnd > 0 ? (hasMessageBody ? messageText.length : 0) : nextText.length
+        const textarea =
+          rootRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="input"]') ??
+          rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
 
-      composer.setText(nextText)
-      setDismissedSuggestionPrefix(prefix?.text ?? null)
-      toast.success(t('ws.knowledge.added', locale))
-      window.requestAnimationFrame(() => {
-        textarea?.focus({ preventScroll: true })
-        try {
-          textarea?.setSelectionRange(cursor, cursor)
-        } catch {
-          // Ignore host selection limitations.
-        }
-      })
+        composer.setText(nextText)
+        setDismissedSuggestionPrefix(prefix?.text ?? null)
+        window.requestAnimationFrame(() => {
+          textarea?.focus({ preventScroll: true })
+          try {
+            textarea?.setSelectionRange(cursor, cursor)
+          } catch {
+            // Ignore host selection limitations.
+          }
+        })
+      }
+
+      if (attachments.length > 0) {
+        storeKnowledgeDraft({
+          documentId: document.id,
+          documentTitle: document.title,
+          requestId: createKnowledgeDraftRequestId(),
+          attachments,
+        })
+      }
+      toast.success(t(
+        hasMessageBody
+          ? attachments.length > 0
+            ? 'knowledgeInputSuggestion.draft.addedContentAndAttachments'
+            : 'knowledgeInputSuggestion.draft.addedContent'
+          : 'knowledgeInputSuggestion.draft.addedAttachments',
+        locale,
+        { count: attachments.length },
+      ))
     },
-    [composer, locale, suggestionPrefix],
+    [composer, locale, richTextMode, storeKnowledgeDraft, suggestionPrefix],
   )
 
-  const handlePlainInputKeyDown = useCallback(
-    (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+  const handleKnowledgeDraftSend = useCallback(async () => {
+    const draft = knowledgeDraft
+    if (!draft || knowledgeDraftSending || isInternalMode) return
+
+    const conversationId = activeConversationIdRef.current
+    const bodyContent = richTextMode
+      ? prepareRichTextMessageHtml(richTextDraft)
+      : composer.getState().text
+    const bodyText = richTextMode
+      ? richTextToPlainText(bodyContent).trim()
+      : bodyContent.trim()
+
+    setKnowledgeDraftSending(true)
+    try {
+      const result = await onKnowledgeDraftSend({
+        bodyContent,
+        bodyText,
+        bodyContentType: richTextMode ? 'rich_text' : 'text',
+        attachments: draft.attachments,
+        requestId: draft.requestId,
+        onAttachmentPreparing: setKnowledgeAttachmentPreparingId,
+        onItemSent: (item) => {
+          if (item.kind === 'body') {
+            if (richTextMode) {
+              setRichTextDraft('<p></p>')
+              setRichTextResetKey((key) => key + 1)
+            } else {
+              composer.setText('')
+            }
+            return
+          }
+
+          const currentDraft = knowledgeDraftsRef.current.get(conversationId)
+          if (!currentDraft) return
+          const nextDraft = {
+            ...currentDraft,
+            attachments: currentDraft.attachments.filter(
+              (attachment) => attachment.id !== item.attachment.id,
+            ),
+          }
+          if (nextDraft.attachments.length > 0) {
+            knowledgeDraftsRef.current.set(conversationId, nextDraft)
+            if (activeConversationIdRef.current === conversationId) setKnowledgeDraft(nextDraft)
+          } else {
+            knowledgeDraftsRef.current.delete(conversationId)
+            if (activeConversationIdRef.current === conversationId) setKnowledgeDraft(null)
+          }
+        },
+      })
+
+      if (result.errorMessage) {
+        toast.error(t('knowledgeInputSuggestion.draft.partialFailed', locale, {
+          sent: result.sent,
+          total: result.total,
+        }))
+      } else {
+        knowledgeDraftsRef.current.delete(conversationId)
+        if (activeConversationIdRef.current === conversationId) setKnowledgeDraft(null)
+        toast.success(t('knowledgeInputSuggestion.draft.sent', locale))
+      }
+    } catch {
+      toast.error(t('knowledgeInputSuggestion.draft.partialFailed', locale, {
+        sent: 0,
+        total: draft.attachments.length + (bodyText ? 1 : 0),
+      }))
+    } finally {
+      setKnowledgeAttachmentPreparingId(null)
+      setKnowledgeDraftSending(false)
+    }
+  }, [
+    composer,
+    isInternalMode,
+    knowledgeDraft,
+    knowledgeDraftSending,
+    locale,
+    onKnowledgeDraftSend,
+    richTextDraft,
+    richTextMode,
+  ])
+
+  const handleSuggestionKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLElement>) => {
+      if (
+        event.key === 'Enter'
+        && !event.shiftKey
+        && !event.nativeEvent.isComposing
+        && knowledgeDraft?.attachments.length
+      ) {
+        event.preventDefault()
+        void handleKnowledgeDraftSend()
+        return
+      }
       if (!showSuggestionPopover) return
       if (event.key === 'ArrowDown') {
         event.preventDefault()
         setSelectedSuggestionIndex((index) => {
-          const max = Math.max(0, suggestionDocuments.length - 1)
-          return index >= max ? 0 : index + 1
+          if (sendableSuggestionIndexes.length === 0) return -1
+          const position = sendableSuggestionIndexes.indexOf(index)
+          return sendableSuggestionIndexes[(position + 1) % sendableSuggestionIndexes.length]
         })
         return
       }
       if (event.key === 'ArrowUp') {
         event.preventDefault()
         setSelectedSuggestionIndex((index) => {
-          const max = Math.max(0, suggestionDocuments.length - 1)
-          return index <= 0 ? max : index - 1
+          if (sendableSuggestionIndexes.length === 0) return -1
+          const position = sendableSuggestionIndexes.indexOf(index)
+          const previous = position <= 0 ? sendableSuggestionIndexes.length - 1 : position - 1
+          return sendableSuggestionIndexes[previous]
         })
         return
       }
@@ -764,7 +969,10 @@ export function AgentComposer({
     },
     [
       handleKnowledgeSuggestionUse,
+      handleKnowledgeDraftSend,
+      knowledgeDraft?.attachments.length,
       selectedSuggestionIndex,
+      sendableSuggestionIndexes,
       showSuggestionPopover,
       suggestionDocuments,
       suggestionPrefix?.text,
@@ -865,21 +1073,36 @@ export function AgentComposer({
         <div className="max-h-[240px] overflow-y-auto p-1.5">
           {suggestionDocuments.map((document, index) => {
             const selected = index === selectedSuggestionIndex
+            const attachmentCount = document.attachments.length
+            const contentType = richTextMode ? 'rich_text' : 'text'
+            const hasMessageBody = knowledgeDocumentHasComposerBody(document, contentType)
+            const sendable = knowledgeDocumentHasComposerSendableContent(document, contentType)
             return (
               <button
                 key={document.id}
                 type="button"
                 role="option"
                 aria-selected={selected}
+                aria-disabled={!sendable}
+                disabled={!sendable}
                 className={cn(
-                  'flex w-full rounded-lg px-3 py-2 text-left transition-colors',
+                  'flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50',
                   selected ? 'bg-muted text-foreground' : 'text-foreground hover:bg-muted/70',
                 )}
-                onMouseEnter={() => setSelectedSuggestionIndex(index)}
+                onMouseEnter={() => sendable && setSelectedSuggestionIndex(index)}
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => handleKnowledgeSuggestionUse(document)}
               >
-                <span className="truncate text-sm font-medium">{document.title}</span>
+                <span className="min-w-0 flex-1 truncate text-sm font-medium">{document.title}</span>
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {!sendable
+                    ? t('knowledgeInputSuggestion.draft.noSendableContentShort', locale)
+                    : attachmentCount > 0
+                      ? hasMessageBody
+                        ? t('knowledgeInputSuggestion.draft.attachmentCount', locale, { count: attachmentCount })
+                        : t('knowledgeInputSuggestion.draft.attachmentsOnly', locale, { count: attachmentCount })
+                      : null}
+                </span>
               </button>
             )
           })}
@@ -971,8 +1194,9 @@ export function AgentComposer({
                   <button
                     type="button"
                     onClick={() => setComposerMode('public')}
+                    disabled={knowledgeDraftSending}
                     className={cn(
-                      'flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] font-medium transition-colors',
+                      'flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-40',
                       composerMode === 'public' ? 'bg-white text-[#1a1a1a] shadow-sm' : 'text-[#737373]',
                     )}
                   >
@@ -982,8 +1206,10 @@ export function AgentComposer({
                   <button
                     type="button"
                     onClick={() => setComposerMode('internal')}
+                    disabled={knowledgeDraftSending}
+                    data-testid="agent-composer-mode-internal"
                     className={cn(
-                      'flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] font-medium transition-colors',
+                      'flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-40',
                       composerMode === 'internal' ? 'bg-white/90 text-[#1a1a1a] shadow-sm' : 'text-[#737373]',
                     )}
                   >
@@ -1007,11 +1233,61 @@ export function AgentComposer({
           </div>
         )}
         {suggestionPopover}
+        {!isInternalMode && knowledgeDraft && (
+          <div className="rounded-lg border border-border bg-muted/40 p-2.5">
+            <div className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+              <span className="shrink-0">{t('knowledgeInputSuggestion.draft.source', locale)}</span>
+              <span aria-hidden="true">·</span>
+              <span className="truncate" title={knowledgeDraft.documentTitle}>{knowledgeDraft.documentTitle}</span>
+              <span aria-hidden="true">·</span>
+              <span className="shrink-0">
+                {t('knowledgeInputSuggestion.draft.attachmentCount', locale, {
+                  count: knowledgeDraft.attachments.length,
+                })}
+              </span>
+            </div>
+            <div className="mt-2 max-h-[132px] space-y-1.5 overflow-y-auto">
+              {knowledgeDraft.attachments.map((attachment) => (
+                <div
+                  key={attachment.id}
+                  className="flex min-h-10 items-center gap-2 rounded-md border border-border bg-background px-2.5 py-1.5"
+                >
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+                    {knowledgeAttachmentPreparingId === attachment.id ? (
+                      <IconLoader2 size={16} className="animate-spin" />
+                    ) : (
+                      <KnowledgeDraftFileIcon mimeType={attachment.mime_type} />
+                    )}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs font-medium text-foreground" title={attachment.name}>
+                      {attachment.name}
+                    </span>
+                    <span className="block text-[11px] text-muted-foreground">
+                      {formatKnowledgeAttachmentSize(attachment.size)}
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleKnowledgeAttachmentRemove(attachment.id)}
+                    disabled={knowledgeDraftSending}
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                    aria-label={t('knowledgeInputSuggestion.draft.removeAttachment', locale, { name: attachment.name })}
+                    title={t('knowledgeInputSuggestion.draft.removeAttachment', locale, { name: attachment.name })}
+                  >
+                    <IconX size={15} stroke={1.8} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {richTextMode ? (
           <RichTextComposer
+            ref={richTextComposerRef}
             key={richTextResetKey}
             value={richTextDraft}
-            disabled={richTextSending}
+            disabled={richTextSending || knowledgeDraftSending}
             uploading={richTextUploading}
             locale={locale}
             editorHeight={inputHeight}
@@ -1019,6 +1295,8 @@ export function AgentComposer({
             endSafeArea={Boolean(messageSearchButton && !hasModeHeader)}
             autoFocusKey={conversation.id}
             onChange={setRichTextDraft}
+            onPlainTextChange={setComposerText}
+            onEditorKeyDown={handleSuggestionKeyDown}
             onImageUpload={onRichTextImageUpload}
             onAttachmentPaste={handleRichTextAttachmentPaste}
             onUploadingChange={setRichTextUploading}
@@ -1027,12 +1305,14 @@ export function AgentComposer({
         ) : (
           <ComposerPrimitive.Input
             asChild
-            placeholder={isInternalMode ? t('ws.chat.internalNotePlaceholder', locale) : t('ws.chat.inputPlaceholder', locale)}
+            data-testid="agent-composer-input"
+            placeholder={isInternalMode ? t('ws.chat.internalNotePlaceholder', locale) : (placeholder ?? t('ws.chat.inputPlaceholder', locale))}
             submitMode="enter"
             rows={1}
             onChange={handleTypingDebounce}
-            onKeyDown={handlePlainInputKeyDown}
+            onKeyDown={handleSuggestionKeyDown}
             onPaste={handlePaste}
+            disabled={knowledgeDraftSending}
             className={cn(
               'max-h-[168px] min-h-[22px] w-full resize-none overflow-y-auto border-0 bg-transparent p-0 text-sm leading-[22px] text-[#1a1a1a] outline-none ring-0 focus-visible:ring-0',
               messageSearchButton && !hasModeHeader && 'pr-9',
@@ -1049,7 +1329,7 @@ export function AgentComposer({
             type="button"
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[#737373] transition-colors hover:bg-neutral-100 hover:text-foreground"
             onClick={handleAttachmentSelect}
-            disabled={uploading || isInternalMode || !canSendPublicReply}
+            disabled={uploading || knowledgeDraftSending || isInternalMode || !canSendPublicReply}
             aria-label={t('ws.chat.attachFile', locale)}
             title={isInternalMode ? t('ws.chat.internalAttachmentDisabled', locale) : t('ws.chat.attachFile', locale)}
           >
@@ -1064,7 +1344,7 @@ export function AgentComposer({
               type="button"
               className="ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[#737373] transition-colors hover:bg-neutral-100 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
               onClick={handleSatisfactionSend}
-              disabled={satisfactionLoading || satisfactionSending || !satisfactionState?.can_invite}
+              disabled={knowledgeDraftSending || satisfactionLoading || satisfactionSending || !satisfactionState?.can_invite}
               aria-label={t('ws.chat.satisfactionSend', locale)}
               title={
                 satisfactionState?.can_invite
@@ -1079,7 +1359,7 @@ export function AgentComposer({
               )}
             </button>
           )}
-          <EmojiPicker config={emojiConfig} locale={locale} disabled={richTextMode} />
+          <EmojiPicker config={emojiConfig} locale={locale} disabled={richTextMode || knowledgeDraftSending} />
           {showRichTextToggle && (
             <button
               type="button"
@@ -1088,7 +1368,7 @@ export function AgentComposer({
                 richTextMode && 'bg-neutral-100 text-foreground',
               )}
               onClick={handleRichTextToggle}
-              disabled={uploading || richTextUploading || richTextSending}
+              disabled={uploading || richTextUploading || richTextSending || knowledgeDraftSending}
               aria-label={t('ws.chat.richText.toggle', locale)}
               title={t('ws.chat.richText.toggle', locale)}
             >
@@ -1115,13 +1395,35 @@ export function AgentComposer({
             <button
               type="button"
               className="shrink-0 rounded-2xl bg-[#1a1a1a] px-4 py-1.5 text-[13px] font-medium leading-none text-white transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40"
-              onClick={() => void handleRichTextSend(richTextDraft)}
-              disabled={!richTextHasMeaningfulContent(richTextDraft) || richTextUploading || richTextSending}
+              onClick={() => void (knowledgeDraft ? handleKnowledgeDraftSend() : handleRichTextSend(richTextDraft))}
+              disabled={
+                (!richTextHasMeaningfulContent(richTextDraft) && !knowledgeDraft?.attachments.length)
+                || richTextUploading
+                || richTextSending
+                || knowledgeDraftSending
+              }
             >
-              {richTextSending ? t('ws.chat.richText.sending', locale) : t('ws.chat.send', locale)}
+              {richTextSending || knowledgeDraftSending
+                ? t('ws.chat.richText.sending', locale)
+                : t('ws.chat.send', locale)}
+            </button>
+          ) : knowledgeDraft ? (
+            <button
+              type="button"
+              data-testid="agent-composer-send"
+              className="shrink-0 rounded-2xl bg-[#1a1a1a] px-4 py-1.5 text-[13px] font-medium leading-none text-white transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40"
+              onClick={() => void handleKnowledgeDraftSend()}
+              disabled={knowledgeDraftSending}
+            >
+              {knowledgeDraftSending
+                ? t('knowledgeInputSuggestion.draft.sending', locale)
+                : t('ws.chat.send', locale)}
             </button>
           ) : (
-            <ComposerPrimitive.Send className="shrink-0 rounded-2xl bg-[#1a1a1a] px-4 py-1.5 text-[13px] font-medium leading-none text-white transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40">
+            <ComposerPrimitive.Send
+              data-testid="agent-composer-send"
+              className="shrink-0 rounded-2xl bg-[#1a1a1a] px-4 py-1.5 text-[13px] font-medium leading-none text-white transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-40"
+            >
               {t('ws.chat.send', locale)}
             </ComposerPrimitive.Send>
           )}
@@ -1147,12 +1449,15 @@ export function AgentComposer({
                 </div>
               ) : (
                 <div className="rounded-t-2xl bg-[#F5F5F5] p-4">
-                  <div className="flex items-center gap-3 rounded-xl bg-white p-4">
+                  <div className="flex items-start gap-3 rounded-xl bg-white p-4">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#F4F4F5] text-[#737373]">
                       <IconPaperclip size={20} stroke={1.7} />
                     </div>
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium text-[#1a1a1a]">
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className="line-clamp-2 min-h-10 break-all text-sm font-medium text-[#1a1a1a]"
+                        title={pastedAttachment.file.name || t('ws.chat.pastedAttachmentFallbackName', locale)}
+                      >
                         {pastedAttachment.file.name || t('ws.chat.pastedAttachmentFallbackName', locale)}
                       </div>
                       <div className="mt-1 text-xs text-[#737373]">

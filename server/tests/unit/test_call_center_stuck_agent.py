@@ -249,6 +249,61 @@ async def test_agent_hangup_when_customer_gone_resets_status(monkeypatch):
 @pytest.mark.asyncio
 async def test_agent_hangup_no_active_call_returns_error(monkeypatch):
     monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _FakeSession(None))
+
+    async def _no_session(_db, _tenant_id, _employee_id):
+        return None
+
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _no_session)
     orch = CallCenterOrchestrator(telephony=MockTelephonyClient())
     result = await orch.hangup_agent_current_call(tenant_id=7, employee_id=42)
     assert result == {"ok": False, "error": "no_active_call"}
+
+
+@pytest.mark.asyncio
+async def test_agent_hangup_internal_participant_tears_down_leg(monkeypatch):
+    """An internal-ring participant (consult / conference target) has a WebRTC
+    leg but no CDR — hanging up tears down their leg and resets them, rather
+    than returning 'no_active_call' and leaving them stuck 通话中."""
+
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    transport = _FakeTransport()
+
+    # No CDR for this agent (row=None), but they hold an internal WebRTC leg.
+    monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _FakeSession(None))
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake_redis)
+    monkeypatch.setattr(orch_module, "get_realtime_transport", lambda: transport)
+
+    async def _get_active(_db, _tenant_id, _employee_id):
+        return {"webrtc_call_id": "internal-web-1"}
+
+    async def _sync_pg(_db, tenant_id, employee_id, status, reason=None):
+        return {}
+
+    async def _set_busy(_db, tenant_id, employee_id, busy):
+        return None
+
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _get_active)
+    monkeypatch.setattr(CcAgentStatusService, "sync_pg_status", _sync_pg)
+    monkeypatch.setattr(AgentWebRTCSessionService, "set_busy", _set_busy)
+
+    # The participant is occupied in_call on their internal leg.
+    await CcAgentResourceService.set_visible_status(fake_redis, 7, 42, "ready")
+    await CcAgentResourceService.reserve_inbound(
+        fake_redis, 7, 42, call_id="internal-offer", offer_id="io1", queue_id=9, ttl_seconds=30,
+    )
+    await CcAgentResourceService.mark_in_call(
+        fake_redis, 7, 42, call_id="internal-offer", direction="inbound", offer_id="io1",
+    )
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+    orch = CallCenterOrchestrator(telephony=tel)
+    result = await orch.hangup_agent_current_call(tenant_id=7, employee_id=42)
+
+    assert result == {"ok": True, "note": "left_internal_call", "call_id": "internal-web-1"}
+    methods = [(m, p.get("call_id")) for m, p in tel.recorded]
+    assert ("call.hangup", "internal-web-1") in methods
+    # Their browser is told to close; their occupied resource is freed.
+    assert any(event == "cc.call_hangup" for event, _data, _room in transport.emits)
+    snapshot = await CcAgentResourceService.get_snapshot(fake_redis, 7, 42)
+    assert snapshot is None or snapshot["resource_state"] != "in_call"

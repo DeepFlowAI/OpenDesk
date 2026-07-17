@@ -97,6 +97,7 @@ export function MaxConcurrentPopover({ agentStats, open, onOpenChange }: Props) 
     <Popover.Root open={open} onOpenChange={onOpenChange}>
       <Popover.Trigger
         type="button"
+        data-testid="max-concurrent-trigger"
         aria-label={t('ws.chat.maxConcurrent.editAria', locale)}
         className="inline-flex items-center gap-1 font-semibold text-[#1a1a1a] transition-colors hover:text-[#333333]"
       >

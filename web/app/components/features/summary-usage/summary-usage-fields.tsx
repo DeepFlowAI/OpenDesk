@@ -206,8 +206,10 @@ function SummaryFieldRow({
   const shouldSaveOnChange = INSTANT_SAVE_FIELD_TYPES.has(field.field_type)
   const editable = state !== 'readonly'
 
+  const fieldKey = field.key ?? (field.id != null ? String(field.id) : field.name)
+
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-1" data-summary-field={fieldKey}>
       <div className="flex items-center gap-1.5">
         <span className="text-[12px] text-muted-foreground">
           {field.name}

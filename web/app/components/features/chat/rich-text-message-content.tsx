@@ -4,7 +4,10 @@ import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { SafeHtml } from '@/components/safe-html'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { cn } from '@/lib/utils'
-import { getConversationFileUrl } from '@/service/use-conversation-files'
+import {
+  CONVERSATION_IMAGE_DISPLAY_PROCESS,
+  getConversationFileUrl,
+} from '@/service/use-conversation-files'
 
 type RichTextMessageContentProps = {
   html: string
@@ -17,12 +20,53 @@ type RichTextMessageContentProps = {
 
 type ImageUrlState = 'loading' | 'failed' | string
 
+type CachedImageUrl = {
+  url: string
+  expiresAt: number
+}
+
 const TRANSPARENT_IMAGE_SRC =
   'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='
+const RICH_TEXT_IMAGE_CACHE_EARLY_EXPIRY_MS = 30 * 1000
+const richTextImageUrlCache = new Map<string, CachedImageUrl>()
 
 type RichTextImageRef = {
   fileId: string
   downloadName?: string
+}
+
+function richTextImageCacheKey(input: {
+  conversationId?: number
+  conversationPublicId?: string
+  visitorSessionToken?: string
+  fileId: string
+  downloadName?: string
+}): string {
+  return [
+    input.conversationId ?? '',
+    input.conversationPublicId ?? '',
+    input.visitorSessionToken ?? '',
+    input.fileId,
+    input.downloadName ?? '',
+    CONVERSATION_IMAGE_DISPLAY_PROCESS,
+  ].join('\u0000')
+}
+
+function getCachedRichTextImageUrl(cacheKey: string): string | null {
+  const cached = richTextImageUrlCache.get(cacheKey)
+  if (!cached) return null
+  if (cached.expiresAt <= Date.now()) {
+    richTextImageUrlCache.delete(cacheKey)
+    return null
+  }
+  return cached.url
+}
+
+function setCachedRichTextImageUrl(cacheKey: string, url: string, expiresSeconds: number): void {
+  richTextImageUrlCache.set(cacheKey, {
+    url,
+    expiresAt: Date.now() + expiresSeconds * 1000 - RICH_TEXT_IMAGE_CACHE_EARLY_EXPIRY_MS,
+  })
 }
 
 function extractRichTextImages(html: string): RichTextImageRef[] {
@@ -62,11 +106,6 @@ function buildRichTextDisplayHtml(html: string, imageUrls: Record<string, ImageU
     const fileId = img.getAttribute('data-file-id')
     if (!fileId) return
 
-    const existingSrc = img.getAttribute('src')?.trim() ?? ''
-    if (existingSrc && !existingSrc.startsWith('blob:') && !existingSrc.startsWith('data:')) {
-      return
-    }
-
     const state = imageUrls[fileId]
     if (state === 'failed') {
       img.setAttribute('src', TRANSPARENT_IMAGE_SRC)
@@ -98,7 +137,21 @@ export function RichTextMessageContent({
   visitorSessionToken,
 }: RichTextMessageContentProps) {
   const images = useMemo(() => extractRichTextImages(html), [html])
-  const [imageUrls, setImageUrls] = useState<Record<string, ImageUrlState>>({})
+  const initialImageUrls = useMemo(
+    () =>
+      Object.fromEntries(images.map((image) => {
+        const cacheKey = richTextImageCacheKey({
+          conversationId,
+          conversationPublicId,
+          visitorSessionToken,
+          fileId: image.fileId,
+          downloadName: image.downloadName,
+        })
+        return [image.fileId, getCachedRichTextImageUrl(cacheKey) ?? 'loading']
+      })),
+    [conversationId, conversationPublicId, images, visitorSessionToken],
+  )
+  const [imageUrls, setImageUrls] = useState<Record<string, ImageUrlState>>(initialImageUrls)
 
   useEffect(() => {
     if (images.length === 0) {
@@ -107,17 +160,29 @@ export function RichTextMessageContent({
     }
 
     let cancelled = false
-    setImageUrls(Object.fromEntries(images.map((item) => [item.fileId, 'loading'])))
+    setImageUrls(initialImageUrls)
 
     for (const image of images) {
-      void getConversationFileUrl({
+      const cacheKey = richTextImageCacheKey({
         conversationId,
         conversationPublicId,
         visitorSessionToken,
         fileId: image.fileId,
         downloadName: image.downloadName,
       })
+      const cachedUrl = getCachedRichTextImageUrl(cacheKey)
+      if (cachedUrl) continue
+
+      void getConversationFileUrl({
+        conversationId,
+        conversationPublicId,
+        visitorSessionToken,
+        fileId: image.fileId,
+        downloadName: image.downloadName,
+        imageProcess: CONVERSATION_IMAGE_DISPLAY_PROCESS,
+      })
         .then((result) => {
+          setCachedRichTextImageUrl(cacheKey, result.url, result.expires_seconds)
           if (cancelled) return
           setImageUrls((prev) => ({ ...prev, [image.fileId]: result.url }))
         })
@@ -130,7 +195,7 @@ export function RichTextMessageContent({
     return () => {
       cancelled = true
     }
-  }, [conversationId, conversationPublicId, images, visitorSessionToken])
+  }, [conversationId, conversationPublicId, images, initialImageUrls, visitorSessionToken])
 
   const displayHtml = useMemo(
     () => buildRichTextDisplayHtml(html, imageUrls),

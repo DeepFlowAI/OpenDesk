@@ -9,12 +9,14 @@ import redis.asyncio as aioredis
 
 from app.db.deps import (
     get_current_principal,
+    get_current_principal_short_session,
     get_current_user,
     get_db,
     get_redis,
     require_permission,
     require_permission_short_session,
 )
+from app.core.exceptions import ForbiddenError
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.conversation import (
     ConversationResponse,
@@ -33,6 +35,8 @@ from app.schemas.message import (
     WorkspaceConversationHistoryResponse,
     WorkspaceMessageSearchResponse,
 )
+from app.schemas.robot_qa import RobotQaCreatePayload, RobotQaCreateResponse
+from app.services.robot_qa_service import RobotQaService
 from app.schemas.agent_status import (
     AgentMaxConcurrentUpdate,
     AgentStatsResponse,
@@ -62,6 +66,44 @@ file_router = APIRouter(
     prefix="/conversations",
     tags=["Conversations"],
 )
+
+
+async def require_knowledge_attachment_send(
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+) -> EffectivePrincipal:
+    if not principal.has_all_permissions(["chat.workspace.use", "knowledge.workspace.view"]):
+        raise ForbiddenError("Permission denied")
+    return principal
+
+
+async def require_robot_qa_create(
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+) -> EffectivePrincipal:
+    if not principal.has_all_permissions([
+        "chat.workspace.use",
+        "chat.conversation.robot_qa.create",
+    ]):
+        raise ForbiddenError("Permission denied")
+    return principal
+
+
+@file_router.post(
+    "/{conversation_id}/messages/{message_id}/robot-qa",
+    response_model=RobotQaCreateResponse,
+)
+async def create_robot_qa_from_message(
+    conversation_id: int,
+    message_id: int,
+    body: RobotQaCreatePayload,
+    principal: EffectivePrincipal = Depends(require_robot_qa_create),
+):
+    """Create an OpenAgent QA item from an accessible active-conversation message."""
+    return await RobotQaService.create_from_message_managed(
+        conversation_id=conversation_id,
+        message_id=message_id,
+        principal=principal,
+        data=body,
+    )
 
 
 @router.get("", response_model=ConversationListResponse)
@@ -365,6 +407,23 @@ async def upload_conversation_file(
     )
 
 
+@file_router.post(
+    "/{conversation_id}/knowledge-attachments/{attachment_id}/prepare",
+    response_model=ConversationFileUploadResponse,
+)
+async def prepare_knowledge_attachment(
+    conversation_id: int,
+    attachment_id: int,
+    principal: EffectivePrincipal = Depends(require_knowledge_attachment_send),
+):
+    """Copy a knowledge attachment into a conversation before sending it."""
+    return await ConversationFileService.prepare_knowledge_attachment_managed(
+        conversation_id=conversation_id,
+        attachment_id=attachment_id,
+        principal=principal,
+    )
+
+
 @router.get(
     "/{conversation_id}/files/{file_id}/url",
     response_model=ConversationFileAccessResponse,
@@ -374,6 +433,7 @@ async def get_conversation_file_url(
     file_id: str,
     download_name: str | None = Query(None),
     download: bool = Query(False),
+    image_process: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
     principal: EffectivePrincipal = Depends(get_current_principal),
 ):
@@ -386,6 +446,7 @@ async def get_conversation_file_url(
         file_id=file_id,
         download_name=download_name,
         download=download,
+        image_process=image_process,
         principal=principal,
     )
 

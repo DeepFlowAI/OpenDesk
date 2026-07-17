@@ -28,6 +28,7 @@ import {
   patchConversationListCache,
 } from '@/service/use-conversations'
 import { get } from '@/service/base'
+import { prepareKnowledgeAttachmentForConversation } from '@/service/use-conversation-files'
 import { knowledgeKeys } from '@/service/use-knowledge'
 import { useUpdateCurrentUserPreferences } from '@/service/use-auth'
 import {
@@ -68,7 +69,9 @@ import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 import type { OfflineMessageArchiveResponse, OfflineMessageConvertResponse } from '@/models/offline-message'
 import type { OfflineMessageListResponse } from '@/models/offline-message'
 import type { QueueAssignmentWorkspaceResponse } from '@/models/queue-workspace'
-import type { ComposerInsertRequest } from '@/components/assistant-ui/agent-composer'
+import type { ComposerContentType, ComposerInsertRequest } from '@/components/assistant-ui/agent-composer'
+import type { KnowledgeAssistantActionContext } from '@/app/components/features/knowledge/knowledge-assistant'
+import { buildKnowledgeSendPlan } from '@/app/components/features/knowledge/knowledge-utils'
 import { useWorkspaceNotificationAlert } from '@/hooks/use-workspace-notification-alert'
 import {
   conversationCollaborationKeys,
@@ -171,6 +174,7 @@ export default function ChatPage() {
     setVisitorTyping,
     markConversationRead,
     markAgentMessagesReadByVisitor,
+    markAgentMessagesDeliveredToVisitor,
   } = useChatStore()
   const [selectedOfflineMessageId, setSelectedOfflineMessageId] = useState<number | null>(null)
   const skipOfflineAutoSelectRef = useRef(false)
@@ -240,6 +244,7 @@ export default function ChatPage() {
   const [ticketDraftConversationIds, setTicketDraftConversationIds] = useState<Set<number>>(new Set())
   const [transferToast, setTransferToast] = useState<string | null>(null)
   const [composerInsertRequest, setComposerInsertRequest] = useState<ComposerInsertRequest | null>(null)
+  const [composerContentType, setComposerContentType] = useState<ComposerContentType>('text')
   const [selectedConversationSnapshot, setSelectedConversationSnapshot] = useState<Conversation | null>(null)
   const [messageSearchOpen, setMessageSearchOpen] = useState(false)
   const transferToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -252,6 +257,7 @@ export default function ChatPage() {
   const [auxiliaryPanelResizing, setAuxiliaryPanelResizing] = useState(false)
   const updateCurrentUserPreferences = useUpdateCurrentUserPreferences()
   const workspaceChatPreferences = user?.preferences?.workspace_chat
+  const [composerInputHeight, setComposerInputHeight] = useState<number | undefined>(undefined)
 
   const saveWorkspaceChatPreference = useCallback(
     (preference: { auxiliary_panel_width?: number; composer_input_height?: number }) => {
@@ -268,6 +274,19 @@ export default function ChatPage() {
       })
     },
     [updateCurrentUserPreferences, user],
+  )
+
+  useEffect(() => {
+    const storedHeight = workspaceChatPreferences?.composer_input_height
+    if (typeof storedHeight === 'number') setComposerInputHeight(storedHeight)
+  }, [workspaceChatPreferences?.composer_input_height])
+
+  const handleComposerInputHeightCommit = useCallback(
+    (height: number) => {
+      setComposerInputHeight(height)
+      saveWorkspaceChatPreference({ composer_input_height: height })
+    },
+    [saveWorkspaceChatPreference],
   )
 
   const hydrateTransferredConversationMessages = useCallback(
@@ -600,6 +619,14 @@ export default function ChatPage() {
       markAgentMessagesReadByVisitor(data.conversation_id, data.message_ids)
     }
 
+    const handleMessagesDelivered = (data: {
+      conversation_id?: number
+      message_ids?: number[]
+    }) => {
+      if (typeof data.conversation_id !== 'number' || !Array.isArray(data.message_ids)) return
+      markAgentMessagesDeliveredToVisitor(data.conversation_id, data.message_ids)
+    }
+
     const handleConversationEnded = (data: { conversation_id: number }) => {
       removeConversation(data.conversation_id)
       queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
@@ -809,6 +836,7 @@ export default function ChatPage() {
     socket.on('new_message', handleNewMessage)
     socket.on('message_recalled', handleMessageRecalled)
     socket.on('messages_read', handleMessagesRead)
+    socket.on('messages_delivered', handleMessagesDelivered)
     socket.on('conversation_ended', handleConversationEnded)
     socket.on('conversation_transferred', handleConversationTransferred)
     socket.on('collaboration_conversation_added', handleCollaborationConversationAdded)
@@ -829,6 +857,7 @@ export default function ChatPage() {
       socket.off('new_message', handleNewMessage)
       socket.off('message_recalled', handleMessageRecalled)
       socket.off('messages_read', handleMessagesRead)
+      socket.off('messages_delivered', handleMessagesDelivered)
       socket.off('conversation_ended', handleConversationEnded)
       socket.off('conversation_transferred', handleConversationTransferred)
       socket.off('collaboration_conversation_added', handleCollaborationConversationAdded)
@@ -856,6 +885,7 @@ export default function ChatPage() {
     setVisitorTyping,
     markConversationRead,
     markAgentMessagesReadByVisitor,
+    markAgentMessagesDeliveredToVisitor,
     playMessageAlert,
     playSessionAlert,
     selectConversation,
@@ -1032,6 +1062,7 @@ export default function ChatPage() {
   // can never surface in another conversation's composer.
   useEffect(() => {
     setComposerInsertRequest(null)
+    setComposerContentType('text')
   }, [selectedConversationId])
 
   const requestComposerInsert = useCallback((request: Omit<ComposerInsertRequest, 'id' | 'conversationId'>) => {
@@ -1046,9 +1077,13 @@ export default function ChatPage() {
     }))
   }, [])
 
-  const handleKnowledgeUse = useCallback((messageText: string) => {
-    requestComposerInsert({ text: messageText })
-  }, [requestComposerInsert])
+  const handleKnowledgeUse = useCallback((context: KnowledgeAssistantActionContext) => {
+    if (composerContentType === 'rich_text') {
+      requestComposerInsert({ text: context.messageHtml, contentType: 'rich_text' })
+      return
+    }
+    requestComposerInsert({ text: context.composerText })
+  }, [composerContentType, requestComposerInsert])
 
   const myCurrentConversations = useMemo(
     () => conversations.filter((conversation) => conversation.viewer_relation !== 'collaborator'),
@@ -1201,7 +1236,7 @@ export default function ChatPage() {
   }, [messageSearchOpen, selectedConversation?.id, selectedConversation?.visitor])
 
   const handleKnowledgeSend = useCallback(
-    (messageText: string) => {
+    async (context: KnowledgeAssistantActionContext) => {
       if (!socket || !connected || !selectedConversation || selectedConversation.status === 'closed') {
         throw new Error('Knowledge message cannot be sent')
       }
@@ -1223,13 +1258,76 @@ export default function ChatPage() {
       if (isPeerConversation && !hasPermission(user, 'chat.conversation.peer_message.send')) {
         throw new Error('No permission to send peer conversation message')
       }
-      socket.emit('send_message', {
-        conversation_id: selectedConversation.id,
-        content: messageText,
-        content_type: 'text',
+
+      const conversationId = selectedConversation.id
+      const plan = buildKnowledgeSendPlan({
+        messageHtml: context.messageHtml,
+        messageText: context.messageText,
+        attachments: context.document.attachments,
+        requestId: context.requestId,
       })
+      const total = plan.length
+      let sent = 0
+
+      const emitMessage = (
+        content: string,
+        contentType: 'rich_text' | 'file',
+        clientMessageId: string,
+      ) => new Promise<void>((resolve, reject) => {
+        socket.timeout(10_000).emit(
+          'send_message',
+          {
+            conversation_id: conversationId,
+            content,
+            content_type: contentType,
+            client_message_id: clientMessageId,
+          },
+          (timeoutError: Error | null, response?: { ok?: boolean; message?: Message | string; error?: string }) => {
+            if (timeoutError || response?.ok === false || response?.error) {
+              const responseMessage = typeof response?.message === 'string' ? response.message : response?.error
+              reject(new Error(responseMessage || timeoutError?.message || 'send_message failed'))
+              return
+            }
+            resolve()
+          },
+        )
+      })
+
+      try {
+        for (const item of plan) {
+          if (item.kind === 'body') {
+            await emitMessage(item.content, 'rich_text', item.clientMessageId)
+            sent += 1
+            continue
+          }
+          const prepared = await prepareKnowledgeAttachmentForConversation({
+            conversationId,
+            attachmentId: item.attachment.id,
+          })
+          const content = JSON.stringify({
+            schema_version: prepared.schema_version,
+            file_id: prepared.file_id,
+            name: prepared.name,
+            size: prepared.size,
+            mime_type: prepared.mime_type,
+          })
+          await emitMessage(
+            content,
+            'file',
+            item.clientMessageId,
+          )
+          sent += 1
+        }
+      } catch (error) {
+        const reason = error instanceof Error && error.message ? ': ' + error.message : ''
+        throw new Error(
+          locale === 'zh'
+            ? '发送中断，已发送 ' + sent + '/' + total + ' 条' + reason + '。可重试剩余内容'
+            : 'Sending stopped after ' + sent + '/' + total + ' messages' + reason + '. You can retry the remaining content',
+        )
+      }
     },
-    [connected, selectedConversation, socket, user],
+    [connected, locale, selectedConversation, socket, user],
   )
 
   const openTicketDraft = useCallback((conversationId: number) => {
@@ -1552,6 +1650,8 @@ export default function ChatPage() {
             onSelect={setSelectedOfflineMessageId}
             loading={offlineMessagesQuery.isLoading}
             onRefresh={() => void offlineMessagesQuery.refetch()}
+            onAssigned={handleOfflineAssigned}
+            agentStatus={agentStatus || null}
             showTitle={false}
           />
         )}
@@ -1586,8 +1686,9 @@ export default function ChatPage() {
             onTransferred={handleTransferred}
             composerInsertRequest={composerInsertRequest}
             onComposerInsertRequest={requestComposerInsert}
-            composerInputHeight={workspaceChatPreferences?.composer_input_height}
-            onComposerInputHeightCommit={(height) => saveWorkspaceChatPreference({ composer_input_height: height })}
+            composerInputHeight={composerInputHeight}
+            onComposerInputHeightCommit={handleComposerInputHeightCommit}
+            onComposerContentTypeChange={setComposerContentType}
             messageSearchOpen={messageSearchOpen}
             onOpenMessageSearch={handleOpenMessageSearch}
             markReadOnOpen={isMyCurrentConversationView}
@@ -1618,6 +1719,7 @@ export default function ChatPage() {
               width={auxiliaryPanelWidth}
               ticketDraftOpen={selectedConversation ? ticketDraftConversationIds.has(selectedConversation.id) : false}
               onCloseTicketDraft={closeTicketDraft}
+              knowledgeUseContentType={composerContentType}
               onKnowledgeUse={handleKnowledgeUse}
               onKnowledgeSend={handleKnowledgeSend}
             />
@@ -1632,12 +1734,16 @@ export default function ChatPage() {
           socket={socket}
           auxiliaryPanelWidth={auxiliaryPanelWidth}
           resizeHandle={auxiliaryPanelResizeHandle}
+          composerInputHeight={composerInputHeight}
+          onComposerInputHeightCommit={handleComposerInputHeightCommit}
         />
       ) : (
         <QueueTaskPanel
           selectedId={selectedQueueTaskId}
           agentStatus={agentStatus || null}
           socket={socket}
+          composerInputHeight={composerInputHeight}
+          onComposerInputHeightCommit={handleComposerInputHeightCommit}
           onAssigned={handleQueueAssigned}
         />
       )}

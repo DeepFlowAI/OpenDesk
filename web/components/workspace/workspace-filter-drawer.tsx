@@ -45,6 +45,7 @@ export type WorkspaceFilterDrawerProps = {
   conditionLogic: 'and' | 'or'
   onApply: (conditions: FilterConditionItem[], logic: 'and' | 'or') => void
   onClose: () => void
+  presentation?: 'side' | 'bottom'
 }
 
 export function WorkspaceFilterDrawer({
@@ -54,6 +55,7 @@ export function WorkspaceFilterDrawer({
   conditionLogic,
   onApply,
   onClose,
+  presentation = 'side',
 }: WorkspaceFilterDrawerProps) {
   const [draft, setDraft] = useState<FilterConditionItem[]>(
     conditions.length > 0 ? conditions.map((c) => ({ ...c })) : [],
@@ -120,12 +122,18 @@ export function WorkspaceFilterDrawer({
   }, [draft, logic, onApply, onClose])
 
   const isZh = locale === 'zh'
+  const isBottom = presentation === 'bottom'
 
   return (
     <Sheet open onOpenChange={(open) => { if (!open) onClose() }}>
       <SheetContent
-        side="right"
-        className="flex flex-col gap-0 p-0 data-[side=right]:w-full sm:data-[side=right]:w-[560px] data-[side=right]:sm:max-w-[560px]"
+        side={isBottom ? 'bottom' : 'right'}
+        className={cn(
+          'flex flex-col gap-0 p-0',
+          isBottom
+            ? 'max-h-[80dvh] rounded-t-xl'
+            : 'data-[side=right]:w-full sm:data-[side=right]:w-[560px] data-[side=right]:sm:max-w-[560px]',
+        )}
         overlayClassName="supports-backdrop-filter:backdrop-blur-none"
         showCloseButton={false}
       >
@@ -142,7 +150,7 @@ export function WorkspaceFilterDrawer({
           </button>
         </SheetHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+        <div className={cn('min-h-0 flex-1 overflow-y-auto py-3', isBottom ? 'px-4' : 'px-5')}>
           <div className="flex flex-col gap-2">
             <div className="flex rounded-lg bg-muted p-0.5">
               {(['and', 'or'] as const).map((mode) => (
@@ -242,6 +250,20 @@ export function WorkspaceFilterDrawer({
             </button>
           </div>
         </div>
+        {isBottom && (
+          <div className="shrink-0 border-t border-border px-4 pb-[max(12px,env(safe-area-inset-bottom))] pt-3">
+            <button
+              type="button"
+              onClick={() => {
+                onApply([], 'and')
+                onClose()
+              }}
+              className="h-11 w-full rounded-lg border border-border text-sm font-medium text-foreground active:opacity-60"
+            >
+              {isZh ? '清除筛选' : 'Clear filters'}
+            </button>
+          </div>
+        )}
       </SheetContent>
     </Sheet>
   )
