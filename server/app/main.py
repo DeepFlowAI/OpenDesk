@@ -117,7 +117,8 @@ async def lifespan(app: FastAPI):
             logging.getLogger(__name__).exception(
                 "Call center orchestrator failed to start; continuing without it"
             )
-            orchestrator = None
+            if orchestrator is not None and not orchestrator._started:
+                orchestrator = None
 
     yield
 
@@ -130,8 +131,13 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await bot_timeout_task
 
-    # Shutdown call center
+    # Shutdown call center: drain in-flight call workflows first so blue/green
+    # rollouts do not tear down orchestration mid-call, then disconnect.
     if orchestrator is not None:
+        try:
+            await orchestrator.drain(timeout=float(settings.CALL_CENTER_DRAIN_TIMEOUT))
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("Call center orchestrator drain failed")
         try:
             await orchestrator.stop()
         except Exception:  # noqa: BLE001

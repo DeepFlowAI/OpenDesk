@@ -4,6 +4,7 @@ import type {
   AgentStatusResponse,
   AgentStatusUpdate,
   ConsultableAgent,
+  TransferQueue,
   CallRecordDetail,
   CallRecordListResponse,
   CallTranscriptResponse,
@@ -17,6 +18,7 @@ const keys = {
   status: () => [NS, 'agent-status', 'me'] as const,
   session: () => [NS, 'webrtc-session', 'me'] as const,
   consultableAgents: (keyword: string) => [NS, 'consultable-agents', keyword] as const,
+  transferQueues: (keyword: string) => [NS, 'transfer-queues', keyword] as const,
   recordsRoot: () => [NS, 'records'] as const,
   records: (params: Record<string, unknown>) => [NS, 'records', params] as const,
   record: (id: number | null | undefined) => [NS, 'records', id ?? null] as const,
@@ -40,6 +42,23 @@ export const useConsultableAgents = (keyword: string, enabled = true) =>
     // 60s cache: reopening always refetches, and while it's open we poll so a
     // colleague who just logged in (or dropped off) shows up without a full
     // page refresh. Polling only runs while the picker is open (enabled).
+    staleTime: 0,
+    refetchInterval: enabled ? 10_000 : false,
+  })
+
+/**
+ * Employee-group queues available as a blind-transfer target, each with a
+ * live available-agent count. `keyword` filters by queue name on the server.
+ * Only enabled while the transfer picker's queue tab is open.
+ */
+export const useTransferQueues = (keyword: string, enabled = true) =>
+  useQuery({
+    queryKey: keys.transferQueues(keyword),
+    queryFn: () =>
+      get<TransferQueue[]>('v1/call-center/transfer-queues', {
+        searchParams: keyword ? { keyword } : {},
+      }),
+    enabled,
     staleTime: 0,
     refetchInterval: enabled ? 10_000 : false,
   })
@@ -136,6 +155,19 @@ export const rejectCurrentCall = (offerId: string) =>
 
 export const hangupCurrentCall = () =>
   post<CurrentCallActionResponse>('v1/call-center/agents/me/current-call/hangup')
+
+export type MediaReconnectResponse = {
+  call_id: string
+  sdp: string
+  consult_active?: boolean
+  consult_target_employee_id?: number | null
+}
+
+/** Rebuild the agent's WebRTC leg and bridge it back to the live customer. */
+export const reconnectCurrentCallMedia = (sdp: string) =>
+  post<MediaReconnectResponse>('v1/call-center/agents/me/current-call/media-reconnect', {
+    json: { sdp },
+  })
 
 // ─────────── In-call control (hold / dtmf / transfer / consult / conference) ───────────
 

@@ -208,14 +208,32 @@ async def _finalize_offline_after_grace(
     """Wait out the disconnect grace window then attempt to flip to offline.
 
     The finalize step is sid-aware: if the agent reconnected during the grace
-    window, ``finalize_disconnect_if_stale`` is a no-op.
+    window, ``finalize_disconnect_if_stale`` is a no-op. After a successful
+    offline flip, shared SIP occupancy is released when the agent has no
+    in-progress call.
     """
     try:
         await asyncio.sleep(max(0, grace_seconds))
         r = redis_client.client
-        await AgentStatusService.finalize_disconnect_if_stale(
+        changed = await AgentStatusService.finalize_disconnect_if_stale(
             r, tenant_id, user_id, sid
         )
+        if changed:
+            try:
+                from app.db.session import AsyncSessionLocal
+                from app.services.sip_extension_occupancy_service import (
+                    SipExtensionOccupancyService,
+                )
+
+                async with AsyncSessionLocal() as db:
+                    await SipExtensionOccupancyService.maybe_release_for_employee(
+                        db, r, tenant_id, user_id
+                    )
+            except Exception:
+                logger.exception(
+                    "Error releasing SIP occupancy after offline agent=%s",
+                    user_id,
+                )
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -354,6 +372,19 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         await AgentStatusService.set_count(r, tenant_id, user_id, active_count)
 
         logger.info("Agent connected: user_id=%s sid=%s active_count=%d", user_id, sid, active_count)
+
+        # Re-push ringing / in-call UI so a page refresh does not lose the
+        # incoming banner while the caller is still waiting / bridged.
+        try:
+            from app.services.call_center.orchestrator import get_orchestrator
+
+            await get_orchestrator().republish_agent_call_ui(
+                tenant_id=tenant_id, employee_id=user_id,
+            )
+        except Exception:
+            logger.exception(
+                "Error republishing call UI for agent %s/%s", tenant_id, user_id,
+            )
 
         # Try queued conversations after connect; the status check keeps
         # offline or busy agents from receiving work implicitly.

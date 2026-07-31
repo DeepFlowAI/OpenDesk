@@ -481,6 +481,17 @@ async def test_public_config_returns_open_agent_welcome_message(monkeypatch):
         "checked_at": None,
     }
 
+    class _FakeSessionContext:
+        async def __aenter__(self):
+            return AsyncMock()
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.channel_service.AsyncSessionLocal",
+        lambda: _FakeSessionContext(),
+    )
     monkeypatch.setattr(
         "app.services.channel_service.ChannelRepository.get_by_key",
         AsyncMock(return_value=channel),
@@ -490,7 +501,7 @@ async def test_public_config_returns_open_agent_welcome_message(monkeypatch):
         AsyncMock(return_value=availability),
     )
     monkeypatch.setattr(
-        "app.services.channel_service.OpenAgentSettingsService.get_agent_visitor_runtime_config",
+        "app.services.channel_service.OpenAgentSettingsService.get_agent_visitor_runtime_config_managed",
         AsyncMock(return_value=OpenAgentVisitorRuntimeConfig(
             welcome_message=welcome_message,
             ai_disclaimer=ai_disclaimer,
@@ -507,8 +518,7 @@ async def test_public_config_returns_open_agent_welcome_message(monkeypatch):
         AsyncMock(return_value={"agent_workspace_enabled": True, "web_sdk_enabled": True}),
     )
 
-    result = await ChannelService.get_public_config_with_availability_by_key(
-        AsyncMock(),
+    result = await ChannelService.get_public_config_with_availability_by_key_managed(
         AsyncMock(),
         channel_key,
     )

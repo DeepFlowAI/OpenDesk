@@ -159,3 +159,217 @@ class TestTelephonyFactory:
         monkeypatch.setattr(settings_module.settings, "TELEPHONY_PROVIDER", "nonexistent")
         with pytest.raises(ValueError, match="Unsupported telephony provider"):
             get_telephony_client()
+
+
+class TestFlowKitClientFailPending:
+    """Unexpected WS close must fail in-flight RPCs immediately (not wait rpc_timeout)."""
+
+    @pytest.mark.asyncio
+    async def test_fail_pending_sets_not_connected(self):
+        from app.libs.telephony.base import TelephonyNotConnectedError
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        client = FlowKitTelephonyClient(
+            ws_url="ws://127.0.0.1:1/ws",
+            sdk_name="test",
+            sdk_version="0",
+        )
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        client._pending["1"] = fut
+        client._fail_pending(TelephonyNotConnectedError("FlowKit connection closed"))
+        assert client._pending == {}
+        with pytest.raises(TelephonyNotConnectedError, match="connection closed"):
+            await fut
+
+    @pytest.mark.asyncio
+    async def test_recv_loop_finally_fails_pending(self):
+        from app.libs.telephony.base import TelephonyNotConnectedError
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        client = FlowKitTelephonyClient(
+            ws_url="ws://127.0.0.1:1/ws",
+            sdk_name="test",
+            sdk_version="0",
+            rpc_timeout=30.0,
+        )
+        client._closing = True  # prevent reconnect scheduling
+
+        class _EmptyWS:
+            """Iterator ends immediately → recv_loop finally must fail pending."""
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        client._ws = _EmptyWS()
+        client._ready.set()
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        client._pending["rpc-1"] = fut
+
+        await client._recv_loop()
+
+        assert client._pending == {}
+        with pytest.raises(TelephonyNotConnectedError):
+            await fut
+
+    @pytest.mark.asyncio
+    async def test_initial_connect_failure_schedules_reconnect(self, monkeypatch):
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        client = FlowKitTelephonyClient(
+            ws_url="ws://127.0.0.1:1/ws",
+            sdk_name="test",
+            sdk_version="0",
+        )
+
+        async def _fail_connect(*_args, **_kwargs):
+            raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+        monkeypatch.setattr(
+            "app.libs.telephony.providers.flowkit.client.websockets.connect",
+            _fail_connect,
+        )
+
+        await client.connect()
+
+        assert client.is_ready is False
+        assert client._reconnect_task is not None
+        assert not client._reconnect_task.done()
+        await client.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_ensure_reconnect_loop_is_idempotent(self, monkeypatch):
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        client = FlowKitTelephonyClient(
+            ws_url="ws://127.0.0.1:1/ws",
+            sdk_name="test",
+            sdk_version="0",
+        )
+
+        async def _sleep_forever(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            "app.libs.telephony.providers.flowkit.client.FlowKitTelephonyClient._reconnect_loop",
+            _sleep_forever,
+        )
+
+        client._ensure_reconnect_loop()
+        first = client._reconnect_task
+        client._ensure_reconnect_loop()
+        assert client._reconnect_task is first
+        await client.disconnect()
+
+    def test_connection_refused_is_transient(self):
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        assert FlowKitTelephonyClient._is_transient_connect_error(
+            ConnectionRefusedError(111, "Connection refused")
+        )
+        assert FlowKitTelephonyClient._is_transient_connect_error(
+            OSError(111, "Connection refused")
+        )
+        assert FlowKitTelephonyClient._is_transient_connect_error(TimeoutError())
+        # Config bugs must still surface as ERROR.
+        assert not FlowKitTelephonyClient._is_transient_connect_error(
+            ValueError("boom")
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconnect_connection_refused_logs_warning_not_error(
+        self, monkeypatch, caplog
+    ):
+        """Regression: errno 111 during reconnect must not spam ERROR alerts.
+
+        Test env alert: 'FlowKit reconnect failed, retrying in 30.0s | 111'
+        was logged via logger.exception every backoff tick while the kernel
+        was simply unreachable.
+        """
+        import logging
+
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        client = FlowKitTelephonyClient(
+            ws_url="ws://127.0.0.1:1/ws",
+            sdk_name="test",
+            sdk_version="0",
+        )
+
+        attempts = {"n": 0}
+
+        async def _fail_once(*_args, **_kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise ConnectionRefusedError(111, "Connection refused")
+            # Stop the loop after the first failure log by closing the client.
+            client._closing = True
+            raise ConnectionRefusedError(111, "Connection refused")
+
+        monkeypatch.setattr(
+            "app.libs.telephony.providers.flowkit.client.websockets.connect",
+            _fail_once,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="app.libs.telephony.providers.flowkit.client"):
+            # Drive one reconnect tick without waiting the real backoff sleep.
+            async def _no_sleep(_delay):
+                return None
+
+            monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+            await client._reconnect_loop()
+
+        warn_msgs = [
+            r.message for r in caplog.records
+            if r.levelno == logging.WARNING and "reconnect failed" in r.message
+        ]
+        error_msgs = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.ERROR and "reconnect failed" in r.message
+        ]
+        assert warn_msgs, "expected WARNING for Connection refused"
+        assert "url=ws://127.0.0.1:1/ws" in warn_msgs[0]
+        assert "111" in warn_msgs[0] or "Connection refused" in warn_msgs[0]
+        assert error_msgs == []
+        await client.disconnect()
+
+
+class TestOrchestratorFlowKitReconnect:
+
+    @pytest.mark.asyncio
+    async def test_start_succeeds_when_flowkit_unreachable(self, monkeypatch):
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+        from app.services.call_center.orchestrator import (
+            CallCenterOrchestrator,
+            reset_orchestrator,
+        )
+
+        reset_orchestrator()
+
+        async def _fail_connect(*_args, **_kwargs):
+            raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+        monkeypatch.setattr(
+            "app.libs.telephony.providers.flowkit.client.websockets.connect",
+            _fail_connect,
+        )
+
+        telephony = FlowKitTelephonyClient(
+            ws_url="ws://127.0.0.1:1/ws",
+            sdk_name="test",
+            sdk_version="0",
+        )
+        orchestrator = CallCenterOrchestrator(telephony=telephony)
+        await orchestrator.start()
+
+        assert orchestrator._started is True
+        assert telephony.is_ready is False
+        assert telephony._reconnect_task is not None
+        assert "call.incoming" in telephony._handlers
+
+        await orchestrator.stop()
+        reset_orchestrator()

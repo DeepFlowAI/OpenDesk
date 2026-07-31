@@ -1,10 +1,11 @@
 """
 Auth router
 """
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
+from app.core.client_info import get_client_ip, get_user_agent
 from app.db.deps import get_current_user, get_db, get_redis
 from app.schemas.auth import LoginRequest, LoginResponse, RefreshResponse, SsoLoginRequest, UserInfo, UserPreferencesUpdate
 from app.schemas.password_reset import (
@@ -20,15 +21,25 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(body: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """User login endpoint"""
-    return await AuthService.login(db, body)
+    return await AuthService.login(
+        db,
+        body,
+        client_ip=get_client_ip(request),
+        user_agent=get_user_agent(request),
+    )
 
 
 @router.post("/sso", response_model=LoginResponse)
-async def sso_login(body: SsoLoginRequest, db: AsyncSession = Depends(get_db)):
+async def sso_login(body: SsoLoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Exchange a Tenant Platform SSO token for a user session."""
-    return await AuthService.sso_login(db, body)
+    return await AuthService.sso_login(
+        db,
+        body,
+        client_ip=get_client_ip(request),
+        user_agent=get_user_agent(request),
+    )
 
 
 @router.post("/refresh", response_model=RefreshResponse)

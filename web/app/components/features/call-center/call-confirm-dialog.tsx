@@ -4,7 +4,7 @@
  * (direct transfer, end-all). Title/body/lines and confirm label are provided
  * by the caller; the confirm button uses destructive semantics.
  */
-import { IconLoader2 } from '@tabler/icons-react'
+import { IconAlertTriangle, IconLoader2 } from '@tabler/icons-react'
 
 import {
   Dialog,
@@ -24,6 +24,8 @@ type Props = {
   body: string
   /** Extra key/value lines shown between body and actions. */
   lines?: { label: string; value: string }[]
+  /** Cautionary note shown below the lines, e.g. transferring to an empty queue. */
+  warning?: string
   confirmLabel: string
   submitting?: boolean
   onConfirm: () => void
@@ -35,6 +37,7 @@ export function CallConfirmDialog({
   title,
   body,
   lines,
+  warning,
   confirmLabel,
   submitting = false,
   onConfirm,
@@ -57,6 +60,15 @@ export function CallConfirmDialog({
               </div>
             ))}
           </dl>
+        )}
+        {warning && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 text-sm text-warning"
+          >
+            <IconAlertTriangle size={16} className="mt-0.5 shrink-0" aria-hidden />
+            <span>{warning}</span>
+          </div>
         )}
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={submitting}>

@@ -146,17 +146,19 @@ class BaseTelephonyClient(ABC):
         *,
         text: str | None = None,
         audio_url: str | None = None,
+        audio: str | None = None,
         loop: bool = False,
         interval_ms: int | None = None,
         voice: str | None = None,
     ) -> dict:
         """Play a prompt tone on the call leg. Returns `{play_id, status}`.
 
-        Supply exactly one of `text` (TTS) or `audio_url` (a fetchable WAV URL —
-        the kernel rejects other container formats). `loop=True` with
-        `interval_ms` repeats the prompt on that cadence until
-        `call_stop(target="play")`. Used for hold/consult/three-party waiting
-        tones on the customer leg; distinct from `call_say`, which is a
+        Supply exactly one of `text` (TTS), `audio_url` (a fetchable WAV URL —
+        the kernel rejects other container formats) or `audio` (base64 WAV
+        bytes, for a tone built in-process that needs no upload or reachable
+        URL). `loop=True` with `interval_ms` repeats the prompt on that cadence
+        until `call_stop(target="play")`. Used for hold/consult/three-party
+        waiting tones on the customer leg; distinct from `call_say`, which is a
         one-shot spoken utterance in the voice-flow path.
         """
 
@@ -171,13 +173,22 @@ class BaseTelephonyClient(ABC):
 
     @abstractmethod
     async def call_bridge(
-        self, call_id: str, other_call_id: str, transcribe: bool = True
+        self,
+        call_id: str,
+        other_call_id: str,
+        transcribe: bool = True,
+        *,
+        keepalive_on_peer_hangup: bool = False,
     ) -> None:
         """Bridge two call legs.
 
         `transcribe` controls whether the media kernel runs live ASR on the
         bridged audio. When False, the kernel is told to skip transcription
         for this call; when True (default), transcription behaves as before.
+
+        `keepalive_on_peer_hangup` keeps the surviving leg alive when the other
+        side hangs up (consult A↔B). Default False matches two-party calls
+        where either hangup ends both legs.
         """
 
     @abstractmethod
@@ -213,6 +224,7 @@ class BaseTelephonyClient(ABC):
         token: str,
         greeting: str | None = None,
         voice_spk_id: str | None = None,
+        performance: dict | None = None,
         traceparent: str | None = None,
         trace_call_id: str | None = None,
     ) -> None:
@@ -224,6 +236,9 @@ class BaseTelephonyClient(ABC):
         it speaks the reply and emits the same
         `call.external_agent.{connected,handoff,failed,ended}` events. No audio
         leaves the kernel.
+
+        ``performance`` is an optional VoiceSpeed dialog-timing override map
+        (endpoint / turn / barge / TTS knobs). Omitted fields keep FlowKit env.
         """
 
     @abstractmethod
@@ -271,6 +286,19 @@ class BaseTelephonyClient(ABC):
 
     @abstractmethod
     async def call_unhold(self, call_id: str) -> None: ...
+
+    @abstractmethod
+    async def call_mute(self, call_id: str) -> None:
+        """Silence what this leg sends, leaving the rest of the call running.
+
+        Not hold: the party stays in the conversation and keeps hearing the
+        other side, so this is accepted while bridged. Needed for an agent on
+        a SIP handset, who has no local audio track for a console's mute
+        button to switch off.
+        """
+
+    @abstractmethod
+    async def call_unmute(self, call_id: str) -> None: ...
 
     @abstractmethod
     async def call_originate(

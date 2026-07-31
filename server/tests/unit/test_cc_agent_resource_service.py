@@ -130,6 +130,7 @@ async def test_mark_in_call_is_idempotent_for_same_call(fake_redis):
         fake_redis, 7, 42, call_id="leg-1", direction="inbound", offer_id="offer-1",
     )
     assert first["resource_state"] == "in_call"
+    assert first.get("in_call_since") is not None
 
     # Repeat with the (now-cleared) offer_id must not raise "Offer expired".
     again = await CcAgentResourceService.mark_in_call(
@@ -137,6 +138,7 @@ async def test_mark_in_call_is_idempotent_for_same_call(fake_redis):
     )
     assert again["resource_state"] == "in_call"
     assert again["current_call_id"] == "leg-1"
+    assert again.get("in_call_since") == first.get("in_call_since")
 
     # And the initiator's re-assert (no offer_id, same call) is also a no-op.
     reassert = await CcAgentResourceService.mark_in_call(
@@ -261,9 +263,48 @@ async def _seed_in_call(fake_redis, tenant=7, emp=42):
 
 
 @pytest.mark.asyncio
+async def test_get_for_employee_reports_busy_while_in_call(fake_redis, monkeypatch):
+    """Consult target: PG may stay ready; API must still report busy from Redis."""
+    import app.services.cc_agent_status_service as css_mod
+
+    await _seed_in_call(fake_redis)
+    monkeypatch.setattr(
+        css_mod.AgentStatusRepository,
+        "get_for_employee",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                employee_id=42,
+                status="ready",
+                reason=None,
+                status_changed_at=None,
+                updated_at=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        css_mod.CcAgentStatusService,
+        "reconcile_agent",
+        AsyncMock(
+            return_value={
+                "resource_state": "in_call",
+                "current_call_id": "c1",
+                "visible_status": "busy",
+            }
+        ),
+    )
+
+    status = await CcAgentStatusService.get_for_employee(
+        db=None, tenant_id=7, employee_id=42, r=fake_redis,
+    )
+    assert status["status"] == "busy"
+    assert status["resource_state"] == "in_call"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_agent_releases_ghost_in_call(fake_redis, monkeypatch):
     """in_call with no active call record AND no WebRTC session = ghost → freed."""
     import app.services.cc_agent_status_service as css_mod
+    from app.services.call_center.call_control_service import CallControlService
 
     await _seed_in_call(fake_redis)
     monkeypatch.setattr(
@@ -273,10 +314,41 @@ async def test_reconcile_agent_releases_ghost_in_call(fake_redis, monkeypatch):
     monkeypatch.setattr(
         css_mod.AgentWebRTCSessionRepository, "get_active", AsyncMock(return_value=None),
     )
+    monkeypatch.setattr(
+        CallControlService,
+        "_find_consult_host_for_target",
+        AsyncMock(return_value=None),
+    )
 
     await CcAgentStatusService.reconcile_agent(db=None, r=fake_redis, tenant_id=7, employee_id=42)
     snap = await CcAgentResourceService.get_snapshot(fake_redis, 7, 42)
     assert snap is None or snap.get("resource_state") != "in_call"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_agent_keeps_consult_target_without_cdr(fake_redis, monkeypatch):
+    """Consult target B has no CDR; host still lists them → keep in_call on refresh."""
+    import app.services.cc_agent_status_service as css_mod
+    from app.services.call_center.call_control_service import CallControlService
+
+    await _seed_in_call(fake_redis)
+    monkeypatch.setattr(
+        css_mod.CallRecordRepository, "get_latest_active_for_agent",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        css_mod.AgentWebRTCSessionRepository, "get_active", AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        CallControlService,
+        "_find_consult_host_for_target",
+        AsyncMock(return_value={"employee_id": 7, "tenant_id": 7}),
+    )
+
+    snap = await CcAgentStatusService.reconcile_agent(
+        db=None, r=fake_redis, tenant_id=7, employee_id=42
+    )
+    assert snap["resource_state"] == "in_call"
 
 
 @pytest.mark.asyncio
@@ -362,3 +434,69 @@ async def test_reconcile_agent_does_not_restore_when_chose_offline(fake_redis, m
     )
     assert snap["visible_status"] == "offline"
     never.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resource_transition_logs_from_to_call_id(fake_redis, caplog):
+    """Every successful state change emits a structured resource_transition line."""
+    import logging
+
+    await CcAgentResourceService.set_visible_status(
+        fake_redis, tenant_id=7, employee_id=42, status="ready"
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.cc_agent_resource_service"):
+        await CcAgentResourceService.reserve_inbound(
+            fake_redis,
+            7,
+            42,
+            call_id="call-log-1",
+            offer_id="offer-log-1",
+            queue_id=9,
+            ttl_seconds=30,
+        )
+        await CcAgentResourceService.mark_ringing(
+            fake_redis,
+            7,
+            42,
+            offer_id="offer-log-1",
+            call_id="call-log-1",
+            ttl_seconds=30,
+        )
+        await CcAgentResourceService.mark_in_call(
+            fake_redis,
+            7,
+            42,
+            call_id="call-log-1",
+            direction="inbound",
+            offer_id="offer-log-1",
+        )
+        await CcAgentResourceService.mark_after_call_work(
+            fake_redis, 7, 42, call_id="call-log-1", reason="call_hangup"
+        )
+
+    messages = [r.getMessage() for r in caplog.records if "resource_transition" in r.getMessage()]
+    assert any("from=idle to=reserved" in m and "call_id=call-log-1" in m for m in messages)
+    assert any("from=reserved to=ringing" in m for m in messages)
+    assert any("from=ringing to=in_call" in m for m in messages)
+    assert any("to=after_call_work" in m and "reason=mark_after_call_work:call_hangup" in m for m in messages)
+
+
+def test_call_center_constants_active_sets_align():
+    from app.constants.call_center import (
+        ACTIVE_CALL_RECORD_STATES,
+        ACTIVE_RESOURCE_STATES,
+        AgentResourceState,
+        CallRecordState,
+    )
+
+    assert ACTIVE_RESOURCE_STATES == {
+        AgentResourceState.RESERVED.value,
+        AgentResourceState.RINGING.value,
+        AgentResourceState.IN_CALL.value,
+    }
+    assert ACTIVE_CALL_RECORD_STATES == {
+        CallRecordState.RINGING.value,
+        CallRecordState.QUEUED.value,
+        CallRecordState.IN_PROGRESS.value,
+    }

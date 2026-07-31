@@ -32,11 +32,19 @@ const SIP_STATUS_HINTS: Record<number, string> = {
   600: '对方占线',
 }
 
+function coerceSipStatus(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    return Number(value.trim())
+  }
+  return null
+}
+
 export function mapOutboundFailure(
   input: OutboundFailureInput,
 ): OutboundFailureMessage {
   const reason = (input.reason ?? '').trim()
-  const sip = input.sip_status ?? null
+  const sip = coerceSipStatus(input.sip_status)
 
   // ── Expected non-errors ──
   // agent_cancel: silent — the agent just clicked the cancel button.
@@ -100,6 +108,11 @@ export function mapOutboundFailure(
     reason === 'invite_failed'
   ) {
     return { message: '语音信令异常，请稍后重试', level: 'error', isFallback: false }
+  }
+
+  // Reason missing but SIP status present (partial hangup payload).
+  if (!reason && sip && SIP_STATUS_HINTS[sip]) {
+    return { message: SIP_STATUS_HINTS[sip], level: 'error', isFallback: false }
   }
 
   // ── Unknown — surface raw so the user can paste it back for a new mapping ──

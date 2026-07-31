@@ -187,7 +187,7 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
                     <Dd>{formatCallRecordDate(data.ended_at, isZh)}</Dd>
                     <Dt>{isZh ? '通话时长' : 'Talk Time'}</Dt>
                     <Dd>{formatCallRecordDuration(data.talk_duration_ms)}</Dd>
-                    <Dt>{isZh ? '响铃时长' : 'Ring Time'}</Dt>
+                    <Dt>{isZh ? '响铃时长（含机器人/排队）' : 'Ring Time (incl. bot/queue)'}</Dt>
                     <Dd>{formatCallRecordDuration(data.ring_duration_ms)}</Dd>
                     <Dt>{isZh ? '挂断原因' : 'Hangup Reason'}</Dt>
                     <Dd>{data.hangup_reason || '-'}</Dd>

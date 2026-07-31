@@ -7,6 +7,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from app.constants.call_center import ACTIVE_CALL_RECORD_STATES
 from app.models.call_record import CallRecord
 
 
@@ -35,7 +36,7 @@ class CallRecordRepository:
             .where(
                 CallRecord.tenant_id == tenant_id,
                 CallRecord.agent_id == agent_id,
-                CallRecord.state.in_(("ringing", "queued", "in_progress")),
+                CallRecord.state.in_(tuple(ACTIVE_CALL_RECORD_STATES)),
             )
             .order_by(desc(CallRecord.started_at))
             .limit(1)

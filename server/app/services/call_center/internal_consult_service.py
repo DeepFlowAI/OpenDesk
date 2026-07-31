@@ -26,6 +26,7 @@ import uuid
 
 import redis.asyncio as aioredis
 
+from app.constants.call_center import consult_cancel_key
 from app.core.exceptions import ConflictError, ValidationError
 from app.db.session import AsyncSessionLocal
 from app.libs.telephony.base import BaseTelephonyClient
@@ -37,6 +38,15 @@ logger = logging.getLogger(__name__)
 # How long the target agent's browser is allowed to ring before we give up,
 # release the reservation, and report the consult/transfer failed.
 _RING_TIMEOUT_SEC = 45.0
+
+# Maps offer_id → customer call_id so /current-call/accept can create the
+# target's WebRTC leg on the same FlowKit kernel as the live customer call
+# (multi-kernel deployments otherwise bridge across colors and fail).
+_OFFER_AFFINITY_PREFIX = "cc:offer:affinity"
+
+
+def _offer_affinity_key(offer_id: str) -> str:
+    return f"{_OFFER_AFFINITY_PREFIX}:{offer_id}"
 
 
 class InternalConsultService:
@@ -53,7 +63,9 @@ class InternalConsultService:
         initiator_display: str | None = None,
         internal_call_id: str | None = None,
         call_type: str = "internal_consult",
+        customer_context: dict | None = None,
         timeout_seconds: float = _RING_TIMEOUT_SEC,
+        offer_id: str | None = None,
     ) -> dict:
         """Ring `target_employee_id`'s browser and wait for them to accept.
 
@@ -61,6 +73,9 @@ class InternalConsultService:
         once the target accepts (their `/current-call/accept` resolved the offer
         with the WebRTC leg id). Raises on every failure after releasing the
         reserved resource and cancelling the offer, so nothing leaks.
+
+        Callers that persist RINGING before this wait may pass ``offer_id`` so
+        ``consult_end`` can cancel the pending offer by the same id.
         """
 
         from app.services.call_center.orchestrator import get_orchestrator
@@ -74,7 +89,7 @@ class InternalConsultService:
                 "目标坐席当前不是可用的 Web 电话，无法发起浏览器呼叫"
             )
 
-        offer_id = uuid.uuid4().hex
+        offer_id = (offer_id or "").strip() or uuid.uuid4().hex
         # A synthetic call_id anchors the reservation to this internal offer so
         # it doesn't collide with any real customer call the target might get.
         resource_call_id = internal_call_id or f"internal:{offer_id}"
@@ -93,10 +108,38 @@ class InternalConsultService:
         if reserved is None:
             raise ConflictError("目标坐席正在通话或不可用")
 
+        affinity_call_id = None
+        if customer_context:
+            raw_affinity = customer_context.get("source_call_id")
+            if isinstance(raw_affinity, str) and raw_affinity.strip():
+                affinity_call_id = raw_affinity.strip()
+        if affinity_call_id:
+            try:
+                await r.set(
+                    _offer_affinity_key(offer_id),
+                    affinity_call_id,
+                    ex=int(timeout_seconds) + 60,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "internal consult affinity save failed offer=%s",
+                    offer_id, exc_info=True,
+                )
+
         orchestrator = get_orchestrator()
         future = orchestrator.register_offer(offer_id)
 
         try:
+            # The host may cancel (consult_end / teardown) before this task
+            # registered its offer — in that window resolve_offer is a no-op,
+            # so check the cancel tombstone before ringing the target.
+            try:
+                cancelled = await r.get(consult_cancel_key(offer_id))
+            except Exception:  # noqa: BLE001
+                cancelled = None
+            if cancelled:
+                raise ConflictError("求助已取消")
+
             await CcAgentResourceService.mark_ringing(
                 r,
                 tenant_id,
@@ -105,16 +148,30 @@ class InternalConsultService:
                 call_id=resource_call_id,
                 ttl_seconds=timeout_seconds,
             )
+            # Customer fields let the target's workspace show the real caller
+            # (user panel + numbers). Internal legs have no CDR of their own.
+            payload: dict = {
+                "offer_id": offer_id,
+                "call_id": resource_call_id,
+                "call_type": call_type,
+                "from": initiator_display or "",
+                "from_employee_id": initiator_employee_id,
+            }
+            if customer_context:
+                for key in (
+                    "source_call_id",
+                    "customer_from",
+                    "customer_to",
+                    "user_id",
+                    "user_public_id",
+                ):
+                    value = customer_context.get(key)
+                    if value is not None and value != "":
+                        payload[key] = value
             pushed = await orchestrator.notify_agent_incoming(
                 tenant_id=tenant_id,
                 employee_id=target_employee_id,
-                payload={
-                    "offer_id": offer_id,
-                    "call_id": resource_call_id,
-                    "call_type": call_type,
-                    "from": initiator_display or "",
-                    "from_employee_id": initiator_employee_id,
-                },
+                payload=payload,
             )
             if not pushed:
                 raise ConflictError("目标坐席不在线，无法振铃")
@@ -186,6 +243,30 @@ class InternalConsultService:
             )
 
     @staticmethod
+    async def pop_offer_affinity(
+        r: aioredis.Redis, offer_id: str
+    ) -> str | None:
+        """Return and clear the kernel-affinity call_id for an internal offer."""
+
+        key = _offer_affinity_key(offer_id)
+        try:
+            raw = await r.get(key)
+            if raw is not None:
+                await r.delete(key)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "internal consult affinity pop failed offer=%s",
+                offer_id, exc_info=True,
+            )
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        value = str(raw).strip()
+        return value or None
+
+    @staticmethod
     async def _release(
         orchestrator,
         r: aioredis.Redis,
@@ -198,6 +279,10 @@ class InternalConsultService:
         """Free the target's reservation and cancel the offer. Best-effort."""
 
         orchestrator.cancel_offer(offer_id)
+        try:
+            await r.delete(_offer_affinity_key(offer_id))
+        except Exception:  # noqa: BLE001
+            pass
         try:
             await CcAgentResourceService.release(
                 r,

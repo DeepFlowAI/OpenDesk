@@ -10,6 +10,7 @@ from app.db.deps import (
     get_db,
     get_redis,
     require_permission,
+    require_permission_short_session,
 )
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.sip_extension import (
@@ -51,11 +52,18 @@ async def list_sip_extensions(
 @router.get("/bindable-employees", response_model=list[BindableEmployee])
 async def list_bindable_employees(
     keyword: str | None = None,
+    for_extension_id: int | None = None,
     principal: EffectivePrincipal = Depends(require_permission(EXTENSION_MANAGE)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Employees eligible to be bound to a SIP extension (dropdown source)."""
-    return await SipExtensionService.list_bindable_employees(db, principal, keyword)
+    """Employees eligible to be bound to a SIP extension (dropdown source).
+
+    Pass ``for_extension_id`` when editing so agents already bound to that
+    extension remain selectable.
+    """
+    return await SipExtensionService.list_bindable_employees(
+        db, principal, keyword, for_extension_id=for_extension_id
+    )
 
 
 @router.post(
@@ -65,11 +73,12 @@ async def list_bindable_employees(
 )
 async def create_sip_extension(
     body: SipExtensionCreate,
-    principal: EffectivePrincipal = Depends(require_permission(EXTENSION_MANAGE)),
-    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session(EXTENSION_MANAGE)
+    ),
 ):
     """Create a SIP extension and return the one-time full registration info."""
-    return await SipExtensionService.create(db, principal, body)
+    return await SipExtensionService.create_managed(principal, body)
 
 
 @router.put("/{extension_id}", response_model=SipExtensionResponse)
@@ -92,13 +101,16 @@ async def update_sip_extension(
 )
 async def reset_sip_extension_password(
     extension_id: int,
-    principal: EffectivePrincipal = Depends(require_permission(EXTENSION_MANAGE)),
-    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session(EXTENSION_MANAGE)
+    ),
     r: aioredis.Redis = Depends(get_redis),
 ):
     """Reset the extension password; the old one dies and the new one is
     returned once."""
-    return await SipExtensionService.reset_password(db, principal, extension_id, r)
+    return await SipExtensionService.reset_password_managed(
+        principal, extension_id, r
+    )
 
 
 @router.get(
@@ -107,11 +119,14 @@ async def reset_sip_extension_password(
 )
 async def get_sip_extension_registration_info(
     extension_id: int,
-    principal: EffectivePrincipal = Depends(require_permission(EXTENSION_MANAGE)),
-    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session(EXTENSION_MANAGE)
+    ),
 ):
     """Registration info for the copy action (masked password)."""
-    return await SipExtensionService.get_registration_info(db, principal, extension_id)
+    return await SipExtensionService.get_registration_info_managed(
+        principal, extension_id
+    )
 
 
 @router.post("/{extension_id}/disable", response_model=SipExtensionResponse)
@@ -148,10 +163,11 @@ device_router = APIRouter(prefix="/call-center/agents/me", tags=["CallCenter"])
 async def list_my_call_devices(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    r: aioredis.Redis = Depends(get_redis),
 ):
     """List the current agent's selectable call devices."""
     return await AgentCallDeviceService.list_available_devices(
-        db, current_user["tenant_id"], current_user["user_id"]
+        db, current_user["tenant_id"], current_user["user_id"], r
     )
 
 
@@ -163,10 +179,11 @@ async def list_my_call_devices(
 async def get_my_current_device(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    r: aioredis.Redis = Depends(get_redis),
 ):
     """Read the agent's current (restored) device selection."""
     return await AgentCallDeviceService.get_current_device(
-        db, current_user["tenant_id"], current_user["user_id"]
+        db, current_user["tenant_id"], current_user["user_id"], r
     )
 
 

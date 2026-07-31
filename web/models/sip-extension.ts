@@ -19,8 +19,10 @@ export interface SipExtension {
   last_registered_at: string | null
   is_active: boolean
   disabled_at: string | null
-  bound_employee_id: number | null
-  bound_employee: SipExtensionBoundEmployee | null
+  bound_employee_ids: number[]
+  bound_employees: SipExtensionBoundEmployee[]
+  current_occupant_employee_id: number | null
+  current_occupant: SipExtensionBoundEmployee | null
   created_at: string | null
   updated_at: string | null
 }
@@ -44,12 +46,12 @@ export interface BindableEmployee {
 export interface CreateSipExtensionPayload {
   name: string
   extension_number: string
-  bound_employee_id?: number | null
+  bound_employee_ids?: number[]
 }
 
 export interface UpdateSipExtensionPayload {
   name?: string
-  bound_employee_id?: number | null
+  bound_employee_ids?: number[]
 }
 
 /** Registration info that includes the one-time plaintext password. */

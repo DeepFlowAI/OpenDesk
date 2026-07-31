@@ -10,9 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.deps import (
     get_current_principal,
+    get_current_principal_short_session,
     get_db,
     get_redis,
-    require_permission,
     require_permission_short_session,
 )
 from app.db.session import AsyncSessionLocal
@@ -40,7 +40,9 @@ from app.services.offline_message_service import OfflineMessageService
 router = APIRouter(
     prefix="/offline-messages",
     tags=["OfflineMessages"],
-    dependencies=[Depends(require_permission("chat.offline_message.view"))],
+    # Short session: upload / temporary-URL routes must not hold a pooled
+    # connection across object-storage I/O. Other routes still open request sessions.
+    dependencies=[Depends(require_permission_short_session("chat.offline_message.view"))],
 )
 
 
@@ -210,11 +212,9 @@ async def get_offline_message_file_url(
     download_name: str | None = Query(None),
     download: bool = Query(False),
     image_process: str | None = Query(None),
-    db: AsyncSession = Depends(get_db),
-    principal: EffectivePrincipal = Depends(get_current_principal),
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
 ):
-    return await OfflineMessageService.get_temporary_url_for_agent(
-        db,
+    return await OfflineMessageService.get_temporary_url_for_agent_managed(
         principal,
         offline_message_id,
         file_id=file_id,

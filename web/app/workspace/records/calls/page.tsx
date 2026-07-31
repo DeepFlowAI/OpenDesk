@@ -14,6 +14,7 @@ import { useCallRecords } from '@/service/use-call-center'
 import type { CallRecordListItem } from '@/models/call-center'
 import { CallRecordDetailDrawer } from '@/app/components/features/call-center/call-record-detail-drawer'
 import { cn } from '@/lib/utils'
+import { formatCallRecordState } from '@/lib/call-record-labels'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 
@@ -79,6 +80,21 @@ function associationStatusLabel(status: CallRecordListItem['user_association_sta
 
 const PER_PAGE_OPTIONS = [20, 50, 100]
 
+function toDateInputValue(d: Date): string {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function dayStartIso(dateStr: string): string {
+  return new Date(`${dateStr}T00:00:00`).toISOString()
+}
+
+function dayEndIso(dateStr: string): string {
+  return new Date(`${dateStr}T23:59:59.999`).toISOString()
+}
+
 export default function CallRecordsPage() {
   const { locale } = useLocaleStore()
   const [page, setPage] = useState(1)
@@ -86,6 +102,9 @@ export default function CallRecordsPage() {
   const [direction, setDirection] = useState<'all' | 'inbound' | 'outbound'>('all')
   const [keyword, setKeyword] = useState('')
   const [keywordInput, setKeywordInput] = useState('')
+  const today = useMemo(() => toDateInputValue(new Date()), [])
+  const [startDate, setStartDate] = useState(today)
+  const [endDate, setEndDate] = useState(today)
   const [openId, setOpenId] = useState<number | null>(null)
 
   const params = useMemo(
@@ -94,8 +113,10 @@ export default function CallRecordsPage() {
       per_page: perPage,
       direction: direction === 'all' ? undefined : direction,
       keyword: keyword || undefined,
+      start_time: startDate ? dayStartIso(startDate) : undefined,
+      end_time: endDate ? dayEndIso(endDate) : undefined,
     }),
-    [page, perPage, direction, keyword],
+    [page, perPage, direction, keyword, startDate, endDate],
   )
   const { data, isLoading } = useCallRecords(params)
   const items = data?.items ?? []
@@ -137,17 +158,40 @@ export default function CallRecordsPage() {
             className="h-9 w-[240px] rounded-md border border-border bg-white pl-7 pr-2 text-sm"
           />
         </div>
-        {keyword && (
+        <input
+          type="date"
+          value={startDate}
+          onChange={(e) => {
+            setStartDate(e.target.value)
+            setPage(1)
+          }}
+          className="h-9 rounded-md border border-border bg-white px-2 text-sm"
+          aria-label="开始日期"
+        />
+        <span className="text-xs text-muted-foreground">至</span>
+        <input
+          type="date"
+          value={endDate}
+          onChange={(e) => {
+            setEndDate(e.target.value)
+            setPage(1)
+          }}
+          className="h-9 rounded-md border border-border bg-white px-2 text-sm"
+          aria-label="结束日期"
+        />
+        {(keyword || startDate !== today || endDate !== today) && (
           <button
             type="button"
             onClick={() => {
               setKeyword('')
               setKeywordInput('')
+              setStartDate(today)
+              setEndDate(today)
               setPage(1)
             }}
             className="text-xs text-muted-foreground underline"
           >
-            清除筛选
+            重置筛选
           </button>
         )}
       </div>
@@ -243,7 +287,7 @@ export default function CallRecordsPage() {
                         {fmtDuration(r.talk_duration_ms)}
                       </td>
                       <td className="border-b border-border py-3 pl-3 pr-4 text-xs text-muted-foreground">
-                        {r.state}
+                        {formatCallRecordState(r.state)}
                       </td>
                     </tr>
                   ))}

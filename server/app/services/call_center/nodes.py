@@ -14,6 +14,7 @@ No other code needs to change (Open-Closed Principle).
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -22,10 +23,21 @@ from app.libs.telephony.base import BaseTelephonyClient
 from app.services.call_center.queue import get_queue_picker
 from app.services.call_center.variables import evaluate_group
 
+logger = logging.getLogger(__name__)
 
 # Sentinel: the picked agent is a Web-phone (WebRTC) agent, so assign_queue
 # must fall through to the unchanged browser-offer path.
 _NOT_SIP_PHONE = object()
+
+# Containers FlowKit's call.play decoder accepts for file prompts.
+_PLAYABLE_AUDIO_MIME = {
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+    "audio/vnd.wave",
+    "audio/mpeg",
+    "audio/mp3",
+}
 
 
 # ─────────────────── Context + Step Types ───────────────────
@@ -104,6 +116,85 @@ async def _drain_tail() -> None:
         await asyncio.sleep(_PLAY_TAIL_DRAIN_SECONDS)
 
 
+async def _resolve_audio_asset_url(tenant_id: int, asset_id: int) -> str | None:
+    """Look up an audio asset and return a short-lived fetchable URL.
+
+    Opens a short DB session only for the metadata read, then closes it
+    before talking to object storage.
+    """
+
+    from app.db.session import AsyncSessionLocal
+    from app.libs.storage import create_storage_client
+    from app.repositories.audio_asset_repository import AudioAssetRepository
+
+    async with AsyncSessionLocal() as db:
+        asset = await AudioAssetRepository.get_by_id(db, asset_id, tenant_id)
+        if asset is None:
+            logger.warning(
+                "audio asset not found id=%s tenant=%s", asset_id, tenant_id
+            )
+            return None
+        mime = asset.mime_type
+        storage_key = asset.storage_key
+
+    if mime not in _PLAYABLE_AUDIO_MIME:
+        logger.warning(
+            "audio asset id=%s mime=%s not playable — skipped", asset_id, mime
+        )
+        return None
+
+    storage = create_storage_client()
+    return await storage.get_temporary_url(storage_key, expires_seconds=900)
+
+
+async def _utter_prompt(ctx: ExecutionContext, prompt: dict | None) -> bool:
+    """Speak or play a node prompt.
+
+    Returns True when playback was started (caller should wait for
+    ``call.play_end``). TTS uses ``call.say``; audio files resolve a
+    temporary URL and use ``call.play(audio_url=...)``.
+    """
+
+    if not prompt:
+        return False
+
+    kind = prompt.get("kind")
+    if kind == "tts":
+        text = (prompt.get("text") or "").strip()
+        if not text:
+            return False
+        await ctx.telephony.call_say(ctx.call_id, text)
+        return True
+
+    if kind == "audio":
+        asset_id = prompt.get("asset_id")
+        if not asset_id:
+            logger.warning(
+                "audio prompt missing asset_id call_id=%s", ctx.call_id
+            )
+            return False
+        url = await _resolve_audio_asset_url(ctx.tenant_id, int(asset_id))
+        if not url:
+            return False
+        try:
+            await ctx.telephony.call_play(ctx.call_id, audio_url=url)
+        except Exception:  # noqa: BLE001
+            # Bad container / fetch failure must not tear down the whole call;
+            # skip this prompt and let the workflow continue.
+            logger.exception(
+                "call.play audio failed call_id=%s asset_id=%s",
+                ctx.call_id,
+                asset_id,
+            )
+            return False
+        return True
+
+    logger.warning(
+        "unknown prompt kind=%s call_id=%s", kind, ctx.call_id
+    )
+    return False
+
+
 # ─────────────────── Base + per-type executors ───────────────────
 
 
@@ -122,9 +213,9 @@ class StartExecutor(BaseNodeExecutor):
 class PlayExecutor(BaseNodeExecutor):
 
     async def execute(self, ctx: ExecutionContext, node: dict) -> NextStep:
-        prompt = node["data"]["prompt"]
-        text = prompt.get("text", "") if prompt.get("kind") == "tts" else f"[audio #{prompt.get('asset_id')}]"
-        await ctx.telephony.call_say(ctx.call_id, text)
+        started = await _utter_prompt(ctx, node["data"].get("prompt"))
+        if not started:
+            return goto_or_end(ctx, node["id"], "next")
 
         async def _on_play_end(ctx_: ExecutionContext, node_: dict, _data: dict) -> NextStep:
             # call.play_end can fire a beat before the last audio drains from the
@@ -156,9 +247,7 @@ class CollectExecutor(BaseNodeExecutor):
 
     async def execute(self, ctx: ExecutionContext, node: dict) -> NextStep:
         data = node["data"]
-        prompt = data["prompt"]
-        text = prompt.get("text", "") if prompt.get("kind") == "tts" else f"[audio #{prompt.get('asset_id')}]"
-        await ctx.telephony.call_say(ctx.call_id, text)
+        await _utter_prompt(ctx, data.get("prompt"))
         # Start ASR so we have a fallback when in-band DTMF is dropped by
         # the trunk. Pass a short timeout so the kernel can recycle the
         # ASR session if the caller stays silent.
@@ -281,9 +370,7 @@ def _await_first_input(node: dict, data: dict, *, attempt: int) -> NextStep:
                 "collect: no_input retry %d/%d call_id=%s",
                 attempt + 1, max_no_input_retries, ctx_.call_id,
             )
-            prompt = data["prompt"]
-            text = prompt.get("text", "") if prompt.get("kind") == "tts" else f"[audio #{prompt.get('asset_id')}]"
-            await ctx_.telephony.call_say(ctx_.call_id, text)
+            await _utter_prompt(ctx_, data.get("prompt"))
             try:
                 await ctx_.telephony.call_listen(
                     ctx_.call_id, timeout_ms=first_timeout_ms,
@@ -382,6 +469,11 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 "Call-center assign_queue requires Redis for agent resource reservation"
             ) from exc
 
+        # Capture failure info inside the session, then play/stop telephony
+        # only after the session closes — never hold a pooled connection across
+        # a media-kernel RPC (TELEPHONY_RPC_TIMEOUT).
+        fail_status: str | None = None
+        fail_limit_reason: str | None = None
         async with AsyncSessionLocal() as db:
             selection = await AssignQueueSelector.select(
                 db,
@@ -392,98 +484,91 @@ class AssignQueueExecutor(BaseNodeExecutor):
             )
             selected = selection.candidate
             if selected is None:
-                status = selection.failure_status or "no_available_queue"
-                self._set_failure_status(ctx, status, selection.limit_reason)
-                await self._say(ctx, self._failure_prompt(data, status))
-                return goto_or_end(ctx, node["id"], "timeout")
+                fail_status = selection.failure_status or "no_available_queue"
+                fail_limit_reason = selection.limit_reason
+            if selected is not None:
+                ctx.variables["sys._assigned_queue_type"] = selected.queue_type
+                ctx.variables["sys._assigned_queue_id"] = selected.queue_id
+                if selected.queue_type == "employee_group":
+                    ctx.variables["sys._assigned_group_id"] = selected.queue_id
 
-            ctx.variables["sys._assigned_queue_type"] = selected.queue_type
-            ctx.variables["sys._assigned_queue_id"] = selected.queue_id
-            if selected.queue_type == "employee_group":
-                ctx.variables["sys._assigned_group_id"] = selected.queue_id
-
-            if selected.queue_type == QueueType.EMPLOYEE_GROUP.value and selected.available_agent_count > 1:
-                policy = await QueuePolicyResolver.resolve(
-                    db,
-                    ctx.tenant_id,
-                    channel=QueueChannel.CALL_CENTER.value,
-                    queue_type=selected.queue_type,
-                    queue_id=selected.queue_id,
-                )
-                config = policy.get("config") or {}
-                if config.get(RETURNING_AGENT_PRIORITY_ENABLED_KEY) is True:
-                    try:
-                        window_hours = int(
-                            config.get(
-                                RETURNING_AGENT_WINDOW_HOURS_KEY,
-                                RETURNING_AGENT_DEFAULT_WINDOW_HOURS,
+                if selected.queue_type == QueueType.EMPLOYEE_GROUP.value and selected.available_agent_count > 1:
+                    policy = await QueuePolicyResolver.resolve(
+                        db,
+                        ctx.tenant_id,
+                        channel=QueueChannel.CALL_CENTER.value,
+                        queue_type=selected.queue_type,
+                        queue_id=selected.queue_id,
+                    )
+                    config = policy.get("config") or {}
+                    if config.get(RETURNING_AGENT_PRIORITY_ENABLED_KEY) is True:
+                        try:
+                            window_hours = int(
+                                config.get(
+                                    RETURNING_AGENT_WINDOW_HOURS_KEY,
+                                    RETURNING_AGENT_DEFAULT_WINDOW_HOURS,
+                                )
                             )
-                        )
-                    except (TypeError, ValueError):
-                        window_hours = 0
-                    if RETURNING_AGENT_MIN_WINDOW_HOURS <= window_hours <= RETURNING_AGENT_MAX_WINDOW_HOURS:
-                        preferred_agent_id = await QueueReturningAgentRepository.find_recent_call_center_agent(
-                            db,
-                            ctx.tenant_id,
-                            call_id=ctx.call_id,
-                            cutoff=datetime.now(timezone.utc) - timedelta(hours=window_hours),
-                        )
+                        except (TypeError, ValueError):
+                            window_hours = 0
+                        if RETURNING_AGENT_MIN_WINDOW_HOURS <= window_hours <= RETURNING_AGENT_MAX_WINDOW_HOURS:
+                            preferred_agent_id = await QueueReturningAgentRepository.find_recent_call_center_agent(
+                                db,
+                                ctx.tenant_id,
+                                call_id=ctx.call_id,
+                                cutoff=datetime.now(timezone.utc) - timedelta(hours=window_hours),
+                            )
 
-            pick = await picker.pick_ready_agent_for_queue(
-                db,
-                ctx.tenant_id,
-                selected.queue_type,
-                selected.queue_id,
-                redis,
-                call_id=ctx.call_id,
-                offer_id=offer_id,
-                ttl_seconds=timeout_s,
-                preferred_employee_id=preferred_agent_id,
-            )
-            if pick:
-                await CallRecordService.bind_queue(
+                pick = await picker.pick_ready_agent_for_queue(
                     db,
                     ctx.tenant_id,
-                    ctx.call_id,
                     selected.queue_type,
                     selected.queue_id,
+                    redis,
+                    call_id=ctx.call_id,
+                    offer_id=offer_id,
+                    ttl_seconds=timeout_s,
+                    preferred_employee_id=preferred_agent_id,
                 )
+                if pick:
+                    await CallRecordService.bind_queue(
+                        db,
+                        ctx.tenant_id,
+                        ctx.call_id,
+                        selected.queue_type,
+                        selected.queue_id,
+                    )
+
+        if fail_status is not None:
+            return await self._fail_after_prompt(
+                ctx,
+                node,
+                data,
+                fail_status,
+                limit_reason=fail_limit_reason,
+                hangup_reason="no_agent_online",
+            )
 
         # No agent is free right now: instead of dropping the caller, hold them
         # in queue and keep retrying so a call can wait for an agent who is
-        # finishing wrap-up / currently busy. Bounded by queue_wait_seconds;
+        # finishing wrap-up / currently on a call. Bounded by queue_wait_seconds;
         # aborts early if the caller hangs up.
         if pick is None:
-            # Holding the caller only makes sense if an agent is on a call and
-            # about to free up. If none are, waiting just loops "正在为您转接" for a
-            # minute for nothing (a ready agent would already have been picked;
-            # busy/break agents and the caller's own open tab won't take it), so
-            # tell them no agent is available and end the call right away.
-            has_on_call = await picker.has_agent_on_call_for_queue(
-                db, ctx.tenant_id, selected.queue_type, selected.queue_id, redis
-            )
-            if has_on_call is False:
+            # Holding only makes sense if someone will free up soon (on a call or
+            # in after-call wrap-up). busy/break chose not to take calls; waiting
+            # would just loop "正在为您转接" for nothing.
+            async with AsyncSessionLocal() as db:
+                worth_waiting = await picker.has_agent_on_call_for_queue(
+                    db, ctx.tenant_id, selected.queue_type, selected.queue_id, redis
+                )
+            if worth_waiting is False:
                 log.info(
-                    "assign_queue: no agent on-call to wait for in queue=%s/%s — immediate fallback call_id=%s",
+                    "assign_queue: no agent worth waiting for in queue=%s/%s — immediate fallback call_id=%s",
                     selected.queue_type, selected.queue_id, ctx.call_id,
                 )
-                self._set_failure_status(ctx, "agent_no_answer")
-                await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
-                node_id = node["id"]
-                fallback_target = edge_target(ctx, node_id, "timeout")
-
-                async def _after_fallback_prompt(
-                    ctx_: ExecutionContext, _node_: dict, _ev: dict, _target=fallback_target
-                ) -> NextStep:
-                    # Prompt finished playing. Route the wired `timeout` outlet
-                    # if the flow author connected one; otherwise hang up so the
-                    # caller isn't left on a dead, silent line.
-                    if _target is not None:
-                        return Goto(_target)
-                    await ctx_.telephony.call_hangup(ctx_.call_id, reason="no_agent_online")
-                    return End("no_agent_online")
-
-                return WaitForEvent(method="call.play_end", on_event=_after_fallback_prompt)
+                return await self._fail_after_prompt(
+                    ctx, node, data, "agent_no_answer", hangup_reason="no_agent_online",
+                )
 
             queue_wait_s = float(data.get("queue_wait_seconds") or 60)
             retry_s = max(1.0, float(data.get("queue_wait_retry_seconds") or 5))
@@ -536,9 +621,11 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 ctx.variables.get("sys._assigned_queue_id"),
                 ctx.call_id,
             )
-            self._set_failure_status(ctx, "agent_no_answer")
-            await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
-            return goto_or_end(ctx, node["id"], "timeout")
+            # Wait for the failure TTS to finish before routing/hangup — otherwise
+            # a wired hangup outlet (or End) cuts the prompt mid-sentence.
+            return await self._fail_after_prompt(
+                ctx, node, data, "agent_no_answer", hangup_reason="no_agent_online",
+            )
 
         orchestrator = ctx.variables.get("__orchestrator__")
         if orchestrator is None:
@@ -763,9 +850,11 @@ class AssignQueueExecutor(BaseNodeExecutor):
 
         employee_id = pick["employee_id"]
 
+        # Read extension scalars inside the short session; never reuse the ORM
+        # row after the session closes (detached instance).
         async with AsyncSessionLocal() as db:
             current = await AgentCallDeviceService.get_current_device(
-                db, ctx.tenant_id, employee_id
+                db, ctx.tenant_id, employee_id, redis
             )
             if current.get("device_type") != DEVICE_SIP_PHONE:
                 return _NOT_SIP_PHONE
@@ -775,6 +864,19 @@ class AssignQueueExecutor(BaseNodeExecutor):
 
             ext = await SipExtensionRepository.get_by_employee(
                 db, ctx.tenant_id, employee_id
+            )
+            # Shared phone: only the current occupant may receive the SIP ring.
+            if (
+                ext is not None
+                and ext.current_occupant_employee_id != employee_id
+            ):
+                ext = None
+            sip_user_id = (
+                ext.sip_user_id
+                if ext is not None
+                and ext.is_active
+                and ext.registration_status == "registered"
+                else None
             )
 
         # Set once the incoming was pushed to the agent's browser, so _fail only
@@ -802,7 +904,7 @@ class AssignQueueExecutor(BaseNodeExecutor):
             await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
             return goto_or_end(ctx, node["id"], "timeout")
 
-        if ext is None or not ext.is_active or ext.registration_status != "registered":
+        if not sip_user_id:
             log.warning(
                 "assign_queue: SIP-phone agent=%s extension unavailable; "
                 "freeing agent call_id=%s", employee_id, ctx.call_id,
@@ -822,7 +924,7 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 return await _fail("offer_push_failed")
 
         try:
-            result = await ctx.telephony.call_originate(extension=ext.sip_user_id)
+            result = await ctx.telephony.call_originate(extension=sip_user_id)
         except TelephonyMethodNotFoundError:
             log.warning(
                 "assign_queue: kernel has SIP extensions disabled; "
@@ -915,6 +1017,24 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 db, ctx.tenant_id, employee_id, busy=True,
             )
 
+        # Flip Redis ringing → in_call. Without this a browser refresh
+        # republishes as 来电 (offer still "ringing") while the handset is live.
+        if redis is not None:
+            try:
+                await CcAgentResourceService.mark_in_call(
+                    redis,
+                    ctx.tenant_id,
+                    employee_id,
+                    call_id=ctx.call_id,
+                    direction="inbound",
+                    offer_id=offer_id,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "assign_queue: SIP-phone mark_in_call failed agent=%s call_id=%s",
+                    employee_id, ctx.call_id,
+                )
+
         # The off-hook happened on the physical handset — move the agent's
         # browser to 通话中 (spec 3.6.3: no second "接听" click in the workspace).
         try:
@@ -1005,6 +1125,20 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 return End("bridge_aborted")
             raise
 
+        # Persist the live agent media leg so consult/transfer bridge the same
+        # id FlowKit just paired (not a stale softphone presence session).
+        try:
+            from app.services.call_center.call_control_service import CallControlService
+
+            await CallControlService.bind_agent_media_leg(
+                ctx.tenant_id, employee_id, webrtc_call_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "assign_queue: bind agent media leg failed agent=%s leg=%s",
+                employee_id, webrtc_call_id, exc_info=True,
+            )
+
         async def _on_bridged(ctx_: ExecutionContext, node_: dict, _ev: dict) -> NextStep:
             return End("bridged")
 
@@ -1073,6 +1207,51 @@ class AssignQueueExecutor(BaseNodeExecutor):
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return cls._DEFAULT_FAILURE_PROMPTS.get(status, "当前坐席繁忙，请稍后再拨。")
+
+    async def _fail_after_prompt(
+        self,
+        ctx: ExecutionContext,
+        node: dict,
+        data: dict,
+        status: str,
+        *,
+        limit_reason: str | None = None,
+        hangup_reason: str = "no_agent_online",
+    ) -> WaitForEvent:
+        """Play a failure prompt, then route/hang up only after call.play_end.
+
+        Queue-wait hold prompts buffer many ``call.play_end`` events while the
+        executor sleeps. Those must not satisfy this wait, or hangup fires
+        before the failure TTS is heard. Stop any in-flight hold audio, start
+        the failure prompt, then drop stale play_ends before waiting.
+        """
+        self._set_failure_status(ctx, status, limit_reason)
+        try:
+            await ctx.telephony.call_stop(ctx.call_id, target="play")
+        except Exception:  # noqa: BLE001
+            pass
+        await self._say(ctx, self._failure_prompt(data, status))
+        # Drop hold/stop play_ends that arrived while we were kicking off TTS.
+        # call.say returns when the utterance is accepted, not when it finishes,
+        # so the failure prompt's own play_end is not in the buffer yet.
+        wf = ctx.variables.get("__workflow__")
+        if wf is not None:
+            wf.clear_buffered("call.play_end")
+        fallback_target = edge_target(ctx, node["id"], "timeout")
+
+        async def _after_prompt(
+            ctx_: ExecutionContext,
+            _node_: dict,
+            _ev: dict,
+            _target=fallback_target,
+            _reason=hangup_reason,
+        ) -> NextStep:
+            if _target is not None:
+                return Goto(_target)
+            await ctx_.telephony.call_hangup(ctx_.call_id, reason=_reason)
+            return End(_reason)
+
+        return WaitForEvent(method="call.play_end", on_event=_after_prompt)
 
     @staticmethod
     async def _say(ctx: ExecutionContext, text: str) -> None:
@@ -1156,8 +1335,21 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
         #     of the kernel, and NO db session held during the call.
         from app.libs.voice_speed import create_voice_speed_client
 
-        turn_url = create_voice_speed_client().build_turn_url(base_url, agent_id)
+        vs_client = create_voice_speed_client()
+        turn_url = vs_client.build_turn_url(base_url, agent_id)
         greeting = (data.get("greeting_text") or "").strip() or self._DEFAULT_GREETING
+        # Best-effort: VoiceSpeed dialog-timing knobs override FlowKit env when set.
+        performance: dict = {}
+        try:
+            performance = await vs_client.get_performance_settings(
+                base_url, api_key, agent_id
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "voicespeed: performance_settings fetch failed call_id=%s",
+                ctx.call_id,
+                exc_info=True,
+            )
         try:
             await ctx.telephony.call_converse_external_agent(
                 ctx.call_id,
@@ -1165,6 +1357,7 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
                 turn_url=turn_url,
                 token=api_key,
                 greeting=greeting,
+                performance=performance or None,
                 traceparent=ctx.variables.get("sys._traceparent"),
                 trace_call_id=ctx.variables.get("sys._trace_call_id") or ctx.call_id,
             )
@@ -1307,9 +1500,9 @@ class HangupExecutor(BaseNodeExecutor):
             return End("hangup")
 
         if pre:
-            text = pre.get("text", "") if pre.get("kind") == "tts" else f"[audio #{pre.get('asset_id')}]"
-            await ctx.telephony.call_say(ctx.call_id, text)
-            return WaitForEvent(method="call.play_end", on_event=_hang)
+            started = await _utter_prompt(ctx, pre)
+            if started:
+                return WaitForEvent(method="call.play_end", on_event=_hang)
         await ctx.telephony.call_hangup(ctx.call_id)
         return End("hangup")
 

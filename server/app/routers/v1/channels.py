@@ -4,7 +4,8 @@ Channel router — CRUD endpoints for channel management
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, require_all_permissions
+from app.core.exceptions import ForbiddenError
+from app.db.deps import get_current_principal_short_session, get_db, require_all_permissions
 from app.schemas.channel import (
     ChannelCreate,
     ChannelUpdate,
@@ -14,10 +15,20 @@ from app.schemas.permission import EffectivePrincipal
 from app.services.channel_service import ChannelService
 
 router = APIRouter(prefix="/channels", tags=["Channels"])
-require_channel_management = require_all_permissions([
+CHANNEL_MANAGEMENT_PERMISSIONS = [
     "admin.access",
     "chat.admin.channel.manage",
-])
+]
+require_channel_management = require_all_permissions(CHANNEL_MANAGEMENT_PERMISSIONS)
+
+
+async def require_channel_management_short_session(
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+) -> EffectivePrincipal:
+    """Authorize channel writes without retaining the auth DB session."""
+    if not principal.has_all_permissions(CHANNEL_MANAGEMENT_PERMISSIONS):
+        raise ForbiddenError("Permission denied")
+    return principal
 
 
 @router.get("", response_model=list[ChannelResponse])
@@ -32,11 +43,10 @@ async def list_channels(
 @router.post("", response_model=ChannelResponse, status_code=status.HTTP_201_CREATED)
 async def create_channel(
     body: ChannelCreate,
-    principal: EffectivePrincipal = Depends(require_channel_management),
-    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(require_channel_management_short_session),
 ):
     """Create a new channel."""
-    return await ChannelService.create(db, principal.tenant_id, body)
+    return await ChannelService.create_managed(principal.tenant_id, body)
 
 
 @router.get("/{channel_id}", response_model=ChannelResponse)
@@ -63,11 +73,10 @@ async def copy_channel(
 async def update_channel(
     channel_id: int,
     body: ChannelUpdate,
-    principal: EffectivePrincipal = Depends(require_channel_management),
-    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(require_channel_management_short_session),
 ):
     """Update channel configuration."""
-    return await ChannelService.update(db, channel_id, principal.tenant_id, body)
+    return await ChannelService.update_managed(channel_id, principal.tenant_id, body)
 
 
 @router.delete("/{channel_id}", status_code=status.HTTP_200_OK)

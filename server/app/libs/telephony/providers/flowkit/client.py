@@ -3,15 +3,18 @@ FlowKit telephony client — WebSocket + JSON-RPC 2.0.
 
 Key behavior:
   * `connect()` opens the WS, spawns the recv loop, sends `system.hello`,
-    then sets `_ready`. RPCs called before this block.
+    then sets `_ready`. RPCs called before this block. If the initial open
+    fails (e.g. FlowKit restarting), a background `_reconnect_loop()` is
+    scheduled instead of raising — callers can register handlers and proceed.
   * `_recv_loop()` parses every frame:
       - frames with `id` → resolve the pending future
       - frames with `method` and no `id` → dispatch via `on_event` handlers
         (concurrently via `asyncio.create_task` so a slow handler doesn't
         stall the receive pump)
-  * On WS close / error, `_reconnect_loop()` retries with exponential backoff
-    (1s → 30s), re-runs hello, then invokes any `on_reconnected` handlers.
-    Orchestrators use this to call `call_list()` and resync call state.
+  * On WS close / error or initial connect failure, `_reconnect_loop()` retries
+    with exponential backoff (1s → 30s), re-runs hello, then invokes any
+    `on_reconnected` handlers. Orchestrators use this to call `call_list()`
+    and resync call state.
 
 We don't bake in business semantics here — `call.incoming`, queue routing,
 agent assignment all live in the orchestrator.
@@ -22,6 +25,7 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Callable
 from itertools import count
 from typing import Any
 
@@ -67,15 +71,55 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         self._reconnect_task: asyncio.Task | None = None
         self._closing = False
         self._hello_result: dict | None = None
+        self._peer_serving_probe: Callable[[], bool] | None = None
 
     # ───────────── Lifecycle ─────────────
 
+    def set_peer_serving_probe(self, probe: Callable[[], bool] | None) -> None:
+        """Teach this client how to ask whether another kernel still serves calls.
+
+        Deployments that run a blue/green pair take one kernel down on every
+        release, so a connection failure there is routine rather than an
+        outage — telephony keeps working through the sibling. Wire this up and
+        such failures are logged at INFO; they stay at WARNING only when no
+        kernel is left, which is when someone actually needs to be paged.
+        """
+        self._peer_serving_probe = probe
+
+    def _another_kernel_serving(self) -> bool:
+        probe = self._peer_serving_probe
+        if probe is None:
+            return False
+        try:
+            return probe()
+        except Exception:  # noqa: BLE001
+            return False
+
     async def connect(self) -> None:
-        if self._ws is not None and not self._ws.closed:
+        if self._closing:
+            return
+        if self.is_ready:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
             return
         self._closing = False
-        await self._open_and_handshake()
-        self._recv_task = asyncio.create_task(self._recv_loop(), name="flowkit-recv")
+        try:
+            await self._open_and_handshake()
+            self._start_recv_loop()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "FlowKit initial connect failed; scheduling reconnect to %s",
+                self._ws_url,
+                exc_info=True,
+            )
+            self._ensure_reconnect_loop()
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        """Fail all in-flight RPCs. Safe to call from disconnect or recv exit."""
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(exc)
+        self._pending.clear()
 
     async def disconnect(self) -> None:
         self._closing = True
@@ -90,11 +134,7 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
             except Exception:  # noqa: BLE001
                 pass
         self._ws = None
-        # Fail any in-flight RPCs
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(TelephonyNotConnectedError("Client disconnected"))
-        self._pending.clear()
+        self._fail_pending(TelephonyNotConnectedError("Client disconnected"))
 
     async def wait_until_ready(self, timeout: float = 30.0) -> None:
         await asyncio.wait_for(self._ready.wait(), timeout=timeout)
@@ -119,27 +159,52 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
 
     # ───────────── Internals ─────────────
 
+    def _start_recv_loop(self) -> None:
+        if self._recv_task is None or self._recv_task.done():
+            self._recv_task = asyncio.create_task(self._recv_loop(), name="flowkit-recv")
+
+    def _ensure_reconnect_loop(self) -> None:
+        if self._closing:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(
+            self._reconnect_loop(), name="flowkit-reconnect"
+        )
+
     async def _open_and_handshake(self) -> None:
-        self._ws = await websockets.connect(self._ws_url, ping_interval=20, ping_timeout=20)
-        # Send hello inline (recv loop not running yet) so we don't race
-        hello = {
-            "jsonrpc": "2.0",
-            "id": "hello",
-            "method": "system.hello",
-            "params": {
-                "sdk": self._sdk_name,
-                "version": self._sdk_version,
-                "capabilities": ["events"],
-            },
-        }
-        await self._ws.send(json.dumps(hello))
-        raw = await self._ws.recv()
-        msg = json.loads(raw)
-        if "error" in msg:
-            err = msg["error"]
-            raise TelephonyRPCError(err.get("code", -1), err.get("message", "hello failed"))
-        self._hello_result = msg.get("result", {})
-        self._ready.set()
+        ws = await websockets.connect(self._ws_url, ping_interval=20, ping_timeout=20)
+        try:
+            # Send hello inline (recv loop not running yet) so we don't race
+            hello = {
+                "jsonrpc": "2.0",
+                "id": "hello",
+                "method": "system.hello",
+                "params": {
+                    "sdk": self._sdk_name,
+                    "version": self._sdk_version,
+                    "capabilities": ["events"],
+                },
+            }
+            await ws.send(json.dumps(hello))
+            raw = await ws.recv()
+            msg = json.loads(raw)
+            if "error" in msg:
+                err = msg["error"]
+                raise TelephonyRPCError(
+                    err.get("code", -1), err.get("message", "hello failed")
+                )
+            self._hello_result = msg.get("result", {})
+            self._ws = ws
+            self._ready.set()
+        except Exception:
+            # Connect succeeded but hello failed — don't leak the half-open socket
+            # or leave self._ws pointing at a dead connection for the next retry.
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         logger.info("FlowKit hello OK: %s", self._hello_result)
 
     async def _recv_loop(self) -> None:
@@ -164,10 +229,9 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         finally:
             self._ready.clear()
             self._ws = None
-            if not self._closing:
-                self._reconnect_task = asyncio.create_task(
-                    self._reconnect_loop(), name="flowkit-reconnect"
-                )
+            # Unexpected close must not leave callers blocked until rpc_timeout.
+            self._fail_pending(TelephonyNotConnectedError("FlowKit connection closed"))
+            self._ensure_reconnect_loop()
 
     def _handle_response(self, msg: dict) -> None:
         rpc_id = str(msg["id"])
@@ -195,20 +259,67 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         for handler in handlers:
             asyncio.create_task(_safe_call(handler, event), name=f"evt:{method}")
 
+    @staticmethod
+    def _is_transient_connect_error(exc: BaseException) -> bool:
+        """True for expected kernel-down / network blips during reconnect.
+
+        These must not be logged at ERROR — the reconnect loop is designed to
+        keep retrying, and ERROR alerts (e.g. errno 111 Connection refused)
+        would fire every backoff tick while FlowKit is simply unreachable.
+        """
+        if isinstance(
+            exc,
+            (
+                ConnectionError,
+                TimeoutError,
+                asyncio.TimeoutError,
+                OSError,
+            ),
+        ):
+            return True
+        # websockets wraps many connect failures; treat package errors as
+        # transient except InvalidURI (bad config — that is a real ERROR).
+        mod = type(exc).__module__ or ""
+        if mod.startswith("websockets"):
+            return type(exc).__name__ != "InvalidURI"
+        return False
+
     async def _reconnect_loop(self) -> None:
         delay = 1.0
         while not self._closing:
             await asyncio.sleep(delay)
             try:
                 await self._open_and_handshake()
-                self._recv_task = asyncio.create_task(self._recv_loop(), name="flowkit-recv")
-                logger.info("FlowKit reconnected")
+                self._start_recv_loop()
+                logger.info("FlowKit reconnected url=%s", self._ws_url)
                 # Notify subscribers (orchestrator uses this to call call.list)
                 for h in list(self._reconnect_handlers):
                     asyncio.create_task(_safe_call0(h), name="on-reconnect")
                 return
-            except Exception:  # noqa: BLE001
-                logger.exception("FlowKit reconnect failed, retrying in %ss", delay)
+            except Exception as exc:  # noqa: BLE001
+                # Match initial-connect policy: connectivity failures are WARNING
+                # (with the exception message in the body so alerts stay useful).
+                # Unexpected bugs stay ERROR via logger.exception. A kernel that
+                # is unreachable while a sibling still carries calls is demoted
+                # to INFO — this retry runs every 30s for as long as the kernel
+                # stays down, and a blue/green deployment leaves one down by
+                # design.
+                if self._is_transient_connect_error(exc):
+                    served = self._another_kernel_serving()
+                    log = logger.info if served else logger.warning
+                    log(
+                        "FlowKit reconnect failed url=%s err=%s; retrying in %ss%s",
+                        self._ws_url,
+                        exc,
+                        delay,
+                        " (another kernel is serving calls)" if served else "",
+                    )
+                else:
+                    logger.exception(
+                        "FlowKit reconnect failed url=%s; retrying in %ss",
+                        self._ws_url,
+                        delay,
+                    )
                 delay = min(delay * 2, 30.0)
 
     async def _rpc(self, method: str, params: dict[str, Any]) -> dict:
@@ -267,6 +378,7 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         *,
         text: str | None = None,
         audio_url: str | None = None,
+        audio: str | None = None,
         loop: bool = False,
         interval_ms: int | None = None,
         voice: str | None = None,
@@ -276,6 +388,8 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
             params["text"] = text
         if audio_url is not None:
             params["audio_url"] = audio_url
+        if audio is not None:
+            params["audio"] = audio
         if loop:
             params["loop"] = True
         if interval_ms is not None:
@@ -293,13 +407,20 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         await self._rpc("call.dtmf", params)
 
     async def call_bridge(
-        self, call_id: str, other_call_id: str, transcribe: bool = True
+        self,
+        call_id: str,
+        other_call_id: str,
+        transcribe: bool = True,
+        *,
+        keepalive_on_peer_hangup: bool = False,
     ) -> None:
         params: dict[str, Any] = {"call_id": call_id, "other_call_id": other_call_id}
         # Omit when True to stay backward-compatible with kernels that default
         # to transcribing; only send the flag to explicitly disable ASR.
         if not transcribe:
             params["transcribe"] = False
+        if keepalive_on_peer_hangup:
+            params["keepalive_on_peer_hangup"] = True
         await self._rpc("call.bridge", params)
 
     async def call_connect_external_agent(
@@ -337,6 +458,7 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         token: str,
         greeting: str | None = None,
         voice_spk_id: str | None = None,
+        performance: dict | None = None,
         traceparent: str | None = None,
         trace_call_id: str | None = None,
     ) -> None:
@@ -356,6 +478,8 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
             params["greeting"] = greeting
         if voice_spk_id:
             params["voice_spk_id"] = voice_spk_id
+        if performance:
+            params["performance"] = performance
         if traceparent:
             params["traceparent"] = traceparent
         if trace_call_id:
@@ -413,6 +537,12 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
 
     async def call_unhold(self, call_id: str) -> None:
         await self._rpc("call.unhold", {"call_id": call_id})
+
+    async def call_mute(self, call_id: str) -> None:
+        await self._rpc("call.mute", {"call_id": call_id})
+
+    async def call_unmute(self, call_id: str) -> None:
+        await self._rpc("call.unmute", {"call_id": call_id})
 
     async def call_originate(
         self,

@@ -300,13 +300,16 @@ export function AgentCallBar({ compact = false, trailing }: Props) {
             })
             setPicker(null)
           } else if (picker === 'conference') {
+            // Keep the submit spinner until the invite request settles; the
+            // call bar already enters conference_ringing on send.
             void addParticipant({
               target_type: target.target_type === 'external' ? 'external' : 'employee',
               target_id: target.target_id,
               number: target.number,
               target_name: target.target_name,
+            }).then(() => {
+              setPicker(null)
             })
-            setPicker(null)
           }
         }}
       />
@@ -315,7 +318,17 @@ export function AgentCallBar({ compact = false, trailing }: Props) {
         open={confirmTransfer !== null}
         title={t('ws.callbar.confirmTransferTitle', locale)}
         body={t('ws.callbar.confirmTransferBody', locale)}
-        lines={confirmTransfer ? [{ label: t('ws.callbar.transfer', locale), value: confirmTransfer.target_name }] : undefined}
+        lines={confirmTransfer ? [
+          { label: t('ws.callbar.transfer', locale), value: confirmTransfer.target_name },
+          ...(confirmTransfer.target_status
+            ? [{ label: t('ws.callbar.confirmTransferStatus', locale), value: confirmTransfer.target_status }]
+            : []),
+        ] : undefined}
+        warning={
+          confirmTransfer?.target_type === 'queue' && confirmTransfer.queue_available_count === 0
+            ? t('ws.callbar.confirmTransferQueueEmptyWarning', locale)
+            : undefined
+        }
         confirmLabel={t('ws.callbar.confirmTransferConfirm', locale)}
         submitting={pending === 'transfer'}
         onClose={() => setConfirmTransfer(null)}
@@ -326,7 +339,7 @@ export function AgentCallBar({ compact = false, trailing }: Props) {
             target_id: confirmTransfer.target_id,
             number: confirmTransfer.number,
           }
-          void submitTransfer(target, confirmTransfer.target_name)
+          void submitTransfer(target)
           setConfirmTransfer(null)
         }}
       />

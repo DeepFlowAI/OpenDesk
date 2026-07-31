@@ -424,7 +424,7 @@ async def prepare_knowledge_attachment(
     )
 
 
-@router.get(
+@file_router.get(
     "/{conversation_id}/files/{file_id}/url",
     response_model=ConversationFileAccessResponse,
 )
@@ -434,12 +434,12 @@ async def get_conversation_file_url(
     download_name: str | None = Query(None),
     download: bool = Query(False),
     image_process: str | None = Query(None),
-    db: AsyncSession = Depends(get_db),
-    principal: EffectivePrincipal = Depends(get_current_principal),
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("chat.workspace.use"),
+    ),
 ):
     """Get a short-lived URL for an agent-accessible conversation file."""
-    return await ConversationFileService.get_temporary_url_for_agent(
-        db,
+    return await ConversationFileService.get_temporary_url_for_agent_managed(
         conversation_id=conversation_id,
         tenant_id=principal.tenant_id,
         agent_id=principal.user_id,

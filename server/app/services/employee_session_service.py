@@ -40,10 +40,50 @@ class EmployeeSessionService:
             return employee
 
         if not current_session_id or not token_session:
+            EmployeeSessionService._log_session_replaced(
+                employee,
+                tenant_id=tenant_id,
+                current_session_id=current_session_id,
+                token_session_id=token_session,
+            )
             raise SessionReplacedError()
         if not hmac.compare_digest(current_session_id, token_session):
+            EmployeeSessionService._log_session_replaced(
+                employee,
+                tenant_id=tenant_id,
+                current_session_id=current_session_id,
+                token_session_id=token_session,
+            )
             raise SessionReplacedError()
         return employee
+
+    @staticmethod
+    def _log_session_replaced(
+        employee: Employee | None,
+        *,
+        tenant_id: int,
+        current_session_id: str | None,
+        token_session_id: str | None,
+    ) -> None:
+        """Log enough to correlate a kicked session with the login that replaced it."""
+        user_id = getattr(employee, "id", None)
+        current_prefix = (current_session_id or "-")[:8]
+        token_prefix = (token_session_id or "-")[:8]
+        extra = {
+            "user_id": str(user_id if user_id is not None else "-"),
+            "tenant_id": str(tenant_id),
+            "current_session_id": current_prefix,
+            "token_session_id": token_prefix,
+        }
+        logger.warning(
+            "Employee session replaced: user_id=%s tenant_id=%s "
+            "current_session_id=%s token_session_id=%s",
+            user_id if user_id is not None else "-",
+            tenant_id,
+            current_prefix,
+            token_prefix,
+            extra=extra,
+        )
 
     @staticmethod
     async def validate_payload(db: AsyncSession, payload: dict) -> Employee:

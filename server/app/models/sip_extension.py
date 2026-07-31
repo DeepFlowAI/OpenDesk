@@ -1,7 +1,8 @@
 """
-SipExtension — a tenant-scoped SIP account (extension) that can be uniquely
-bound to one agent. Holds registration credentials (hashed + masked) and the
-current registration status reported by the media kernel.
+SipExtension — a tenant-scoped SIP account (extension).
+
+Multiple agents may be bound via ``sip_extension_bindings``; at most one
+``current_occupant_employee_id`` holds exclusive use of the shared phone.
 """
 from datetime import datetime
 
@@ -13,7 +14,6 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
-    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,20 +24,14 @@ from app.models.base import AuditActorMixin, TimestampMixin
 class SipExtension(Base, TimestampMixin, AuditActorMixin):
     __tablename__ = "sip_extensions"
     __table_args__ = (
-        # Extension number is unique within a tenant.
         UniqueConstraint(
             "tenant_id", "extension_number", name="uq_sip_ext_tenant_number"
         ),
-        # SIP user id is unique across the registration domain.
         UniqueConstraint("sip_user_id", name="uq_sip_ext_sip_user_id"),
-        # One agent may be bound to at most one extension. Multiple NULLs are
-        # allowed by SQL semantics, so unbound extensions do not conflict.
-        UniqueConstraint(
-            "bound_employee_id", name="uq_sip_ext_bound_employee"
-        ),
         Index("ix_sip_ext_tenant_id", "tenant_id"),
         Index("ix_sip_ext_tenant_active", "tenant_id", "is_active"),
         Index("ix_sip_ext_tenant_reg_status", "tenant_id", "registration_status"),
+        Index("ix_sip_ext_current_occupant", "current_occupant_employee_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -71,6 +65,8 @@ class SipExtension(Base, TimestampMixin, AuditActorMixin):
         DateTime(timezone=True), nullable=True
     )
 
-    bound_employee_id: Mapped[int | None] = mapped_column(
+    # Agent currently holding exclusive occupancy of this shared extension.
+    # Binding alone does not set this; switching to SIP phone acquires it.
+    current_occupant_employee_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True
     )

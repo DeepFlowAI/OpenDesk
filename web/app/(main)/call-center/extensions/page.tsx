@@ -264,7 +264,8 @@ export default function SipExtensionsPage() {
             <div className="w-28">{t('se.col.number', locale)}</div>
             <div className="flex-1">{t('se.col.name', locale)}</div>
             <div className="w-24">{t('se.col.registration', locale)}</div>
-            <div className="flex-1">{t('se.col.employee', locale)}</div>
+            <div className="min-w-0 flex-[1.2]">{t('se.col.employee', locale)}</div>
+            <div className="w-36">{t('se.col.occupant', locale)}</div>
             <div className="w-20">{t('se.col.active', locale)}</div>
             <div className="w-40">{t('se.col.lastRegistered', locale)}</div>
             <div className="w-28 text-right">{t('se.col.actions', locale)}</div>
@@ -394,25 +395,29 @@ function ExtensionRow({
           {registered ? t('se.status.registered', locale) : t('se.status.unregistered', locale)}
         </span>
       </div>
-      <div className="flex min-w-0 flex-1 items-center gap-2">
-        {item.bound_employee ? (
-          <>
-            <span className="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted text-[10px] text-muted-foreground">
-              {item.bound_employee.avatar ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={item.bound_employee.avatar}
-                  alt={item.bound_employee.name}
-                  className="h-full w-full object-cover"
-                />
-              ) : (
-                item.bound_employee.name.slice(0, 1)
-              )}
-            </span>
-            <span className="min-w-0 truncate">{item.bound_employee.name}</span>
-          </>
-        ) : (
+      <div
+        className="min-w-0 flex-[1.2] truncate"
+        title={(item.bound_employees ?? []).map((person) => person.name).join('、') || undefined}
+      >
+        {(item.bound_employees?.length ?? 0) === 0 ? (
           <span className="text-muted-foreground">{t('se.employee.unbound', locale)}</span>
+        ) : (item.bound_employees?.length ?? 0) <= 3 ? (
+          <span>{item.bound_employees.map((person) => person.name).join('、')}</span>
+        ) : (
+          <span>
+            {item.bound_employees
+              .slice(0, 3)
+              .map((person) => person.name)
+              .join('、')}
+            {t('se.employee.more', locale, {
+              count: String(item.bound_employees.length),
+            })}
+          </span>
+        )}
+      </div>
+      <div className="w-36 truncate" title={item.current_occupant?.name || undefined}>
+        {item.current_occupant?.name || (
+          <span className="text-muted-foreground">{t('se.occupant.none', locale)}</span>
         )}
       </div>
       <div className="w-20">

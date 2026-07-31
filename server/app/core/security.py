@@ -108,6 +108,18 @@ def decode_access_token(token: str) -> dict | None:
         return None
 
 
+def decode_token_claims_unverified(token: str) -> dict | None:
+    """Return JWT claims without verifying signature or expiry.
+
+    Logging only: never use the result for authentication or authorization.
+    Expired or tampered tokens still carry useful identifiers for ops logs.
+    """
+    try:
+        return jwt.get_unverified_claims(token)
+    except Exception:
+        return None
+
+
 def decode_visitor_session_token(token: str) -> dict | None:
     """Decode and validate a visitor session JWT."""
     payload = decode_access_token(token)

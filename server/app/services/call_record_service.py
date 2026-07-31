@@ -53,10 +53,19 @@ class CallRecordService:
         to_number: str | None,
         voice_flow_id: int | None = None,
         voice_flow_version_id: int | None = None,
+        identify_user: bool = True,
     ) -> dict:
+        """Create the inbound CDR.
+
+        ``identify_user`` defaults to True for callers that already run off the
+        media path. The inbound orchestrator passes False and identifies in a
+        background task — phone matching loads every user with a phone and must
+        not delay ``call.answer`` / the first prompt.
+        """
         existing = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
         if existing:
-            await _best_effort_identify_user(db, tenant_id, existing)
+            if identify_user:
+                await _best_effort_identify_user(db, tenant_id, existing)
             return _to_detail(existing, None)
         row = await CallRecordRepository.create(
             db,
@@ -75,8 +84,20 @@ class CallRecordService:
                 "extra_metadata": {},
             },
         )
-        await _best_effort_identify_user(db, tenant_id, row)
+        if identify_user:
+            await _best_effort_identify_user(db, tenant_id, row)
         return _to_detail(row, None)
+
+    @staticmethod
+    async def identify_user_for_call_managed(tenant_id: int, call_id: str) -> None:
+        """Best-effort caller identification on a short-lived DB session."""
+        from app.db.session import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            row = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
+            if not row:
+                return
+            await _best_effort_identify_user(db, tenant_id, row)
 
     @staticmethod
     async def create_for_outbound(

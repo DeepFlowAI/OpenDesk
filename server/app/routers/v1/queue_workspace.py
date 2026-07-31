@@ -30,7 +30,9 @@ from app.services.queue_workspace_service import QueueWorkspaceService
 router = APIRouter(
     prefix="/workspace/queue",
     tags=["WorkspaceQueue"],
-    dependencies=[Depends(require_permission("chat.workspace.use"))],
+    # Short session: the file-upload route must not hold a pooled connection
+    # across object-storage I/O. Other routes still open their own request sessions.
+    dependencies=[Depends(require_permission_short_session("chat.workspace.use"))],
 )
 
 
@@ -140,7 +142,6 @@ async def assign_workspace_queue_task_to_self_and_send(
 @router.post(
     "/tasks/{task_id}/files",
     response_model=ConversationFileUploadResponse,
-    dependencies=[Depends(require_permission("chat.queue.assign_self"))],
 )
 async def upload_workspace_queue_task_file(
     task_id: int,

@@ -12,7 +12,7 @@ from app.schemas.base import PaginatedResponse
 
 
 class BoundEmployeeBrief(BaseModel):
-    """Minimal identity of the agent bound to an extension."""
+    """Minimal identity of an agent bound to / occupying an extension."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -24,7 +24,7 @@ class BoundEmployeeBrief(BaseModel):
 class SipExtensionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=50)
     extension_number: str = Field(min_length=2, max_length=10)
-    bound_employee_id: int | None = None
+    bound_employee_ids: list[int] = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod
@@ -44,14 +44,26 @@ class SipExtensionCreate(BaseModel):
             raise ValueError("Extension number must be 2-10 digits")
         return normalized
 
+    @field_validator("bound_employee_ids")
+    @classmethod
+    def dedupe_bound_ids(cls, value: list[int]) -> list[int]:
+        seen: set[int] = set()
+        out: list[int] = []
+        for emp_id in value:
+            if emp_id in seen:
+                continue
+            seen.add(emp_id)
+            out.append(emp_id)
+        return out
+
 
 class SipExtensionUpdate(BaseModel):
-    """Edit name and/or binding. Extension number is immutable."""
+    """Edit name and/or binding set. Extension number is immutable."""
 
     name: str | None = Field(default=None, min_length=1, max_length=50)
-    # Presence of the key means "set the binding to this value" (None = unbind).
-    # Absence means "leave binding unchanged".
-    bound_employee_id: int | None = None
+    # Presence of the key means "replace the binding set" (empty list = unbind all).
+    # Absence means "leave bindings unchanged".
+    bound_employee_ids: list[int] | None = None
 
     @field_validator("name")
     @classmethod
@@ -62,6 +74,20 @@ class SipExtensionUpdate(BaseModel):
         if not (1 <= len(normalized) <= 50):
             raise ValueError("Name must be 1-50 characters")
         return normalized
+
+    @field_validator("bound_employee_ids")
+    @classmethod
+    def dedupe_bound_ids(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        seen: set[int] = set()
+        out: list[int] = []
+        for emp_id in value:
+            if emp_id in seen:
+                continue
+            seen.add(emp_id)
+            out.append(emp_id)
+        return out
 
 
 class SipExtensionResponse(BaseModel):
@@ -77,8 +103,10 @@ class SipExtensionResponse(BaseModel):
     last_registered_at: datetime | None = None
     is_active: bool
     disabled_at: datetime | None = None
-    bound_employee_id: int | None = None
-    bound_employee: BoundEmployeeBrief | None = None
+    bound_employee_ids: list[int] = Field(default_factory=list)
+    bound_employees: list[BoundEmployeeBrief] = Field(default_factory=list)
+    current_occupant_employee_id: int | None = None
+    current_occupant: BoundEmployeeBrief | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -137,6 +165,12 @@ class AvailableDevice(BaseModel):
     unavailable_reason: str | None = None
     extension_number: str | None = None
     registration_status: str | None = None
+    # Shared-phone occupancy hints for the workspace selector.
+    status_message: str | None = None
+    current_occupant_employee_id: int | None = None
+    current_occupant_name: str | None = None
+    blocking_agent_name: str | None = None
+    blocking_agent_count: int | None = None
 
 
 class AvailableDeviceList(BaseModel):
@@ -152,6 +186,11 @@ class CurrentDeviceResponse(BaseModel):
     unavailable_reason: str | None = None
     extension_number: str | None = None
     registration_status: str | None = None
+    status_message: str | None = None
+    current_occupant_employee_id: int | None = None
+    current_occupant_name: str | None = None
+    blocking_agent_name: str | None = None
+    blocking_agent_count: int | None = None
 
 
 class CurrentDeviceUpdate(BaseModel):

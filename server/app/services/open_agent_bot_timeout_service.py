@@ -18,7 +18,7 @@ OPEN_AGENT_BOT_TIMEOUT_ENDED_BY = "bot_timeout"
 
 
 class OpenAgentBotTimeoutService:
-    """Close idle bot conversations after the last bot-side activity times out."""
+    """Close idle bot or handoff-confirmation conversations after bot activity times out."""
 
     @staticmethod
     async def is_stale(
@@ -27,7 +27,10 @@ class OpenAgentBotTimeoutService:
         *,
         now: datetime | None = None,
     ) -> bool:
-        if not conversation or conversation.status != ConversationStatus.BOT.value:
+        if not conversation or conversation.status not in {
+            ConversationStatus.BOT.value,
+            ConversationStatus.HANDOFF_PENDING.value,
+        }:
             return False
 
         latest_bot_activity = await MessageRepository.get_latest_open_agent_bot_activity(

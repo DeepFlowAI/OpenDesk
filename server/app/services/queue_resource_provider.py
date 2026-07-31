@@ -153,6 +153,28 @@ class OnlineChatResourceProvider:
             await r.hset(key, "current_count", 0)
 
 
+async def filter_ringable_call_center_candidates(
+    r: aioredis.Redis,
+    tenant_id: int,
+    candidates: list[QueueCandidate],
+) -> list[QueueCandidate]:
+    """Keep ready+idle agents whose browser is currently connected.
+
+    Intentionally matches ``QueuePicker.pick_ready_agent`` connection checks so
+    transfer UI counts and sync 409 gates never promise an agent the wait-loop
+    picker cannot select. Device type is ignored here for the same reason —
+    SIP-only agents without a Socket.IO connection are also excluded today.
+    Only candidates already marked ``available`` are checked (Redis-only).
+    """
+    ringable: list[QueueCandidate] = []
+    for candidate in candidates:
+        if not candidate.available:
+            continue
+        if await AgentStatusService.is_connected(r, tenant_id, candidate.employee_id):
+            ringable.append(candidate)
+    return ringable
+
+
 class CallCenterResourceProvider:
     async def list_candidates(
         self,

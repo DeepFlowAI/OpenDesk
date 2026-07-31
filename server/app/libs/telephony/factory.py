@@ -17,6 +17,16 @@ from app.libs.telephony.base import BaseTelephonyClient
 _instance: BaseTelephonyClient | None = None
 
 
+def _flowkit_ws_urls() -> list[str]:
+    """Resolve FlowKit WS URL list from TELEPHONY_WS_URLS or TELEPHONY_WS_URL."""
+    urls = [u.strip() for u in (settings.TELEPHONY_WS_URLS or "").split(",") if u.strip()]
+    if urls:
+        return urls
+    if settings.TELEPHONY_WS_URL:
+        return [settings.TELEPHONY_WS_URL]
+    return []
+
+
 def get_telephony_client() -> BaseTelephonyClient:
     global _instance
     if _instance is not None:
@@ -25,19 +35,36 @@ def get_telephony_client() -> BaseTelephonyClient:
     provider = settings.TELEPHONY_PROVIDER
     match provider:
         case "flowkit":
-            if not settings.TELEPHONY_WS_URL:
+            urls = _flowkit_ws_urls()
+            if not urls:
                 raise ValueError(
-                    "TELEPHONY_PROVIDER=flowkit but TELEPHONY_WS_URL is empty. "
-                    "Set the FlowKit kernel WebSocket URL in your env file "
+                    "TELEPHONY_PROVIDER=flowkit but TELEPHONY_WS_URL / "
+                    "TELEPHONY_WS_URLS is empty. Set the FlowKit kernel "
+                    "WebSocket URL in your env file "
                     "(e.g. TELEPHONY_WS_URL=ws://<kernel-host>:<port>/ws)."
                 )
-            from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
-            _instance = FlowKitTelephonyClient(
-                ws_url=settings.TELEPHONY_WS_URL,
-                sdk_name=settings.TELEPHONY_SDK_NAME,
-                sdk_version=settings.TELEPHONY_SDK_VERSION,
-                rpc_timeout=settings.TELEPHONY_RPC_TIMEOUT,
-            )
+            if len(urls) == 1:
+                from app.libs.telephony.providers.flowkit.client import (
+                    FlowKitTelephonyClient,
+                )
+
+                _instance = FlowKitTelephonyClient(
+                    ws_url=urls[0],
+                    sdk_name=settings.TELEPHONY_SDK_NAME,
+                    sdk_version=settings.TELEPHONY_SDK_VERSION,
+                    rpc_timeout=settings.TELEPHONY_RPC_TIMEOUT,
+                )
+            else:
+                from app.libs.telephony.providers.flowkit.multi_client import (
+                    MultiKernelTelephonyClient,
+                )
+
+                _instance = MultiKernelTelephonyClient(
+                    ws_urls=urls,
+                    sdk_name=settings.TELEPHONY_SDK_NAME,
+                    sdk_version=settings.TELEPHONY_SDK_VERSION,
+                    rpc_timeout=settings.TELEPHONY_RPC_TIMEOUT,
+                )
         case "mock":
             from app.libs.telephony.providers.mock.client import MockTelephonyClient
             _instance = MockTelephonyClient()

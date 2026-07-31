@@ -16,6 +16,8 @@ from app.schemas.voice_flow_graph import (
     ConditionItem,
     ConditionNode,
     Edge,
+    HangupData,
+    HangupNode,
     PlayData,
     PlayNode,
     StartNode,
@@ -43,20 +45,19 @@ def _validate(graph: VoiceFlowGraph):
 
 class TestVoiceSpeedNode:
 
-    def _graph(self, *, agent_id="agt_1", handoff_target="q", self_loop=False):
+    def _graph(self, *, agent_id="agt_1", handoff_target="hq", self_loop=False):
         target = "vs" if self_loop else handoff_target
         nodes = [
             StartNode(id="s", type="start"),
             VoiceSpeedNode(id="vs", type="voicespeed", data=VoiceSpeedData(agent_id=agent_id)),
         ]
         if not self_loop:
-            nodes.append(PlayNode(id="q", type="play", data=PlayData(prompt=TtsPrompt(kind="tts", text="bye"))))
+            # Valid handoff targets are human-routing nodes, not play/collect.
+            nodes.append(HangupNode(id="hq", type="hangup", data=HangupData()))
         edges = [
             Edge(id="e0", source="s", target="vs"),
             Edge(id="e1", source="vs", target=target, source_handle="handoff"),
         ]
-        if not self_loop:
-            edges.append(Edge(id="e2", source="q", target="q", source_handle="next"))
         return VoiceFlowGraph(nodes=nodes, edges=edges)
 
     def test_valid_voicespeed_node(self):
@@ -64,6 +65,7 @@ class TestVoiceSpeedNode:
         assert "missing_agent_id" not in _err_codes(errors)
         assert "missing_handoff_edge" not in _err_codes(errors)
         assert "self_handoff" not in _err_codes(errors)
+        assert "invalid_handoff_target" not in _err_codes(errors)
 
     def test_missing_agent_id(self):
         errors = _validate(self._graph(agent_id=""))
@@ -83,6 +85,21 @@ class TestVoiceSpeedNode:
     def test_self_handoff_rejected(self):
         errors = _validate(self._graph(self_loop=True))
         assert "self_handoff" in _err_codes(errors)
+
+    def test_handoff_to_play_rejected(self):
+        graph = VoiceFlowGraph(
+            nodes=[
+                StartNode(id="s", type="start"),
+                VoiceSpeedNode(id="vs", type="voicespeed", data=VoiceSpeedData(agent_id="a")),
+                PlayNode(id="p", type="play", data=PlayData(prompt=TtsPrompt(kind="tts", text="x"))),
+            ],
+            edges=[
+                Edge(id="e0", source="s", target="vs"),
+                Edge(id="e1", source="vs", target="p", source_handle="handoff"),
+            ],
+        )
+        errors = _validate(graph)
+        assert "invalid_handoff_target" in _err_codes(errors)
 
     def test_handoff_to_missing_node_rejected(self):
         graph = VoiceFlowGraph(

@@ -43,6 +43,10 @@ import {
   callRecordCustomerNumber,
   callRecordServiceNumber,
 } from '@/app/components/features/call-center/call-record-utils'
+import {
+  formatCallRecordState,
+  formatWebRtcDeviceError,
+} from '@/lib/call-record-labels'
 import { CallSummaryFields } from '@/app/components/features/call-summary/call-summary-fields'
 import { CallTicketDraftPanel } from '@/app/components/features/call-summary/call-ticket-draft-panel'
 import {
@@ -94,6 +98,8 @@ export default function CallWorkspacePage() {
     now,
     status,
     records,
+    recordsPage,
+    setRecordsPage,
     selectedRecordId,
     setSelectedRecordId,
     setDraftDialNumber,
@@ -101,6 +107,7 @@ export default function CallWorkspacePage() {
     callSummaryTab,
     setCallSummaryTab,
     selectedRecord,
+    currentRecord,
     callSummaryRecordId,
     callRecordForTicket,
     screenPopNumber,
@@ -123,6 +130,19 @@ export default function CallWorkspacePage() {
   const canExecuteOutboundTasks = hasPermission(currentUser, 'engagement.outbound_task.execute')
   const showingOutboundTasks =
     canExecuteOutboundTasks && searchParams.get('view') === 'outbound-tasks'
+  // Selecting the live call's own record must still show the live panel +
+  // realtime transcript (not HistoryDetail). Only other records count as history.
+  const isViewingHistory = Boolean(
+    selectedRecord &&
+      !(incoming?.call_id && selectedRecord.call_id === incoming.call_id),
+  )
+  const viewingHistoryDuringLiveCall =
+    isViewingHistory &&
+    !!incoming?.call_id &&
+    (phase === 'on_call' ||
+      phase === 'incoming' ||
+      phase === 'wrap_up' ||
+      phase === 'outbound_ringing')
 
   useEffect(() => {
     if (!canCreateTicket && callSummaryTab === 'ticket') {
@@ -143,7 +163,16 @@ export default function CallWorkspacePage() {
   const showCallCenterNotice =
     systemInfo != null && !systemInfo.call_center_enabled && !callCenterNoticeDismissed
 
-  const currentStatus = phase === 'wrap_up' ? 'after_call_work' : (status?.status ?? 'offline')
+  // While ringing / on a live call, show 忙碌 even if the polled PG status
+  // still says 就绪 (common for consult targets before status catches up).
+  const currentStatus =
+    phase === 'wrap_up'
+      ? 'after_call_work'
+      : phase === 'on_call' ||
+          phase === 'incoming' ||
+          phase === 'outbound_ringing'
+        ? 'busy'
+        : (status?.status ?? 'offline')
   const currentStatusOption = STATUS_OPTIONS.find((o) => o.value === currentStatus) ?? STATUS_OPTIONS[4]
   const statusSelectorDisabled = statusChangePending || mic.state === 'checking'
 
@@ -244,8 +273,15 @@ export default function CallWorkspacePage() {
             )}
           </div>
           <p className="mt-2 text-xs text-muted-foreground">
-            {leg.state === 'ready' && leg.callId
-              ? `通话中 · WebRTC: ${leg.callId.slice(-8)}`
+            {phase === 'on_call'
+              ? (incoming?.device_type === 'sip_phone' ||
+                  currentDevice?.device_type === 'sip_phone')
+                ? '通话中 · 话机接听'
+                : leg.state === 'ready' && leg.callId
+                  ? `通话中 · WebRTC: ${leg.callId.slice(-8)}`
+                  : leg.state === 'connecting'
+                    ? '正在接通...'
+                    : '通话中'
               : leg.state === 'connecting'
                 ? '正在接通...'
                 : phase === 'wrap_up'
@@ -256,7 +292,7 @@ export default function CallWorkspacePage() {
           </p>
           {leg.error && (
             <p className="mt-1 rounded bg-red-50 px-2 py-1 text-[11px] text-red-700">
-              WebRTC 错误：{leg.error}
+              WebRTC 错误：{formatWebRtcDeviceError(leg.error)}
             </p>
           )}
           {mic.error && (
@@ -287,19 +323,31 @@ export default function CallWorkspacePage() {
           )}
         </div>
 
-        <div className="flex-1 overflow-y-auto px-2 py-2">
-          <h3 className="px-2 text-xs font-semibold text-foreground/70">最近通话</h3>
+        <div className="flex min-h-0 flex-1 flex-col px-2 py-2">
+          <h3 className="px-2 text-xs font-semibold text-foreground/70">最近通话（近 24 小时）</h3>
+          <div className="min-h-0 flex-1 overflow-y-auto">
           {(records?.items ?? []).length === 0 ? (
-            <p className="px-2 py-4 text-xs text-muted-foreground">暂无通话记录</p>
+            <p className="px-2 py-4 text-xs text-muted-foreground">近 24 小时暂无通话记录</p>
           ) : (
-            (records?.items ?? []).slice(0, 20).map((r) => {
-              const active = !showingOutboundTasks && r.id === selectedRecordId
+            (records?.items ?? []).map((r) => {
+              const isCurrentLive =
+                !!incoming?.call_id &&
+                r.call_id === incoming.call_id &&
+                (phase === 'on_call' ||
+                  phase === 'incoming' ||
+                  phase === 'wrap_up' ||
+                  phase === 'outbound_ringing')
+              const active =
+                !showingOutboundTasks &&
+                (selectedRecordId === r.id || (selectedRecordId == null && isCurrentLive))
               return (
                 <button
                   type="button"
                   key={r.id}
                   onClick={() => {
-                    setSelectedRecordId(r.id)
+                    // Clicking the live call should restore the live panel
+                    // (incl. realtime transcript), not HistoryDetail.
+                    setSelectedRecordId(isCurrentLive ? null : r.id)
                     if (showingOutboundTasks) router.push('/workspace/call')
                   }}
                   className={`my-1 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${
@@ -311,13 +359,44 @@ export default function CallWorkspacePage() {
                   ) : (
                     <IconPhoneOutgoing size={14} className="text-green-500" />
                   )}
-                  <span className="truncate">{callRecordCustomerNumber(r) || '未知号码'}</span>
+                  <span className="min-w-0 flex-1 truncate">
+                    {r.user_name || callRecordCustomerNumber(r) || '未知号码'}
+                    {r.user_name && callRecordCustomerNumber(r) ? (
+                      <span className="ml-1 text-xs text-muted-foreground">
+                        {callRecordCustomerNumber(r)}
+                      </span>
+                    ) : null}
+                  </span>
                   <span className="ml-auto shrink-0 text-xs text-muted-foreground">
                     {formatRelative(r.started_at)}
                   </span>
                 </button>
               )
             })
+          )}
+          </div>
+          {(records?.pages ?? 0) > 1 && (
+            <div className="mt-2 flex shrink-0 items-center justify-between gap-2 border-t border-border px-2 pt-2">
+              <button
+                type="button"
+                disabled={recordsPage <= 1}
+                onClick={() => setRecordsPage(Math.max(1, recordsPage - 1))}
+                className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-40"
+              >
+                上一页
+              </button>
+              <span className="text-[11px] text-muted-foreground">
+                {recordsPage}/{records?.pages ?? 1}
+              </span>
+              <button
+                type="button"
+                disabled={recordsPage >= (records?.pages ?? 1)}
+                onClick={() => setRecordsPage(recordsPage + 1)}
+                className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-40"
+              >
+                下一页
+              </button>
+            </div>
           )}
         </div>
       </aside>
@@ -408,7 +487,12 @@ export default function CallWorkspacePage() {
                 strong
                 color="text-amber-700"
               />
-              <div className="ml-auto flex gap-2">
+              <div className="ml-auto flex items-center gap-2">
+                {incoming.device_type === 'sip_phone' && (
+                  <span className="whitespace-nowrap text-xs text-muted-foreground">
+                    话机响铃中
+                  </span>
+                )}
                 <button
                   type="button"
                   onClick={reject}
@@ -418,15 +502,20 @@ export default function CallWorkspacePage() {
                 >
                   <IconPhoneOff size={16} />
                 </button>
-                <button
-                  type="button"
-                  onClick={accept}
-                  disabled={leg.state === 'connecting'}
-                  title={leg.state === 'connecting' ? '正在接通...' : '接听'}
-                  className="rounded-full bg-green-500 p-2.5 text-white disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <IconPhone size={16} />
-                </button>
+                {/* A desk phone is answered by lifting the handset; the browser
+                    has no leg to accept, so an 接听 button here would do
+                    nothing. Rejecting still works — that runs server-side. */}
+                {incoming.device_type !== 'sip_phone' && (
+                  <button
+                    type="button"
+                    onClick={accept}
+                    disabled={leg.state === 'connecting'}
+                    title={leg.state === 'connecting' ? '正在接通...' : '接听'}
+                    className="rounded-full bg-green-500 p-2.5 text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <IconPhone size={16} />
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -447,7 +536,18 @@ export default function CallWorkspacePage() {
                 strong
                 color="text-sky-700"
               />
-              <div className="ml-auto flex gap-2">
+              <div className="ml-auto flex items-center gap-2">
+                {/* The handset rings first and then carries the call; without
+                    this the browser looks like it should be making the sound. */}
+                {currentDevice?.device_type === 'sip_phone' && (
+                  <span className="whitespace-nowrap text-xs text-muted-foreground">
+                    正在呼叫你的话机
+                    {currentDevice.extension_number
+                      ? ` ${currentDevice.extension_number}`
+                      : ''}{' '}
+                    · 接通后声音在话机上
+                  </span>
+                )}
                 <button
                   type="button"
                   onClick={hangup}
@@ -486,66 +586,153 @@ export default function CallWorkspacePage() {
             <MyOutboundTargetsView onStartCall={() => router.push('/workspace/call')} />
           </div>
         ) : (
-          <div className={`flex-1 overflow-y-auto ${showEmptyCallState ? 'bg-white' : 'bg-muted p-5'}`}>
+          <div className={`flex min-h-0 flex-1 ${showEmptyCallState ? 'bg-white' : 'bg-muted p-5'}`}>
           {showEmptyCallState ? (
-            <CallWorkspaceEmptyState />
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <CallWorkspaceEmptyState />
+            </div>
           ) : (
-            <div className="grid gap-4 xl:grid-cols-3">
-              <section className="rounded-xl border border-border bg-white p-5">
-                <div className="mb-3 flex items-center border-b border-border pb-2">
+            <div className="grid min-h-0 w-full flex-1 gap-4 xl:grid-cols-3 xl:items-stretch">
+              {/* Full column height; 实时对话 flex-grows to the bottom. */}
+              <section className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-white p-5 xl:h-full">
+                <div className="mb-3 flex shrink-0 items-center justify-between gap-2 border-b border-border pb-2">
                   <h3 className="flex items-center gap-2 text-sm font-semibold">
                     <IconPhone size={16} className="text-muted-foreground" />
                     通话信息
                   </h3>
+                  {viewingHistoryDuringLiveCall && (
+                    <button
+                      type="button"
+                      onClick={() => setSelectedRecordId(null)}
+                      className="shrink-0 text-xs font-medium text-primary underline-offset-2 hover:underline"
+                    >
+                      返回当前通话
+                    </button>
+                  )}
                 </div>
-                {selectedRecord ? (
-                  <HistoryDetail recordId={selectedRecord.id} />
-                ) : incoming?.direction === 'outbound' ? (
-                  <dl className="grid grid-cols-2 gap-y-2 text-sm">
-                    <Dt>通话类型</Dt><Dd>呼出</Dd>
-                    <Dt>外呼号码</Dt><Dd>{incoming?.from || '—'}</Dd>
-                    <Dt>被叫号码</Dt><Dd>{incoming?.to || '—'}</Dd>
-                    <Dt>通话时长</Dt>
-                    <Dd>
-                      {phase === 'outbound_ringing'
-                        ? '拨号中...'
-                        : formatDuration(callStart ? Date.now() - callStart : 0)}
-                    </Dd>
-                    <Dt>发起时间</Dt>
-                    <Dd>{callStart ? new Date(callStart).toLocaleTimeString() : '—'}</Dd>
-                    <Dt>通话 ID</Dt>
-                    <Dd>{incoming?.call_id ? <code className="font-mono text-xs">{incoming.call_id}</code> : '—'}</Dd>
-                  </dl>
+                {isViewingHistory ? (
+                  <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                    <HistoryDetail recordId={selectedRecord!.id} />
+                  </div>
                 ) : (
-                  <dl className="grid grid-cols-2 gap-y-2 text-sm">
-                    <Dt>通话类型</Dt><Dd>呼入</Dd>
-                    <Dt>用户号码</Dt><Dd>{incoming?.from || '未知号码'}</Dd>
-                    <Dt>服务号码</Dt><Dd>{incoming?.to || '—'}</Dd>
-                    <Dt>通话时长</Dt>
-                    <Dd>
-                      {phase === 'incoming'
-                        ? '响铃中...'
-                        : formatDuration(callStart ? Date.now() - callStart : 0)}
-                    </Dd>
-                    <Dt>来电时间</Dt>
-                    <Dd>{callStart ? new Date(callStart).toLocaleTimeString() : '—'}</Dd>
-                    <Dt>通话 ID</Dt>
-                    <Dd>{incoming?.call_id ? <code className="font-mono text-xs">{incoming.call_id}</code> : '—'}</Dd>
-                  </dl>
-                )}
-                {!selectedRecord && incoming?.call_id && (phase === 'on_call' || phase === 'wrap_up') && (
-                  <CallTranscriptPanel callId={incoming.call_id} live={phase === 'on_call'} />
+                  <>
+                    <div className="shrink-0">
+                      {incoming?.direction === 'outbound' ? (
+                        <dl className="grid grid-cols-2 gap-y-2 text-sm">
+                          <Dt>通话类型</Dt><Dd>呼出</Dd>
+                          <Dt>外呼号码</Dt><Dd>{incoming?.from || '—'}</Dd>
+                          <Dt>被叫号码</Dt><Dd>{incoming?.to || '—'}</Dd>
+                          <Dt>通话时长</Dt>
+                          <Dd>
+                            {phase === 'outbound_ringing'
+                              ? '拨号中...'
+                              : formatDuration(callStart ? Date.now() - callStart : 0)}
+                          </Dd>
+                          <Dt>发起时间</Dt>
+                          <Dd>{callStart ? new Date(callStart).toLocaleTimeString() : '—'}</Dd>
+                          <Dt>通话 ID</Dt>
+                          <Dd>
+                            {incoming?.call_id ? (
+                              <code className="font-mono text-xs">{incoming.call_id}</code>
+                            ) : (
+                              '—'
+                            )}
+                          </Dd>
+                        </dl>
+                      ) : incoming?.call_type === 'internal_consult' ||
+                        incoming?.call_type === 'internal_transfer' ||
+                        incoming?.call_type === 'internal_conference' ? (
+                        <dl className="grid grid-cols-2 gap-y-2 text-sm">
+                          <Dt>通话类型</Dt>
+                          <Dd>
+                            {incoming.call_type === 'internal_transfer'
+                              ? '转接'
+                              : incoming.call_type === 'internal_conference'
+                                ? '会议'
+                                : '咨询'}
+                          </Dd>
+                          <Dt>
+                            {incoming.call_type === 'internal_transfer'
+                              ? '转接自'
+                              : incoming.call_type === 'internal_conference'
+                                ? '邀请自'
+                                : '咨询自'}
+                          </Dt>
+                          <Dd>{incoming.from || '同事'}</Dd>
+                          <Dt>用户号码</Dt>
+                          <Dd>{incoming.customer_from || '未知号码'}</Dd>
+                          <Dt>服务号码</Dt>
+                          <Dd>{incoming.customer_to || '—'}</Dd>
+                          <Dt>通话时长</Dt>
+                          <Dd>
+                            {phase === 'incoming'
+                              ? '响铃中...'
+                              : formatDuration(callStart ? Date.now() - callStart : 0)}
+                          </Dd>
+                          <Dt>来电时间</Dt>
+                          <Dd>{callStart ? new Date(callStart).toLocaleTimeString() : '—'}</Dd>
+                          <Dt>客户通话 ID</Dt>
+                          <Dd>
+                            {incoming.source_call_id ? (
+                              <code className="font-mono text-xs">{incoming.source_call_id}</code>
+                            ) : (
+                              '—'
+                            )}
+                          </Dd>
+                        </dl>
+                      ) : (
+                        <dl className="grid grid-cols-2 gap-y-2 text-sm">
+                          <Dt>通话类型</Dt><Dd>呼入</Dd>
+                          <Dt>用户号码</Dt><Dd>{incoming?.from || '未知号码'}</Dd>
+                          <Dt>服务号码</Dt><Dd>{incoming?.to || '—'}</Dd>
+                          <Dt>通话时长</Dt>
+                          <Dd>
+                            {phase === 'incoming'
+                              ? '响铃中...'
+                              : formatDuration(callStart ? Date.now() - callStart : 0)}
+                          </Dd>
+                          <Dt>来电时间</Dt>
+                          <Dd>{callStart ? new Date(callStart).toLocaleTimeString() : '—'}</Dd>
+                          <Dt>通话 ID</Dt>
+                          <Dd>
+                            {incoming?.call_id ? (
+                              <code className="font-mono text-xs">{incoming.call_id}</code>
+                            ) : (
+                              '—'
+                            )}
+                          </Dd>
+                        </dl>
+                      )}
+                    </div>
+                    {incoming?.call_id &&
+                      (phase === 'on_call' || phase === 'wrap_up') && (
+                        <CallTranscriptPanel
+                          callId={incoming.call_id}
+                          live={phase === 'on_call'}
+                          fallbackRecordId={currentRecord?.id}
+                          sourceCallId={incoming.source_call_id}
+                        />
+                      )}
+                  </>
                 )}
               </section>
 
-              <section className="rounded-xl border border-border bg-white p-5">
+              <section className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-white p-5 xl:h-full">
+                <div className="min-h-0 flex-1 overflow-y-auto">
                 <CallUserInfoPanel
                   recordId={callSummaryRecordId}
                   fallbackNumber={screenPopNumber}
+                  userRef={
+                    callSummaryRecordId
+                      ? null
+                      : (incoming?.user_public_id ?? incoming?.user_id ?? null)
+                  }
                 />
+                </div>
               </section>
 
-              <section className="rounded-xl border border-border bg-white p-5">
+              <section className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-white p-5 xl:h-full">
+                <div className="min-h-0 flex-1 overflow-y-auto">
                 {callRecordForTicket && (
                   <div className="mb-3 flex items-center border-b border-border pb-2">
                     <div className="flex shrink-0 rounded-md border border-border bg-muted p-0.5">
@@ -610,6 +797,7 @@ export default function CallWorkspacePage() {
                 ) : (
                   <CallSummaryFields callRecordId={callSummaryRecordId} />
                 )}
+                </div>
               </section>
             </div>
           )}
@@ -700,8 +888,8 @@ function HistoryDetail({ recordId }: { recordId: number }) {
   const customerNumber = callRecordCustomerNumber(record)
   const serviceNumber = callRecordServiceNumber(record)
   return (
-    <div className="space-y-4">
-      <section>
+    <div className="flex min-h-0 flex-1 flex-col gap-4">
+      <section className="shrink-0">
         <h4 className="mb-2 text-xs font-semibold text-foreground/70">通话录音</h4>
         {record.recording_url ? (
           <div className="flex items-center gap-2">
@@ -721,16 +909,17 @@ function HistoryDetail({ recordId }: { recordId: number }) {
           </div>
         )}
       </section>
-      <dl className="grid grid-cols-2 gap-y-2 text-sm">
+      <dl className="grid shrink-0 grid-cols-2 gap-y-2 text-sm">
         <Dt>通话类型</Dt><Dd>{record.direction === 'inbound' ? '呼入' : '呼出'}</Dd>
         <Dt>用户号码</Dt><Dd>{customerNumber || '—'}</Dd>
         <Dt>服务号码</Dt><Dd>{serviceNumber || '—'}</Dd>
         <Dt>通话时长</Dt><Dd>{formatDuration(record.talk_duration_ms)}</Dd>
-        <Dt>响铃时长</Dt><Dd>{formatDuration(record.ring_duration_ms)}</Dd>
+        <Dt>响铃时长（含机器人/排队）</Dt>
+        <Dd>{formatDuration(record.ring_duration_ms)}</Dd>
         <Dt>来电时间</Dt><Dd>{started ? started.toLocaleString() : '—'}</Dd>
         <Dt>结束时间</Dt><Dd>{ended ? ended.toLocaleString() : '—'}</Dd>
         <Dt>接听坐席</Dt><Dd>{record.agent_name || '—'}</Dd>
-        <Dt>状态</Dt><Dd>{record.state || '—'}</Dd>
+        <Dt>状态</Dt><Dd>{formatCallRecordState(record.state)}</Dd>
         <Dt>通话 ID</Dt>
         <Dd><code className="font-mono text-xs">{record.call_id}</code></Dd>
       </dl>

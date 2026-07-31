@@ -139,6 +139,10 @@ class Settings(BaseSettings):
     # TELEPHONY_PROVIDER=flowkit; we deliberately do not bake in a default
     # so OSS builds never accidentally connect to an upstream address.
     TELEPHONY_WS_URL: str = Field(default="")
+    # Comma-separated FlowKit WS URLs for blue/green dual-kernel. When set,
+    # takes precedence over TELEPHONY_WS_URL (single URL still works as a
+    # one-element list). Empty → fall back to TELEPHONY_WS_URL.
+    TELEPHONY_WS_URLS: str = Field(default="")
     TELEPHONY_SDK_NAME: str = Field(default="opendesk-cc")
     TELEPHONY_SDK_VERSION: str = Field(default="1.0.0")
     TELEPHONY_RPC_TIMEOUT: float = Field(default=30.0)
@@ -151,6 +155,9 @@ class Settings(BaseSettings):
     # first tenant in DB. Multi-tenant deployments should switch to DID-based
     # routing instead.
     CALL_CENTER_DEFAULT_TENANT_SLUG: str = Field(default="")
+    # Seconds to wait for in-flight call workflows to finish on process
+    # shutdown (blue/green drain) before force-finalizing leftovers.
+    CALL_CENTER_DRAIN_TIMEOUT: int = Field(default=1800)
 
     # ── SIP extension registration endpoint (shown to admins) ─────────────
     # Address, port and transport a physical SIP phone uses to REGISTER a

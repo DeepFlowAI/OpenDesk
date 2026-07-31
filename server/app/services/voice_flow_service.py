@@ -387,15 +387,29 @@ class VoiceFlowService:
                         message=f"VoiceSpeed node '{node.id}' must connect its 'handoff' outlet",
                     ))
                 for edge in graph.edges:
-                    if (
-                        edge.source == node.id
-                        and edge.source_handle == "handoff"
-                        and edge.target == node.id
-                    ):
+                    if edge.source != node.id or edge.source_handle != "handoff":
+                        continue
+                    if edge.target == node.id:
                         errors.append(GraphError(
                             node_id=node.id, field="outlet:handoff",
                             code="self_handoff",
                             message=f"VoiceSpeed node '{node.id}' cannot hand off to itself",
+                        ))
+                        continue
+                    target = node_index.get(edge.target)
+                    # Handoff must go to human routing (assign_queue / hangup /
+                    # another voicespeed), not back into announcement nodes.
+                    if target is not None and target.type in {
+                        "play", "collect", "condition", "start",
+                    }:
+                        errors.append(GraphError(
+                            node_id=node.id, field="outlet:handoff",
+                            code="invalid_handoff_target",
+                            message=(
+                                f"VoiceSpeed node '{node.id}' handoff cannot "
+                                f"target a '{target.type}' node; connect to "
+                                f"assign_queue or hangup instead"
+                            ),
                         ))
 
         # Cross-entity references: queue targets, audio_asset_id, service_hours.id

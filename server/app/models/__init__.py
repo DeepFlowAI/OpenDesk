@@ -19,6 +19,7 @@ from app.models.call_record import CallRecord  # noqa: F401
 from app.models.call_transcript_segment import CallTranscriptSegment  # noqa: F401
 from app.models.agent_webrtc_session import AgentWebRTCSession  # noqa: F401
 from app.models.sip_extension import SipExtension  # noqa: F401
+from app.models.sip_extension_binding import SipExtensionBinding  # noqa: F401
 from app.models.agent_call_device import AgentCallDevice  # noqa: F401
 from app.models.inbound_routing_rule import InboundRoutingRule  # noqa: F401
 from app.models.sip_trunk import SipTrunk  # noqa: F401

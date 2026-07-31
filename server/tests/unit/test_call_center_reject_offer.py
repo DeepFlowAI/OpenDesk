@@ -118,7 +118,6 @@ async def test_accept_offer_releases_and_resolves_when_webrtc_offer_fails(monkey
     response = await call_center.accept_offer(
         AcceptOfferRequest(offer_id="offer-1", sdp="v=0"),
         current_user={"tenant_id": 7, "user_id": 42},
-        db=object(),
         r=fake_redis,
     )
 
@@ -153,7 +152,6 @@ async def test_accept_offer_releases_and_resolves_when_kernel_returns_no_call_id
     response = await call_center.accept_offer(
         AcceptOfferRequest(offer_id="offer-1", sdp="v=0"),
         current_user={"tenant_id": 7, "user_id": 42},
-        db=object(),
         r=fake_redis,
     )
 
@@ -177,6 +175,12 @@ async def test_accept_offer_lock_blocks_duplicate_accept(monkeypatch):
     async def _upsert_session(_db, _tenant_id, _employee_id, _webrtc_call_id):
         return {"ok": True}
 
+    async def _sync_pg_status(_db, _tenant_id, _employee_id, _status, _reason=None):
+        return {}
+
+    async def _set_busy(_db, _tenant_id, _employee_id, busy=True):
+        return None
+
     monkeypatch.setattr(
         "app.services.call_center.orchestrator.get_orchestrator",
         lambda: fake_orchestrator,
@@ -187,13 +191,22 @@ async def test_accept_offer_lock_blocks_duplicate_accept(monkeypatch):
         "upsert_with_real_call_id",
         _upsert_session,
     )
+    # Imported inside accept_offer — patch the class attribute, not the router.
+    monkeypatch.setattr(
+        "app.services.cc_agent_status_service.CcAgentStatusService.sync_pg_status",
+        _sync_pg_status,
+    )
+    monkeypatch.setattr(
+        call_center.AgentWebRTCSessionService,
+        "set_busy",
+        _set_busy,
+    )
     await _prepare_ringing_offer(fake_redis)
 
     first = asyncio.create_task(
         call_center.accept_offer(
             AcceptOfferRequest(offer_id="offer-1", sdp="v=0"),
             current_user={"tenant_id": 7, "user_id": 42},
-            db=object(),
             r=fake_redis,
         )
     )
@@ -202,7 +215,6 @@ async def test_accept_offer_lock_blocks_duplicate_accept(monkeypatch):
     duplicate = await call_center.accept_offer(
         AcceptOfferRequest(offer_id="offer-1", sdp="v=0"),
         current_user={"tenant_id": 7, "user_id": 42},
-        db=object(),
         r=fake_redis,
     )
 

@@ -97,6 +97,30 @@ class HTTPVoiceSpeedClient(BaseVoiceSpeedClient):
 
         return self._parse_realtime_session(response)
 
+    async def get_performance_settings(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+    ) -> dict:
+        """GET agent performance-settings; empty/missing knobs → {}."""
+        url = self._build_performance_settings_url(base_url, agent_id)
+        headers = {"Authorization": f"Bearer {api_key}"}
+        try:
+            async with httpx.AsyncClient(timeout=self.list_timeout_seconds) as client:
+                response = await client.get(url, headers=headers)
+        except httpx.RequestError:
+            return {}
+        if not 200 <= response.status_code < 300:
+            return {}
+        try:
+            payload = response.json()
+        except ValueError:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {k: v for k, v in payload.items() if v is not None}
+
     @staticmethod
     def _parse_realtime_session(response: httpx.Response) -> VoiceSpeedRealtimeSession:
         try:
@@ -170,6 +194,18 @@ class HTTPVoiceSpeedClient(BaseVoiceSpeedClient):
         base = base_url.rstrip("/")
         path = parsed.path.rstrip("/")
         suffix = f"agents/{agent_id}/realtime-sessions"
+        if path.endswith("/api/v1/openapi"):
+            return f"{base}/{suffix}"
+        if path.endswith("/api/v1"):
+            return f"{base}/openapi/{suffix}"
+        return f"{base}/api/v1/openapi/{suffix}"
+
+    @staticmethod
+    def _build_performance_settings_url(base_url: str, agent_id: str) -> str:
+        parsed = urlparse(base_url)
+        base = base_url.rstrip("/")
+        path = parsed.path.rstrip("/")
+        suffix = f"agents/{agent_id}/performance-settings"
         if path.endswith("/api/v1/openapi"):
             return f"{base}/{suffix}"
         if path.endswith("/api/v1"):

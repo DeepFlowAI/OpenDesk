@@ -14,8 +14,16 @@ import pytest
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.libs.telephony.base import TelephonyRPCError
+from app.services.call_center.orchestrator import get_orchestrator, reset_orchestrator
 from app.services.call_center.outbound_dial_service import OutboundDialService
 from app.services.cc_agent_resource_service import CcAgentResourceService
+
+
+@pytest.fixture(autouse=True)
+def _reset_orch():
+    reset_orchestrator()
+    yield
+    reset_orchestrator()
 
 
 def _stub_tenant(tenant_string_id: str = "tenant-x"):
@@ -50,7 +58,13 @@ async def test_dial_happy_path():
 
     with patch(
         "app.services.call_center.outbound_dial_service.TenantPhoneNumberRepository"
-    ) as repo:
+    ) as repo, patch(
+        "app.services.call_center.outbound_dial_service.CcAgentStatusService.sync_pg_status",
+        new_callable=AsyncMock,
+    ), patch(
+        "app.services.call_center.outbound_dial_service.CallRecordService.create_for_outbound",
+        new_callable=AsyncMock,
+    ):
         repo.get_tenant = AsyncMock(return_value=_stub_tenant())
         repo.get_assigned_by_id = AsyncMock(return_value=_stub_phone_number())
 
@@ -68,6 +82,10 @@ async def test_dial_happy_path():
         uri="13800138000",
         caller_id="+8602112345678",
         trunk_id="trunk_sh",
+    )
+    assert "out-123" in get_orchestrator()._outbound_originators
+    assert get_orchestrator()._outbound_originators["out-123"] == (
+        1, 42, "+8602112345678",
     )
 
 

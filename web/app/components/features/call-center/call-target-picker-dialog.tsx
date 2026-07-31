@@ -6,10 +6,11 @@
  *
  * The three entry points share this one dialog but keep distinct titles and
  * submit labels; the caller passes `mode` and `onSubmit`. Employee selection
- * resolves to a live agent `target_id`; external resolves to a `number`.
+ * resolves to a live agent `target_id`; queue selection resolves to a queue
+ * `target_id`; external resolves to a `number`.
  */
 import { useEffect, useMemo, useState } from 'react'
-import { IconLoader2, IconUser } from '@tabler/icons-react'
+import { IconLoader2, IconUser, IconUsersGroup } from '@tabler/icons-react'
 
 import {
   Dialog,
@@ -23,8 +24,8 @@ import { Button } from '@/components/ui/button'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
-import { useConsultableAgents } from '@/service/use-call-center'
-import type { AgentStatus, ConsultableAgent } from '@/models/call-center'
+import { useConsultableAgents, useTransferQueues } from '@/service/use-call-center'
+import type { AgentStatus, ConsultableAgent, TransferQueue } from '@/models/call-center'
 import type { TransferTargetType } from '@/service/use-call-center'
 
 export type CallTargetPickerMode = 'transfer' | 'consult' | 'conference'
@@ -34,6 +35,10 @@ export type PickedTarget = {
   target_id?: number | null
   number?: string | null
   target_name: string
+  /** Display-only status line for the confirm dialog (e.g. queue availability). */
+  target_status?: string
+  /** Available-agent count when target is a queue; used for empty-queue warning. */
+  queue_available_count?: number
 }
 
 type Props = {
@@ -80,6 +85,11 @@ const STATUS_LABEL_KEY: Record<AgentStatus, string> = {
   offline: 'ws.callbar.agentStatusOffline',
 }
 
+/** Only ready agents can be consulted / transferred / conferenced to. */
+function isAgentAvailable(status: AgentStatus): boolean {
+  return status === 'ready'
+}
+
 export function CallTargetPickerDialog({
   open,
   mode,
@@ -88,12 +98,19 @@ export function CallTargetPickerDialog({
   onClose,
   onSubmit,
 }: Props) {
+  // Latch on click so a second press cannot fire before the parent
+  // re-renders with submitting=true (relevant when the dialog stays open).
+  const [submitLatched, setSubmitLatched] = useState(false)
+  useEffect(() => {
+    if (!open) setSubmitLatched(false)
+  }, [open])
   const { locale } = useLocaleStore()
   const [filter, setFilter] = useState<TransferTargetType>('external')
   const [keyword, setKeyword] = useState('')
   const [debouncedKeyword, setDebouncedKeyword] = useState('')
   const [externalNumber, setExternalNumber] = useState('')
   const [selectedAgentId, setSelectedAgentId] = useState<number | null>(null)
+  const [selectedQueueId, setSelectedQueueId] = useState<number | null>(null)
 
   // Reset transient state each time the dialog opens.
   useEffect(() => {
@@ -103,6 +120,7 @@ export function CallTargetPickerDialog({
       setDebouncedKeyword('')
       setExternalNumber('')
       setSelectedAgentId(null)
+      setSelectedQueueId(null)
     }
   }, [open])
 
@@ -122,6 +140,16 @@ export function CallTargetPickerDialog({
     [agents, selectedAgentId],
   )
 
+  const queuesQuery = useTransferQueues(
+    debouncedKeyword,
+    open && filter === 'queue',
+  )
+  const queues = queuesQuery.data ?? []
+  const selectedQueue = useMemo(
+    () => queues.find((q) => q.queue_id === selectedQueueId) ?? null,
+    [queues, selectedQueueId],
+  )
+
   const filters: { value: TransferTargetType; labelKey: string }[] = [
     { value: 'employee', labelKey: 'ws.callbar.filterEmployee' },
     ...(allowQueue
@@ -130,23 +158,26 @@ export function CallTargetPickerDialog({
     { value: 'external', labelKey: 'ws.callbar.filterExternal' },
   ]
 
+  const busy = submitting || submitLatched
   const canSubmit =
-    !submitting &&
+    !busy &&
     (filter === 'external'
       ? externalNumber.trim().length > 0
       : filter === 'employee'
-        ? selectedAgent !== null && selectedAgent.status !== 'offline'
-        : keyword.trim().length > 0)
+        ? selectedAgent !== null && isAgentAvailable(selectedAgent.status)
+        : selectedQueue !== null)
 
   const handleSubmit = () => {
     if (!canSubmit) return
     if (filter === 'external') {
       const number = externalNumber.trim()
+      setSubmitLatched(true)
       onSubmit({ target_type: 'external', number, target_name: number })
       return
     }
     if (filter === 'employee') {
-      if (!selectedAgent || selectedAgent.status === 'offline') return
+      if (!selectedAgent || !isAgentAvailable(selectedAgent.status)) return
+      setSubmitLatched(true)
       onSubmit({
         target_type: 'employee',
         target_id: selectedAgent.employee_id,
@@ -154,17 +185,21 @@ export function CallTargetPickerDialog({
       })
       return
     }
-    // Queue: a live queue directory isn't wired here yet, so we forward the
-    // typed value as the display name and leave target_id resolution to a
-    // future queue-list upgrade.
+    if (!selectedQueue) return
+    setSubmitLatched(true)
     onSubmit({
-      target_type: filter,
-      target_name: keyword.trim(),
+      target_type: 'queue',
+      target_id: selectedQueue.queue_id,
+      target_name: selectedQueue.name,
+      target_status: t('ws.callbar.queueAvailableCount', locale, {
+        count: selectedQueue.available_agent_count,
+      }),
+      queue_available_count: selectedQueue.available_agent_count,
     })
   }
 
   return (
-    <Dialog open={open} onOpenChange={(next) => { if (!next && !submitting) onClose() }}>
+    <Dialog open={open} onOpenChange={(next) => { if (!next && !busy) onClose() }}>
       <DialogContent className="gap-3 pb-3 sm:max-w-[480px]">
         <DialogHeader>
           <DialogTitle>{t(TITLE_KEY[mode], locale)}</DialogTitle>
@@ -213,22 +248,24 @@ export function CallTargetPickerDialog({
             onSelect={setSelectedAgentId}
           />
         ) : (
-          <input
-            type="text"
-            value={keyword}
-            onChange={(e) => setKeyword(e.target.value)}
-            placeholder={t('ws.callbar.pickerSearchPlaceholder', locale)}
-            aria-label={t('ws.callbar.pickerSearchPlaceholder', locale)}
-            className="h-10 w-full rounded-md border border-border px-3 text-sm outline-none focus:border-primary"
+          <QueueList
+            locale={locale}
+            keyword={keyword}
+            onKeywordChange={setKeyword}
+            queues={queues}
+            isLoading={queuesQuery.isLoading}
+            hasKeyword={debouncedKeyword.length > 0}
+            selectedQueueId={selectedQueueId}
+            onSelect={setSelectedQueueId}
           />
         )}
 
         <DialogFooter className="pt-3 pb-0">
-          <Button variant="outline" onClick={onClose} disabled={submitting}>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
             {t('ws.callbar.cancel', locale)}
           </Button>
           <Button onClick={handleSubmit} disabled={!canSubmit}>
-            {submitting && <IconLoader2 size={14} className="mr-1 animate-spin" />}
+            {busy && <IconLoader2 size={14} className="mr-1 animate-spin" />}
             {t(SUBMIT_KEY[mode], locale)}
           </Button>
         </DialogFooter>
@@ -309,22 +346,26 @@ function AgentRow({
   selected: boolean
   onSelect: (id: number) => void
 }) {
-  const offline = agent.status === 'offline'
+  const available = isAgentAvailable(agent.status)
   const style = STATUS_STYLE[agent.status] ?? STATUS_STYLE.offline
   const displayName = agent.name ?? String(agent.employee_id)
+  const unavailableHint =
+    agent.status === 'offline'
+      ? t('ws.callbar.agentOfflineHint', locale)
+      : t('ws.callbar.agentUnavailableHint', locale)
 
   return (
     <button
       type="button"
       role="option"
       aria-selected={selected}
-      aria-disabled={offline}
-      disabled={offline}
-      title={offline ? t('ws.callbar.agentOfflineHint', locale) : undefined}
-      onClick={() => { if (!offline) onSelect(agent.employee_id) }}
+      aria-disabled={!available}
+      disabled={!available}
+      title={available ? undefined : unavailableHint}
+      onClick={() => { if (available) onSelect(agent.employee_id) }}
       className={cn(
         'flex w-full items-center gap-3 border-b border-border/60 px-3 py-2 text-left transition-colors last:border-b-0',
-        offline
+        !available
           ? 'cursor-not-allowed opacity-50'
           : selected
             ? 'bg-primary/10'
@@ -343,6 +384,106 @@ function AgentRow({
       <span className={cn('flex shrink-0 items-center gap-1.5 text-xs', style.text)}>
         <span className={cn('inline-block h-2 w-2 rounded-full', style.dot)} />
         {t(STATUS_LABEL_KEY[agent.status] ?? STATUS_LABEL_KEY.offline, locale)}
+      </span>
+    </button>
+  )
+}
+
+type QueueListProps = {
+  locale: Locale
+  keyword: string
+  onKeywordChange: (value: string) => void
+  queues: TransferQueue[]
+  isLoading: boolean
+  hasKeyword: boolean
+  selectedQueueId: number | null
+  onSelect: (id: number) => void
+}
+
+function QueueList({
+  locale,
+  keyword,
+  onKeywordChange,
+  queues,
+  isLoading,
+  hasKeyword,
+  selectedQueueId,
+  onSelect,
+}: QueueListProps) {
+  return (
+    <div className="flex flex-col gap-2">
+      <input
+        type="text"
+        value={keyword}
+        onChange={(e) => onKeywordChange(e.target.value)}
+        placeholder={t('ws.callbar.queueSearchPlaceholder', locale)}
+        aria-label={t('ws.callbar.queueSearchPlaceholder', locale)}
+        className="h-10 w-full rounded-md border border-border px-3 text-sm outline-none focus:border-primary"
+      />
+      <div
+        role="listbox"
+        aria-label={t('ws.callbar.filterQueue', locale)}
+        className="max-h-64 min-h-32 overflow-y-auto rounded-md border border-border"
+      >
+        {isLoading ? (
+          <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+            <IconLoader2 size={14} className="animate-spin" />
+            {t('ws.callbar.queueListLoading', locale)}
+          </div>
+        ) : queues.length === 0 ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">
+            {t(hasKeyword ? 'ws.callbar.queueListNoMatch' : 'ws.callbar.queueListEmpty', locale)}
+          </div>
+        ) : (
+          queues.map((queue) => (
+            <QueueRow
+              key={queue.queue_id}
+              locale={locale}
+              queue={queue}
+              selected={queue.queue_id === selectedQueueId}
+              onSelect={onSelect}
+            />
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+function QueueRow({
+  locale,
+  queue,
+  selected,
+  onSelect,
+}: {
+  locale: Locale
+  queue: TransferQueue
+  selected: boolean
+  onSelect: (id: number) => void
+}) {
+  const availableCount = queue.available_agent_count
+  return (
+    <button
+      type="button"
+      role="option"
+      aria-selected={selected}
+      onClick={() => onSelect(queue.queue_id)}
+      className={cn(
+        'flex w-full items-center gap-3 border-b border-border/60 px-3 py-2 text-left transition-colors last:border-b-0',
+        selected ? 'bg-primary/10' : 'hover:bg-muted/50',
+      )}
+    >
+      <span className="grid h-8 w-8 shrink-0 place-items-center overflow-hidden rounded-full bg-muted">
+        <IconUsersGroup size={16} className="text-muted-foreground" />
+      </span>
+      <span className="min-w-0 flex-1 truncate text-sm text-foreground">{queue.name}</span>
+      <span
+        className={cn(
+          'shrink-0 text-xs',
+          availableCount > 0 ? 'text-success' : 'text-muted-foreground',
+        )}
+      >
+        {t('ws.callbar.queueAvailableCount', locale, { count: availableCount })}
       </span>
     </button>
   )

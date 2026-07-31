@@ -864,14 +864,24 @@ async def test_submit_feedback_updates_bot_message_metadata(monkeypatch):
         msg.metadata_ = metadata
         return msg
 
+    class _FakeSessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.open_agent_conversation_service.AsyncSessionLocal",
+        lambda: _FakeSessionContext(),
+    )
     monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
     monkeypatch.setattr(MessageRepository, "get_by_id_for_conversation", fake_get_message)
     monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
     monkeypatch.setattr(MessageRepository, "update_metadata", fake_update_metadata)
 
     client = FakeFeedbackOpenAgentClient()
-    result = await OpenAgentConversationService.submit_feedback_for_session(
-        object(),
+    result = await OpenAgentConversationService.submit_feedback_for_session_managed(
         "cv_test",
         {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
         OpenAgentFeedbackRequest(message_id=51, step_id=88, rating="like", comment="ignored"),
@@ -912,12 +922,22 @@ async def test_submit_feedback_rejects_when_open_agent_conversation_missing(monk
     async def fake_get_message(*_args, **_kwargs):
         return message
 
+    class _FakeSessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.open_agent_conversation_service.AsyncSessionLocal",
+        lambda: _FakeSessionContext(),
+    )
     monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
     monkeypatch.setattr(MessageRepository, "get_by_id_for_conversation", fake_get_message)
 
     with pytest.raises(ValidationError, match="conversation is not available"):
-        await OpenAgentConversationService.submit_feedback_for_session(
-            object(),
+        await OpenAgentConversationService.submit_feedback_for_session_managed(
             "cv_test",
             {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
             OpenAgentFeedbackRequest(message_id=51, step_id=88, rating="like"),
@@ -932,11 +952,21 @@ async def test_submit_feedback_rejects_when_channel_switch_disabled(monkeypatch)
     async def fake_get_conversation(*_args, **_kwargs):
         return conversation
 
+    class _FakeSessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.open_agent_conversation_service.AsyncSessionLocal",
+        lambda: _FakeSessionContext(),
+    )
     monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
 
     with pytest.raises(ValidationError, match="feedback is not enabled"):
-        await OpenAgentConversationService.submit_feedback_for_session(
-            object(),
+        await OpenAgentConversationService.submit_feedback_for_session_managed(
             "cv_test",
             {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
             OpenAgentFeedbackRequest(message_id=51, step_id=88, rating="like"),

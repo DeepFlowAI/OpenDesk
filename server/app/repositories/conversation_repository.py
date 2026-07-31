@@ -844,19 +844,25 @@ class ConversationRepository:
         cutoff_at: datetime,
         limit: int = 100,
     ) -> list[Conversation]:
-        """List bot conversations whose latest bot activity is older than the cutoff."""
+        """List bot and handoff-confirmation conversations idle past the cutoff."""
         bot_conversations = (
             select(
                 Conversation.id.label("conversation_id"),
                 Conversation.tenant_id.label("tenant_id"),
             )
-            .where(Conversation.status == ConversationStatus.BOT.value)
+            .where(
+                Conversation.status.in_((
+                    ConversationStatus.BOT.value,
+                    ConversationStatus.HANDOFF_PENDING.value,
+                ))
+            )
             .subquery()
         )
         bot_activity_filter = or_(
-            Message.sender_type == MessageSenderType.BOT.value,
-            Message.content_type == MessageContentType.BOT_WELCOME.value,
-            Message.metadata_["event_type"].astext == "open_agent_bot_started",
+                Message.sender_type == MessageSenderType.BOT.value,
+                Message.content_type == MessageContentType.BOT_WELCOME.value,
+                Message.metadata_["event_type"].astext == "open_agent_bot_started",
+                Message.metadata_["handoff_event_type"].astext == "confirm_requested",
         )
         row_number = func.row_number().over(
             partition_by=Message.conversation_id,
@@ -905,7 +911,10 @@ class ConversationRepository:
             )
             .join(latest_bot_activity, latest_bot_activity.c.conversation_id == Conversation.id)
             .where(
-                Conversation.status == ConversationStatus.BOT.value,
+                Conversation.status.in_((
+                    ConversationStatus.BOT.value,
+                    ConversationStatus.HANDOFF_PENDING.value,
+                )),
                 latest_bot_activity.c.created_at <= cutoff_at,
                 ~visitor_after_latest_bot,
             )

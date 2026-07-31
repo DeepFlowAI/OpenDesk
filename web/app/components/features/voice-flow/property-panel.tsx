@@ -850,7 +850,17 @@ function VoiceSpeedPanel({
     (e) => e.source === nodeId && (e.sourceHandle ?? 'next') === 'handoff',
   )
   const handoffTarget = handoffEdge?.target ?? ''
-  const targetOptions = allNodes.filter((n) => n.id !== nodeId && n.type !== 'start')
+  // Handoff should go to human routing (assign_queue / hangup), not back into
+  // announcement nodes like play/collect which are easy to mis-select.
+  const targetOptions = allNodes.filter(
+    (n) =>
+      n.id !== nodeId &&
+      n.type !== 'start' &&
+      n.type !== 'play' &&
+      n.type !== 'collect' &&
+      n.type !== 'condition',
+  )
+  const handoffTargetStillListed = targetOptions.some((n) => n.id === handoffTarget)
 
   return (
     <>
@@ -876,12 +886,17 @@ function VoiceSpeedPanel({
           </label>
           <div className="relative">
             <select
-              value={handoffTarget}
+              value={handoffTargetStillListed ? handoffTarget : ''}
               onChange={(e) => onConnectOutlet?.(nodeId, 'handoff', e.target.value || null)}
               disabled={!onConnectOutlet}
               className="h-9 w-full appearance-none rounded-md border border-border bg-white px-2 pr-8 text-sm disabled:opacity-50"
             >
               <option value="">请选择后续节点</option>
+              {handoffTarget && !handoffTargetStillListed && (
+                <option value={handoffTarget}>
+                  当前连线目标不可用（请改选分配队列）
+                </option>
+              )}
               {targetOptions.map((n) => (
                 <option key={n.id} value={n.id}>
                   {n.label}
@@ -891,7 +906,7 @@ function VoiceSpeedPanel({
             <IconChevronDown size={14} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
           </div>
           <p className="mt-1 text-xs text-foreground/60">
-            与画布上的「转人工」出口连线为同一份数据，任一处修改自动同步。推荐连接到「分配队列」节点。
+            与画布上的「转人工」出口连线为同一份数据。请连接到「分配队列」或「挂断」，不要连到纯语音节点。
           </p>
         </div>
       </section>

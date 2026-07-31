@@ -6,6 +6,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.core.exceptions import ForbiddenError, ValidationError
 from app.core.secret_store import decrypt_secret, encrypt_secret
+from app.db.session import AsyncSessionLocal
 from app.libs.open_agent import create_open_agent_client
 from app.libs.open_agent.base import BaseOpenAgentClient, OpenAgentClientError
 from app.libs.voice_speed import create_voice_speed_client
@@ -84,11 +85,38 @@ class OpenAgentSettingsService:
     ) -> OpenAgentConnectionTestResponse:
         """Test OpenAgent connectivity using provided or stored credentials."""
         api_key = data.api_key or await OpenAgentSettingsService._load_saved_api_key(db, tenant_id)
+        return await OpenAgentSettingsService._test_connection_with_api_key(
+            data.base_url,
+            api_key,
+            open_agent_client=open_agent_client,
+        )
+
+    @staticmethod
+    async def test_connection_managed(
+        tenant_id: int,
+        data: OpenAgentConnectionTestRequest,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentConnectionTestResponse:
+        """Test OpenAgent connectivity without holding a DB session during HTTP."""
+        async with AsyncSessionLocal() as db:
+            api_key = data.api_key or await OpenAgentSettingsService._load_saved_api_key(db, tenant_id)
+        return await OpenAgentSettingsService._test_connection_with_api_key(
+            data.base_url,
+            api_key,
+            open_agent_client=open_agent_client,
+        )
+
+    @staticmethod
+    async def _test_connection_with_api_key(
+        base_url: str,
+        api_key: str | None,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentConnectionTestResponse:
         if not api_key:
             raise ValidationError("API key is required before testing OpenAgent connection")
 
         client = open_agent_client or create_open_agent_client()
-        result = await client.test_connection(data.base_url, api_key)
+        result = await client.test_connection(base_url, api_key)
         if not result.ok:
             raise ValidationError(result.message)
         return OpenAgentConnectionTestResponse(ok=True, message=result.message)
@@ -151,11 +179,40 @@ class OpenAgentSettingsService:
     ) -> VoiceSpeedConnectionTestResponse:
         """Test VoiceSpeed connectivity using provided or stored credentials."""
         api_key = data.api_key or await OpenAgentSettingsService._load_saved_voice_speed_api_key(db, tenant_id)
+        return await OpenAgentSettingsService._test_voice_speed_connection_with_api_key(
+            data.base_url,
+            api_key,
+            voice_speed_client=voice_speed_client,
+        )
+
+    @staticmethod
+    async def test_voice_speed_connection_managed(
+        tenant_id: int,
+        data: VoiceSpeedConnectionTestRequest,
+        voice_speed_client: BaseVoiceSpeedClient | None = None,
+    ) -> VoiceSpeedConnectionTestResponse:
+        """Test VoiceSpeed connectivity without holding a DB session during HTTP."""
+        async with AsyncSessionLocal() as db:
+            api_key = data.api_key or await OpenAgentSettingsService._load_saved_voice_speed_api_key(
+                db, tenant_id
+            )
+        return await OpenAgentSettingsService._test_voice_speed_connection_with_api_key(
+            data.base_url,
+            api_key,
+            voice_speed_client=voice_speed_client,
+        )
+
+    @staticmethod
+    async def _test_voice_speed_connection_with_api_key(
+        base_url: str,
+        api_key: str | None,
+        voice_speed_client: BaseVoiceSpeedClient | None = None,
+    ) -> VoiceSpeedConnectionTestResponse:
         if not api_key:
             raise ValidationError("API key is required before testing VoiceSpeed connection")
 
         client = voice_speed_client or create_voice_speed_client()
-        result = await client.test_connection(data.base_url, api_key)
+        result = await client.test_connection(base_url, api_key)
         if not result.ok:
             raise ValidationError(result.message)
         return VoiceSpeedConnectionTestResponse(ok=True, message=result.message)
@@ -180,6 +237,29 @@ class OpenAgentSettingsService:
         bound. The API key never leaves the server and is never returned.
         """
         credentials = await OpenAgentSettingsService.get_voice_speed_credentials(db, tenant_id)
+        return await OpenAgentSettingsService._list_voice_speed_agents_from_credentials(
+            credentials,
+            voice_speed_client=voice_speed_client,
+        )
+
+    @staticmethod
+    async def list_voice_speed_agents_managed(
+        tenant_id: int,
+        voice_speed_client: BaseVoiceSpeedClient | None = None,
+    ) -> VoiceSpeedAgentListResponse:
+        """List VoiceSpeed agents without holding a DB session during HTTP."""
+        async with AsyncSessionLocal() as db:
+            credentials = await OpenAgentSettingsService.get_voice_speed_credentials(db, tenant_id)
+        return await OpenAgentSettingsService._list_voice_speed_agents_from_credentials(
+            credentials,
+            voice_speed_client=voice_speed_client,
+        )
+
+    @staticmethod
+    async def _list_voice_speed_agents_from_credentials(
+        credentials: tuple[str, str] | None,
+        voice_speed_client: BaseVoiceSpeedClient | None = None,
+    ) -> VoiceSpeedAgentListResponse:
         if not credentials:
             return VoiceSpeedAgentListResponse(configured=False, items=[])
 
@@ -213,6 +293,29 @@ class OpenAgentSettingsService:
     ) -> OpenAgentAgentListResponse:
         """List active OpenAgent agents using saved tenant credentials."""
         credentials = await OpenAgentSettingsService.get_credentials(db, tenant_id)
+        return await OpenAgentSettingsService._list_active_agents_from_credentials(
+            credentials,
+            open_agent_client=open_agent_client,
+        )
+
+    @staticmethod
+    async def list_active_agents_managed(
+        tenant_id: int,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentAgentListResponse:
+        """List active OpenAgent agents without holding a DB session during HTTP."""
+        async with AsyncSessionLocal() as db:
+            credentials = await OpenAgentSettingsService.get_credentials(db, tenant_id)
+        return await OpenAgentSettingsService._list_active_agents_from_credentials(
+            credentials,
+            open_agent_client=open_agent_client,
+        )
+
+    @staticmethod
+    async def _list_active_agents_from_credentials(
+        credentials: tuple[str, str] | None,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentAgentListResponse:
         if not credentials:
             raise ValidationError("OpenAgent settings are required before listing agents")
 
@@ -258,6 +361,33 @@ class OpenAgentSettingsService:
     ) -> OpenAgentAttachmentHandoffStatus:
         """Check whether an agent can route attachment-only turns to a human."""
         credentials = await OpenAgentSettingsService.get_credentials(db, tenant_id)
+        return await OpenAgentSettingsService._attachment_handoff_status_from_credentials(
+            credentials,
+            agent_id,
+            open_agent_client=open_agent_client,
+        )
+
+    @staticmethod
+    async def get_attachment_handoff_status_managed(
+        tenant_id: int,
+        agent_id: int,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentAttachmentHandoffStatus:
+        """Check attachment handoff without holding a DB session during HTTP."""
+        async with AsyncSessionLocal() as db:
+            credentials = await OpenAgentSettingsService.get_credentials(db, tenant_id)
+        return await OpenAgentSettingsService._attachment_handoff_status_from_credentials(
+            credentials,
+            agent_id,
+            open_agent_client=open_agent_client,
+        )
+
+    @staticmethod
+    async def _attachment_handoff_status_from_credentials(
+        credentials: tuple[str, str] | None,
+        agent_id: int,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentAttachmentHandoffStatus:
         if not credentials or not credentials[1]:
             raise ValidationError("OpenAgent settings are required before checking attachments")
 
@@ -334,6 +464,33 @@ class OpenAgentSettingsService:
     ) -> OpenAgentVisitorRuntimeConfig:
         """Return visitor-facing OpenAgent runtime settings."""
         credentials = await OpenAgentSettingsService.get_credentials(db, tenant_id)
+        return await OpenAgentSettingsService._visitor_runtime_config_from_credentials(
+            credentials,
+            agent_id,
+            open_agent_client=open_agent_client,
+        )
+
+    @staticmethod
+    async def get_agent_visitor_runtime_config_managed(
+        tenant_id: int,
+        agent_id: int,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentVisitorRuntimeConfig:
+        """Load credentials briefly, then fetch OpenAgent runtime config without a DB session."""
+        async with AsyncSessionLocal() as db:
+            credentials = await OpenAgentSettingsService.get_credentials(db, tenant_id)
+        return await OpenAgentSettingsService._visitor_runtime_config_from_credentials(
+            credentials,
+            agent_id,
+            open_agent_client=open_agent_client,
+        )
+
+    @staticmethod
+    async def _visitor_runtime_config_from_credentials(
+        credentials: tuple[str, str] | None,
+        agent_id: int,
+        open_agent_client: BaseOpenAgentClient | None = None,
+    ) -> OpenAgentVisitorRuntimeConfig:
         if not credentials:
             return OpenAgentVisitorRuntimeConfig()
 

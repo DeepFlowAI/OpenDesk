@@ -27,13 +27,26 @@ export const useSipExtensions = (params?: SipExtensionListParams) =>
       get<SipExtensionListResponse>('v1/sip-extensions', { searchParams: cleanParams(params) }),
   })
 
-export const useBindableEmployees = (keyword: string, enabled: boolean) =>
+export const useBindableEmployees = (
+  keyword: string,
+  enabled: boolean,
+  forExtensionId?: number | null,
+) =>
   useQuery({
-    queryKey: [...sipExtensionKeys.all, 'bindable-employees', keyword] as const,
-    queryFn: () =>
-      get<BindableEmployee[]>('v1/sip-extensions/bindable-employees', {
-        searchParams: keyword ? { keyword } : undefined,
-      }),
+    queryKey: [
+      ...sipExtensionKeys.all,
+      'bindable-employees',
+      keyword,
+      forExtensionId ?? null,
+    ] as const,
+    queryFn: () => {
+      const searchParams: Record<string, string | number> = {}
+      if (keyword) searchParams.keyword = keyword
+      if (forExtensionId != null) searchParams.for_extension_id = forExtensionId
+      return get<BindableEmployee[]>('v1/sip-extensions/bindable-employees', {
+        searchParams: Object.keys(searchParams).length ? searchParams : undefined,
+      })
+    },
     enabled,
   })
 

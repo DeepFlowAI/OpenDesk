@@ -133,6 +133,13 @@ async def test_accept_returns_leg_and_marks_in_call(monkeypatch):
             tel, object(),
             tenant_id=7, initiator_employee_id=1, target_employee_id=2,
             initiator_display="Alice",
+            customer_context={
+                "source_call_id": "sip-customer",
+                "customer_from": "13800138000",
+                "customer_to": "400800",
+                "user_id": 99,
+                "user_public_id": "usr_abc",
+            },
         )
     )
     # Let it reserve + ring + register the offer, then simulate the target
@@ -146,9 +153,13 @@ async def test_accept_returns_leg_and_marks_in_call(monkeypatch):
 
     assert result["ok"] is True
     assert result["target_webrtc_call_id"] == "target-leg"
-    # cc.call_incoming carried the internal call_type + initiator display.
+    # cc.call_incoming carried the internal call_type + initiator display
+    # plus the initiator's customer context for the target's user panel.
     assert orch.incoming[0]["call_type"] == "internal_consult"
     assert orch.incoming[0]["from"] == "Alice"
+    assert orch.incoming[0]["source_call_id"] == "sip-customer"
+    assert orch.incoming[0]["customer_from"] == "13800138000"
+    assert orch.incoming[0]["user_public_id"] == "usr_abc"
     # Resource lifecycle: reserve → ring → in_call, no release on success.
     assert resource.method_names() == ["reserve", "ringing", "in_call"]
 
@@ -175,6 +186,47 @@ async def test_decline_releases_and_raises(monkeypatch):
 
     assert "release" in resource.method_names()
     assert orch.cancelled  # offer cancelled
+
+
+class _FakeRedisKV:
+    """Just enough of redis for the consult-cancel tombstone check."""
+
+    def __init__(self, store=None):
+        self.store = dict(store or {})
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.store[key] = value
+
+    async def delete(self, key):
+        self.store.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_precancelled_offer_aborts_before_ring(monkeypatch):
+    """A cancel tombstone written before the ring task registered its offer
+    must abort the consult before cc.call_incoming, releasing the target."""
+
+    from app.constants.call_center import consult_cancel_key
+
+    resource, orch = _install(monkeypatch, device=_WEBRTC_OK)
+    tel = MockTelephonyClient()
+    await tel.connect()
+
+    r = _FakeRedisKV({consult_cancel_key("offer-x"): "1"})
+
+    with pytest.raises(ConflictError):
+        await InternalConsultService.initiate_webrtc_consult(
+            tel, r, tenant_id=7, initiator_employee_id=1, target_employee_id=2,
+            offer_id="offer-x",
+        )
+
+    # Reservation freed, offer cancelled, target browser never rung.
+    assert "release" in resource.method_names()
+    assert orch.cancelled == ["offer-x"]
+    assert orch.incoming == []
 
 
 @pytest.mark.asyncio

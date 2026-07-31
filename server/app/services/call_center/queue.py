@@ -50,6 +50,7 @@ class QueuePicker:
         offer_id: str | None = None,
         ttl_seconds: float | None = None,
         preferred_employee_id: int | None = None,
+        exclude_employee_ids: set[int] | None = None,
     ) -> dict | None:
         """
         Pick the next `ready` agent in the group without requiring a
@@ -80,13 +81,17 @@ class QueuePicker:
         if not employees:
             return None
 
+        excluded = exclude_employee_ids or set()
         candidates = [
             {
                 "employee_id": emp.id,
                 "name": emp.display_name or emp.nickname or emp.name or emp.username,
             }
             for emp in employees
+            if emp.id not in excluded
         ]
+        if not candidates:
+            return None
         # Only offer to agents whose browser is actually connected. The DB
         # "ready" status records the status an agent last *chose* and is never
         # cleared on disconnect, so without this a call gets offered to a
@@ -173,6 +178,7 @@ class QueuePicker:
         offer_id: str | None = None,
         ttl_seconds: float | None = None,
         preferred_employee_id: int | None = None,
+        exclude_employee_ids: set[int] | None = None,
     ) -> dict | None:
         if queue_type == "employee_group":
             return await self.pick_ready_agent(
@@ -184,11 +190,15 @@ class QueuePicker:
                 offer_id=offer_id,
                 ttl_seconds=ttl_seconds,
                 preferred_employee_id=preferred_employee_id,
+                exclude_employee_ids=exclude_employee_ids,
             )
 
         from sqlalchemy import select
         from app.models.agent_status import AgentStatus
         from app.models.employee import Employee
+
+        if exclude_employee_ids and queue_id in exclude_employee_ids:
+            return None
 
         result = await db.execute(
             select(Employee)
@@ -236,15 +246,15 @@ class QueuePicker:
         queue_id: int,
         r: aioredis.Redis | None = None,
     ) -> bool | None:
-        """Whether the queue has an agent currently *engaged on a call* (resource
-        reserved / ringing / in_call) who will free up soon — the only case where
-        holding the caller in queue is worthwhile.
+        """Whether the queue has an agent worth holding the caller for.
 
-        A genuinely available agent would already have been picked; this runs
-        only after that failed. So a `ready` agent left here is unreachable
-        (e.g. a SIP extension that's down) or reserved elsewhere, a `busy`/`break`
-        agent chose to stop taking calls, and the caller's own open workspace tab
-        is idle — none of those will take this call, so we do NOT wait for them.
+        Worth waiting: currently engaged (reserved / ringing / in_call) — about
+        to free up — or in after-call wrap-up (`after_call_work`), who typically
+        returns to ready shortly.
+
+        Not worth waiting: `busy` / `break` (chose to stop taking calls), idle
+        browser tabs that are not ready, unreachable "ready" agents. A genuinely
+        available ready agent would already have been picked before this runs.
 
         Returns None when resource state can't be read (no Redis) so callers keep
         their existing wait behavior rather than dropping a caller blindly.
@@ -259,6 +269,8 @@ class QueuePicker:
             ACTIVE_RESOURCE_STATES,
             CcAgentResourceService,
         )
+
+        waitable = ACTIVE_RESOURCE_STATES | {"after_call_work"}
 
         if queue_type == "employee_group":
             q = (
@@ -281,7 +293,14 @@ class QueuePicker:
         employee_ids = list((await db.execute(q)).scalars().all())
         for employee_id in employee_ids:
             snapshot = await CcAgentResourceService.get_snapshot(r, tenant_id, employee_id)
-            if snapshot and snapshot.get("resource_state") in ACTIVE_RESOURCE_STATES:
+            if not snapshot:
+                continue
+            state = snapshot.get("resource_state")
+            if state in waitable:
+                return True
+            # Visible wrap-up can briefly disagree with resource_state after
+            # reconnect; still treat it as waitable.
+            if snapshot.get("visible_status") == "after_call_work":
                 return True
         return False
 

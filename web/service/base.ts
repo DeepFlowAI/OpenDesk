@@ -1,5 +1,6 @@
 import ky, { HTTPError } from 'ky'
 import { logAuthEvent } from '@/utils/auth-log'
+import { adoptNewerTokenIfAny, readStoredToken } from '@/utils/auth-session'
 import {
   clearStoredAuth,
   isSessionReplacedCode,
@@ -7,10 +8,15 @@ import {
   redirectToSessionReplacedLogin,
 } from '@/utils/session-replacement'
 
+/** Strip trailing slashes so manual URL joins never produce `//` path segments. */
+export function normalizeApiBase(raw: string | undefined): string {
+  return (raw ?? '').replace(/\/+$/, '')
+}
+
 // API base URL must be supplied via NEXT_PUBLIC_API_URL (see web/.env.example).
 // We intentionally avoid a hard-coded localhost fallback so production builds
 // never silently target an internal/dev address.
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? ''
+const API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_URL)
 
 /**
  * Result of a token refresh attempt.
@@ -30,6 +36,63 @@ export type RefreshOutcome =
   | { status: 'transient_error' }
   | { status: 'no_token' }
 
+export type RefreshFailureState = {
+  consecutiveFailures: number
+  lastStatus: number | null
+  lastReason: string | null
+}
+
+let refreshFailureState: RefreshFailureState = {
+  consecutiveFailures: 0,
+  lastStatus: null,
+  lastReason: null,
+}
+
+/** Snapshot of recent refresh failures (for logout diagnostics). */
+export function getRefreshFailureState(): Readonly<RefreshFailureState> {
+  return refreshFailureState
+}
+
+function recordRefreshFailure(status: number | null, reason: string) {
+  refreshFailureState = {
+    consecutiveFailures: refreshFailureState.consecutiveFailures + 1,
+    lastStatus: status,
+    lastReason: reason,
+  }
+}
+
+function clearRefreshFailures() {
+  refreshFailureState = {
+    consecutiveFailures: 0,
+    lastStatus: null,
+    lastReason: null,
+  }
+}
+
+function bearerTokenFromRequest(request: Request): string | null {
+  const header = request.headers.get('Authorization')
+  if (!header?.startsWith('Bearer ')) return null
+  return header.slice('Bearer '.length)
+}
+
+/**
+ * Skip clearing the shared session when another tab already replaced the token.
+ * Returns true when the logout was skipped.
+ */
+async function skipClearIfNewerToken(
+  staleToken: string | null,
+  trigger: string,
+  path?: string,
+): Promise<boolean> {
+  if (!adoptNewerTokenIfAny(staleToken)) return false
+  await logAuthEvent(
+    'session_clear_skipped',
+    { trigger, ...(path ? { path } : {}) },
+    { immediate: true },
+  )
+  return true
+}
+
 let refreshPromise: Promise<RefreshOutcome> | null = null
 
 /**
@@ -42,14 +105,16 @@ export async function refreshAccessToken(): Promise<RefreshOutcome> {
   refreshPromise = (async (): Promise<RefreshOutcome> => {
     const token = localStorage.getItem('auth_token')
     if (!token) return { status: 'no_token' }
+    const refreshUrl = `${API_BASE}/v1/auth/refresh`
     try {
       const res = await ky
-        .post(`${API_BASE}/v1/auth/refresh`, {
+        .post(refreshUrl, {
           headers: { Authorization: `Bearer ${token}` },
           timeout: 10000,
         })
         .json<{ access_token: string }>()
       localStorage.setItem('auth_token', res.access_token)
+      clearRefreshFailures()
       logAuthEvent('token_refresh_succeeded')
       return { status: 'success', token: res.access_token }
     } catch (err) {
@@ -63,20 +128,30 @@ export async function refreshAccessToken(): Promise<RefreshOutcome> {
         } catch {
           // ignore JSON parse errors
         }
-        logAuthEvent('token_refresh_failed', {
-          status,
-          reason: serverMessage || 'http_error',
-        })
-        if ((status === 401 || status === 403) && isSessionReplacedCode(code)) {
+        const reason = serverMessage || 'http_error'
+        recordRefreshFailure(status, reason)
+        // Non-auth HTTP failures (404, 5xx, …) usually mean misconfig/deploy
+        // issues, not brief network blips — surface them at error level.
+        const isAuthRejection = status === 401 || status === 403
+        logAuthEvent(
+          'token_refresh_failed',
+          { status, reason, url: refreshUrl },
+          isAuthRejection ? undefined : { level: 'error' },
+        )
+        if (isAuthRejection && isSessionReplacedCode(code)) {
           return { status: 'session_replaced' }
         }
         // Only 401/403 mean the credentials are truly invalid; any other
         // status (5xx, 429, ...) is treated as a retryable transient failure.
-        if (status === 401 || status === 403) return { status: 'auth_error' }
+        if (isAuthRejection) return { status: 'auth_error' }
         return { status: 'transient_error' }
       }
       // Network error / timeout — retryable, don't drop the session.
-      logAuthEvent('token_refresh_failed', { reason: 'network_or_unknown' })
+      recordRefreshFailure(null, 'network_or_unknown')
+      logAuthEvent('token_refresh_failed', {
+        reason: 'network_or_unknown',
+        url: refreshUrl,
+      })
       return { status: 'transient_error' }
     } finally {
       refreshPromise = null
@@ -98,8 +173,10 @@ const client = ky.create({
     afterResponse: [
       async (request, _options, response) => {
         if (response.status !== 401) return
+        const requestToken = bearerTokenFromRequest(request)
         const code = await readApiErrorCode(response)
         if (isSessionReplacedCode(code)) {
+          if (await skipClearIfNewerToken(requestToken, 'session_replaced', request.url)) return
           await logAuthEvent('session_cleared', {
             trigger: 'session_replaced',
             path: request.url,
@@ -109,6 +186,7 @@ const client = ky.create({
         }
         // Don't retry the refresh endpoint itself
         if (request.url.includes('/auth/refresh')) {
+          if (await skipClearIfNewerToken(requestToken, 'refresh_endpoint_401', request.url)) return
           await logAuthEvent('session_cleared', {
             trigger: 'refresh_endpoint_401',
             path: request.url,
@@ -118,6 +196,10 @@ const client = ky.create({
           return
         }
         logAuthEvent('api_unauthorized', { path: request.url })
+        // refreshAccessToken reads localStorage — capture that token so the
+        // post-refresh clear gate compares against what was actually refreshed,
+        // not the (possibly older) Authorization header on this request.
+        const tokenBeforeRefresh = readStoredToken()
         const outcome = await refreshAccessToken()
         if (outcome.status === 'success') {
           // Retry the original request with the fresh token
@@ -129,6 +211,7 @@ const client = ky.create({
         // kick the user out.
         if (outcome.status === 'transient_error') return
         if (outcome.status === 'session_replaced') {
+          if (await skipClearIfNewerToken(tokenBeforeRefresh, 'refresh_session_replaced', request.url)) return
           await logAuthEvent('session_cleared', {
             trigger: 'refresh_session_replaced',
             path: request.url,
@@ -137,6 +220,7 @@ const client = ky.create({
           return
         }
         // auth_error / no_token: credentials are invalid → force re-login.
+        if (await skipClearIfNewerToken(tokenBeforeRefresh, 'refresh_after_api_401', request.url)) return
         await logAuthEvent('session_cleared', {
           trigger: 'refresh_after_api_401',
           path: request.url,

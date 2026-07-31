@@ -1047,15 +1047,6 @@ async def test_create_conversation_closes_single_offline_bot_conversation(monkey
 
 @pytest.mark.asyncio
 async def test_create_or_continue_and_send_file_for_session_locks_existing_pending_message(monkeypatch):
-    def add_message(message):
-        message.id = 102
-
-    db = SimpleNamespace(
-        add=Mock(side_effect=add_message),
-        flush=AsyncMock(),
-        commit=AsyncMock(),
-        rollback=AsyncMock(),
-    )
     visitor = SimpleNamespace(id=20, name="Visitor")
     row = SimpleNamespace(
         id=12,
@@ -1068,6 +1059,7 @@ async def test_create_or_continue_and_send_file_for_session_locks_existing_pendi
         visitor=visitor,
         visitor_name=visitor.name,
         message_count=1,
+        metadata_={},
     )
     refreshed = SimpleNamespace(
         **{key: value for key, value in row.__dict__.items() if key != "message_count"},
@@ -1078,7 +1070,40 @@ async def test_create_or_continue_and_send_file_for_session_locks_existing_pendi
     locked_lookup = AsyncMock(return_value=row)
     unlocked_lookup = AsyncMock(return_value=None)
     emit_updated = AsyncMock()
+    commit = AsyncMock()
+    rollback = AsyncMock()
+    session_dbs: list[object] = []
 
+    class TrackingDb:
+        def __init__(self):
+            self.commit = commit
+            self.rollback = rollback
+
+        def add(self, obj):
+            if getattr(obj, "id", None) is None:
+                obj.id = 102
+
+        async def flush(self):
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+    class TrackingSession:
+        def __init__(self):
+            self.db = TrackingDb()
+
+        async def __aenter__(self):
+            session_dbs.append(self.db)
+            return self.db
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.offline_message_service.AsyncSessionLocal",
+        lambda: TrackingSession(),
+    )
     monkeypatch.setattr(
         OfflineMessageService,
         "_prepare_leave_message_session",
@@ -1087,25 +1112,39 @@ async def test_create_or_continue_and_send_file_for_session_locks_existing_pendi
     monkeypatch.setattr(OfflineMessageRepository, "get_pending_by_visitor_for_update", locked_lookup)
     monkeypatch.setattr(OfflineMessageRepository, "get_pending_by_visitor", unlocked_lookup)
     monkeypatch.setattr(
+        OfflineMessageRepository,
+        "get_by_id_for_update",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
         OfflineMessageService,
-        "_upload_file",
+        "_upload_file_for_offline_message",
         AsyncMock(return_value={
             "schema_version": 1,
             "file_id": "file_test",
             "name": "a.pdf",
             "size": 12,
             "mime_type": "application/pdf",
+            "access_url": "https://storage.example.com/a.pdf",
         }),
     )
     monkeypatch.setattr(
         "app.services.offline_message_service.ConversationService.validate_message_content",
         lambda _content_type, content: content,
     )
+    monkeypatch.setattr(
+        "app.services.offline_message_service.ConversationService.build_message_preview",
+        lambda *_a, **_k: "[file]",
+    )
     monkeypatch.setattr(OfflineMessageRepository, "get_by_id", AsyncMock(return_value=refreshed))
     monkeypatch.setattr(OfflineMessageRealtimeService, "emit_updated", emit_updated)
+    monkeypatch.setattr(
+        OfflineMessageService,
+        "_public_entry_payload",
+        staticmethod(lambda entry, _row: {"id": getattr(entry, "id", 102)}),
+    )
 
-    result = await OfflineMessageService.create_or_continue_and_send_file_for_session(
-        db,
+    result = await OfflineMessageService.create_or_continue_and_send_file_for_session_managed(
         object(),
         {"tenant_id": 1, "channel_id": 2, "visitor_external_id": "visitor-1"},
         object(),
@@ -1113,14 +1152,14 @@ async def test_create_or_continue_and_send_file_for_session_locks_existing_pendi
 
     assert result["message"]["id"] == 102
     locked_lookup.assert_awaited_once_with(
-        db,
+        session_dbs[0],
         tenant_id=1,
         channel_id=2,
         visitor_external_id="visitor-1",
     )
     unlocked_lookup.assert_not_awaited()
-    db.commit.assert_awaited_once()
-    db.rollback.assert_not_awaited()
+    assert commit.await_count == 2
+    rollback.assert_not_awaited()
     emit_updated.assert_awaited_once_with(refreshed, action="message")
 
 

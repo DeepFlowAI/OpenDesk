@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any
 
 from app.libs.telephony.base import (
@@ -66,6 +67,7 @@ class MockTelephonyClient(BaseTelephonyClient):
         # (e.g. unsupported audio container) so callers can prove they degrade.
         self.play_response: dict = {"play_id": "mock-play", "status": "playing"}
         self.play_error: Exception | None = None
+        self.peer_serving_probe: Callable[[], bool] | None = None
 
     # ── Lifecycle ──
 
@@ -81,6 +83,13 @@ class MockTelephonyClient(BaseTelephonyClient):
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set()
+
+    def set_peer_serving_probe(self, probe: Callable[[], bool] | None) -> None:
+        """Kept so tests can assert what a multi-kernel client wired up here.
+
+        The mock never fails to connect, so it has no failure to downgrade.
+        """
+        self.peer_serving_probe = probe
 
     # ── Event subscription ──
 
@@ -135,6 +144,7 @@ class MockTelephonyClient(BaseTelephonyClient):
         *,
         text: str | None = None,
         audio_url: str | None = None,
+        audio: str | None = None,
         loop: bool = False,
         interval_ms: int | None = None,
         voice: str | None = None,
@@ -145,6 +155,7 @@ class MockTelephonyClient(BaseTelephonyClient):
                 "call_id": call_id,
                 "text": text,
                 "audio_url": audio_url,
+                "audio": audio,
                 "loop": loop,
                 "interval_ms": interval_ms,
                 "voice": voice,
@@ -160,12 +171,22 @@ class MockTelephonyClient(BaseTelephonyClient):
         self.recorded.append(("call.dtmf", {"call_id": call_id, "digits": digits, "duration_ms": duration_ms}))
 
     async def call_bridge(
-        self, call_id: str, other_call_id: str, transcribe: bool = True
+        self,
+        call_id: str,
+        other_call_id: str,
+        transcribe: bool = True,
+        *,
+        keepalive_on_peer_hangup: bool = False,
     ) -> None:
-        self.recorded.append((
-            "call.bridge",
-            {"call_id": call_id, "other_call_id": other_call_id, "transcribe": transcribe},
-        ))
+        # Mirror FlowKit client: only surface keepalive when enabled.
+        args = {
+            "call_id": call_id,
+            "other_call_id": other_call_id,
+            "transcribe": transcribe,
+        }
+        if keepalive_on_peer_hangup:
+            args["keepalive_on_peer_hangup"] = True
+        self.recorded.append(("call.bridge", args))
         if self.bridge_error is not None:
             raise self.bridge_error
 
@@ -204,6 +225,7 @@ class MockTelephonyClient(BaseTelephonyClient):
         token: str,
         greeting: str | None = None,
         voice_spk_id: str | None = None,
+        performance: dict | None = None,
         traceparent: str | None = None,
         trace_call_id: str | None = None,
     ) -> None:
@@ -216,6 +238,7 @@ class MockTelephonyClient(BaseTelephonyClient):
                 "token": token,
                 "greeting": greeting,
                 "voice_spk_id": voice_spk_id,
+                "performance": performance,
                 "traceparent": traceparent,
                 "trace_call_id": trace_call_id,
             },
@@ -296,6 +319,12 @@ class MockTelephonyClient(BaseTelephonyClient):
 
     async def call_unhold(self, call_id: str) -> None:
         self.recorded.append(("call.unhold", {"call_id": call_id}))
+
+    async def call_mute(self, call_id: str) -> None:
+        self.recorded.append(("call.mute", {"call_id": call_id}))
+
+    async def call_unmute(self, call_id: str) -> None:
+        self.recorded.append(("call.unmute", {"call_id": call_id}))
 
     async def call_originate(
         self,

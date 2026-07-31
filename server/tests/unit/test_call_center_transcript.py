@@ -35,11 +35,31 @@ def _orch(monkeypatch, transport):
     return CallCenterOrchestrator(telephony=MockTelephonyClient())
 
 
+def _stub_transcript_persist(monkeypatch):
+    """Final lines open AsyncSessionLocal to persist — incidental to relay tests."""
+
+    class _FakeService:
+        @staticmethod
+        async def append(_db, *, tenant_id, call_id, role, text, seq=None):
+            return None
+
+    class _Session:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _Session())
+    monkeypatch.setattr(orch_module, "CallTranscriptService", _FakeService)
+
+
 @pytest.mark.asyncio
 async def test_relays_user_and_agent_text_to_bridged_agent(monkeypatch):
     transport = _FakeTransport()
     orch = _orch(monkeypatch, transport)
     orch._workflows["call-1"] = _FakeWorkflow({"tenant_id": 7, "employee_id": 42})
+    _stub_transcript_persist(monkeypatch)
 
     await orch._on_transcript_event(
         CallEvent("call.user_text", {"call_id": "call-1", "text": "你好"})
@@ -88,6 +108,7 @@ async def test_bridge_transcript_uses_explicit_speaker_and_final(monkeypatch):
     transport = _FakeTransport()
     orch = _orch(monkeypatch, transport)
     orch._workflows["call-1"] = _FakeWorkflow({"tenant_id": 3, "employee_id": 9})
+    _stub_transcript_persist(monkeypatch)
 
     # Agent leg, streaming partial.
     await orch._on_transcript_event(

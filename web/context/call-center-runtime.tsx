@@ -6,15 +6,18 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useReducer,
+  useRef,
   useState,
   type ReactNode,
 } from 'react'
 import { toast } from 'sonner'
 import { useQueryClient } from '@tanstack/react-query'
 
-import { agentDeviceKeys } from '@/service/use-agent-devices'
+import { agentDeviceKeys, useMyCurrentCallDevice } from '@/service/use-agent-devices'
 import { mapOutboundFailure } from '@/app/components/features/call-center/outbound-failure-message'
 import { callRecordCustomerNumber } from '@/app/components/features/call-center/call-record-utils'
+import { formatWebRtcDeviceError } from '@/lib/call-record-labels'
 import { useCallControl, type CallControlApi } from '@/app/components/features/call-center/use-call-control'
 import { useMicrophone } from '@/app/components/features/call-center/use-microphone'
 import { useRingtone } from '@/app/components/features/call-center/use-ringtone'
@@ -35,28 +38,23 @@ import type {
   CallRecordListItem,
   CallRecordListResponse,
 } from '@/models/call-center'
+import { CcSocketEvent } from '@/lib/call-center-events'
+import { callRecordAnsweredByAgent } from '@/lib/call-record-ownership'
+import {
+  callSessionReducer,
+  canPollHydrate,
+  hangupMatches,
+  initialCallSession,
+  type CallCenterPhase,
+  type CallSessionEvent,
+  type IncomingCall,
+} from '@/lib/call-session-reducer'
 
-export type CallCenterPhase =
-  | 'mic_check'
-  | 'mic_denied'
-  | 'idle'
-  | 'incoming'
-  | 'outbound_ringing'
-  | 'on_call'
-  | 'wrap_up'
+export type { CallCenterPhase, IncomingCall }
 
-export type IncomingCall = {
-  offer_id: string
-  call_id: string
-  from: string
-  to: string
-  queue_id: number | null
-  /** 'internal_consult' / 'internal_transfer' for agent-to-agent calls; absent for real inbound. */
-  call_type?: string
-  startedAt: number
-  direction?: 'inbound' | 'outbound'
-  /** Current call device: 'sip_phone' rings/answers on the physical handset (no browser accept). */
-  device_type?: string
+/** SIP desk-phone media lives on the handset — never rebuild in the browser. */
+function browserOwnsMedia(deviceType?: string | null): boolean {
+  return deviceType !== 'sip_phone'
 }
 
 type DialStartedInfo = {
@@ -84,6 +82,20 @@ export function formatCallDuration(ms: number | null): string {
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 }
 
+function callStartMsFromIso(raw?: string | null): number | null {
+  if (!raw) return null
+  const ms = Date.parse(raw)
+  return Number.isFinite(ms) ? ms : null
+}
+
+/** Prefer answered_at (talk clock) then started_at so a refresh continues the timer. */
+function callStartMsFromRecord(rec?: {
+  answered_at?: string | null
+  started_at?: string | null
+} | null): number | null {
+  return callStartMsFromIso(rec?.answered_at || rec?.started_at)
+}
+
 type CallCenterRuntimeValue = {
   mic: ReturnType<typeof useMicrophone>
   leg: ReturnType<typeof useWebRTCLeg>
@@ -94,6 +106,8 @@ type CallCenterRuntimeValue = {
   now: number
   status: AgentStatusResponse | undefined
   records: CallRecordListResponse | undefined
+  recordsPage: number
+  setRecordsPage: (page: number) => void
   selectedRecordId: number | null
   setSelectedRecordId: (id: number | null) => void
   draftDialNumber: string
@@ -130,6 +144,7 @@ export function CallCenterProvider({
 }: CallCenterProviderProps) {
   const mic = useMicrophone({ autoRequestOnGranted: false })
   const { data: status, refetch: refetchStatus } = useMyAgentStatus()
+  const { data: currentDevice } = useMyCurrentCallDevice()
   const queryClient = useQueryClient()
   const setStatusMutation = useSetAgentStatus()
   const closeSession = useCloseWebRTCSession()
@@ -144,8 +159,18 @@ export function CallCenterProvider({
   const handleConferenceParticipantLeft = callControl.onConferenceParticipantLeft
   const ringtone = useRingtone()
   const { socket } = useSocketStore()
+  const [recordsPage, setRecordsPage] = useState(1)
+  const recordsQueryParams = useMemo(
+    () => ({
+      page: recordsPage,
+      per_page: 20,
+      // Workspace sidebar: last 24 hours (not a fixed "today" calendar day).
+      start_time: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    }),
+    [recordsPage],
+  )
   const { data: records, refetch: refetchRecords } = useCallRecords(
-    { page: 1, per_page: 20 },
+    recordsQueryParams,
     { enabled: recordsEnabled },
   )
 
@@ -154,14 +179,35 @@ export function CallCenterProvider({
     void refetchRecords()
   }, [recordsEnabled, refetchRecords])
 
-  const [phase, setPhase] = useState<CallCenterPhase>('mic_check')
-  const [incoming, setIncoming] = useState<IncomingCall | null>(null)
-  const [callStart, setCallStart] = useState<number | null>(null)
+  const [session, dispatchRaw] = useReducer(callSessionReducer, initialCallSession)
+  const { phase, incoming, callStart } = session
   const [now, setNow] = useState<number>(Date.now())
   const [selectedRecordId, setSelectedRecordId] = useState<number | null>(null)
   const [draftDialNumber, setDraftDialNumber] = useState('')
   const [draftOutboundNumber, setDraftOutboundNumber] = useState('')
   const [callSummaryTab, setCallSummaryTab] = useState<'summary' | 'ticket'>('summary')
+  // Dedup socket hangup toast vs dial-webrtc 410 toast for the same failure.
+  const lastOutboundFailToastRef = useRef<string | null>(null)
+  // Prevent overlapping media-reconnect attempts after refresh / consult end.
+  const mediaReconnectInFlightRef = useRef(false)
+  // Restore 结束咨询 UI at most once per on_call session from server state.
+  const consultUiRestoredRef = useRef(false)
+  const sessionRef = useRef(session)
+  sessionRef.current = session
+
+  /** Single write path for session state — logs every dispatched event. */
+  const dispatch = useCallback((event: CallSessionEvent) => {
+    const before = sessionRef.current
+    console.debug('[cc-session]', {
+      event: event.type,
+      from: before.phase,
+      callId: before.incoming?.call_id ?? null,
+      epoch: before.epoch,
+      ts: Date.now(),
+      detail: event,
+    })
+    dispatchRaw(event)
+  }, [])
 
   const selectedRecord =
     selectedRecordId != null
@@ -186,11 +232,127 @@ export function CallCenterProvider({
 
   useEffect(() => {
     if (mic.state === 'denied' || mic.state === 'error') {
-      setPhase((curr) => (curr === 'mic_check' ? 'mic_denied' : curr))
+      dispatch({ type: 'MIC_DENIED' })
     } else if (mic.state === 'granted' || mic.state === 'prompt') {
-      setPhase((curr) => (curr === 'mic_check' ? 'idle' : curr))
+      dispatch({ type: 'MIC_READY' })
     }
-  }, [mic.state])
+  }, [mic.state, dispatch])
+
+  // Backup hydrate: if Socket re-push is missed, recover ringing / in-call from
+  // the polled agent-status resource snapshot after a page refresh.
+  // Reducer enforces: poll never overrides a live (non-idle) session.
+  useEffect(() => {
+    if (!status) return
+    if (!canPollHydrate(phase)) return
+    const callId = status.current_call_id
+    if (!callId) return
+    const rec = (records?.items ?? []).find((r) => r.call_id === callId)
+    const deviceType = currentDevice?.device_type || undefined
+    // Consult targets have no CDR — fall back to Redis in_call_since.
+    const startMs =
+      callStartMsFromRecord(rec) ??
+      callStartMsFromIso(status.in_call_since) ??
+      Date.now()
+    // Still ringing in Redis — but this agent's own CDR already answered
+    // (SIP handset off-hook before mark_in_call) must hydrate as 通话中,
+    // not a second 来电. Another agent's answered CDR (queue transfer) must not.
+    const ringingButAnswered =
+      status.resource_state === 'ringing' &&
+      !!status.offer_id &&
+      callRecordAnsweredByAgent(rec, status.employee_id)
+    if (status.resource_state === 'ringing' && status.offer_id && !ringingButAnswered) {
+      setSelectedRecordId(null)
+      dispatch({
+        type: 'POLL_HYDRATE',
+        phase: 'incoming',
+        callStart: startMs,
+        incoming: {
+          offer_id: status.offer_id,
+          call_id: callId,
+          from: rec?.from_number || '',
+          to: rec?.to_number || '',
+          queue_id: status.queue_id ?? null,
+          direction: status.direction ?? 'inbound',
+          device_type: deviceType,
+          startedAt: startMs,
+        },
+      })
+      ringtone.start()
+      refetchCallRecords()
+      return
+    }
+    // in_call, answered-but-still-ringing Redis, or busy+current_call_id when
+    // Redis resource drifted mid-consult (SIP desk-phone after refresh).
+    if (
+      status.resource_state === 'in_call' ||
+      ringingButAnswered ||
+      (status.status === 'busy' && !!status.current_call_id)
+    ) {
+      setSelectedRecordId(null)
+      dispatch({
+        type: 'POLL_HYDRATE',
+        phase: 'on_call',
+        callStart: startMs,
+        incoming: {
+          offer_id: status.offer_id || '',
+          call_id: callId,
+          from: rec?.from_number || '',
+          to: rec?.to_number || '',
+          queue_id: status.queue_id ?? null,
+          direction: status.direction ?? 'inbound',
+          device_type: deviceType,
+          startedAt: startMs,
+        },
+      })
+      refetchCallRecords()
+    }
+  }, [status, phase, records, ringtone, refetchCallRecords, currentDevice?.device_type, dispatch])
+
+  // After restore/hydrate, CDR list may arrive a tick later — pull the real
+  // answered_at so the live timer continues instead of restarting at 00:00.
+  // If hydrate showed 来电 before CDR loaded, upgrade once answered_at is known.
+  useEffect(() => {
+    if (phase !== 'on_call' && phase !== 'outbound_ringing' && phase !== 'incoming') {
+      return
+    }
+    const callId = incoming?.call_id
+    if (!callId) return
+    const rec =
+      (records?.items ?? []).find((r) => r.call_id === callId) ??
+      (incoming?.source_call_id
+        ? (records?.items ?? []).find((r) => r.call_id === incoming.source_call_id)
+        : undefined)
+    if (phase === 'incoming') {
+      // Only upgrade when *this* agent answered — a transferred call keeps the
+      // prior agent's answered_at on the same call_id.
+      if (!callRecordAnsweredByAgent(rec, status?.employee_id)) return
+      ringtone.stop()
+      dispatch({
+        type: 'CDR_ANSWERED',
+        callStart: callStartMsFromRecord(rec),
+      })
+      return
+    }
+    const startMs =
+      callStartMsFromRecord(rec) ?? callStartMsFromIso(status?.in_call_since)
+    if (startMs == null) return
+    dispatch({ type: 'CDR_ANSWERED', callStart: startMs })
+  }, [
+    phase,
+    incoming?.call_id,
+    incoming?.source_call_id,
+    records,
+    ringtone,
+    status?.employee_id,
+    status?.in_call_since,
+    dispatch,
+  ])
+
+  useEffect(() => {
+    if (!socket) return
+    // Fresh socket after refresh — pull latest resource state promptly.
+    void refetchStatus()
+  }, [socket, refetchStatus])
 
   useEffect(() => {
     if (!socket) return
@@ -203,30 +365,71 @@ export function CallCenterProvider({
       queue_id: number | null
       call_type?: string
       device_type?: string
+      direction?: 'inbound' | 'outbound'
+      source_call_id?: string
+      customer_from?: string
+      customer_to?: string
+      user_id?: number
+      user_public_id?: string
+      restore?: boolean
+      answered_at?: string
     }) => {
-      setIncoming({
-        offer_id: data.offer_id,
-        call_id: data.call_id,
-        from: data.from || '',
-        to: data.to || '',
-        queue_id: data.queue_id ?? null,
-        call_type: data.call_type,
-        device_type: data.device_type,
-        startedAt: Date.now(),
-      })
-      setCallStart(Date.now())
+      const rec =
+        (records?.items ?? []).find((r) => r.call_id === data.call_id) ??
+        (data.source_call_id
+          ? (records?.items ?? []).find((r) => r.call_id === data.source_call_id)
+          : undefined)
+      const restoredStart = data.restore
+        ? callStartMsFromIso(data.answered_at) ??
+          callStartMsFromRecord(rec) ??
+          callStartMsFromIso(status?.in_call_since)
+        : null
+      const startMs = restoredStart ?? Date.now()
+      // Queue blind-transfer reuses the customer's call_id (already answered by
+      // the prior agent). Only this agent's own CDR counts as alreadyAnswered.
+      const alreadyAnswered = callRecordAnsweredByAgent(
+        rec,
+        status?.employee_id,
+      )
       setSelectedRecordId(null)
-      setPhase('incoming')
-      ringtone.start()
+      const wasOnCall = sessionRef.current.phase === 'on_call'
+      dispatch({
+        type: 'SOCKET_INCOMING',
+        restore: data.restore,
+        alreadyAnswered,
+        callStart: restoredStart ?? startMs,
+        incoming: {
+          offer_id: data.offer_id,
+          call_id: data.call_id,
+          from: data.from || '',
+          to: data.to || '',
+          queue_id: data.queue_id ?? null,
+          call_type: data.call_type,
+          device_type: data.device_type,
+          direction: data.direction,
+          source_call_id: data.source_call_id,
+          customer_from: data.customer_from,
+          customer_to: data.customer_to,
+          user_id: data.user_id,
+          user_public_id: data.user_public_id,
+          startedAt: startMs,
+        },
+      })
+      if (data.restore || alreadyAnswered || wasOnCall) {
+        ringtone.stop()
+      } else {
+        ringtone.start()
+      }
       refetchCallRecords()
     }
 
     // SIP-phone inbound: the call is answered on the physical handset, so the
     // backend tells the browser to move to 通话中 (no browser "接听" click).
+    // Also used after page-refresh restore (server emits incoming then answered).
     const onCallAnswered = (data: { call_id: string }) => {
       void data
       ringtone.stop()
-      setPhase((curr) => (curr === 'incoming' ? 'on_call' : curr))
+      dispatch({ type: 'SOCKET_ANSWERED' })
     }
 
     // SIP-phone registration went up/down (kernel event or reconnect reconcile)
@@ -241,35 +444,33 @@ export function CallCenterProvider({
     }
 
     const onHangup = (data: { call_id: string; reason?: string }) => {
-      void data
+      const matches = hangupMatches({
+        hangupCallId: data?.call_id,
+        activeLegId: leg.callId,
+        businessCallId: sessionRef.current.incoming?.call_id,
+        sourceCallId: sessionRef.current.incoming?.source_call_id,
+      })
+      if (!matches) return
       ringtone.stop()
       leg.goOffline()
-      // A hangup while the call was only ringing (never answered — e.g. a SIP
-      // handset that didn't pick up, or the caller giving up) returns to idle;
-      // wrap-up is only for a call that was actually on air.
-      setPhase((curr) => {
-        if (curr === 'incoming' || curr === 'outbound_ringing') {
-          setIncoming(null)
-          return 'idle'
-        }
-        return 'wrap_up'
+      dispatch({
+        type: 'SOCKET_HANGUP',
+        callId: data.call_id,
+        matches: true,
       })
       void refetchStatus()
       refetchCallRecords()
     }
 
     const onOutboundRinging = (data: { call_id: string }) => {
-      setIncoming((prev) => {
-        if (prev?.call_id !== data.call_id) return prev
-        return { ...prev }
-      })
+      void data
       refetchCallRecords()
     }
 
     const onOutboundAnswered = (data: { call_id: string }) => {
       void data
       ringtone.stop()
-      setPhase((curr) => (curr === 'outbound_ringing' ? 'on_call' : curr))
+      dispatch({ type: 'SOCKET_OUTBOUND_ANSWERED' })
       refetchCallRecords()
     }
 
@@ -284,24 +485,15 @@ export function CallCenterProvider({
         reason: data.reason,
         sip_status: data.sip_status,
       })
-      const showFailureToast = () => {
-        if (!failure.message) return
+      // Always toast failures — hangup can beat outbound_ringing when the
+      // carrier rejects in <50ms (phase still idle). Dedup against dial-webrtc.
+      const toastKey = `${data.call_id}:${data.reason ?? ''}:${data.sip_status ?? ''}`
+      if (failure.message && lastOutboundFailToastRef.current !== toastKey) {
+        lastOutboundFailToastRef.current = toastKey
         if (failure.level === 'info') toast(failure.message)
         else toast.error(failure.message)
       }
-      setPhase((curr) => {
-        if (curr === 'outbound_ringing') {
-          showFailureToast()
-          setIncoming(null)
-          setCallStart(null)
-          return 'idle'
-        }
-        if (curr === 'on_call') {
-          showFailureToast()
-          return 'wrap_up'
-        }
-        return curr
-      })
+      dispatch({ type: 'SOCKET_OUTBOUND_HANGUP', callId: data.call_id })
       void refetchStatus()
       refetchCallRecords()
     }
@@ -313,16 +505,61 @@ export function CallCenterProvider({
       ok: boolean
       reason?: string
       target_name?: string
+      ended?: boolean
+      resumed?: boolean
     }) => {
       handleConsultResult(data)
     }
 
-    // Result of a browser-ring transfer to a Web-phone colleague. On failure
-    // the initiator returns to "单人通话" (customer preserved); on success the
-    // customer is handed over and the initiator's own leg hangs up (which the
-    // cc.call_hangup handler turns into wrap-up), so here we only clear state.
+    const onMediaReconnectRequired = (data: {
+      customer_call_id?: string
+      reason?: string
+    }) => {
+      void data
+      // SIP desk-phone media lives on the handset — a browser WebRTC rebuild
+      // would steal the customer bridge and leave the mobile silent.
+      if (
+        !browserOwnsMedia(sessionRef.current.incoming?.device_type) ||
+        !browserOwnsMedia(currentDevice?.device_type)
+      ) {
+        return
+      }
+      if (mediaReconnectInFlightRef.current) return
+      mediaReconnectInFlightRef.current = true
+      void (async () => {
+        try {
+          if (mic.state !== 'granted') {
+            const ok = await mic.request()
+            if (!ok) {
+              toast.error('请先授权麦克风以恢复通话')
+              return
+            }
+          }
+          const newCallId = await leg.reconnectMedia()
+          if (newCallId) {
+            dispatch({ type: 'MEDIA_LEG_UPDATED', callId: newCallId })
+            dispatch({ type: 'FORCE_ON_CALL' })
+            void refetchStatus()
+            toast.success('已恢复通话媒体')
+          } else {
+            toast.error('恢复客户通话失败，请刷新页面后重试')
+          }
+        } finally {
+          mediaReconnectInFlightRef.current = false
+        }
+      })()
+    }
+
+    // Transfer outcome. On success the customer is handed over — leave the call
+    // UI immediately (do not wait for a possibly-missing media hangup event).
     const onTransferResult = (data: { ok: boolean; reason?: string }) => {
-      handleTransferResult(data)
+      const ok = handleTransferResult(data)
+      if (!ok) return
+      ringtone.stop()
+      leg.goOffline()
+      dispatch({ type: 'USER_TRANSFER_ENDED' })
+      void refetchStatus()
+      refetchCallRecords()
     }
 
     // A ringing conference participant answered (→ live) or failed to connect.
@@ -335,35 +572,39 @@ export function CallCenterProvider({
       handleConferenceParticipantLeft()
     }
 
-    socket.on('cc.call_incoming', onIncoming)
-    socket.on('cc.call_answered', onCallAnswered)
-    socket.on('cc.device_registration_changed', onDeviceRegistrationChanged)
-    socket.on('cc.webrtc.ice', onRemoteIce)
-    socket.on('cc.call_hangup', onHangup)
-    socket.on('cc.outbound_ringing', onOutboundRinging)
-    socket.on('cc.outbound_answered', onOutboundAnswered)
-    socket.on('cc.outbound_hangup', onOutboundHangup)
-    socket.on('cc.consult_result', onConsultResult)
-    socket.on('cc.transfer_result', onTransferResult)
-    socket.on('cc.conference_result', onConferenceResult)
-    socket.on('cc.conference_participant_left', onConferenceParticipantLeft)
+    socket.on(CcSocketEvent.CALL_INCOMING, onIncoming)
+    socket.on(CcSocketEvent.CALL_ANSWERED, onCallAnswered)
+    socket.on(CcSocketEvent.DEVICE_REGISTRATION_CHANGED, onDeviceRegistrationChanged)
+    socket.on(CcSocketEvent.WEBRTC_ICE, onRemoteIce)
+    socket.on(CcSocketEvent.CALL_HANGUP, onHangup)
+    socket.on(CcSocketEvent.OUTBOUND_RINGING, onOutboundRinging)
+    socket.on(CcSocketEvent.OUTBOUND_ANSWERED, onOutboundAnswered)
+    socket.on(CcSocketEvent.OUTBOUND_HANGUP, onOutboundHangup)
+    socket.on(CcSocketEvent.CONSULT_RESULT, onConsultResult)
+    socket.on(CcSocketEvent.MEDIA_RECONNECT_REQUIRED, onMediaReconnectRequired)
+    socket.on(CcSocketEvent.TRANSFER_RESULT, onTransferResult)
+    socket.on(CcSocketEvent.CONFERENCE_RESULT, onConferenceResult)
+    socket.on(CcSocketEvent.CONFERENCE_PARTICIPANT_LEFT, onConferenceParticipantLeft)
     return () => {
-      socket.off('cc.call_incoming', onIncoming)
-      socket.off('cc.call_answered', onCallAnswered)
-      socket.off('cc.device_registration_changed', onDeviceRegistrationChanged)
-      socket.off('cc.webrtc.ice', onRemoteIce)
-      socket.off('cc.call_hangup', onHangup)
-      socket.off('cc.outbound_ringing', onOutboundRinging)
-      socket.off('cc.outbound_answered', onOutboundAnswered)
-      socket.off('cc.outbound_hangup', onOutboundHangup)
-      socket.off('cc.consult_result', onConsultResult)
-      socket.off('cc.transfer_result', onTransferResult)
-      socket.off('cc.conference_result', onConferenceResult)
-      socket.off('cc.conference_participant_left', onConferenceParticipantLeft)
+      socket.off(CcSocketEvent.CALL_INCOMING, onIncoming)
+      socket.off(CcSocketEvent.CALL_ANSWERED, onCallAnswered)
+      socket.off(CcSocketEvent.DEVICE_REGISTRATION_CHANGED, onDeviceRegistrationChanged)
+      socket.off(CcSocketEvent.WEBRTC_ICE, onRemoteIce)
+      socket.off(CcSocketEvent.CALL_HANGUP, onHangup)
+      socket.off(CcSocketEvent.OUTBOUND_RINGING, onOutboundRinging)
+      socket.off(CcSocketEvent.OUTBOUND_ANSWERED, onOutboundAnswered)
+      socket.off(CcSocketEvent.OUTBOUND_HANGUP, onOutboundHangup)
+      socket.off(CcSocketEvent.CONSULT_RESULT, onConsultResult)
+      socket.off(CcSocketEvent.MEDIA_RECONNECT_REQUIRED, onMediaReconnectRequired)
+      socket.off(CcSocketEvent.TRANSFER_RESULT, onTransferResult)
+      socket.off(CcSocketEvent.CONFERENCE_RESULT, onConferenceResult)
+      socket.off(CcSocketEvent.CONFERENCE_PARTICIPANT_LEFT, onConferenceParticipantLeft)
     }
   }, [
     socket,
     leg,
+    currentDevice?.device_type,
+    mic,
     ringtone,
     handleConsultResult,
     handleTransferResult,
@@ -372,6 +613,54 @@ export function CallCenterProvider({
     refetchCallRecords,
     refetchStatus,
     queryClient,
+    dispatch,
+    status?.employee_id,
+    status?.in_call_since,
+    records,
+  ])
+
+  // Page refresh / socket republish leaves phase=on_call with no live PC —
+  // rebuild media against the still-active customer leg.
+  // SIP desk-phone media lives on the handset — never create a browser leg.
+  useEffect(() => {
+    if (phase !== 'on_call') return
+    if (
+      !browserOwnsMedia(incoming?.device_type) ||
+      !browserOwnsMedia(currentDevice?.device_type)
+    ) {
+      return
+    }
+    if (leg.state !== 'idle' && leg.state !== 'closed') return
+    if (mediaReconnectInFlightRef.current) return
+    mediaReconnectInFlightRef.current = true
+    void (async () => {
+      try {
+        if (mic.state !== 'granted') {
+          const ok = await mic.request()
+          if (!ok) return
+        }
+        const newCallId = await leg.reconnectMedia()
+        if (newCallId) {
+          // Keep hangup matching in sync when consult-target rebuilds a new leg.
+          dispatch({ type: 'MEDIA_LEG_UPDATED', callId: newCallId })
+          void refetchStatus()
+          toast.success('已恢复通话媒体')
+        } else {
+          toast.error('恢复通话媒体失败，可点「重置通话状态」清理')
+        }
+      } finally {
+        mediaReconnectInFlightRef.current = false
+      }
+    })()
+  }, [
+    phase,
+    leg.state,
+    leg.reconnectMedia,
+    incoming?.device_type,
+    currentDevice?.device_type,
+    mic,
+    refetchStatus,
+    dispatch,
   ])
 
   useEffect(() => {
@@ -382,14 +671,59 @@ export function CallCenterProvider({
 
   // Any in-call control state (hold/consult/conference/mute) only makes sense
   // during an active call; clear it once the call leaves the on_call phase.
+  // While on_call, restore consult_active from Redis InCallLegs after refresh
+  // (SIP keeps the handset consult; Web rebuilds media then hydrates UI).
+  // If a restored consult is not confirmed by the server, drop the false
+  // 「结束咨询」button — never interrupt a local consult_ringing the agent started.
   useEffect(() => {
-    if (phase !== 'on_call') callControl.reset()
+    if (phase !== 'on_call') {
+      callControl.reset()
+      consultUiRestoredRef.current = false
+      return
+    }
+    if (status?.consult_active) {
+      if (consultUiRestoredRef.current) return
+      consultUiRestoredRef.current = true
+      callControl.restoreConsult({
+        target_id: status.consult_target_employee_id ?? undefined,
+        state: status.consult_state === 'ringing' ? 'ringing' : 'active',
+      })
+      return
+    }
+    if (
+      consultUiRestoredRef.current &&
+      (callControl.mode === 'consult_active' || callControl.mode === 'consult_ringing')
+    ) {
+      consultUiRestoredRef.current = false
+      callControl.reset()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase])
+  }, [
+    phase,
+    status?.consult_active,
+    status?.consult_state,
+    status?.consult_target_employee_id,
+    callControl.mode,
+  ])
+
+  // Sync transfer (non-WebRTC ring) sets callControl.mode to "ended" without a
+  // socket event — advance the workspace phase the same way as transfer_result.
+  useEffect(() => {
+    if (phase !== 'on_call') return
+    if (callControl.mode !== 'ended') return
+    ringtone.stop()
+    leg.goOffline()
+    dispatch({ type: 'USER_TRANSFER_ENDED' })
+    refetchCallRecords()
+    void refetchStatus()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [callControl.mode, phase, dispatch])
 
   useEffect(() => {
     if (leg.state === 'failed') {
-      toast.error(`通话服务连接失败${leg.error ? `：${leg.error}` : ''}`)
+      toast.error(
+        `通话服务连接失败${leg.error ? `：${formatWebRtcDeviceError(leg.error)}` : ''}`,
+      )
     }
   }, [leg.state, leg.error])
 
@@ -403,10 +737,8 @@ export function CallCenterProvider({
       // pill (which is pinned to "整理中"/after_call_work while phase === 'wrap_up')
       // and the wrap-up panel reflect the new status immediately instead of
       // staying on "整理中" until the page is refreshed.
-      if (phase === 'wrap_up') {
-        setIncoming(null)
-        setCallStart(null)
-        setPhase('idle')
+      if (sessionRef.current.phase === 'wrap_up') {
+        dispatch({ type: 'USER_STATUS_ENDS_WRAP_UP' })
         refetchCallRecords()
       }
       if (newStatus === 'ready') toast.success('已就绪 — 等待来电')
@@ -414,13 +746,14 @@ export function CallCenterProvider({
     } catch {
       toast.error('状态切换失败')
     }
-  }, [leg, setStatusMutation, phase, refetchCallRecords])
+  }, [leg, setStatusMutation, refetchCallRecords, dispatch])
 
   const accept = useCallback(async () => {
-    if (!incoming) return
+    const current = sessionRef.current.incoming
+    if (!current) return
     // SIP-phone calls are answered on the physical handset; there is no browser
     // WebRTC leg to accept. The backend's cc.call_answered moves us to 通话中.
-    if (incoming.device_type === 'sip_phone') return
+    if (!browserOwnsMedia(current.device_type)) return
     ringtone.stop()
     if (mic.state !== 'granted') {
       const ok = await mic.request()
@@ -429,35 +762,34 @@ export function CallCenterProvider({
         return
       }
     }
-    const ok = await leg.acceptOffer(incoming.offer_id)
+    const ok = await leg.acceptOffer(current.offer_id)
     if (ok) {
-      setPhase('on_call')
-      setCallStart(Date.now())
+      dispatch({ type: 'USER_ACCEPT_OK', callStart: Date.now() })
     } else {
       toast.error('接听失败，请稍后重试')
-      setPhase('idle')
-      setIncoming(null)
+      dispatch({ type: 'USER_ACCEPT_FAIL' })
     }
-  }, [incoming, leg, mic, ringtone])
+  }, [leg, mic, ringtone, dispatch])
 
   const reject = useCallback(async () => {
-    if (!incoming) return
+    const current = sessionRef.current.incoming
+    if (!current) return
     ringtone.stop()
     try {
-      await rejectCurrentCall(incoming.offer_id)
+      await rejectCurrentCall(current.offer_id)
     } catch {
       toast.error('拒接失败，请稍后重试')
     }
-    setPhase('idle')
-    setIncoming(null)
-  }, [incoming, ringtone])
+    dispatch({ type: 'USER_REJECT' })
+  }, [ringtone, dispatch])
 
   const hangup = useCallback(async () => {
     ringtone.stop()
-    const isOutbound = incoming?.direction === 'outbound'
+    const current = sessionRef.current.incoming
+    const isOutbound = current?.direction === 'outbound'
     try {
-      if (isOutbound && incoming?.call_id) {
-        await cancelOutboundCall(incoming.call_id)
+      if (isOutbound && current?.call_id) {
+        await cancelOutboundCall(current.call_id)
       } else {
         await hangupCurrentCall()
       }
@@ -466,59 +798,74 @@ export function CallCenterProvider({
     } finally {
       if (isOutbound) {
         leg.goOffline()
-        setIncoming(null)
-        setCallStart(null)
-        setPhase('idle')
+        dispatch({ type: 'USER_OUTBOUND_FAIL' })
         refetchCallRecords()
       }
     }
-  }, [incoming, leg, refetchCallRecords, ringtone])
+  }, [leg, refetchCallRecords, ringtone, dispatch])
 
   const completeWrapUp = useCallback(() => {
-    setIncoming(null)
-    setCallStart(null)
-    setPhase('idle')
+    dispatch({ type: 'USER_WRAP_UP_DONE' })
     setStatusMutation.mutate(
       { status: 'ready' },
       { onSettled: () => void refetchStatus() },
     )
     refetchCallRecords()
-  }, [refetchCallRecords, refetchStatus, setStatusMutation])
+  }, [refetchCallRecords, refetchStatus, setStatusMutation, dispatch])
 
   const handleDialStarted = useCallback(async ({ callId, destination, outboundNumber }: DialStartedInfo) => {
     setSelectedRecordId(null)
-    setIncoming({
-      offer_id: '',
-      call_id: callId,
-      from: outboundNumber,
-      to: destination,
-      queue_id: null,
-      startedAt: Date.now(),
-      direction: 'outbound',
+    const startedAt = Date.now()
+    dispatch({
+      type: 'USER_DIAL_STARTED',
+      callStart: startedAt,
+      incoming: {
+        offer_id: '',
+        call_id: callId,
+        from: outboundNumber,
+        to: destination,
+        queue_id: null,
+        startedAt,
+        direction: 'outbound',
+      },
     })
-    setCallStart(Date.now())
-    setPhase('outbound_ringing')
     refetchCallRecords()
+    // A desk-phone outbound is dialled from the handset's own extension, so
+    // there is no browser leg to originate. Going further would pop a pointless
+    // microphone prompt and then report a WebRTC failure for a call that is
+    // ringing perfectly well. No browser ringback either: the handset plays its
+    // own, and hearing one here suggests the call lives in the browser — which
+    // makes the audio then arriving on the handset look like a fault.
+    if (!browserOwnsMedia(currentDevice?.device_type)) return
     ringtone.start()
     if (mic.state !== 'granted') {
       await mic.request()
     }
-    const ok = await leg.originateOffer(callId)
-    if (!ok) {
-      if (leg.error) toast.error(leg.error)
+    const failMessage = await leg.originateOffer(callId)
+    if (failMessage) {
       ringtone.stop()
       leg.goOffline()
-      setIncoming(null)
-      setCallStart(null)
-      setPhase('idle')
+      const toastKey = `${callId}:webrtc:${failMessage}`
+      if (lastOutboundFailToastRef.current !== toastKey) {
+        // Prefer the socket toast key shape when message already shown.
+        const alreadyToasted =
+          lastOutboundFailToastRef.current?.startsWith(`${callId}:`) ?? false
+        if (!alreadyToasted) {
+          lastOutboundFailToastRef.current = toastKey
+          toast.error(failMessage)
+        }
+      }
+      dispatch({ type: 'USER_OUTBOUND_FAIL' })
     }
-  }, [leg, mic, refetchCallRecords, ringtone])
+  }, [leg, mic, refetchCallRecords, ringtone, dispatch, currentDevice?.device_type])
 
   const screenPopNumber = selectedRecord
     ? callRecordCustomerNumber(selectedRecord) || ''
-    : incoming?.direction === 'outbound'
-      ? incoming.to || draftDialNumber.trim()
-      : incoming?.from || draftDialNumber.trim()
+    : incoming?.customer_from
+      ? incoming.customer_from
+      : incoming?.direction === 'outbound'
+        ? incoming.to || draftDialNumber.trim()
+        : incoming?.from || draftDialNumber.trim()
   const showEmptyCallState = !selectedRecord && !incoming
 
   const value = useMemo<CallCenterRuntimeValue>(() => ({
@@ -531,6 +878,8 @@ export function CallCenterProvider({
     now,
     status,
     records,
+    recordsPage,
+    setRecordsPage,
     selectedRecordId,
     setSelectedRecordId,
     draftDialNumber,
@@ -562,6 +911,7 @@ export function CallCenterProvider({
     now,
     status,
     records,
+    recordsPage,
     selectedRecordId,
     draftDialNumber,
     draftOutboundNumber,

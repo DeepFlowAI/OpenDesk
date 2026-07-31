@@ -25,6 +25,7 @@ import {
   useCreateInboundRoutingRule,
   useUpdateInboundRoutingRule,
 } from '@/service/use-inbound-routing-rules'
+import { useTenantPhoneNumbers } from '@/service/use-tenant-phone-numbers'
 import {
   VoiceSpeedAgentSelect,
   isVoiceSpeedSelectBlocking,
@@ -43,12 +44,14 @@ function defaultRow(): RowState {
 
 function normalizeOperators(ct: RoutingConditionType): string[] {
   if (ct === 'call_time') return ['in_schedule', 'not_in_schedule']
-  return ['eq', 'ne']
+  return ['eq', 'ne', 'contains', 'not_contains']
 }
 
 function opLabel(op: string, locale: import('@/context/locale-store').Locale): string {
   if (op === 'eq') return t('rr.cond.op.eq', locale)
   if (op === 'ne') return t('rr.cond.op.ne', locale)
+  if (op === 'contains') return t('rr.cond.op.contains', locale)
+  if (op === 'not_contains') return t('rr.cond.op.notContains', locale)
   if (op === 'in_schedule') return t('rr.cond.op.in', locale)
   if (op === 'not_in_schedule') return t('rr.cond.op.notIn', locale)
   return op
@@ -63,8 +66,13 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
   const { data: rule, isLoading: loadingRule } = useInboundRoutingRule(ruleId ?? 0)
   const { data: flows } = useVoiceFlowsSelect()
   const { data: serviceHoursList } = useServiceHours()
+  const { data: phoneNumbers } = useTenantPhoneNumbers({ page: 1, per_page: 200 })
   const createMut = useCreateInboundRoutingRule()
   const updateMut = useUpdateInboundRoutingRule()
+  const phoneOptions = useMemo(
+    () => (phoneNumbers?.items ?? []).map((p) => p.phone_number).filter(Boolean),
+    [phoneNumbers?.items],
+  )
 
   const [name, setName] = useState('')
   const [enabled, setEnabled] = useState(true)
@@ -333,7 +341,7 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
                   </div>
 
                   {/* Operator dropdown */}
-                  <div className="relative w-[90px] shrink-0">
+                  <div className="relative w-[110px] shrink-0">
                     <select
                       value={row.operator}
                       onChange={(e) => updateRow(row._key, { operator: e.target.value })}
@@ -360,6 +368,25 @@ export function RoutingRuleForm({ ruleId }: RoutingRuleFormProps) {
                         {(serviceHoursList ?? []).map((sh) => (
                           <option key={sh.id} value={String(sh.id)}>
                             {sh.name}
+                          </option>
+                        ))}
+                      </select>
+                      <IconChevronDown size={14} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                    </div>
+                  ) : row.condition_type === 'callee_number' ? (
+                    <div className="relative min-w-0 flex-1">
+                      <select
+                        value={row.value}
+                        onChange={(e) => updateRow(row._key, { value: e.target.value })}
+                        className="h-9 w-full appearance-none rounded-lg border border-border bg-white px-2.5 pr-7 text-[13px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                      >
+                        <option value="">{t('rr.cond.value.phonePool.placeholder', locale)}</option>
+                        {row.value && !phoneOptions.includes(row.value) && (
+                          <option value={row.value}>{row.value}</option>
+                        )}
+                        {phoneOptions.map((num) => (
+                          <option key={num} value={num}>
+                            {num}
                           </option>
                         ))}
                       </select>

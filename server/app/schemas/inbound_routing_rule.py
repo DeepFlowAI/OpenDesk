@@ -31,7 +31,7 @@ class RoutingCondition(BaseModel):
         val = self.value
 
         if ct in ("caller_number", "callee_number"):
-            if op not in ("eq", "ne"):
+            if op not in ("eq", "ne", "contains", "not_contains"):
                 raise ValueError("Invalid operator for number condition")
             if not val.isdigit():
                 raise ValueError("Phone value must contain digits only")

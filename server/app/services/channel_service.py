@@ -19,6 +19,7 @@ from app.core.security import (
     decode_visitor_session_token,
     verify_visitor_identity_secret,
 )
+from app.db.session import AsyncSessionLocal
 from app.repositories.channel_repository import ChannelRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.service_hours_repository import ServiceHoursRepository
@@ -155,6 +156,9 @@ class ChannelService:
         db: AsyncSession,
         tenant_id: int,
         config: ChannelConfig,
+        *,
+        remote_open_agent_validate: bool = True,
+        open_agent_client=None,
     ) -> dict:
         payload = config.model_dump()
         payload["outside_service_hours_strategy"] = (
@@ -217,7 +221,13 @@ class ChannelService:
             )
 
         if payload.get("open_agent_enabled"):
-            await ChannelService._normalize_open_agent_config(db, tenant_id, payload)
+            await ChannelService._normalize_open_agent_config(
+                db,
+                tenant_id,
+                payload,
+                remote_validate=remote_open_agent_validate,
+                open_agent_client=open_agent_client,
+            )
         else:
             payload["open_agent_attachment_upload_enabled"] = False
             if payload.get("open_agent_bot_strategy") != "service_hours":
@@ -246,6 +256,9 @@ class ChannelService:
         db: AsyncSession,
         tenant_id: int,
         payload: dict,
+        *,
+        remote_validate: bool = True,
+        open_agent_client=None,
     ) -> None:
         agent_id = payload.get("open_agent_agent_id")
         if not agent_id:
@@ -261,18 +274,54 @@ class ChannelService:
         else:
             payload["open_agent_bot_service_hours_id"] = None
 
-        agents = await OpenAgentSettingsService.list_active_agents(db, tenant_id)
+        if remote_validate:
+            await ChannelService._apply_open_agent_remote_validation(
+                tenant_id,
+                payload,
+                open_agent_client=open_agent_client,
+                db=db,
+            )
+
+    @staticmethod
+    async def _apply_open_agent_remote_validation(
+        tenant_id: int,
+        payload: dict,
+        *,
+        open_agent_client=None,
+        db: AsyncSession | None = None,
+    ) -> None:
+        """Validate the selected OpenAgent against upstream; prefer no held DB session."""
+        agent_id = payload.get("open_agent_agent_id")
+        if not agent_id:
+            raise ValidationError("OpenAgent agent is required when bot is enabled")
+
+        if db is not None:
+            agents = await OpenAgentSettingsService.list_active_agents(
+                db, tenant_id, open_agent_client=open_agent_client
+            )
+        else:
+            agents = await OpenAgentSettingsService.list_active_agents_managed(
+                tenant_id, open_agent_client=open_agent_client
+            )
         selected_agent = next((item for item in agents.items if item.id == int(agent_id)), None)
         if not selected_agent:
             raise ValidationError("OpenAgent agent is not active or unavailable")
         payload["open_agent_agent_name"] = payload.get("open_agent_agent_name") or selected_agent.name
 
         if payload.get("open_agent_attachment_upload_enabled"):
-            status = await OpenAgentSettingsService.get_attachment_handoff_status(
-                db,
-                tenant_id,
-                int(agent_id),
-            )
+            if db is not None:
+                status = await OpenAgentSettingsService.get_attachment_handoff_status(
+                    db,
+                    tenant_id,
+                    int(agent_id),
+                    open_agent_client=open_agent_client,
+                )
+            else:
+                status = await OpenAgentSettingsService.get_attachment_handoff_status_managed(
+                    tenant_id,
+                    int(agent_id),
+                    open_agent_client=open_agent_client,
+                )
             if not status.ready:
                 raise ValidationError(
                     "OpenAgent attachment upload requires an enabled human handoff tool"
@@ -296,6 +345,35 @@ class ChannelService:
         payload["channel_key"] = await ChannelRepository.generate_unique_channel_key(db)
         payload["config"] = await ChannelService._normalize_config(db, tenant_id, data.config)
         return await ChannelRepository.create(db, payload)
+
+    @staticmethod
+    async def create_managed(
+        tenant_id: int,
+        data: ChannelCreate,
+        open_agent_client=None,
+    ):
+        """Create a channel without holding a DB session during OpenAgent HTTP."""
+        async with AsyncSessionLocal() as db:
+            config = await ChannelService._normalize_config(
+                db,
+                tenant_id,
+                data.config,
+                remote_open_agent_validate=False,
+            )
+
+        if config.get("open_agent_enabled"):
+            await ChannelService._apply_open_agent_remote_validation(
+                tenant_id,
+                config,
+                open_agent_client=open_agent_client,
+            )
+
+        async with AsyncSessionLocal() as db:
+            payload = data.model_dump()
+            payload["tenant_id"] = tenant_id
+            payload["channel_key"] = await ChannelRepository.generate_unique_channel_key(db)
+            payload["config"] = config
+            return await ChannelRepository.create(db, payload)
 
     @staticmethod
     def _generate_copy_name(source_name: str, existing_names: list[str]) -> str:
@@ -340,6 +418,40 @@ class ChannelService:
         payload = data.model_dump()
         payload["config"] = await ChannelService._normalize_config(db, tenant_id, data.config)
         return await ChannelRepository.update(db, item, payload)
+
+    @staticmethod
+    async def update_managed(
+        channel_id: int,
+        tenant_id: int,
+        data: ChannelUpdate,
+        open_agent_client=None,
+    ):
+        """Update a channel without holding a DB session during OpenAgent HTTP."""
+        async with AsyncSessionLocal() as db:
+            item = await ChannelRepository.get_by_id(db, channel_id)
+            if not item or item.tenant_id != tenant_id:
+                raise NotFoundError("Channel not found")
+            config = await ChannelService._normalize_config(
+                db,
+                tenant_id,
+                data.config,
+                remote_open_agent_validate=False,
+            )
+
+        if config.get("open_agent_enabled"):
+            await ChannelService._apply_open_agent_remote_validation(
+                tenant_id,
+                config,
+                open_agent_client=open_agent_client,
+            )
+
+        async with AsyncSessionLocal() as db:
+            item = await ChannelRepository.get_by_id(db, channel_id)
+            if not item or item.tenant_id != tenant_id:
+                raise NotFoundError("Channel not found")
+            payload = data.model_dump()
+            payload["config"] = config
+            return await ChannelRepository.update(db, item, payload)
 
     @staticmethod
     async def rotate_key(db: AsyncSession, channel_id: int, tenant_id: int):
@@ -766,61 +878,72 @@ class ChannelService:
         }
 
     @staticmethod
-    async def get_public_config_with_availability_by_key(
-        db: AsyncSession,
+    async def get_public_config_with_availability_by_key_managed(
         r: aioredis.Redis,
         channel_key: str,
         visitor_external_id: str | None = None,
         current_conversation_public_id: str | None = None,
+        open_agent_client=None,
     ) -> dict:
-        """Get public channel config using the high-entropy public key."""
-        item = await ChannelService.get_public_channel_by_key(db, channel_key)
-        config = ChannelConfig.model_validate(item.config or {}).model_dump()
-        has_conversation_history = False
-        visitor_id: int | None = None
-        if visitor_external_id:
-            visitor = await UserRepository.get_by_external_id(db, item.tenant_id, visitor_external_id)
-            visitor_id = visitor.id if visitor else None
-            from app.services.conversation_service import ConversationService
+        """Get public channel config without holding a DB session during OpenAgent HTTP."""
+        open_agent_agent_id: int | None = None
+        tenant_id: int | None = None
+        async with AsyncSessionLocal() as db:
+            item = await ChannelService.get_public_channel_by_key(db, channel_key)
+            config = ChannelConfig.model_validate(item.config or {}).model_dump()
+            has_conversation_history = False
+            visitor_id: int | None = None
+            if visitor_external_id:
+                visitor = await UserRepository.get_by_external_id(db, item.tenant_id, visitor_external_id)
+                visitor_id = visitor.id if visitor else None
+                from app.services.conversation_service import ConversationService
 
-            has_conversation_history = await ConversationService.has_visitor_history(
-                db,
-                channel_id=item.id,
-                visitor_external_id=visitor_external_id,
-                current_conversation_public_id=current_conversation_public_id,
+                has_conversation_history = await ConversationService.has_visitor_history(
+                    db,
+                    channel_id=item.id,
+                    visitor_external_id=visitor_external_id,
+                    current_conversation_public_id=current_conversation_public_id,
+                )
+            availability = await ChannelService.check_channel_availability(
+                db, r, item.id, visitor_id=visitor_id,
             )
-        availability = await ChannelService.check_channel_availability(db, r, item.id, visitor_id=visitor_id)
-        from app.services.conversation_announcement_rule_service import ConversationAnnouncementRuleService
-        from app.services.conversation_read_status_service import ConversationReadStatusService
-        from app.services.welcome_message_rule_service import WelcomeMessageRuleService
-        announcement = await ConversationAnnouncementRuleService.match_public_announcement(db, item)
-        read_status = await ConversationReadStatusService.get_public_config(db, item.tenant_id)
-        welcome_message = None
-        open_agent_welcome_message = None
-        open_agent_ai_disclaimer = None
-        if not config.get("open_agent_enabled"):
-            welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
-        else:
-            open_agent_runtime_config = await ChannelService._get_open_agent_runtime_config(db, item, config)
-            if open_agent_runtime_config:
-                open_agent_welcome_message = open_agent_runtime_config.welcome_message
-                open_agent_ai_disclaimer = open_agent_runtime_config.ai_disclaimer
-        return {
-            "channel_key": item.channel_key,
-            "name": item.name,
-            "channel_type": item.channel_type,
-            "access_mode": item.access_mode,
-            "logo_url": item.logo_url,
-            "favicon_url": item.favicon_url,
-            "config": config,
-            "availability": availability,
-            "has_conversation_history": has_conversation_history,
-            "announcement": announcement,
-            "welcome_message": welcome_message,
-            "open_agent_welcome_message": open_agent_welcome_message,
-            "open_agent_ai_disclaimer": open_agent_ai_disclaimer,
-            "read_status": read_status,
-        }
+            from app.services.conversation_announcement_rule_service import ConversationAnnouncementRuleService
+            from app.services.conversation_read_status_service import ConversationReadStatusService
+            from app.services.welcome_message_rule_service import WelcomeMessageRuleService
+            announcement = await ConversationAnnouncementRuleService.match_public_announcement(db, item)
+            read_status = await ConversationReadStatusService.get_public_config(db, item.tenant_id)
+            welcome_message = None
+            if not config.get("open_agent_enabled"):
+                welcome_message = await WelcomeMessageRuleService.match_public_welcome_message(db, item)
+            elif config.get("open_agent_agent_id"):
+                open_agent_agent_id = int(config["open_agent_agent_id"])
+                tenant_id = item.tenant_id
+            payload = {
+                "channel_key": item.channel_key,
+                "name": item.name,
+                "channel_type": item.channel_type,
+                "access_mode": item.access_mode,
+                "logo_url": item.logo_url,
+                "favicon_url": item.favicon_url,
+                "config": config,
+                "availability": availability,
+                "has_conversation_history": has_conversation_history,
+                "announcement": announcement,
+                "welcome_message": welcome_message,
+                "open_agent_welcome_message": None,
+                "open_agent_ai_disclaimer": None,
+                "read_status": read_status,
+            }
+
+        if open_agent_agent_id is not None and tenant_id is not None:
+            open_agent_runtime_config = await OpenAgentSettingsService.get_agent_visitor_runtime_config_managed(
+                tenant_id,
+                open_agent_agent_id,
+                open_agent_client=open_agent_client,
+            )
+            payload["open_agent_welcome_message"] = open_agent_runtime_config.welcome_message
+            payload["open_agent_ai_disclaimer"] = open_agent_runtime_config.ai_disclaimer
+        return payload
 
     @staticmethod
     async def create_visitor_session(

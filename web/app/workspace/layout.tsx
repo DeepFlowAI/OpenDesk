@@ -47,6 +47,7 @@ import {
 import type { Conversation, Message } from '@/models/conversation'
 import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 import { logAuthEvent } from '@/utils/auth-log'
+import { adoptNewerTokenIfAny } from '@/utils/auth-session'
 import { redirectToSessionReplacedLogin } from '@/utils/session-replacement'
 import { useWorkspaceNotificationAlert } from '@/hooks/use-workspace-notification-alert'
 import { useWorkspaceTitleBlink } from '@/hooks/use-workspace-title-blink'
@@ -172,14 +173,28 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
   }, [authRefreshing, mounted, token, user, pathname, router])
 
   useEffect(() => {
-    if (authFailed) {
-      void logAuthEvent('session_cleared', { trigger: 'socket_auth_failed' }, { immediate: true }).then(() => {
-        useAuthStore.getState().clearAuth()
-        if (sessionReplaced) {
-          redirectToSessionReplacedLogin()
-        }
+    if (!authFailed) return
+
+    // Prefer the token the socket actually rejected; memory may already have
+    // been updated by a cross-tab storage listener before this effect runs.
+    const staleToken =
+      useSocketStore.getState().authFailureToken ?? useAuthStore.getState().token
+    if (adoptNewerTokenIfAny(staleToken)) {
+      void logAuthEvent('session_clear_skipped', { trigger: 'socket_auth_failed' }, { immediate: true })
+      useSocketStore.setState({
+        authFailed: false,
+        sessionReplaced: false,
+        authFailureToken: null,
       })
+      return
     }
+
+    void logAuthEvent('session_cleared', { trigger: 'socket_auth_failed' }, { immediate: true }).then(() => {
+      useAuthStore.getState().clearAuth()
+      if (sessionReplaced) {
+        redirectToSessionReplacedLogin()
+      }
+    })
   }, [authFailed, sessionReplaced])
 
   useEffect(() => {

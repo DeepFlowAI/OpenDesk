@@ -7,6 +7,11 @@ export interface AgentCallDevice {
   unavailable_reason: string | null
   extension_number?: string | null
   registration_status?: 'registered' | 'unregistered' | null
+  status_message?: string | null
+  current_occupant_employee_id?: number | null
+  current_occupant_name?: string | null
+  blocking_agent_name?: string | null
+  blocking_agent_count?: number | null
 }
 
 export interface AgentDeviceListResponse {
@@ -15,4 +20,13 @@ export interface AgentDeviceListResponse {
 
 export interface AgentCurrentDevice {
   device_type: CallDeviceType | null
+  available?: boolean
+  unavailable_reason?: string | null
+  status_message?: string | null
+  extension_number?: string | null
+  registration_status?: 'registered' | 'unregistered' | null
+  current_occupant_employee_id?: number | null
+  current_occupant_name?: string | null
+  blocking_agent_name?: string | null
+  blocking_agent_count?: number | null
 }

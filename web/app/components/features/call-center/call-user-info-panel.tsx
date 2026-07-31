@@ -27,6 +27,8 @@ import { FieldType } from '@/types/field-enums'
 type Props = {
   recordId: number | null | undefined
   fallbackNumber: string
+  /** Direct user ref when there is no local CDR (consult / transfer target). */
+  userRef?: string | number | null
 }
 
 const SYSTEM_KEY_ALIAS: Record<string, keyof User> = {
@@ -55,9 +57,20 @@ const INSTANT_SAVE_FIELD_TYPES = new Set<FieldType>([
   FieldType.ORGANIZATION_SELECT,
   FieldType.EMPLOYEE_SELECT,
   FieldType.GROUP_SELECT,
+  // Date pickers blur the container when the calendar opens; save on change instead.
+  FieldType.DATE,
+  FieldType.DATETIME,
+  FieldType.TIME,
+])
+const BLUR_SAVE_EXCLUDED_FIELD_TYPES = new Set<FieldType>([
+  FieldType.FILE,
+  FieldType.DATE,
+  FieldType.DATETIME,
+  FieldType.TIME,
+  FieldType.RICH_TEXT,
 ])
 
-export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
+export function CallUserInfoPanel({ recordId, fallbackNumber, userRef = null }: Props) {
   const router = useRouter()
   const { locale } = useLocaleStore()
   const currentUser = useAuthStore((state) => state.user)
@@ -67,7 +80,8 @@ export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
   const attemptedIdentifyRef = useRef<number | null>(null)
 
   const record = recordQuery.data ?? null
-  const associatedUserRef = record?.user_public_id ?? record?.user_id ?? null
+  const associatedUserRef =
+    record?.user_public_id ?? record?.user_id ?? userRef ?? null
   const userQuery = useUser(associatedUserRef)
   const fieldsQuery = useUnifiedFields({ domain: 'user', locale, include_metadata: false })
   const updateUser = useUpdateUser()
@@ -92,7 +106,10 @@ export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
     [fieldsQuery.data?.items],
   )
 
-  const status = record?.user_association_status ?? (fallbackNumber ? 'unlinked' : 'unknown')
+  // Consult/transfer targets get a userRef without a local CDR — treat as linked.
+  const status =
+    record?.user_association_status
+    ?? (associatedUserRef ? 'linked' : fallbackNumber ? 'unlinked' : 'unknown')
   const canViewUser = !!associatedUserRef && (status === 'linked' || status === 'created')
 
   return (
@@ -116,11 +133,11 @@ export function CallUserInfoPanel({ recordId, fallbackNumber }: Props) {
         </p>
       )}
 
-      {!recordId ? (
+      {!recordId && !userRef ? (
         <PanelStateMessage>{fallbackNumber ? '等待通话记录生成后匹配用户' : '无法根据未知号码关联用户'}</PanelStateMessage>
-      ) : recordQuery.isLoading ? (
+      ) : recordId && recordQuery.isLoading ? (
         <PanelStateMessage>用户信息加载中...</PanelStateMessage>
-      ) : recordQuery.isError || identifyUser.isError ? (
+      ) : recordId && (recordQuery.isError || identifyUser.isError) ? (
         <RetryState
           message="用户识别失败，请重试"
           onRetry={() => {
@@ -331,7 +348,7 @@ function EditableInfoRow({
         <div
           onBlurCapture={(event) => {
             if (event.currentTarget.contains(event.relatedTarget as Node | null)) return
-            if (field.field_type === FieldType.FILE) return
+            if (BLUR_SAVE_EXCLUDED_FIELD_TYPES.has(field.field_type)) return
             void onSave()
           }}
           onKeyDown={(event) => {
@@ -339,7 +356,12 @@ function EditableInfoRow({
               event.preventDefault()
               onCancel()
             }
-            if (event.key === 'Enter' && field.field_type !== FieldType.MULTI_LINE_TEXT && !INSTANT_SAVE_FIELD_TYPES.has(field.field_type)) {
+            if (
+              event.key === 'Enter' &&
+              field.field_type !== FieldType.MULTI_LINE_TEXT &&
+              field.field_type !== FieldType.RICH_TEXT &&
+              !INSTANT_SAVE_FIELD_TYPES.has(field.field_type)
+            ) {
               event.preventDefault()
               void onSave()
             }
@@ -360,6 +382,26 @@ function EditableInfoRow({
             />
             {saving && <IconLoader2 size={14} className="absolute right-2 top-2.5 animate-spin text-muted-foreground" />}
           </div>
+          {field.field_type === FieldType.RICH_TEXT && (
+            <div className="mt-1.5 flex items-center gap-2">
+              <button
+                type="button"
+                disabled={saving}
+                onClick={() => void onSave()}
+                className="rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground disabled:opacity-50"
+              >
+                保存
+              </button>
+              <button
+                type="button"
+                disabled={saving}
+                onClick={onCancel}
+                className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground disabled:opacity-50"
+              >
+                取消
+              </button>
+            </div>
+          )}
           {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
         </div>
       ) : (

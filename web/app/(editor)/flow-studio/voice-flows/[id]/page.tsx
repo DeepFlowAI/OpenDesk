@@ -76,11 +76,19 @@ function EditorBody({ id }: { id: number }) {
   const [savedSnapshot, setSavedSnapshot] = useState<string>('')
   const [validationIssues, setValidationIssues] = useState<ValidationIssue[]>([])
   const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false)
+  const isPreviewing = previewVersion !== null
 
   // Track which version we've hydrated so a window-focus refetch can't
   // silently overwrite the user's in-progress edits. We only re-hydrate
   // when the active version changes (save / rollback / explicit refetch).
   const hydratedVersionRef = useRef<number | null>(null)
+  // Stash the editable draft when entering history preview so Exit restores it.
+  const draftBeforePreviewRef = useRef<{
+    nodes: Node[]
+    edges: Edge[]
+    name: string
+    description: string
+  } | null>(null)
 
   useEffect(() => {
     if (!flow) return
@@ -90,10 +98,20 @@ function EditorBody({ id }: { id: number }) {
     const graph = flow.graph_json ?? { version: 1, nodes: [], edges: [], variables: [] }
     const { nodes: n, edges: e } = fromBackend(graph)
     setNodes(n)
-    setEdges(e)
+    // Drop VoiceSpeed handoff edges that incorrectly target announcement nodes.
+    const invalidHandoffTargets = new Set(['play', 'collect', 'condition', 'start'])
+    const sanitizedEdges = e.filter((edge) => {
+      const src = n.find((node) => node.id === edge.source)
+      if (src?.type !== 'voicespeed' || (edge.sourceHandle ?? 'next') !== 'handoff') {
+        return true
+      }
+      const tgt = n.find((node) => node.id === edge.target)
+      return !tgt || !invalidHandoffTargets.has(String(tgt.type))
+    })
+    setEdges(sanitizedEdges)
     setName(flow.name)
     setDescription(flow.description ?? '')
-    setSavedSnapshot(snap(flow.name, flow.description ?? '', n, e))
+    setSavedSnapshot(snap(flow.name, flow.description ?? '', n, sanitizedEdges))
   }, [flow, setNodes, setEdges])
 
   const currentSnap = useMemo(() => snap(name, description, nodes, edges), [name, description, nodes, edges])
@@ -108,12 +126,14 @@ function EditorBody({ id }: { id: number }) {
   }
 
   const updateNode = (nodeId: string, patch: { data?: Record<string, unknown> }) => {
+    if (isPreviewing) return
     setNodes((prev) =>
       prev.map((n) => (n.id === nodeId ? { ...n, data: { ...n.data, ...(patch.data ?? {}) } } : n)),
     )
   }
 
   const addNode = (type: NodeType) => {
+    if (isPreviewing) return
     const n = makeNewNode(type)
     setNodes((prev) => [...prev, n])
     setSelectedId(n.id)
@@ -122,6 +142,7 @@ function EditorBody({ id }: { id: number }) {
   // Set/replace/clear the single edge from a node's named outlet — keeps the
   // property-panel outlet dropdown and the canvas connection in sync.
   const connectOutlet = (sourceId: string, handle: string, targetId: string | null) => {
+    if (isPreviewing) return
     setEdges((prev) => {
       const filtered = prev.filter(
         (e) => !(e.source === sourceId && (e.sourceHandle ?? 'next') === handle),
@@ -142,12 +163,34 @@ function EditorBody({ id }: { id: number }) {
   }
 
   const addNodeAt = (type: NodeType, position: { x: number; y: number }) => {
+    if (isPreviewing) return
     const n = makeNewNode(type, position)
     setNodes((prev) => [...prev, n])
     setSelectedId(n.id)
   }
 
+  const exitPreview = () => {
+    const draft = draftBeforePreviewRef.current
+    draftBeforePreviewRef.current = null
+    setPreviewVersion(null)
+    if (draft) {
+      setNodes(draft.nodes)
+      setEdges(draft.edges)
+      setName(draft.name)
+      setDescription(draft.description)
+      return
+    }
+    if (flow) {
+      const g = flow.graph_json ?? { version: 1, nodes: [], edges: [], variables: [] }
+      const { nodes: n2, edges: e2 } = fromBackend(g)
+      setNodes(n2)
+      setEdges(e2)
+      hydratedVersionRef.current = flow.current_version_no ?? null
+    }
+  }
+
   const handleSave = async () => {
+    if (isPreviewing) return
     if (!name.trim()) {
       toast.error('请填写流程名称')
       return
@@ -209,6 +252,7 @@ function EditorBody({ id }: { id: number }) {
             name={name}
             description={description}
             onChange={({ name: n, description: d }) => {
+              if (isPreviewing) return
               setName(n)
               setDescription(d)
             }}
@@ -225,14 +269,15 @@ function EditorBody({ id }: { id: number }) {
           <button
             type="button"
             onClick={() => setVersionsOpen(true)}
-            className="flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted"
+            disabled={isPreviewing}
+            className="flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-40"
           >
             <IconHistory size={14} /> 历史版本
           </button>
           <button
             type="button"
             onClick={handleSave}
-            disabled={update.isPending || !isDirty}
+            disabled={update.isPending || !isDirty || isPreviewing}
             className="h-9 rounded-md bg-black px-4 text-sm font-medium text-white disabled:opacity-40"
           >
             {update.isPending ? '保存中...' : '保存'}
@@ -273,15 +318,22 @@ function EditorBody({ id }: { id: number }) {
             selectedNodeId={selectedId}
             onSelect={setSelectedId}
             onDropNode={addNodeAt}
+            readOnly={isPreviewing}
           />
-          <div className="pointer-events-none absolute inset-x-0 bottom-4 flex justify-center">
-            <div className="pointer-events-auto">
-              <NodeToolbar onAdd={addNode} />
+          {!isPreviewing && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-4 flex justify-center">
+              <div className="pointer-events-auto">
+                <NodeToolbar onAdd={addNode} />
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
-        <aside className="flex w-[360px] shrink-0 flex-col overflow-y-auto border-l border-border bg-white">
+        <aside
+          className={`flex w-[360px] shrink-0 flex-col overflow-y-auto border-l border-border bg-white ${
+            isPreviewing ? 'pointer-events-none opacity-60' : ''
+          }`}
+        >
           <PropertyPanel
             selected={selected}
             updateNode={updateNode}
@@ -302,12 +354,28 @@ function EditorBody({ id }: { id: number }) {
           flowId={id}
           onClose={() => setVersionsOpen(false)}
           onPreview={(versionNo, graph) => {
+            draftBeforePreviewRef.current = {
+              nodes,
+              edges,
+              name,
+              description,
+            }
             const { nodes: n, edges: e } = fromBackend(graph)
+            const invalidHandoffTargets = new Set(['play', 'collect', 'condition', 'start'])
+            const sanitizedEdges = e.filter((edge) => {
+              const src = n.find((node) => node.id === edge.source)
+              if (src?.type !== 'voicespeed' || (edge.sourceHandle ?? 'next') !== 'handoff') {
+                return true
+              }
+              const tgt = n.find((node) => node.id === edge.target)
+              return !tgt || !invalidHandoffTargets.has(String(tgt.type))
+            })
             setNodes(n)
-            setEdges(e)
+            setEdges(sanitizedEdges)
+            setSelectedId(null)
             setPreviewVersion(versionNo)
             setVersionsOpen(false)
-            toast.info(`预览版本 v${versionNo}（只读，未保存）`)
+            toast.info(`预览版本 v${versionNo}（只读）`)
           }}
           onRollbackSuccess={() => refetch()}
         />
@@ -327,24 +395,10 @@ function EditorBody({ id }: { id: number }) {
         }}
       />
 
-      {previewVersion !== null && (
-        <div className="fixed bottom-6 left-1/2 z-30 -translate-x-1/2 rounded-full bg-black/90 px-4 py-2 text-sm text-white shadow-lg">
-          预览版本 v{previewVersion} · 未编辑
-          <button
-            type="button"
-            onClick={() => {
-              setPreviewVersion(null)
-              if (flow) {
-                const g = flow.graph_json ?? { version: 1, nodes: [], edges: [], variables: [] }
-                const { nodes: n2, edges: e2 } = fromBackend(g)
-                setNodes(n2)
-                setEdges(e2)
-                hydratedVersionRef.current = flow.current_version_no ?? null
-              }
-              refetch()
-            }}
-            className="ml-3 underline"
-          >
+      {isPreviewing && (
+        <div className="fixed bottom-6 left-1/2 z-40 -translate-x-1/2 rounded-full bg-black/90 px-4 py-2 text-sm text-white shadow-lg">
+          预览版本 v{previewVersion} · 只读
+          <button type="button" onClick={exitPreview} className="ml-3 underline">
             退出预览
           </button>
         </div>

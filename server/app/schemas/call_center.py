@@ -12,6 +12,7 @@ from app.schemas.ticket import RelatedTicketResponse
 
 
 # ─────────────── Agent status ───────────────
+# Keep in sync with app.constants.call_center.AgentStatus / AgentResourceState.
 
 AgentStatusValue = Literal["ready", "busy", "break", "after_call_work", "offline"]
 AgentResourceState = Literal[
@@ -41,6 +42,14 @@ class AgentStatusResponse(BaseModel):
     reserved_until: datetime | None = None
     resource_updated_at: datetime | None = None
     last_release_reason: str | None = None
+    # In-call control restore after browser refresh (from Redis InCallLegs).
+    consult_active: bool = False
+    consult_target_employee_id: int | None = None
+    # none | ringing | active — see constants.ConsultState
+    consult_state: str | None = None
+    # When the agent entered in_call (Redis). Used to restore the live timer for
+    # consult targets that have no CallRecord of their own.
+    in_call_since: datetime | None = None
 
 
 class AgentStatusUpdate(BaseModel):
@@ -68,6 +77,15 @@ class ConsultableAgent(BaseModel):
     name: str | None = None
     avatar: str | None = None
     status: AgentStatusValue
+
+
+class TransferQueue(BaseModel):
+    """A queue that can be a blind-transfer target, with live availability."""
+
+    queue_type: str  # always "employee_group"
+    queue_id: int
+    name: str
+    available_agent_count: int
 
 
 # ─────────────── Call record ───────────────
@@ -296,3 +314,16 @@ class DialWebRTCOfferRequest(BaseModel):
 class DialWebRTCOfferResponse(BaseModel):
     webrtc_call_id: str
     sdp: str
+
+
+class MediaReconnectRequest(BaseModel):
+    """Browser SDP offer to rebuild the agent's media leg mid-call."""
+
+    sdp: str = Field(..., min_length=1)
+
+
+class MediaReconnectResponse(BaseModel):
+    call_id: str
+    sdp: str
+    consult_active: bool = False
+    consult_target_employee_id: int | None = None

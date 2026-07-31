@@ -2,8 +2,9 @@
 
 import { useEffect, useRef } from 'react'
 import { useAuthStore } from '@/context/auth-store'
-import { refreshAccessToken } from '@/service/base'
+import { getRefreshFailureState, refreshAccessToken } from '@/service/base'
 import { logAuthEvent } from '@/utils/auth-log'
+import { adoptNewerTokenIfAny, readStoredToken } from '@/utils/auth-session'
 import { redirectToSessionReplacedLogin } from '@/utils/session-replacement'
 
 // Re-evaluate whether the token needs refreshing on a short tick. Using a
@@ -59,13 +60,34 @@ export function useTokenRefresh() {
       const now = Date.now()
       if (now >= expiresAt) {
         // Token is already dead; a silent refresh is no longer possible.
-        await logAuthEvent('session_cleared', { trigger: 'token_expired' }, { immediate: true })
+        // Another tab may have logged in again with a newer token — don't
+        // wipe that shared session.
+        if (adoptNewerTokenIfAny(current)) {
+          await logAuthEvent('session_clear_skipped', { trigger: 'token_expired' }, { immediate: true })
+          return
+        }
+        const failure = getRefreshFailureState()
+        await logAuthEvent(
+          'session_cleared',
+          {
+            trigger: 'token_expired',
+            consecutive_failures: failure.consecutiveFailures,
+            last_status: failure.lastStatus ?? undefined,
+            last_reason: failure.lastReason ?? undefined,
+            token_exp: new Date(expiresAt).toISOString(),
+            expired_for_ms: now - expiresAt,
+          },
+          { immediate: true },
+        )
         useAuthStore.getState().clearAuth()
         return
       }
       // Still outside the renewal window → nothing to do yet.
       if (now < expiresAt - REFRESH_LEAD_MS) return
 
+      // Capture the token we are about to refresh so a concurrent login in
+      // another tab can be detected if this attempt fails.
+      const tokenBeforeRefresh = readStoredToken()
       refreshingRef.current = true
       try {
         const outcome = await refreshAccessToken()
@@ -73,10 +95,26 @@ export function useTokenRefresh() {
         if (outcome.status === 'success' && currentUser) {
           setAuth(currentUser, outcome.token)
         } else if (outcome.status === 'session_replaced') {
+          if (adoptNewerTokenIfAny(tokenBeforeRefresh)) {
+            await logAuthEvent(
+              'session_clear_skipped',
+              { trigger: 'periodic_refresh_session_replaced' },
+              { immediate: true },
+            )
+            return
+          }
           await logAuthEvent('session_cleared', { trigger: 'periodic_refresh_session_replaced' }, { immediate: true })
           clearAuth()
           redirectToSessionReplacedLogin()
         } else if (outcome.status === 'auth_error' || outcome.status === 'no_token') {
+          if (adoptNewerTokenIfAny(tokenBeforeRefresh)) {
+            await logAuthEvent(
+              'session_clear_skipped',
+              { trigger: 'periodic_refresh_auth_error' },
+              { immediate: true },
+            )
+            return
+          }
           await logAuthEvent('session_cleared', { trigger: 'periodic_refresh_auth_error' }, { immediate: true })
           clearAuth()
         }
@@ -87,8 +125,23 @@ export function useTokenRefresh() {
       }
     }
 
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void tick()
+    }
+    const onWake = () => {
+      void tick()
+    }
+
     void tick()
     const timer = setInterval(() => void tick(), CHECK_INTERVAL_MS)
-    return () => clearInterval(timer)
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onWake)
+    window.addEventListener('online', onWake)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onWake)
+      window.removeEventListener('online', onWake)
+    }
   }, [token, user])
 }

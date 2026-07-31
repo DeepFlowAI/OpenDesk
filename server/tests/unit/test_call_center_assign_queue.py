@@ -158,6 +158,69 @@ async def test_queue_picker_no_connected_agents_returns_none(monkeypatch):
     reserve.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_queue_picker_excludes_failed_employee_ids(monkeypatch):
+    picker = QueuePicker()
+    employees = [
+        SimpleNamespace(id=1, display_name="A1", nickname=None, name="A1", username="a1"),
+        SimpleNamespace(id=2, display_name="A2", nickname=None, name="A2", username="a2"),
+    ]
+    monkeypatch.setattr(AgentStatusService, "is_connected", AsyncMock(return_value=True))
+    reserve = AsyncMock(return_value={"resource_state": "ringing"})
+    monkeypatch.setattr(CcAgentResourceService, "ensure_from_visible", AsyncMock())
+    monkeypatch.setattr(CcAgentResourceService, "reserve_inbound", reserve)
+    monkeypatch.setattr(
+        CcAgentResourceService, "next_queue_index", AsyncMock(return_value=0)
+    )
+
+    pick = await picker.pick_ready_agent_for_queue(
+        _FakeDb(employees),
+        tenant_id=7,
+        queue_type="employee_group",
+        queue_id=9,
+        r=object(),
+        call_id="call-1",
+        offer_id="offer-1",
+        ttl_seconds=30,
+        exclude_employee_ids={1},
+    )
+
+    assert pick["employee_id"] == 2
+    assert reserve.await_args.args[2] == 2
+
+
+@pytest.mark.asyncio
+async def test_queue_picker_without_exclude_unchanged(monkeypatch):
+    """Omitting exclude_employee_ids keeps the previous first-connected pick."""
+
+    picker = QueuePicker()
+    employees = [
+        SimpleNamespace(id=1, display_name="A1", nickname=None, name="A1", username="a1"),
+        SimpleNamespace(id=2, display_name="A2", nickname=None, name="A2", username="a2"),
+    ]
+    monkeypatch.setattr(AgentStatusService, "is_connected", AsyncMock(return_value=True))
+    reserve = AsyncMock(return_value={"resource_state": "ringing"})
+    monkeypatch.setattr(CcAgentResourceService, "ensure_from_visible", AsyncMock())
+    monkeypatch.setattr(CcAgentResourceService, "reserve_inbound", reserve)
+    monkeypatch.setattr(
+        CcAgentResourceService, "next_queue_index", AsyncMock(return_value=0)
+    )
+
+    pick = await picker.pick_ready_agent_for_queue(
+        _FakeDb(employees),
+        tenant_id=7,
+        queue_type="employee_group",
+        queue_id=9,
+        r=object(),
+        call_id="call-1",
+        offer_id="offer-1",
+        ttl_seconds=30,
+    )
+
+    assert pick["employee_id"] == 1
+    assert reserve.await_args.args[2] == 1
+
+
 def _candidate(
     queue_id: int,
     *,

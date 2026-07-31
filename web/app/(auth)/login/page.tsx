@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useRef, Suspense } from 'react'
+import { useState, useEffect, useCallback, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { IconHeadset, IconEye, IconEyeOff } from '@tabler/icons-react'
 import { useLogin, useSsoLogin } from '@/service/use-auth'
@@ -15,6 +15,65 @@ import { LegalFooter } from '@/components/legal-footer'
 import { SESSION_REPLACED_REASON } from '@/utils/session-replacement'
 
 const LAST_TENANT_KEY = 'opendesk_last_tenant'
+// Survive AuthSessionKeeper reloads that strip ?sso_token= from the address bar.
+const SSO_PENDING_TOKEN_KEY = 'opendesk_pending_sso_token'
+const SSO_PENDING_REDIRECT_KEY = 'opendesk_pending_sso_redirect'
+// Set when SSO finishes so a mid-navigation reload still enters the app.
+const SSO_NAV_KEY = 'opendesk_sso_nav'
+// Module-level so Suspense remounts of LoginPage do not re-exchange the same token.
+const handledSsoTokens = new Set<string>()
+
+function clearPendingSso() {
+  try {
+    sessionStorage.removeItem(SSO_PENDING_TOKEN_KEY)
+    sessionStorage.removeItem(SSO_PENDING_REDIRECT_KEY)
+  } catch {
+    // sessionStorage unavailable
+  }
+}
+
+function readPendingSso(): { token: string | null; redirect: string | null } {
+  try {
+    return {
+      token: sessionStorage.getItem(SSO_PENDING_TOKEN_KEY),
+      redirect: sessionStorage.getItem(SSO_PENDING_REDIRECT_KEY),
+    }
+  } catch {
+    return { token: null, redirect: null }
+  }
+}
+
+function writePendingSso(token: string, redirect: string | null) {
+  try {
+    sessionStorage.setItem(SSO_PENDING_TOKEN_KEY, token)
+    if (redirect && redirect.startsWith('/')) {
+      sessionStorage.setItem(SSO_PENDING_REDIRECT_KEY, redirect)
+    } else {
+      sessionStorage.removeItem(SSO_PENDING_REDIRECT_KEY)
+    }
+  } catch {
+    // sessionStorage unavailable
+  }
+}
+
+function markSsoNavigation(path: string) {
+  try {
+    sessionStorage.setItem(SSO_NAV_KEY, path)
+  } catch {
+    // sessionStorage unavailable
+  }
+}
+
+function consumeSsoNavigation(): string | null {
+  try {
+    const path = sessionStorage.getItem(SSO_NAV_KEY)
+    if (!path) return null
+    sessionStorage.removeItem(SSO_NAV_KEY)
+    return path.startsWith('/') ? path : null
+  } catch {
+    return null
+  }
+}
 
 export default function LoginPageWrapper() {
   return (
@@ -27,12 +86,11 @@ export default function LoginPageWrapper() {
 function LoginPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { setAuth } = useAuthStore()
+  const { setAuth, token, user } = useAuthStore()
   const { locale, setLocale } = useLocaleStore()
   const loginMutation = useLogin()
   const ssoLoginMutation = useSsoLogin()
   const { data: systemInfo } = useSystemInfo()
-  const ssoHandledRef = useRef(false)
   // Default to false (= show field) when info unavailable — safer for users
   // who otherwise wouldn't see what to type.
   const singleTenantMode = systemInfo?.single_tenant_mode ?? false
@@ -43,34 +101,84 @@ function LoginPage() {
   const [showSessionReplacedAlert, setShowSessionReplacedAlert] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [touched, setTouched] = useState<Record<string, boolean>>({})
+  const [mounted, setMounted] = useState(false)
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
 
   useEffect(() => {
     setShowSessionReplacedAlert(searchParams.get('reason') === SESSION_REPLACED_REASON)
   }, [searchParams])
 
+  // SSO finished but a cross-tab reload interrupted router.replace — resume entry.
+  // Do not auto-bounce every logged-in visit to /login (password account switch).
   useEffect(() => {
-    const ssoToken = searchParams.get('sso_token')
-    if (!ssoToken || ssoHandledRef.current) return
-    ssoHandledRef.current = true
+    if (!mounted || !token || !user) return
+    if (searchParams.get('reason') === SESSION_REPLACED_REASON) return
+    if (searchParams.get('sso_token') || readPendingSso().token) return
+    const path = consumeSsoNavigation()
+    if (!path) return
+    router.replace(path)
+  }, [mounted, token, user, router, searchParams])
+
+  useEffect(() => {
+    const fromQuery = searchParams.get('sso_token')
+    const pending = readPendingSso()
+    const ssoToken = fromQuery || pending.token
+    if (!ssoToken || handledSsoTokens.has(ssoToken)) return
+    handledSsoTokens.add(ssoToken)
+
+    // Capture before stripping the query; useSearchParams may update after replaceState.
+    const redirect =
+      (fromQuery ? searchParams.get('redirect') : null) || pending.redirect
+
+    // Persist across reloads, then drop sso_token from the URL so a later
+    // reload cannot keep replaying a bearer credential from the address bar.
+    writePendingSso(ssoToken, redirect)
+    if (fromQuery) {
+      const url = new URL(window.location.href)
+      url.searchParams.delete('sso_token')
+      const next = `${url.pathname}${url.search}${url.hash}`
+      window.history.replaceState(window.history.state, '', next)
+    }
+
     setApiError('')
     ssoLoginMutation.mutate(ssoToken, {
       onSuccess: (data) => {
-        setAuth(data.user, data.access_token)
-        const redirect = searchParams.get('redirect')
         const defaultPath = getDefaultAccessiblePath(data.user)
-        router.replace(redirect && redirect.startsWith('/') ? redirect : defaultPath)
+        const path = redirect && redirect.startsWith('/') ? redirect : defaultPath
+        setAuth(data.user, data.access_token)
+        markSsoNavigation(path)
+        clearPendingSso()
+        router.replace(path)
       },
       onError: async (err: unknown) => {
+        clearPendingSso()
         let status = 0
         let code = ''
+        let message = ''
         if (err && typeof err === 'object' && 'response' in err) {
           const response = (err as { response: Response }).response
           status = response.status
           try {
             const body = await response.json()
             code = body?.code ?? ''
+            message = typeof body?.message === 'string' ? body.message : ''
           } catch {
             // ignore json parse error
+          }
+        }
+        // First attempt may have already claimed jti and written localStorage
+        // before this tab was reloaded — land on that session instead of /login.
+        if (message.toLowerCase().includes('already used')) {
+          const current = useAuthStore.getState()
+          if (current.token && current.user) {
+            const defaultPath = getDefaultAccessiblePath(current.user)
+            const path = redirect && redirect.startsWith('/') ? redirect : defaultPath
+            markSsoNavigation(path)
+            router.replace(path)
+            return
           }
         }
         setApiError(mapApiError(status, code))

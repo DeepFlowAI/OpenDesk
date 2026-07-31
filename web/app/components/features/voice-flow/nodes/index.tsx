@@ -23,6 +23,7 @@ import {
   type PlayData,
   type VoiceSpeedData,
 } from '@/models/voice-flow-graph'
+import { useAudioAsset } from '@/service/use-audio-assets'
 
 // Reusable card chrome
 function NodeCard({
@@ -44,7 +45,7 @@ function NodeCard({
 }) {
   return (
     <div
-      className="relative min-w-[180px] rounded-lg bg-white shadow-sm"
+      className="relative w-[220px] max-w-[220px] rounded-lg bg-white shadow-sm"
       style={{
         boxShadow: selected
           ? `0 0 0 2px ${color}, 0 1px 3px rgba(0,0,0,0.08)`
@@ -69,7 +70,11 @@ function NodeCard({
         <span className="flex-1 truncate">{title}</span>
         {badge && <span className="rounded bg-white/25 px-1 text-[10px]">{badge}</span>}
       </div>
-      {children && <div className="px-3 py-2 text-[11px] text-foreground/80">{children}</div>}
+      {children && (
+        <div className="px-3 py-2 text-[11px] break-words [overflow-wrap:anywhere] text-foreground/80">
+          {children}
+        </div>
+      )}
     </div>
   )
 }
@@ -96,10 +101,20 @@ export function StartNodeView({ selected }: NodeProps) {
 
 // ──────────────── play ────────────────
 
+function PlayAudioPreview({ assetId }: { assetId: number }) {
+  const assetQuery = useAudioAsset(assetId > 0 ? assetId : null)
+  const name = assetQuery.data?.name
+  return <>{name || `音频文件 #${assetId}`}</>
+}
+
 export function PlayNodeView({ data, selected }: NodeProps) {
   const d = data as PlayData
   const preview =
-    d.prompt.kind === 'tts' ? d.prompt.text || '未配置语音文案' : `音频文件 #${d.prompt.asset_id}`
+    d.prompt.kind === 'tts' ? (
+      d.prompt.text || '未配置语音文案'
+    ) : (
+      <PlayAudioPreview assetId={d.prompt.asset_id} />
+    )
   return (
     <NodeCard
       color={NODE_COLOR.play}
@@ -108,7 +123,7 @@ export function PlayNodeView({ data, selected }: NodeProps) {
       badge="play"
       selected={selected}
     >
-      <p className="line-clamp-2">{preview}</p>
+      <p className="line-clamp-3 break-all">{preview}</p>
       <Handle
         type="source"
         position={Position.Right}
@@ -173,7 +188,7 @@ export function ConditionNodeView({ data, selected }: NodeProps) {
     >
       {d.groups.map((g, i) => (
         <div key={g.id} className="flex items-center gap-1">
-          <span className="text-foreground/70">[{g.name}]</span>
+          <span className="min-w-0 flex-1 truncate text-foreground/70">[{g.name}]</span>
           <Handle
             type="source"
             position={Position.Right}

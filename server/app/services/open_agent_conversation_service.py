@@ -1710,53 +1710,59 @@ class OpenAgentConversationService:
         )
 
     @staticmethod
-    async def submit_feedback_for_session(
-        db: AsyncSession,
+    async def submit_feedback_for_session_managed(
         conversation_public_id: str,
         visitor_context: dict,
         body: OpenAgentFeedbackRequest,
         open_agent_client: BaseOpenAgentClient | None = None,
     ) -> dict:
-        conversation = await ConversationService.get_conversation_for_visitor_session(
-            db,
-            conversation_public_id=conversation_public_id,
-            tenant_id=visitor_context["tenant_id"],
-            channel_id=visitor_context["channel_id"],
-            visitor_external_id=visitor_context["visitor_external_id"],
-        )
-        if not conversation.channel:
-            raise ValidationError("Channel is required")
+        """Submit OpenAgent feedback without holding a DB session during the HTTP call."""
+        async with AsyncSessionLocal() as db:
+            conversation = await ConversationService.get_conversation_for_visitor_session(
+                db,
+                conversation_public_id=conversation_public_id,
+                tenant_id=visitor_context["tenant_id"],
+                channel_id=visitor_context["channel_id"],
+                visitor_external_id=visitor_context["visitor_external_id"],
+            )
+            if not conversation.channel:
+                raise ValidationError("Channel is required")
 
-        config = ChannelConfig.model_validate(conversation.channel.config or {})
-        if not config.open_agent_enabled or not config.open_agent_agent_id:
-            raise ValidationError("OpenAgent bot is not enabled")
-        if not config.open_agent_feedback_enabled:
-            raise ValidationError("OpenAgent feedback is not enabled")
+            config = ChannelConfig.model_validate(conversation.channel.config or {})
+            if not config.open_agent_enabled or not config.open_agent_agent_id:
+                raise ValidationError("OpenAgent bot is not enabled")
+            if not config.open_agent_feedback_enabled:
+                raise ValidationError("OpenAgent feedback is not enabled")
 
-        message = await MessageRepository.get_by_id_for_conversation(
-            db,
-            tenant_id=conversation.tenant_id,
-            conversation_id=conversation.id,
-            message_id=body.message_id,
-        )
-        if not message:
-            raise ValidationError("Feedback message is not available")
-        if message.sender_type != MessageSenderType.BOT.value:
-            raise ValidationError("Only bot messages can receive OpenAgent feedback")
+            message = await MessageRepository.get_by_id_for_conversation(
+                db,
+                tenant_id=conversation.tenant_id,
+                conversation_id=conversation.id,
+                message_id=body.message_id,
+            )
+            if not message:
+                raise ValidationError("Feedback message is not available")
+            if message.sender_type != MessageSenderType.BOT.value:
+                raise ValidationError("Only bot messages can receive OpenAgent feedback")
 
-        metadata = dict(getattr(message, "metadata_", None) or {})
-        feedback_step_id = OpenAgentConversationService._feedback_step_int(
-            metadata.get("open_agent_feedback_step_id"),
-        )
-        if feedback_step_id is None or feedback_step_id != body.step_id:
-            raise ValidationError("OpenAgent feedback step does not match the message")
-        if not conversation.open_agent_conversation_id:
-            raise ValidationError("OpenAgent conversation is not available for feedback")
+            metadata = dict(getattr(message, "metadata_", None) or {})
+            feedback_step_id = OpenAgentConversationService._feedback_step_int(
+                metadata.get("open_agent_feedback_step_id"),
+            )
+            if feedback_step_id is None or feedback_step_id != body.step_id:
+                raise ValidationError("OpenAgent feedback step does not match the message")
+            if not conversation.open_agent_conversation_id:
+                raise ValidationError("OpenAgent conversation is not available for feedback")
 
-        credentials = await OpenAgentSettingsService.get_credentials(db, conversation.tenant_id)
-        if not credentials or not credentials[1]:
-            raise ValidationError("OpenAgent settings are required")
-        base_url, api_key = credentials
+            credentials = await OpenAgentSettingsService.get_credentials(db, conversation.tenant_id)
+            if not credentials or not credentials[1]:
+                raise ValidationError("OpenAgent settings are required")
+            base_url, api_key = credentials
+            tenant_id = conversation.tenant_id
+            conversation_id = conversation.id
+            agent_id = int(config.open_agent_agent_id)
+            open_agent_conversation_id = int(conversation.open_agent_conversation_id)
+            message_id = message.id
 
         comment = body.comment if body.rating == "dislike" else None
         client = open_agent_client or create_open_agent_client()
@@ -1764,8 +1770,8 @@ class OpenAgentConversationService:
             result = await client.submit_feedback(
                 base_url,
                 api_key,
-                int(config.open_agent_agent_id),
-                int(conversation.open_agent_conversation_id),
+                agent_id,
+                open_agent_conversation_id,
                 body.step_id,
                 {
                     "rating": body.rating,
@@ -1785,15 +1791,33 @@ class OpenAgentConversationService:
             "comment": normalized_comment,
             "updated_at": updated_at,
         }
-        metadata["open_agent_feedback"] = feedback
-        updated_message = await MessageRepository.update_metadata(db, message, metadata)
-        return {
-            "message": ConversationService._public_message_payload(updated_message, conversation),
-            "step_id": body.step_id,
-            "rating": rating,
-            "comment": normalized_comment,
-            "updated_at": updated_at,
-        }
+
+        async with AsyncSessionLocal() as db:
+            conversation = await ConversationService.get_conversation_for_visitor_session(
+                db,
+                conversation_public_id=conversation_public_id,
+                tenant_id=visitor_context["tenant_id"],
+                channel_id=visitor_context["channel_id"],
+                visitor_external_id=visitor_context["visitor_external_id"],
+            )
+            message = await MessageRepository.get_by_id_for_conversation(
+                db,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                message_id=message_id,
+            )
+            if not message:
+                raise ValidationError("Feedback message is not available")
+            metadata = dict(getattr(message, "metadata_", None) or {})
+            metadata["open_agent_feedback"] = feedback
+            updated_message = await MessageRepository.update_metadata(db, message, metadata)
+            return {
+                "message": ConversationService._public_message_payload(updated_message, conversation),
+                "step_id": body.step_id,
+                "rating": rating,
+                "comment": normalized_comment,
+                "updated_at": updated_at,
+            }
 
     @staticmethod
     def _handoff_unavailable_status_fields(result: dict) -> dict:

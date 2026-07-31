@@ -1,6 +1,10 @@
 """
 Auth service
 """
+import logging
+import math
+from datetime import datetime, timezone
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from jose import JWTError, jwt
 
@@ -12,6 +16,11 @@ from app.repositories.employee_repository import EmployeeRepository
 from app.schemas.auth import LoginRequest, LoginResponse, SsoLoginRequest, UserInfo, UserPreferencesUpdate
 from app.services.employee_session_service import EmployeeSessionService
 from app.services.permission_service import PermissionService
+
+logger = logging.getLogger(__name__)
+
+# Fallback TTL when the SSO JWT has no usable exp (matches issuer TOKEN_EXPIRE_SECONDS).
+_SSO_JTI_CLAIM_FALLBACK_TTL_SECONDS = 120
 
 
 class AuthService:
@@ -48,6 +57,44 @@ class AuthService:
         return payload
 
     @staticmethod
+    def _sso_jti_claim_ttl_seconds(payload: dict) -> int:
+        exp = payload.get("exp")
+        if exp is None:
+            return _SSO_JTI_CLAIM_FALLBACK_TTL_SECONDS
+        try:
+            remaining = float(exp) - datetime.now(timezone.utc).timestamp()
+            return max(1, math.ceil(remaining))
+        except (TypeError, ValueError, OverflowError):
+            return _SSO_JTI_CLAIM_FALLBACK_TTL_SECONDS
+
+    @staticmethod
+    async def _claim_sso_jti(payload: dict) -> None:
+        """Atomically consume an SSO token jti so the URL bearer cannot be replayed."""
+        jti = payload.get("jti")
+        if not jti:
+            return
+        if not settings.REDIS_URL:
+            return
+        key = f"sso:jti:{jti}"
+        ttl = AuthService._sso_jti_claim_ttl_seconds(payload)
+        try:
+            from app.db.redis import redis_client
+
+            r = redis_client.client
+            claimed = await r.set(key, "1", ex=ttl, nx=True)
+            if not claimed:
+                raise UnauthorizedError("SSO token already used")
+        except UnauthorizedError:
+            raise
+        except RuntimeError:
+            logger.debug(
+                "Skipped SSO jti claim; Redis is not initialized",
+                exc_info=True,
+            )
+        except Exception:
+            logger.exception("Failed to claim SSO jti key=%s", key)
+
+    @staticmethod
     def _merge_preferences(current: dict, patch: dict) -> dict:
         merged = {**current}
         for key, value in patch.items():
@@ -68,7 +115,58 @@ class AuthService:
         return user_info
 
     @staticmethod
-    async def login(db: AsyncSession, data: LoginRequest) -> LoginResponse:
+    def _short_session_id(session_id: str | None) -> str:
+        if not session_id:
+            return "-"
+        return session_id[:8]
+
+    @staticmethod
+    def _log_login_success(
+        *,
+        method: str,
+        user,
+        tenant_id: int,
+        session_id: str,
+        replaced_previous: bool,
+        client_ip: str | None,
+        user_agent: str | None,
+    ) -> None:
+        ip = client_ip or "-"
+        ua = user_agent or "-"
+        session_prefix = AuthService._short_session_id(session_id)
+        username = getattr(user, "username", None) or "-"
+        extra = {
+            "auth_method": method,
+            "user_id": str(user.id),
+            "tenant_id": str(tenant_id),
+            "username": str(username),
+            "session_id": session_prefix,
+            "replaced_previous": str(replaced_previous).lower(),
+            "client_ip": ip,
+            "user_agent": ua,
+        }
+        logger.info(
+            "Login success: method=%s user_id=%s tenant_id=%s username=%s "
+            "session_id=%s replaced_previous=%s client_ip=%s user_agent=%s",
+            method,
+            user.id,
+            tenant_id,
+            username,
+            session_prefix,
+            replaced_previous,
+            ip,
+            ua,
+            extra=extra,
+        )
+
+    @staticmethod
+    async def login(
+        db: AsyncSession,
+        data: LoginRequest,
+        *,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> LoginResponse:
         """Authenticate user and return JWT token."""
         tenant = await TenantRepository.resolve_by_identifier(db, data.tenant)
         if not tenant or not tenant.is_active:
@@ -84,6 +182,7 @@ class AuthService:
         if not user.is_active:
             raise UnauthorizedError("Account is disabled")
 
+        replaced_previous = bool(user.current_session_id)
         await EmployeeSessionService.disconnect_current_socket(tenant.id, user.id)
         session_id = EmployeeSessionService.generate_session_id()
         user = await EmployeeRepository.update_login_session(db, user, session_id)
@@ -100,6 +199,15 @@ class AuthService:
             {"user_id": user.id, "tenant_id": tenant.id},
         )
         user_info = AuthService._build_user_info(user, principal)
+        AuthService._log_login_success(
+            method="password",
+            user=user,
+            tenant_id=tenant.id,
+            session_id=session_id,
+            replaced_previous=replaced_previous,
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
 
         return LoginResponse(
             access_token=access_token,
@@ -107,9 +215,17 @@ class AuthService:
         )
 
     @staticmethod
-    async def sso_login(db: AsyncSession, data: SsoLoginRequest) -> LoginResponse:
+    async def sso_login(
+        db: AsyncSession,
+        data: SsoLoginRequest,
+        *,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> LoginResponse:
         """Exchange a Tenant Platform SSO token for a normal OpenDesk JWT."""
         payload = AuthService._decode_sso_token(data.token)
+        # SSO tokens travel in the browser URL; claim jti once so they cannot be replayed.
+        await AuthService._claim_sso_jti(payload)
         tenant_identifier = str(payload.get("tenant_id") or payload.get("sub") or "")
         tenant = await TenantRepository.resolve_by_identifier(db, tenant_identifier)
         if not tenant or not tenant.is_active:
@@ -119,6 +235,7 @@ class AuthService:
         if not user:
             raise UnauthorizedError("No enabled tenant admin account")
 
+        replaced_previous = bool(user.current_session_id)
         await EmployeeSessionService.disconnect_current_socket(tenant.id, user.id)
         session_id = EmployeeSessionService.generate_session_id()
         user = await EmployeeRepository.update_login_session(db, user, session_id)
@@ -134,6 +251,15 @@ class AuthService:
             {"user_id": user.id, "tenant_id": tenant.id},
         )
         user_info = AuthService._build_user_info(user, principal)
+        AuthService._log_login_success(
+            method="sso",
+            user=user,
+            tenant_id=tenant.id,
+            session_id=session_id,
+            replaced_previous=replaced_previous,
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
         return LoginResponse(access_token=access_token, user=user_info)
 
     @staticmethod

@@ -107,14 +107,10 @@ def _rule_matches(
         op = c.get("operator")
         val = c.get("value")
         if ct == "caller_number":
-            if op == "eq" and (from_number or "") != (val or ""):
-                return False
-            if op == "ne" and (from_number or "") == (val or ""):
+            if not _number_matches(from_number, op, val):
                 return False
         elif ct == "callee_number":
-            if op == "eq" and (to_number or "") != (val or ""):
-                return False
-            if op == "ne" and (to_number or "") == (val or ""):
+            if not _number_matches(to_number, op, val):
                 return False
         elif ct == "call_time":
             try:
@@ -129,3 +125,17 @@ def _rule_matches(
         else:
             return False
     return True
+
+
+def _number_matches(actual: str | None, op: str | None, expected: str | None) -> bool:
+    left = actual or ""
+    right = expected or ""
+    if op == "eq":
+        return left == right
+    if op == "ne":
+        return left != right
+    if op == "contains":
+        return bool(right) and right in left
+    if op == "not_contains":
+        return not right or right not in left
+    return False

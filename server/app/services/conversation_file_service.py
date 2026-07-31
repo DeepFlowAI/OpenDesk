@@ -476,35 +476,40 @@ class ConversationFileService:
         }
 
     @staticmethod
-    async def get_temporary_url(
+    async def _resolve_accessible_file_key(
         db: AsyncSession,
+        *,
+        tenant_id: int,
         conversation_id: int,
         file_id: str,
-        download_name: str | None = None,
-        download: bool = False,
-        image_process: str | None = None,
-    ) -> dict:
-        """Create a short-lived URL for a conversation file."""
-        conversation = await ConversationRepository.get_by_id(db, conversation_id)
-        if not conversation:
-            raise NotFoundError("Conversation not found")
+    ) -> str:
+        """Validate file ownership / recall state and return the storage key."""
+        from app.repositories.message_repository import MessageRepository
 
         key = ConversationFileService.decode_file_id(file_id)
-        expected_prefix = f"conversation-files/{conversation.tenant_id}/{conversation_id}/"
-        offline_message_prefix = f"offline-message-files/{conversation.tenant_id}/"
+        expected_prefix = f"conversation-files/{tenant_id}/{conversation_id}/"
+        offline_message_prefix = f"offline-message-files/{tenant_id}/"
         if not (key.startswith(expected_prefix) or key.startswith(offline_message_prefix)):
             raise ValidationError("File does not belong to conversation")
-
-        from app.repositories.message_repository import MessageRepository
         message = await MessageRepository.get_file_message_by_file_id(
             db,
-            tenant_id=conversation.tenant_id,
+            tenant_id=tenant_id,
             conversation_id=conversation_id,
             file_id=file_id,
         )
         if message and getattr(message, "is_recalled", False):
             raise NotFoundError("File not found")
+        return key
 
+    @staticmethod
+    async def _issue_temporary_url(
+        key: str,
+        *,
+        download_name: str | None = None,
+        download: bool = False,
+        image_process: str | None = None,
+    ) -> dict:
+        """Create a short-lived object-storage URL (no DB session required)."""
         storage = create_storage_client()
         url = await storage.get_temporary_url(
             key,
@@ -515,8 +520,7 @@ class ConversationFileService:
         return {"url": url, "expires_seconds": TEMPORARY_URL_EXPIRES_SECONDS}
 
     @staticmethod
-    async def get_temporary_url_for_visitor_session(
-        db: AsyncSession,
+    async def get_temporary_url_for_visitor_session_managed(
         conversation_public_id: str,
         visitor_context: dict,
         file_id: str,
@@ -524,28 +528,33 @@ class ConversationFileService:
         download: bool = False,
         image_process: str | None = None,
     ) -> dict:
-        """Create a short-lived URL for a token-bound visitor conversation file."""
+        """Create a short-lived URL without holding a DB session during object storage I/O."""
         from app.services.conversation_service import ConversationService
 
-        conversation = await ConversationService.get_conversation_for_visitor_session(
-            db,
-            conversation_public_id=conversation_public_id,
-            tenant_id=visitor_context["tenant_id"],
-            channel_id=visitor_context["channel_id"],
-            visitor_external_id=visitor_context["visitor_external_id"],
-        )
-        return await ConversationFileService.get_temporary_url(
-            db,
-            conversation_id=conversation.id,
-            file_id=file_id,
+        async with AsyncSessionLocal() as db:
+            conversation = await ConversationService.get_conversation_for_visitor_session(
+                db,
+                conversation_public_id=conversation_public_id,
+                tenant_id=visitor_context["tenant_id"],
+                channel_id=visitor_context["channel_id"],
+                visitor_external_id=visitor_context["visitor_external_id"],
+            )
+            key = await ConversationFileService._resolve_accessible_file_key(
+                db,
+                tenant_id=conversation.tenant_id,
+                conversation_id=conversation.id,
+                file_id=file_id,
+            )
+
+        return await ConversationFileService._issue_temporary_url(
+            key,
             download_name=download_name,
             download=download,
             image_process=image_process,
         )
 
     @staticmethod
-    async def get_temporary_url_for_agent(
-        db: AsyncSession,
+    async def get_temporary_url_for_agent_managed(
         conversation_id: int,
         tenant_id: int,
         agent_id: int,
@@ -555,19 +564,25 @@ class ConversationFileService:
         image_process: str | None = None,
         principal: EffectivePrincipal | None = None,
     ) -> dict:
-        """Create a short-lived URL for an agent-accessible conversation file."""
-        await ConversationFileService._get_conversation_for_agent(
-            db,
-            conversation_id=conversation_id,
-            tenant_id=tenant_id,
-            agent_id=agent_id,
-            principal=principal,
-            action="view",
-        )
-        return await ConversationFileService.get_temporary_url(
-            db,
-            conversation_id=conversation_id,
-            file_id=file_id,
+        """Create a short-lived agent URL without holding a DB session during storage I/O."""
+        async with AsyncSessionLocal() as db:
+            conversation = await ConversationFileService._get_conversation_for_agent(
+                db,
+                conversation_id=conversation_id,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                principal=principal,
+                action="view",
+            )
+            key = await ConversationFileService._resolve_accessible_file_key(
+                db,
+                tenant_id=conversation.tenant_id,
+                conversation_id=conversation_id,
+                file_id=file_id,
+            )
+
+        return await ConversationFileService._issue_temporary_url(
+            key,
             download_name=download_name,
             download=download,
             image_process=image_process,

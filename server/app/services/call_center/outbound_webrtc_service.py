@@ -57,7 +57,7 @@ class OutboundWebRTCService:
             raise ValidationError("sdp required")
 
         orchestrator = get_orchestrator()
-        info = orchestrator._peek_outbound_originator(outbound_call_id)
+        info = await orchestrator._peek_outbound_originator(outbound_call_id)
         if info is None:
             raise NotFoundError("outbound call not found")
         owner_tenant, owner_employee, _did = info
@@ -68,7 +68,7 @@ class OutboundWebRTCService:
         # Race guard: carrier may have already rejected before the browser
         # finished getUserMedia + SDP. Return 410 so the frontend can show
         # the actual SIP reason instead of a generic "通道连接失败".
-        ended = orchestrator.outbound_ended_reason(outbound_call_id)
+        ended = await orchestrator.outbound_ended_reason(outbound_call_id)
         if ended is not None:
             reason, sip_status = ended
             raise OutboundCallEndedError(reason=reason, sip_status=sip_status)
@@ -90,7 +90,7 @@ class OutboundWebRTCService:
                 "outbound webrtc call.answer failed (continuing): %s", exc,
             )
 
-        orchestrator.pair_outbound_webrtc(
+        await orchestrator.pair_outbound_webrtc(
             outbound_call_id=outbound_call_id,
             webrtc_call_id=webrtc_call_id,
         )

@@ -57,17 +57,11 @@ async def list_system_variables(db: AsyncSession = Depends(get_db)):
 async def upload_audio_asset(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    tenant_id = current_user["tenant_id"]
-    actor = await AuditActorService.resolve_current_employee(
-        db, tenant_id, current_user.get("user_id")
-    )
     data = await file.read()
-    return await AudioAssetService.upload(
-        db,
-        tenant_id,
-        actor,
+    return await AudioAssetService.upload_managed(
+        current_user["tenant_id"],
+        current_user.get("user_id"),
         filename=file.filename or "audio.bin",
         content_type=file.content_type,
         data=data,
@@ -78,9 +72,8 @@ async def upload_audio_asset(
 async def get_audio_asset(
     asset_id: int,
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    return await AudioAssetService.get(db, asset_id, current_user["tenant_id"])
+    return await AudioAssetService.get_managed(asset_id, current_user["tenant_id"])
 
 
 @router.delete("/audio-assets/{asset_id}")

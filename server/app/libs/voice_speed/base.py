@@ -105,3 +105,15 @@ class BaseVoiceSpeedClient(ABC):
         call shares one trace across services.
         """
         ...
+
+    async def get_performance_settings(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+    ) -> dict:
+        """Fetch agent dialog-timing knobs for FlowKit (empty dict = no override).
+
+        Default no-op so mock/test clients need not implement it.
+        """
+        return {}

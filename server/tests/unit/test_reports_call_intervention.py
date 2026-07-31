@@ -183,6 +183,90 @@ async def _establish_leg(mock, principal, call_id, redis=None, sdp="v=0"):
     )
 
 
+# ───────────────────────── call phase ─────────────────────────
+
+call_control = importlib.import_module("app.services.call_center.call_control_service")
+
+
+def _patch_legs(monkeypatch, legs=None, *, raises=False):
+    async def fake_legs(tenant_id, employee_id):
+        if raises:
+            raise RuntimeError("redis unavailable")
+        return legs
+
+    monkeypatch.setattr(call_control, "_legs", fake_legs)
+
+
+@pytest.mark.asyncio
+class TestPhaseDerivation:
+    """Barging into a consultation, or taking over one leg of a three-party
+    call, drops the supervisor into the wrong conversation. The phase driving
+    that check is read from the agent's persisted call legs.
+    """
+
+    async def test_plain_two_party_call_is_single(self, monkeypatch):
+        _patch_legs(monkeypatch, call_control.InCallLegs())
+        assert await CallInterventionService._derive_phase(1, 99) == "single"
+
+    async def test_live_consult_is_consulting(self, monkeypatch):
+        _patch_legs(
+            monkeypatch,
+            call_control.InCallLegs(consult_state="active", consult_call_id="consult-1"),
+        )
+        assert await CallInterventionService._derive_phase(1, 99) == "consulting"
+
+    async def test_ringing_consult_counts_too(self, monkeypatch):
+        _patch_legs(
+            monkeypatch,
+            call_control.InCallLegs(consult_state="ringing", consult_offer_id="offer-1"),
+        )
+        assert await CallInterventionService._derive_phase(1, 99) == "consulting"
+
+    async def test_open_room_is_three_way(self, monkeypatch):
+        _patch_legs(monkeypatch, call_control.InCallLegs(room_id="room-1"))
+        assert await CallInterventionService._derive_phase(1, 99) == "three_way"
+
+    async def test_ringing_participant_is_three_way(self, monkeypatch):
+        _patch_legs(
+            monkeypatch,
+            call_control.InCallLegs(conference_participant_call_id="party-1"),
+        )
+        assert await CallInterventionService._derive_phase(1, 99) == "three_way"
+
+    async def test_call_without_an_agent_has_no_legs_to_read(self, monkeypatch):
+        _patch_legs(monkeypatch, call_control.InCallLegs())
+        assert await CallInterventionService._derive_phase(1, 0) == "single"
+
+    async def test_unreadable_state_does_not_block_monitoring(self, monkeypatch):
+        _patch_legs(monkeypatch, raises=True)
+        assert await CallInterventionService._derive_phase(1, 99) == "single"
+
+
+@pytest.mark.asyncio
+class TestPhaseMatrix:
+    async def test_barge_rejected_mid_consult(self, stub_db):
+        stub_db["target"].phase = "consulting"
+        with pytest.raises(ConflictError):
+            await CallInterventionService.barge(
+                MockTelephonyClient(), None, _principal(), "call-1"
+            )
+
+    async def test_takeover_rejected_in_three_way(self, stub_db):
+        stub_db["target"].phase = "three_way"
+        with pytest.raises(ConflictError):
+            await CallInterventionService.takeover(
+                MockTelephonyClient(), None, _principal(), "call-1",
+                "customer_escalation", None,
+            )
+
+    async def test_listening_in_stays_allowed(self, stub_db):
+        stub_db["target"].phase = "consulting"
+        result = await CallInterventionService.listen(
+            MockTelephonyClient(), None, _principal(), "call-1"
+        )
+        assert result["ok"] is True
+
+
 @pytest.mark.asyncio
 class TestListen:
     async def test_listen_calls_kernel_and_records_trail(self, stub_db):

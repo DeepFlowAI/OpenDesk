@@ -766,8 +766,7 @@ class OfflineMessageService:
         }
 
     @staticmethod
-    async def create_or_continue_and_send_file_for_session(
-        db: AsyncSession,
+    async def create_or_continue_and_send_file_for_session_managed(
         r: aioredis.Redis,
         visitor_context: dict,
         file: UploadFile,
@@ -778,112 +777,153 @@ class OfflineMessageService:
         queue_type: str | None = None,
         queue_id: int | None = None,
     ) -> dict:
-        tenant_id, channel_id, visitor_external_id, visitor, group_id, row_metadata, leave_message_prompt = (
-            await OfflineMessageService._prepare_leave_message_session(
-                db,
-                r,
-                visitor_context,
-                visitor_system=visitor_system,
-                visitor_browser=visitor_browser,
-                source=source,
-                queue_type=queue_type,
-                queue_id=queue_id,
-            )
-        )
-        row = await OfflineMessageRepository.get_pending_by_visitor_for_update(
-            db,
-            tenant_id=tenant_id,
-            channel_id=channel_id,
-            visitor_external_id=visitor_external_id,
-        )
-        created = False
-        try:
-            if not row:
-                row = OfflineMessage(
-                    public_id=await OfflineMessageRepository.generate_unique_public_id(db),
-                    tenant_id=tenant_id,
-                    channel_id=channel_id,
-                    visitor_id=visitor.id,
-                    visitor_external_id=visitor_external_id,
-                    visitor_name=visitor.name,
-                    target_group_id=group_id,
-                    status="pending",
-                    message_count=0,
-                    metadata_=row_metadata,
-                )
-                db.add(row)
-                await db.flush()
-                created = True
-            elif row.status != "pending":
-                raise BusinessError("Offline message has already been converted")
-            else:
-                updated_metadata = OfflineMessageService._merge_visitor_environment_metadata(
-                    OfflineMessageService._metadata(row),
+        """Create/continue an offline thread and upload a file without holding a DB session during storage I/O."""
+        from sqlalchemy import select
+
+        prompt_entry_id: int | None = None
+        async with AsyncSessionLocal() as db:
+            tenant_id, channel_id, visitor_external_id, visitor, group_id, row_metadata, leave_message_prompt = (
+                await OfflineMessageService._prepare_leave_message_session(
+                    db,
+                    r,
+                    visitor_context,
                     visitor_system=visitor_system,
                     visitor_browser=visitor_browser,
-                    visitor_ip=visitor_context.get("visitor_ip"),
+                    source=source,
+                    queue_type=queue_type,
+                    queue_id=queue_id,
                 )
-                if OfflineMessageService._metadata(row) != updated_metadata:
-                    row.metadata_ = updated_metadata
-
-            created_entries: list[OfflineMessageEntry] = []
-            if created:
-                prompt_msg = OfflineMessageService._build_leave_message_prompt_entry(
-                    row,
-                    leave_message_prompt,
-                )
-                if prompt_msg:
-                    db.add(prompt_msg)
-                    await db.flush()
-                    created_entries.append(prompt_msg)
-
-            uploaded = await OfflineMessageService._upload_file(db, row, file)
-            content_type = MessageContentType.IMAGE.value if uploaded["mime_type"].startswith("image/") else MessageContentType.FILE.value
-            content = json.dumps({
-                "schema_version": uploaded["schema_version"],
-                "file_id": uploaded["file_id"],
-                "name": uploaded["name"],
-                "size": uploaded["size"],
-                "mime_type": uploaded["mime_type"],
-            })
-            normalized_content = ConversationService.validate_message_content(content_type, content)
-            msg = OfflineMessageEntry(
-                tenant_id=row.tenant_id,
-                offline_message_id=row.id,
-                sender_type=MessageSenderType.VISITOR.value,
-                sender_id=row.visitor_id,
-                content_type=content_type,
-                content=normalized_content,
-                metadata_={"offline_message_public_id": row.public_id},
-                created_at=datetime.now(timezone.utc),
             )
-            db.add(msg)
-            await db.flush()
-            created_entries.append(msg)
-            row.last_message_preview = ConversationService.build_message_preview(content_type, normalized_content)
-            row.last_message_at = msg.created_at
-            row.message_count = (row.message_count or 0) + len(created_entries)
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
+            row = await OfflineMessageRepository.get_pending_by_visitor_for_update(
+                db,
+                tenant_id=tenant_id,
+                channel_id=channel_id,
+                visitor_external_id=visitor_external_id,
+            )
+            created = False
+            try:
+                if not row:
+                    row = OfflineMessage(
+                        public_id=await OfflineMessageRepository.generate_unique_public_id(db),
+                        tenant_id=tenant_id,
+                        channel_id=channel_id,
+                        visitor_id=visitor.id,
+                        visitor_external_id=visitor_external_id,
+                        visitor_name=visitor.name,
+                        target_group_id=group_id,
+                        status="pending",
+                        message_count=0,
+                        metadata_=row_metadata,
+                    )
+                    db.add(row)
+                    await db.flush()
+                    created = True
+                elif row.status != "pending":
+                    raise BusinessError("Offline message has already been converted")
+                else:
+                    updated_metadata = OfflineMessageService._merge_visitor_environment_metadata(
+                        OfflineMessageService._metadata(row),
+                        visitor_system=visitor_system,
+                        visitor_browser=visitor_browser,
+                        visitor_ip=visitor_context.get("visitor_ip"),
+                    )
+                    if OfflineMessageService._metadata(row) != updated_metadata:
+                        row.metadata_ = updated_metadata
 
-        row = await OfflineMessageRepository.get_by_id(db, row.id)
-        if not row:
-            raise NotFoundError("Offline message not found")
-        await OfflineMessageRealtimeService.emit_updated(
-            row,
-            action="created" if created else "message",
+                if created:
+                    prompt_msg = OfflineMessageService._build_leave_message_prompt_entry(
+                        row,
+                        leave_message_prompt,
+                    )
+                    if prompt_msg:
+                        db.add(prompt_msg)
+                        await db.flush()
+                        prompt_entry_id = prompt_msg.id
+
+                row_id = row.id
+                public_id = row.public_id
+                visitor_id = row.visitor_id
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+        uploaded = await OfflineMessageService._upload_file_for_offline_message(
+            tenant_id=tenant_id,
+            offline_message_id=row_id,
+            file=file,
         )
-        return {
-            "ok": True,
-            "offline_message_public_id": row.public_id,
-            "message": OfflineMessageService._public_entry_payload(msg, row),
-            "messages": [
-                OfflineMessageService._public_entry_payload(entry, row)
-                for entry in created_entries
-            ],
-        }
+        content_type = (
+            MessageContentType.IMAGE.value
+            if uploaded["mime_type"].startswith("image/")
+            else MessageContentType.FILE.value
+        )
+        content = json.dumps({
+            "schema_version": uploaded["schema_version"],
+            "file_id": uploaded["file_id"],
+            "name": uploaded["name"],
+            "size": uploaded["size"],
+            "mime_type": uploaded["mime_type"],
+        })
+        normalized_content = ConversationService.validate_message_content(content_type, content)
+
+        async with AsyncSessionLocal() as db:
+            try:
+                row = await OfflineMessageRepository.get_by_id_for_update(db, row_id)
+                if not row:
+                    raise NotFoundError("Offline message not found")
+                if row.status != "pending":
+                    raise BusinessError("Offline message has already been converted")
+
+                created_entries: list[OfflineMessageEntry] = []
+                if prompt_entry_id is not None:
+                    prompt_result = await db.execute(
+                        select(OfflineMessageEntry).where(OfflineMessageEntry.id == prompt_entry_id)
+                    )
+                    prompt_entry = prompt_result.scalar_one_or_none()
+                    if prompt_entry:
+                        created_entries.append(prompt_entry)
+
+                msg = OfflineMessageEntry(
+                    tenant_id=row.tenant_id,
+                    offline_message_id=row.id,
+                    sender_type=MessageSenderType.VISITOR.value,
+                    sender_id=visitor_id,
+                    content_type=content_type,
+                    content=normalized_content,
+                    metadata_={"offline_message_public_id": public_id},
+                    created_at=datetime.now(timezone.utc),
+                )
+                db.add(msg)
+                await db.flush()
+                created_entries.append(msg)
+                row.last_message_preview = ConversationService.build_message_preview(
+                    content_type, normalized_content,
+                )
+                row.last_message_at = msg.created_at
+                # Prompt (if any) was persisted earlier without bumping message_count.
+                row.message_count = (row.message_count or 0) + len(created_entries)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+            row = await OfflineMessageRepository.get_by_id(db, row_id)
+            if not row:
+                raise NotFoundError("Offline message not found")
+            await OfflineMessageRealtimeService.emit_updated(
+                row,
+                action="created" if created else "message",
+            )
+            return {
+                "ok": True,
+                "offline_message_public_id": row.public_id,
+                "message": OfflineMessageService._public_entry_payload(msg, row),
+                "messages": [
+                    OfflineMessageService._public_entry_payload(entry, row)
+                    for entry in created_entries
+                ],
+            }
 
     @staticmethod
     async def get_public_response(
@@ -1462,6 +1502,26 @@ class OfflineMessageService:
             raise
 
     @staticmethod
+    async def upload_public_file_managed(
+        public_id: str,
+        visitor_context: dict,
+        file: UploadFile,
+    ) -> dict:
+        """Upload a visitor offline-message file without holding a DB session during storage I/O."""
+        async with AsyncSessionLocal() as db:
+            row = await OfflineMessageService._get_for_session_for_update(db, public_id, visitor_context)
+            if row.status != "pending":
+                raise BusinessError("Offline message has already been converted")
+            tenant_id = row.tenant_id
+            row_id = row.id
+
+        return await OfflineMessageService._upload_file_for_offline_message(
+            tenant_id=tenant_id,
+            offline_message_id=row_id,
+            file=file,
+        )
+
+    @staticmethod
     async def upload_agent_file_managed(
         offline_message_id: int,
         principal: EffectivePrincipal,
@@ -1487,32 +1547,20 @@ class OfflineMessageService:
         )
 
     @staticmethod
-    async def get_temporary_url(
-        db: AsyncSession,
-        row: OfflineMessage,
-        *,
+    def _resolve_offline_file_key(
+        tenant_id: int,
+        offline_message_id: int,
         file_id: str,
-        download_name: str | None = None,
-        download: bool = False,
-        image_process: str | None = None,
-    ) -> dict:
+    ) -> str:
+        """Validate offline-message file ownership and return the storage key."""
         key = ConversationFileService.decode_file_id(file_id)
-        expected_prefix = f"offline-message-files/{row.tenant_id}/{row.id}/"
+        expected_prefix = f"offline-message-files/{tenant_id}/{offline_message_id}/"
         if not key.startswith(expected_prefix):
             raise ValidationError("File does not belong to offline message")
-
-        storage = create_storage_client()
-        url = await storage.get_temporary_url(
-            key,
-            expires_seconds=TEMPORARY_URL_EXPIRES_SECONDS,
-            download_name=ConversationFileService._safe_download_name(download_name or "download") if download else None,
-            image_process=ConversationFileService._safe_image_process(image_process, download),
-        )
-        return {"url": url, "expires_seconds": TEMPORARY_URL_EXPIRES_SECONDS}
+        return key
 
     @staticmethod
-    async def get_temporary_url_for_public(
-        db: AsyncSession,
+    async def get_temporary_url_for_public_managed(
         public_id: str,
         visitor_context: dict,
         *,
@@ -1521,19 +1569,24 @@ class OfflineMessageService:
         download: bool = False,
         image_process: str | None = None,
     ) -> dict:
-        row = await OfflineMessageService._get_for_session(db, public_id, visitor_context)
-        return await OfflineMessageService.get_temporary_url(
-            db,
-            row,
-            file_id=file_id,
+        """Create a short-lived URL without holding a DB session during object storage I/O."""
+        async with AsyncSessionLocal() as db:
+            row = await OfflineMessageService._get_for_session(db, public_id, visitor_context)
+            key = OfflineMessageService._resolve_offline_file_key(
+                row.tenant_id,
+                row.id,
+                file_id,
+            )
+
+        return await ConversationFileService._issue_temporary_url(
+            key,
             download_name=download_name,
             download=download,
             image_process=image_process,
         )
 
     @staticmethod
-    async def get_temporary_url_for_agent(
-        db: AsyncSession,
+    async def get_temporary_url_for_agent_managed(
         principal: EffectivePrincipal,
         offline_message_id: int,
         *,
@@ -1542,14 +1595,20 @@ class OfflineMessageService:
         download: bool = False,
         image_process: str | None = None,
     ) -> dict:
-        row = await OfflineMessageRepository.get_by_id(db, offline_message_id)
-        if not row:
-            raise NotFoundError("Offline message not found")
-        await OfflineMessageService._assert_view_access(db, principal, row)
-        return await OfflineMessageService.get_temporary_url(
-            db,
-            row,
-            file_id=file_id,
+        """Create a short-lived agent URL without holding a DB session during storage I/O."""
+        async with AsyncSessionLocal() as db:
+            row = await OfflineMessageRepository.get_by_id(db, offline_message_id)
+            if not row:
+                raise NotFoundError("Offline message not found")
+            await OfflineMessageService._assert_view_access(db, principal, row)
+            key = OfflineMessageService._resolve_offline_file_key(
+                row.tenant_id,
+                row.id,
+                file_id,
+            )
+
+        return await ConversationFileService._issue_temporary_url(
+            key,
             download_name=download_name,
             download=download,
             image_process=image_process,

@@ -15,6 +15,7 @@ import {
 import type {
   CreateSipExtensionResponse,
   SipExtension,
+  SipExtensionBoundEmployee,
 } from '@/models/sip-extension'
 
 async function readErrorMessage(error: unknown, fallback: string): Promise<string> {
@@ -29,18 +30,18 @@ async function readErrorMessage(error: unknown, fallback: string): Promise<strin
   return fallback
 }
 
-type BoundEmployeeInitial = { id: number; name: string; avatar: string | null } | null
-
-function BindableEmployeeSelect({
-  value,
-  initialLabel,
+function BindableEmployeeMultiSelect({
+  values,
+  selectedPeople,
   onChange,
   disabled,
+  forExtensionId,
 }: {
-  value: number | null
-  initialLabel: string | null
-  onChange: (id: number | null) => void
+  values: number[]
+  selectedPeople: SipExtensionBoundEmployee[]
+  onChange: (ids: number[], people: SipExtensionBoundEmployee[]) => void
   disabled?: boolean
+  forExtensionId?: number | null
 }) {
   const { locale } = useLocaleStore()
   const [open, setOpen] = useState(false)
@@ -52,13 +53,34 @@ function BindableEmployeeSelect({
     return () => window.clearTimeout(timer)
   }, [search])
 
-  const { data: employees = [], isLoading } = useBindableEmployees(debounced, open)
+  const { data: employees = [], isLoading } = useBindableEmployees(
+    debounced,
+    open,
+    forExtensionId,
+  )
 
-  const selectedLabel = useMemo(() => {
-    if (value == null) return ''
-    const match = employees.find((e) => e.id === value)
-    return match?.name ?? initialLabel ?? ''
-  }, [value, employees, initialLabel])
+  const selectedSet = useMemo(() => new Set(values), [values])
+
+  const toggle = (employee: { id: number; name: string; avatar: string | null }) => {
+    if (selectedSet.has(employee.id)) {
+      onChange(
+        values.filter((id) => id !== employee.id),
+        selectedPeople.filter((p) => p.id !== employee.id),
+      )
+      return
+    }
+    onChange(
+      [...values, employee.id],
+      [...selectedPeople, { id: employee.id, name: employee.name, avatar: employee.avatar }],
+    )
+  }
+
+  const remove = (id: number) => {
+    onChange(
+      values.filter((v) => v !== id),
+      selectedPeople.filter((p) => p.id !== id),
+    )
+  }
 
   return (
     <div className="relative">
@@ -67,31 +89,45 @@ function BindableEmployeeSelect({
         disabled={disabled}
         onClick={() => setOpen((prev) => !prev)}
         className={cn(
-          'flex h-10 w-full items-center gap-2 rounded-lg border border-border bg-white px-3 text-left text-sm text-foreground outline-none transition-colors focus:border-foreground/40 disabled:cursor-not-allowed disabled:opacity-50',
+          'flex min-h-10 w-full items-center gap-2 rounded-lg border border-border bg-white px-3 py-2 text-left text-sm text-foreground outline-none transition-colors focus:border-foreground/40 disabled:cursor-not-allowed disabled:opacity-50',
         )}
       >
-        <span className={cn('min-w-0 flex-1 truncate', !selectedLabel && 'text-muted-foreground')}>
-          {selectedLabel || t('se.form.employee.placeholder', locale)}
+        <span className="min-w-0 flex-1">
+          {selectedPeople.length === 0 ? (
+            <span className="text-muted-foreground">{t('se.form.employee.placeholder', locale)}</span>
+          ) : (
+            <span className="flex flex-wrap gap-1.5">
+              {selectedPeople.map((person) => (
+                <span
+                  key={person.id}
+                  className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 text-xs text-foreground"
+                >
+                  {person.name}
+                  {!disabled && (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      aria-label={t('se.form.employee.clear', locale)}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        remove(person.id)
+                      }}
+                      className="text-muted-foreground hover:text-foreground"
+                    >
+                      <IconX size={12} />
+                    </span>
+                  )}
+                </span>
+              ))}
+            </span>
+          )}
         </span>
-        {value != null && !disabled && (
-          <span
-            role="button"
-            tabIndex={0}
-            aria-label={t('se.form.employee.clear', locale)}
-            onClick={(event) => {
-              event.stopPropagation()
-              onChange(null)
-            }}
-            className="rounded text-muted-foreground hover:text-foreground"
-          >
-            <IconX size={14} />
-          </span>
-        )}
         <IconChevronDown size={14} className="shrink-0 text-muted-foreground" />
       </button>
 
       {open && !disabled && (
-        <div className="absolute z-50 mt-1 w-full rounded-lg border border-border bg-white p-2 shadow-lg">
+        // Open upward so the list is not clipped by the dialog's overflow.
+        <div className="absolute bottom-full z-50 mb-1 w-full rounded-lg border border-border bg-white p-2 shadow-lg">
           <input
             value={search}
             onChange={(event) => setSearch(event.target.value)}
@@ -99,23 +135,20 @@ function BindableEmployeeSelect({
             className="mb-2 h-8 w-full rounded-md border border-border bg-white px-2 text-sm outline-none focus:border-foreground/40"
             autoFocus
           />
-          <div className="max-h-56 overflow-y-auto">
+          <div className="max-h-48 overflow-y-auto overscroll-contain">
             {isLoading ? (
               <div className="px-2 py-2 text-sm text-muted-foreground">{t('se.loading', locale)}</div>
             ) : employees.length === 0 ? (
               <div className="px-2 py-2 text-sm text-muted-foreground">{t('se.form.employee.empty', locale)}</div>
             ) : (
               employees.map((employee) => {
-                const selected = value === employee.id
+                const selected = selectedSet.has(employee.id)
                 return (
                   <button
                     type="button"
                     key={employee.id}
                     onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => {
-                      onChange(employee.id)
-                      setOpen(false)
-                    }}
+                    onClick={() => toggle(employee)}
                     className={cn(
                       'flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition-colors hover:bg-accent',
                       selected && 'bg-accent',
@@ -149,8 +182,8 @@ export function SipExtensionFormDialog({
   const isEdit = !!target
   const [name, setName] = useState('')
   const [extensionNumber, setExtensionNumber] = useState('')
-  const [employeeId, setEmployeeId] = useState<number | null>(null)
-  const [initialEmployee, setInitialEmployee] = useState<BoundEmployeeInitial>(null)
+  const [employeeIds, setEmployeeIds] = useState<number[]>([])
+  const [selectedPeople, setSelectedPeople] = useState<SipExtensionBoundEmployee[]>([])
   const [nameError, setNameError] = useState('')
   const [numberError, setNumberError] = useState('')
   const [formError, setFormError] = useState('')
@@ -164,8 +197,8 @@ export function SipExtensionFormDialog({
     if (!open) return
     setName(target?.name ?? '')
     setExtensionNumber(target?.extension_number ?? '')
-    setEmployeeId(target?.bound_employee_id ?? null)
-    setInitialEmployee(target?.bound_employee ?? null)
+    setEmployeeIds(target?.bound_employee_ids ?? [])
+    setSelectedPeople(target?.bound_employees ?? [])
     setNameError('')
     setNumberError('')
     setFormError('')
@@ -196,20 +229,19 @@ export function SipExtensionFormDialog({
       if (isEdit && target) {
         await updateMutation.mutateAsync({
           id: target.id,
-          data: { name: name.trim(), bound_employee_id: employeeId },
+          data: { name: name.trim(), bound_employee_ids: employeeIds },
         })
         onClose()
       } else {
         const response = await createMutation.mutateAsync({
           name: name.trim(),
           extension_number: extensionNumber.trim(),
-          bound_employee_id: employeeId,
+          bound_employee_ids: employeeIds,
         })
         onCreated(response)
       }
     } catch (error) {
       const message = await readErrorMessage(error, t('se.form.saveFailed', locale))
-      // Duplicate extension number surfaces inline on its field.
       if (!isEdit && error instanceof HTTPError && error.response.status === 409) {
         setNumberError(message)
         return
@@ -231,13 +263,13 @@ export function SipExtensionFormDialog({
     : []
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="max-h-[90vh] w-[560px] max-w-[92vw] overflow-y-auto rounded-xl bg-white p-6 shadow-xl">
-        <h2 className="text-base font-semibold text-foreground">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="flex max-h-[90vh] w-[600px] max-w-[92vw] flex-col overflow-hidden rounded-xl bg-white shadow-xl">
+        <h2 className="shrink-0 px-6 pt-6 text-base font-semibold text-foreground">
           {isEdit ? t('se.edit.title', locale) : t('se.create.title', locale)}
         </h2>
 
-        <div className="mt-5 flex flex-col gap-4">
+        <div className="mt-5 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6">
           <div className="flex flex-col gap-1.5">
             <label className="text-sm font-medium text-foreground">{t('se.form.name', locale)}</label>
             <input
@@ -276,14 +308,28 @@ export function SipExtensionFormDialog({
 
           <div className="flex flex-col gap-1.5">
             <label className="text-sm font-medium text-foreground">{t('se.form.employee', locale)}</label>
-            <BindableEmployeeSelect
-              value={employeeId}
-              initialLabel={initialEmployee?.name ?? null}
-              onChange={setEmployeeId}
+            <BindableEmployeeMultiSelect
+              values={employeeIds}
+              selectedPeople={selectedPeople}
+              onChange={(ids, people) => {
+                setEmployeeIds(ids)
+                setSelectedPeople(people)
+              }}
               disabled={submitting}
+              forExtensionId={target?.id ?? null}
             />
             <p className="text-xs text-muted-foreground">{t('se.form.employee.hint', locale)}</p>
           </div>
+
+          {isEdit && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-muted/30 p-3">
+              <p className="text-sm font-medium text-foreground">{t('se.form.occupant', locale)}</p>
+              <p className="text-sm text-foreground">
+                {target?.current_occupant?.name || t('se.occupant.none', locale)}
+              </p>
+              <p className="text-xs text-muted-foreground">{t('se.form.occupant.hint', locale)}</p>
+            </div>
+          )}
 
           {isEdit && (
             <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/30 p-3">
@@ -306,7 +352,7 @@ export function SipExtensionFormDialog({
           {formError && <p className="text-sm text-destructive">{formError}</p>}
         </div>
 
-        <div className="mt-6 flex justify-end gap-3">
+        <div className="mt-6 flex shrink-0 justify-end gap-3 px-6 pb-6">
           <button
             type="button"
             onClick={onClose}

@@ -112,6 +112,7 @@ export function VoiceFlowCanvas({
   selectedNodeId,
   onSelect,
   onDropNode,
+  readOnly = false,
 }: {
   nodes: Node[]
   edges: Edge[]
@@ -120,28 +121,52 @@ export function VoiceFlowCanvas({
   selectedNodeId: string | null
   onSelect: (id: string | null) => void
   onDropNode?: (type: NodeType, position: { x: number; y: number }) => void
+  readOnly?: boolean
 }) {
   const { screenToFlowPosition } = useReactFlow()
   const onNodesChange = useCallback(
-    (changes: NodeChange[]) => setNodes((nds) => applyNodeChanges(changes, nds)),
-    [setNodes],
+    (changes: NodeChange[]) => {
+      if (readOnly) {
+        // Keep select/dimensions so preview can focus nodes; block moves/removes.
+        const filtered = changes.filter((c) => c.type === 'select' || c.type === 'dimensions')
+        if (!filtered.length) return
+        setNodes((nds) => applyNodeChanges(filtered, nds))
+        return
+      }
+      setNodes((nds) => applyNodeChanges(changes, nds))
+    },
+    [readOnly, setNodes],
   )
   const onEdgesChange = useCallback(
-    (changes: EdgeChange[]) => setEdges((eds) => applyEdgeChanges(changes, eds)),
-    [setEdges],
+    (changes: EdgeChange[]) => {
+      if (readOnly) return
+      setEdges((eds) => applyEdgeChanges(changes, eds))
+    },
+    [readOnly, setEdges],
   )
   const onConnect = useCallback(
     (conn: Connection) => {
+      if (readOnly) return
+      const src = nodes.find((n) => n.id === conn.source)
+      const tgt = nodes.find((n) => n.id === conn.target)
+      const handle = conn.sourceHandle ?? 'next'
+      // VoiceSpeed handoff must go to human routing, not announcement nodes.
+      if (
+        src?.type === 'voicespeed' &&
+        handle === 'handoff' &&
+        (tgt?.type === 'play' || tgt?.type === 'collect' || tgt?.type === 'condition' || tgt?.type === 'start')
+      ) {
+        return
+      }
       setEdges((eds) => {
-        const src = nodes.find((n) => n.id === conn.source)
         const next: Edge = {
           id: genEdgeId(),
           source: conn.source ?? '',
           target: conn.target ?? '',
-          sourceHandle: conn.sourceHandle ?? 'next',
+          sourceHandle: handle,
           type: 'smoothstep',
           style: {
-            stroke: edgeColor(src?.type ?? null, conn.sourceHandle ?? 'next'),
+            stroke: edgeColor(src?.type ?? null, handle),
             strokeWidth: 2,
           },
         }
@@ -153,24 +178,26 @@ export function VoiceFlowCanvas({
         return addEdge(next, filtered)
       })
     },
-    [nodes, setEdges],
+    [nodes, readOnly, setEdges],
   )
 
   const onDragOver = useCallback((event: React.DragEvent) => {
+    if (readOnly) return
     if (!event.dataTransfer.types.includes(NODE_DRAG_MIME)) return
     event.preventDefault()
     event.dataTransfer.dropEffect = 'copy'
-  }, [])
+  }, [readOnly])
 
   const onDrop = useCallback(
     (event: React.DragEvent) => {
+      if (readOnly || !onDropNode) return
       const type = event.dataTransfer.getData(NODE_DRAG_MIME) as NodeType
-      if (!type || !onDropNode) return
+      if (!type) return
       event.preventDefault()
       const position = screenToFlowPosition({ x: event.clientX, y: event.clientY })
       onDropNode(type, position)
     },
-    [onDropNode, screenToFlowPosition],
+    [onDropNode, readOnly, screenToFlowPosition],
   )
 
   // Inject `selected` prop into node data so custom views can react.
@@ -192,6 +219,11 @@ export function VoiceFlowCanvas({
       onDrop={onDrop}
       nodeTypes={NODE_TYPES}
       fitView
+      nodesDraggable={!readOnly}
+      nodesConnectable={!readOnly}
+      elementsSelectable
+      edgesReconnectable={!readOnly}
+      deleteKeyCode={readOnly ? null : ['Backspace', 'Delete']}
       proOptions={{ hideAttribution: true }}
       defaultEdgeOptions={{ type: 'smoothstep' }}
     >

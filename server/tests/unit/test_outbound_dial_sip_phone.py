@@ -47,6 +47,8 @@ def _ext(**kw):
     base = dict(
         id=1, sip_user_id="acme-1001", is_active=True,
         registration_status="registered", extension_number="1001",
+        # Default occupant matches the dialing agent used in these tests.
+        current_occupant_employee_id=42,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -339,5 +341,7 @@ async def test_webrtc_path_never_rings_extension(monkeypatch):
     originates = [a for m, a in telephony.recorded if m == "call.originate"]
     assert originates == [{"uri": "13800138000", "caller_id": "+8602112345678", "trunk_id": "trunk_sh"}]
     assert resp.call_id == "cust-leg"
+    # Originator must be registered so /dial-webrtc/offer can attach media.
+    assert "cust-leg" in get_orchestrator()._outbound_originators
     # No pairing created for a WebRTC dial (that happens later via /dial-webrtc).
     assert "cust-leg" not in get_orchestrator()._outbound_webrtc_pairs

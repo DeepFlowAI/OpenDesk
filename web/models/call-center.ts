@@ -24,6 +24,13 @@ export type AgentStatusResponse = {
   reserved_until?: string | null
   resource_updated_at?: string | null
   last_release_reason?: string | null
+  /** True when Redis in-call legs still have an active consult after refresh. */
+  consult_active?: boolean
+  consult_target_employee_id?: number | null
+  /** none | ringing | active — host consult lifecycle from server. */
+  consult_state?: string | null
+  /** When the agent entered in_call (Redis). Restores the timer without a CDR. */
+  in_call_since?: string | null
 }
 
 export type AgentStatusUpdate = {
@@ -36,6 +43,14 @@ export type ConsultableAgent = {
   name: string | null
   avatar: string | null
   status: AgentStatus
+}
+
+/** Queue entry shown in the transfer target picker. */
+export type TransferQueue = {
+  queue_type: 'employee_group'
+  queue_id: number
+  name: string
+  available_agent_count: number
 }
 
 export type CallUserAssociationStatus =

@@ -1,9 +1,12 @@
 'use client'
 
 import { useEffect } from 'react'
+import { useAuthStore } from '@/context/auth-store'
 import { useTokenRefresh } from '@/hooks/use-token-refresh'
+import { logAuthEvent } from '@/utils/auth-log'
 
 const AUTH_STORE_KEY = 'app-auth'
+const AUTH_TOKEN_KEY = 'auth_token'
 
 type AuthIdentity = {
   userId: number | null
@@ -55,6 +58,18 @@ export function AuthSessionKeeper() {
         window.location.reload()
         return
       }
+
+      // Same user re-logged in another tab: silently pick up the new token
+      // without a full reload so the socket/API can keep working.
+      if (event.key === AUTH_TOKEN_KEY) {
+        const nextToken = event.newValue
+        if (typeof nextToken === 'string' && nextToken && nextToken !== useAuthStore.getState().token) {
+          useAuthStore.setState({ token: nextToken })
+          void logAuthEvent('token_adopted_from_storage')
+        }
+        return
+      }
+
       if (event.key !== AUTH_STORE_KEY) return
 
       const previous = readAuthIdentity(event.oldValue)

@@ -9,28 +9,36 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import app.services.cc_agent_status_service as status_mod
+from app.services.cc_agent_status_service import CcAgentStatusService
+
+
+class _SessionContext:
+    async def __aenter__(self):
+        return SimpleNamespace(commit=AsyncMock())
+
+    async def __aexit__(self, *_exc_info):
+        return False
+
 
 @pytest.mark.asyncio
 async def test_reset_call_state_cleans_all_sources(monkeypatch):
-    from app.routers.v1 import call_center as cc_router
-    import app.services.agent_webrtc_session_service as sess_mod
-    import app.services.call_center.call_control_service as ccs_mod
-
     hangups: list[tuple] = []
 
     class _Tel:
         async def call_hangup(self, call_id, reason=None):
             hangups.append((call_id, reason))
 
-    monkeypatch.setattr(cc_router, "get_telephony_client", lambda: _Tel())
-
+    monkeypatch.setattr(status_mod, "AsyncSessionLocal", lambda: _SessionContext())
     monkeypatch.setattr(
-        sess_mod.AgentWebRTCSessionService,
-        "get_active",
+        "app.services.agent_webrtc_session_service.AgentWebRTCSessionService.get_active",
         AsyncMock(return_value={"webrtc_call_id": "leg-1"}),
     )
     close_mock = AsyncMock()
-    monkeypatch.setattr(sess_mod.AgentWebRTCSessionService, "close", close_mock)
+    monkeypatch.setattr(
+        "app.services.agent_webrtc_session_service.AgentWebRTCSessionService.close",
+        close_mock,
+    )
 
     # Two lingering active CDRs, then none.
     active_seq = [SimpleNamespace(call_id="c1"), SimpleNamespace(call_id="c2"), None]
@@ -39,15 +47,18 @@ async def test_reset_call_state_cleans_all_sources(monkeypatch):
         return active_seq.pop(0)
 
     monkeypatch.setattr(
-        cc_router.CallRecordRepository, "get_latest_active_for_agent", _get_latest
+        status_mod.CallRecordRepository, "get_latest_active_for_agent", _get_latest
     )
     mark_mock = AsyncMock()
-    monkeypatch.setattr(cc_router.CallRecordService, "mark_completed", mark_mock)
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordService.mark_completed",
+        mark_mock,
+    )
 
     force_mock = AsyncMock()
-    monkeypatch.setattr(cc_router.CcAgentResourceService, "force_release", force_mock)
+    monkeypatch.setattr(status_mod.CcAgentResourceService, "force_release", force_mock)
     monkeypatch.setattr(
-        cc_router.CcAgentStatusService,
+        CcAgentStatusService,
         "get_for_employee",
         AsyncMock(return_value={"status": "ready"}),
     )
@@ -56,13 +67,16 @@ async def test_reset_call_state_cleans_all_sources(monkeypatch):
     async def _fake_clear(t, e):
         cleared.append((t, e))
 
-    monkeypatch.setattr(ccs_mod, "_clear_legs", _fake_clear)
+    monkeypatch.setattr(
+        "app.services.call_center.call_control_service._clear_legs",
+        _fake_clear,
+    )
 
-    db = SimpleNamespace(commit=AsyncMock())
-    r = SimpleNamespace()
-
-    result = await cc_router.reset_my_agent_call_resource(
-        current_user={"tenant_id": 8, "user_id": 42}, db=db, r=r,
+    result = await CcAgentStatusService.reset_call_resource_managed(
+        _Tel(),
+        tenant_id=8,
+        employee_id=42,
+        r=SimpleNamespace(),
     )
 
     assert result == {"status": "ready"}
@@ -79,35 +93,37 @@ async def test_reset_call_state_cleans_all_sources(monkeypatch):
 @pytest.mark.asyncio
 async def test_reset_call_state_no_session_does_not_raise(monkeypatch):
     """No active session / no CDR must not 404 (close() raises NotFoundError)."""
-    from app.routers.v1 import call_center as cc_router
-    import app.services.agent_webrtc_session_service as sess_mod
-    import app.services.call_center.call_control_service as ccs_mod
-
-    monkeypatch.setattr(cc_router, "get_telephony_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(status_mod, "AsyncSessionLocal", lambda: _SessionContext())
     monkeypatch.setattr(
-        sess_mod.AgentWebRTCSessionService, "get_active", AsyncMock(return_value=None)
+        "app.services.agent_webrtc_session_service.AgentWebRTCSessionService.get_active",
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        cc_router.CallRecordRepository,
+        status_mod.CallRecordRepository,
         "get_latest_active_for_agent",
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        cc_router.CcAgentResourceService, "force_release", AsyncMock()
+        status_mod.CcAgentResourceService, "force_release", AsyncMock()
     )
     monkeypatch.setattr(
-        cc_router.CcAgentStatusService,
+        CcAgentStatusService,
         "get_for_employee",
         AsyncMock(return_value={"status": "offline"}),
     )
+
     async def _noop_clear(t, e):
         return None
 
-    monkeypatch.setattr(ccs_mod, "_clear_legs", _noop_clear)
+    monkeypatch.setattr(
+        "app.services.call_center.call_control_service._clear_legs",
+        _noop_clear,
+    )
 
-    result = await cc_router.reset_my_agent_call_resource(
-        current_user={"tenant_id": 8, "user_id": 42},
-        db=SimpleNamespace(commit=AsyncMock()),
+    result = await CcAgentStatusService.reset_call_resource_managed(
+        SimpleNamespace(),
+        tenant_id=8,
+        employee_id=42,
         r=SimpleNamespace(),
     )
     assert result == {"status": "offline"}

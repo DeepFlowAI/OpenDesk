@@ -131,6 +131,11 @@ export function CallDeviceSelector() {
                       <span className="truncate font-medium">{deviceLabel(device, locale)}</span>
                       {device.device_type === 'sip_phone' && <HeartbeatDot device={device} locale={locale} />}
                     </span>
+                    {device.available && device.status_message && (
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        {device.status_message}
+                      </span>
+                    )}
                     {!device.available && device.unavailable_reason && (
                       <span className="mt-0.5 block text-xs text-muted-foreground">
                         {device.unavailable_reason}
@@ -161,13 +166,25 @@ export function CallDeviceSelector() {
         <p className="mt-2 text-xs text-muted-foreground">{t('se.device.selectPrompt', locale)}</p>
       )}
 
+      {current?.unavailable_reason && !currentType && !loading && (
+        <div
+          role="alert"
+          className="mt-2 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800"
+        >
+          <IconAlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <span>{current.unavailable_reason}</span>
+        </div>
+      )}
+
       {currentDevice?.device_type === 'sip_phone' && currentUnavailable && !inCall && (
         <div
           role="alert"
           className="mt-2 flex items-start gap-2 rounded-md border border-red-200 bg-red-50 px-2.5 py-2 text-[11px] text-red-700"
         >
           <IconAlertTriangle size={14} className="mt-0.5 shrink-0" />
-          <span>{t('se.device.sipBanner', locale)}</span>
+          <span>
+            {currentDevice.unavailable_reason || t('se.device.sipBanner', locale)}
+          </span>
         </div>
       )}
     </div>

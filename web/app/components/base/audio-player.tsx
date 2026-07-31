@@ -49,8 +49,10 @@ export function AudioPlayer({
 }: AudioPlayerProps) {
   const [playing, setPlaying] = useState(false)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const stoppingRef = useRef(false)
 
   const stop = () => {
+    stoppingRef.current = true
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
@@ -70,6 +72,7 @@ export function AudioPlayer({
   useEffect(() => () => stop(), [])
 
   const play = () => {
+    stoppingRef.current = false
     onActivate?.(token)
     setPlaying(true)
 
@@ -116,9 +119,14 @@ export function AudioPlayer({
       setPlaying(false)
       onDeactivate?.()
     }
-    utter.onerror = () => {
+    utter.onerror = (event) => {
+      const intentional = stoppingRef.current
+      stoppingRef.current = false
       setPlaying(false)
       onDeactivate?.()
+      // Stop/close while speaking fires interrupted/canceled — not a real failure.
+      const err = (event as SpeechSynthesisErrorEvent).error
+      if (intentional || err === 'interrupted' || err === 'canceled') return
       onError?.('load-failed')
     }
     window.speechSynthesis.cancel()

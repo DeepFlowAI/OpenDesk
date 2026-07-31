@@ -39,7 +39,11 @@ async def test_mark_connected_preserves_manual_offline_status(fake_redis):
 
 
 @pytest.mark.asyncio
-async def test_set_status_offline_preserves_current_count(fake_redis):
+async def test_set_status_offline_preserves_current_count(fake_redis, monkeypatch):
+    # set_count notifies via AgentRealtimeService, which opens a real DB session
+    # to read max_concurrent — incidental to this Redis-state assertion.
+    monkeypatch.setattr(AgentStatusService, "_notify_stats_changed", AsyncMock())
+
     await AgentStatusService.set_count(fake_redis, tenant_id=7, user_id=42, count=2)
 
     await AgentStatusService.set_status(

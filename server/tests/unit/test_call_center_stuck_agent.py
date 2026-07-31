@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import fakeredis.aioredis
 import pytest
 
+from app.libs import realtime as realtime_module
 from app.libs.telephony.base import TelephonyRPCError
 from app.libs.telephony.providers.mock.client import MockTelephonyClient
 from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
@@ -28,6 +29,7 @@ from app.services.call_center.orchestrator import CallCenterOrchestrator
 from app.services.call_record_service import CallRecordService
 from app.services.cc_agent_resource_service import CcAgentResourceService
 from app.services.cc_agent_status_service import CcAgentStatusService
+from app.services.system_settings_service import SystemSettingsService
 
 
 class _FakeTransport:
@@ -86,6 +88,7 @@ async def test_withdraw_pending_offer_frees_agent_and_stops_ringing(monkeypatch)
     transport = _FakeTransport()
     monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake_redis)
     monkeypatch.setattr(orch_module, "get_realtime_transport", lambda: transport)
+    monkeypatch.setattr(realtime_module, "get_realtime_transport", lambda: transport)
     await _prepare_ringing(fake_redis)
 
     orch = CallCenterOrchestrator(telephony=MockTelephonyClient())
@@ -133,7 +136,16 @@ class _CapturingOrchestrator:
 
 
 @pytest.mark.asyncio
-async def test_bridge_aborts_when_peer_call_missing():
+async def test_bridge_aborts_when_peer_call_missing(monkeypatch):
+    async def _bridge_asr_enabled(_tenant_id):
+        return True
+
+    monkeypatch.setattr(
+        SystemSettingsService,
+        "is_bridge_asr_enabled_managed",
+        _bridge_asr_enabled,
+    )
+
     tel = MockTelephonyClient()
     await tel.connect()
     tel.bridge_error = TelephonyRPCError(-32002, "call not found: call-1")
@@ -188,6 +200,7 @@ async def test_agent_hangup_when_customer_gone_resets_status(monkeypatch):
     monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _FakeSession(row))
     monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake_redis)
     monkeypatch.setattr(orch_module, "get_realtime_transport", lambda: transport)
+    monkeypatch.setattr(realtime_module, "get_realtime_transport", lambda: transport)
 
     async def _get_active(_db, _tenant_id, _employee_id):
         return {"webrtc_call_id": "webrtc-1"}
@@ -272,6 +285,7 @@ async def test_agent_hangup_internal_participant_tears_down_leg(monkeypatch):
     monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _FakeSession(None))
     monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake_redis)
     monkeypatch.setattr(orch_module, "get_realtime_transport", lambda: transport)
+    monkeypatch.setattr(realtime_module, "get_realtime_transport", lambda: transport)
 
     async def _get_active(_db, _tenant_id, _employee_id):
         return {"webrtc_call_id": "internal-web-1"}

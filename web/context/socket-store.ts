@@ -24,8 +24,19 @@ type SocketState = {
   connecting: boolean
   authFailed: boolean
   sessionReplaced: boolean
+  /** Token that triggered authFailed; used to detect a newer cross-tab login. */
+  authFailureToken: string | null
   connect: (token: string) => void
   disconnect: () => void
+}
+
+function tokenFromSocketAuth(socket: Socket): string | null {
+  const auth = socket.auth
+  if (auth && typeof auth === 'object' && 'token' in auth) {
+    const token = (auth as { token?: unknown }).token
+    return typeof token === 'string' && token ? token : null
+  }
+  return null
 }
 
 export const useSocketStore = create<SocketState>((set, get) => ({
@@ -34,6 +45,7 @@ export const useSocketStore = create<SocketState>((set, get) => ({
   connecting: false,
   authFailed: false,
   sessionReplaced: false,
+  authFailureToken: null,
 
   connect: (token: string) => {
     const existing = get().socket
@@ -41,12 +53,12 @@ export const useSocketStore = create<SocketState>((set, get) => ({
       if (existing.connected) return
 
       existing.auth = { token }
-      set({ connecting: true, authFailed: false, sessionReplaced: false })
+      set({ connecting: true, authFailed: false, sessionReplaced: false, authFailureToken: null })
       existing.connect()
       return
     }
 
-    set({ connecting: true, authFailed: false, sessionReplaced: false })
+    set({ connecting: true, authFailed: false, sessionReplaced: false, authFailureToken: null })
 
     // Bound the refresh-then-reconnect loop: if a freshly refreshed token is
     // still rejected, retrying forever just hammers the server. Reset on a
@@ -64,7 +76,13 @@ export const useSocketStore = create<SocketState>((set, get) => ({
 
     socket.on('connect', () => {
       authRetries = 0
-      set({ connected: true, connecting: false, authFailed: false, sessionReplaced: false })
+      set({
+        connected: true,
+        connecting: false,
+        authFailed: false,
+        sessionReplaced: false,
+        authFailureToken: null,
+      })
     })
 
     socket.on('disconnect', () => {
@@ -76,13 +94,21 @@ export const useSocketStore = create<SocketState>((set, get) => ({
         set({ connecting: false })
         return
       }
+      const failureToken = tokenFromSocketAuth(socket)
       if (isSessionReplacedError(err)) {
         logAuthEvent('socket_auth_failed', {
           error: err.message,
           sessionReplaced: true,
         })
         socket.disconnect()
-        set({ socket: null, connected: false, connecting: false, authFailed: true, sessionReplaced: true })
+        set({
+          socket: null,
+          connected: false,
+          connecting: false,
+          authFailed: true,
+          sessionReplaced: true,
+          authFailureToken: failureToken,
+        })
         return
       }
       // Refreshed token still rejected too many times — stop, surface auth failure.
@@ -93,7 +119,14 @@ export const useSocketStore = create<SocketState>((set, get) => ({
           exhausted: true,
         })
         socket.disconnect()
-        set({ socket: null, connected: false, connecting: false, authFailed: true, sessionReplaced: false })
+        set({
+          socket: null,
+          connected: false,
+          connecting: false,
+          authFailed: true,
+          sessionReplaced: false,
+          authFailureToken: failureToken,
+        })
         return
       }
       authRetries += 1
@@ -112,7 +145,14 @@ export const useSocketStore = create<SocketState>((set, get) => ({
           sessionReplaced: true,
         })
         socket.disconnect()
-        set({ socket: null, connected: false, connecting: false, authFailed: true, sessionReplaced: true })
+        set({
+          socket: null,
+          connected: false,
+          connecting: false,
+          authFailed: true,
+          sessionReplaced: true,
+          authFailureToken: failureToken,
+        })
         return
       }
       // Transient refresh failure (network/5xx): keep the session and let the
@@ -127,7 +167,14 @@ export const useSocketStore = create<SocketState>((set, get) => ({
         refreshFailed: true,
       })
       socket.disconnect()
-      set({ socket: null, connected: false, connecting: false, authFailed: true, sessionReplaced: false })
+      set({
+        socket: null,
+        connected: false,
+        connecting: false,
+        authFailed: true,
+        sessionReplaced: false,
+        authFailureToken: failureToken,
+      })
     })
 
     set({ socket })
@@ -137,7 +184,13 @@ export const useSocketStore = create<SocketState>((set, get) => ({
     const { socket } = get()
     if (socket) {
       socket.disconnect()
-      set({ socket: null, connected: false, connecting: false, sessionReplaced: false })
+      set({
+        socket: null,
+        connected: false,
+        connecting: false,
+        sessionReplaced: false,
+        authFailureToken: null,
+      })
     }
   },
 }))

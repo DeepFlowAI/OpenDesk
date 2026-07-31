@@ -13,7 +13,10 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
+from app.constants.call_center import VISIBLE_STATUSES as VALID_STATUS
 from app.core.exceptions import ConflictError, NotFoundError
+from app.db.session import AsyncSessionLocal
+from app.libs.telephony.base import BaseTelephonyClient
 from app.repositories.agent_status_repository import AgentStatusRepository
 from app.repositories.agent_webrtc_session_repository import AgentWebRTCSessionRepository
 from app.repositories.call_record_repository import CallRecordRepository
@@ -21,8 +24,6 @@ from app.services.cc_agent_resource_service import CcAgentResourceService
 
 
 logger = logging.getLogger(__name__)
-
-VALID_STATUS = {"ready", "busy", "break", "after_call_work", "offline"}
 
 
 class CcAgentStatusService:
@@ -84,7 +85,18 @@ class CcAgentStatusService:
                 )
         except Exception:  # noqa: BLE001
             return base | _empty_resource_fields()
-        return base | _resource_fields(snapshot)
+        result = base | _resource_fields(snapshot)
+        # PG stores the last *chosen* status; Redis resource is authoritative
+        # while the agent is reserved/ringing/in_call (e.g. consult target
+        # accepts without a CDR write, so PG stays "ready"). Surface busy so
+        # the workspace dropdown matches the real occupation.
+        rs = (snapshot or {}).get("resource_state")
+        if rs in {"reserved", "ringing", "in_call"}:
+            result["status"] = "busy"
+        # Surface active consult so a page refresh can restore 结束咨询 UI
+        # (SIP desk-phone and Web phone share the same InCallLegs key).
+        result.update(await _consult_fields(tenant_id, employee_id))
+        return result
 
     @staticmethod
     async def reconcile_agent(
@@ -133,6 +145,20 @@ class CcAgentStatusService:
             )
             if active_call or active_session:
                 return snapshot  # a real call backs the in_call state — leave it
+            # Consult targets have no CDR of their own; during a page refresh the
+            # WebRTC session may already be gone while the host still lists them.
+            try:
+                from app.services.call_center.call_control_service import (
+                    CallControlService,
+                )
+
+                host = await CallControlService._find_consult_host_for_target(
+                    tenant_id, employee_id
+                )
+            except Exception:  # noqa: BLE001
+                host = None
+            if host is not None:
+                return snapshot
             logger.info(
                 "reconcile_agent: releasing ghost in_call for agent=%s/%s "
                 "(no active call record or WebRTC session)",
@@ -250,6 +276,67 @@ class CcAgentStatusService:
         return base | (_resource_fields(snapshot) if snapshot else _empty_resource_fields())
 
     @staticmethod
+    async def reset_call_resource_managed(
+        telephony: BaseTelephonyClient,
+        *,
+        tenant_id: int,
+        employee_id: int,
+        r: aioredis.Redis,
+    ) -> dict:
+        """Escape hatch for a stranded agent: force-clean stuck call state.
+
+        Uses short DB sessions around reads/writes only — the telephony hangup
+        runs with no pooled connection checked out.
+        """
+        from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
+        from app.services.call_center.call_control_service import _clear_legs
+        from app.services.call_record_service import CallRecordService
+
+        webrtc_call_id: str | None = None
+        had_session = False
+        async with AsyncSessionLocal() as db:
+            session = await AgentWebRTCSessionService.get_active(
+                db, tenant_id, employee_id
+            )
+            if session:
+                had_session = True
+                webrtc_call_id = session.get("webrtc_call_id")
+
+        if webrtc_call_id:
+            try:
+                await telephony.call_hangup(webrtc_call_id, reason="manual_reset")
+            except Exception:  # noqa: BLE001
+                pass
+
+        async with AsyncSessionLocal() as db:
+            if had_session:
+                try:
+                    await AgentWebRTCSessionService.close(db, tenant_id, employee_id)
+                except Exception:  # noqa: BLE001 — best-effort; may already be closed
+                    pass
+
+            for _ in range(10):
+                active = await CallRecordRepository.get_latest_active_for_agent(
+                    db, tenant_id, employee_id
+                )
+                if not active:
+                    break
+                await CallRecordService.mark_completed(
+                    db, tenant_id, active.call_id, hangup_reason="manual_reset"
+                )
+            await db.commit()
+
+        await _clear_legs(tenant_id, employee_id)
+        await CcAgentResourceService.force_release(
+            r, tenant_id, employee_id, reason="manual_reset"
+        )
+
+        async with AsyncSessionLocal() as db:
+            return await CcAgentStatusService.get_for_employee(
+                db, tenant_id, employee_id, r
+            )
+
+    @staticmethod
     async def list_consultable_agents(
         db: AsyncSession,
         tenant_id: int,
@@ -298,6 +385,54 @@ class CcAgentStatusService:
             }
             for emp in employees
         ]
+
+    @staticmethod
+    async def list_transfer_queues(
+        db: AsyncSession,
+        tenant_id: int,
+        keyword: str | None = None,
+        r: aioredis.Redis | None = None,
+    ) -> list[dict]:
+        """Employee-group queues available as blind-transfer targets.
+
+        Each item includes a live count of agents who can actually be rung
+        (ready + idle and browser-connected), matching queue picker rules.
+        """
+        from app.repositories.employee_group_repository import EmployeeGroupRepository
+        from app.services.queue_resource_provider import (
+            CallCenterResourceProvider,
+            filter_ringable_call_center_candidates,
+        )
+
+        groups, _total = await EmployeeGroupRepository.get_paginated(
+            db, tenant_id, page=1, per_page=200, keyword=keyword
+        )
+
+        provider = CallCenterResourceProvider()
+        results: list[dict] = []
+        for group in groups:
+            available_count = 0
+            if r is not None:
+                candidates = await provider.list_candidates(
+                    db, r, tenant_id, "employee_group", group["id"]
+                )
+                ringable = await filter_ringable_call_center_candidates(
+                    r, tenant_id, candidates
+                )
+                available_count = len(ringable)
+            results.append(
+                {
+                    "queue_type": "employee_group",
+                    "queue_id": group["id"],
+                    "name": group["name"],
+                    "available_agent_count": available_count,
+                }
+            )
+
+        results.sort(
+            key=lambda item: (-item["available_agent_count"], item["name"] or "")
+        )
+        return results
 
     @staticmethod
     async def list_online_for_group(
@@ -378,6 +513,10 @@ def _empty_resource_fields() -> dict:
         "reserved_until": None,
         "resource_updated_at": None,
         "last_release_reason": None,
+        "consult_active": False,
+        "consult_target_employee_id": None,
+        "consult_state": "none",
+        "in_call_since": None,
     }
 
 
@@ -393,4 +532,44 @@ def _resource_fields(snapshot: dict | None) -> dict:
         "reserved_until": snapshot.get("reserved_until"),
         "resource_updated_at": snapshot.get("resource_updated_at"),
         "last_release_reason": snapshot.get("last_release_reason"),
+        "consult_active": False,
+        "consult_target_employee_id": None,
+        "consult_state": "none",
+        "in_call_since": snapshot.get("in_call_since"),
     }
+
+
+async def _consult_fields(tenant_id: int, employee_id: int) -> dict:
+    try:
+        from app.constants.call_center import ConsultState
+        from app.services.call_center import consult_session
+        from app.services.call_center.call_control_service import _legs
+
+        legs = await _legs(tenant_id, employee_id)
+        # Orphan guard: consult leg must not be the agent's own media leg
+        # (leftover Redis state from a prior call that failed to clear).
+        if (
+            legs.consult_call_id
+            and legs.agent_media_call_id
+            and legs.consult_call_id == legs.agent_media_call_id
+        ):
+            await consult_session.clear(
+                tenant_id=tenant_id,
+                host_employee_id=employee_id,
+                reason="orphan_consult_same_as_media",
+                consult_call_id=legs.consult_call_id,
+            )
+            legs = await _legs(tenant_id, employee_id)
+        return {
+            "consult_active": consult_session.is_consult_active(legs),
+            "consult_target_employee_id": legs.consult_target_employee_id,
+            "consult_state": consult_session.derive_state(legs).value
+            if consult_session.is_consult_active(legs)
+            else ConsultState.NONE.value,
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "consult_active": False,
+            "consult_target_employee_id": None,
+            "consult_state": "none",
+        }

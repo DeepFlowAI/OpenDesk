@@ -151,12 +151,10 @@ async def get_channel_public(
     channel_key: str,
     visitor_external_id: str | None = Query(None, min_length=1),
     current_conversation_public_id: str | None = Query(None),
-    db: AsyncSession = Depends(get_db),
     r: aioredis.Redis = Depends(get_redis),
 ):
     """Get channel config for the visitor chat widget. No auth required."""
-    return await ChannelService.get_public_config_with_availability_by_key(
-        db,
+    return await ChannelService.get_public_config_with_availability_by_key_managed(
         r,
         channel_key,
         visitor_external_id=visitor_external_id,
@@ -465,12 +463,12 @@ async def chat_open_agent_public(
 async def submit_open_agent_feedback_public(
     conversation_public_id: str,
     body: OpenAgentFeedbackRequest,
-    db: AsyncSession = Depends(get_db),
-    visitor_context: dict = Depends(get_visitor_context),
+    request: Request,
+    authorization: str | None = Header(None),
 ):
     """Submit visitor feedback for a bot answer owned by this visitor session."""
-    return await OpenAgentConversationService.submit_feedback_for_session(
-        db,
+    visitor_context = await get_visitor_context_short_session(request, authorization)
+    return await OpenAgentConversationService.submit_feedback_for_session_managed(
         conversation_public_id=conversation_public_id,
         visitor_context=visitor_context,
         body=body,
@@ -551,19 +549,19 @@ async def upload_conversation_file_public(
 
 @router.post("/offline-messages/files")
 async def create_and_send_offline_message_file_public(
+    request: Request,
     file: UploadFile = File(...),
     system: str | None = Form(None, max_length=64),
     browser: str | None = Form(None, max_length=128),
     source: OfflineMessageSource | None = Form(None),
     queue_type: Literal["employee_group"] | None = Form(None),
     queue_id: int | None = Form(None, gt=0),
-    db: AsyncSession = Depends(get_db),
     r: aioredis.Redis = Depends(get_redis),
-    visitor_context: dict = Depends(get_visitor_context),
+    authorization: str | None = Header(None),
 ):
     """Create or continue an offline message thread and append a visitor file."""
-    return await OfflineMessageService.create_or_continue_and_send_file_for_session(
-        db,
+    visitor_context = await get_visitor_context_short_session(request, authorization)
+    return await OfflineMessageService.create_or_continue_and_send_file_for_session_managed(
         r,
         visitor_context,
         file,
@@ -581,13 +579,13 @@ async def create_and_send_offline_message_file_public(
 )
 async def upload_offline_message_file_public(
     offline_message_public_id: str,
+    request: Request,
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    visitor_context: dict = Depends(get_visitor_context),
+    authorization: str | None = Header(None),
 ):
     """Upload a visitor file bound to an offline message thread."""
-    return await OfflineMessageService.upload_public_file(
-        db,
+    visitor_context = await get_visitor_context_short_session(request, authorization)
+    return await OfflineMessageService.upload_public_file_managed(
         offline_message_public_id,
         visitor_context,
         file,
@@ -600,16 +598,16 @@ async def upload_offline_message_file_public(
 )
 async def get_conversation_file_url_public(
     file_id: str,
+    request: Request,
     conversation_public_id: str = Query(...),
     download_name: str | None = Query(None),
     download: bool = Query(False),
     image_process: str | None = Query(None),
-    db: AsyncSession = Depends(get_db),
-    visitor_context: dict = Depends(get_visitor_context),
+    authorization: str | None = Header(None),
 ):
     """Get a short-lived URL for a conversation file."""
-    return await ConversationFileService.get_temporary_url_for_visitor_session(
-        db,
+    visitor_context = await get_visitor_context_short_session(request, authorization)
+    return await ConversationFileService.get_temporary_url_for_visitor_session_managed(
         conversation_public_id=conversation_public_id,
         visitor_context=visitor_context,
         file_id=file_id,
@@ -625,16 +623,16 @@ async def get_conversation_file_url_public(
 )
 async def get_offline_message_file_url_public(
     file_id: str,
+    request: Request,
     offline_message_public_id: str = Query(...),
     download_name: str | None = Query(None),
     download: bool = Query(False),
     image_process: str | None = Query(None),
-    db: AsyncSession = Depends(get_db),
-    visitor_context: dict = Depends(get_visitor_context),
+    authorization: str | None = Header(None),
 ):
     """Get a short-lived URL for an offline message file."""
-    return await OfflineMessageService.get_temporary_url_for_public(
-        db,
+    visitor_context = await get_visitor_context_short_session(request, authorization)
+    return await OfflineMessageService.get_temporary_url_for_public_managed(
         offline_message_public_id,
         visitor_context,
         file_id=file_id,

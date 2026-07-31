@@ -428,6 +428,7 @@ class MessageRepository:
                     Message.sender_type == MessageSenderType.BOT.value,
                     Message.content_type == MessageContentType.BOT_WELCOME.value,
                     Message.metadata_["event_type"].astext == "open_agent_bot_started",
+                    Message.metadata_["handoff_event_type"].astext == "confirm_requested",
                 ),
             )
             .order_by(Message.created_at.desc(), Message.id.desc())

@@ -86,6 +86,9 @@ class VoiceFlowWorkflow:
         # module (keeps the executor file dependency-free for tests).
         self.ctx.variables["__orchestrator__"] = orchestrator
         self.ctx.variables["__tenant_id__"] = tenant_id
+        # Executors may need to discard stale buffered events (e.g. hold-prompt
+        # play_end) before waiting on a fresh prompt's play_end.
+        self.ctx.variables["__workflow__"] = self
 
         self._current_node_id: str | None = self._find_start_node_id()
         self._waiting: tuple[str, Callable[..., Awaitable[NextStep]]] | None = None
@@ -181,6 +184,27 @@ class VoiceFlowWorkflow:
                 del self._pending_events[i]
                 return item
         return None
+
+    def clear_buffered(self, method: str | tuple[str, ...]) -> int:
+        """Drop all buffered events matching `method`. Returns how many were removed.
+
+        Used when an executor is about to play a new prompt and wait for
+        ``call.play_end``: hold-prompt play_ends accumulated during a sleep
+        loop must not satisfy that wait, or the new prompt is cut immediately.
+        """
+        wanted = method if isinstance(method, tuple) else (method,)
+        before = len(self._pending_events)
+        self._pending_events = deque(
+            ((m, d) for m, d in self._pending_events if m not in wanted),
+            maxlen=_PENDING_EVENT_BUFFER,
+        )
+        removed = before - len(self._pending_events)
+        if removed:
+            logger.info(
+                "workflow: cleared %d buffered %s call_id=%s",
+                removed, wanted, self.call_id,
+            )
+        return removed
 
     def _cancel_timeout(self) -> None:
         if self._timeout_task is not None and not self._timeout_task.done():
@@ -314,6 +338,15 @@ class VoiceFlowWorkflow:
         if emp_id is None:
             return None
         return {"tenant_id": self.tenant_id, "employee_id": int(emp_id)}
+
+    def rebind_bridged_agent(self, employee_id: int) -> None:
+        """Point live transcript / hangup settlement at a new bridged agent.
+
+        Used after a successful blind transfer so ``cc.transcript`` and
+        customer-hangup ACW target the agent who now owns the call.
+        """
+
+        self.ctx.variables["sys._bridged_agent_id"] = int(employee_id)
 
     def pending_offer_info(self) -> dict | None:
         """

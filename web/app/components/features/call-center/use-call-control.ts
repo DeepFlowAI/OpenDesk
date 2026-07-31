@@ -4,8 +4,11 @@
  *
  * Wraps the backend `/agents/me/current-call/*` endpoints and tracks the
  * agent-facing call mode (single / hold / consult / conference / transferring).
- * Mute is local-only: it flips the WebRTC audio track via `setMuted` and
- * mirrors the state to the backend operation trail (best-effort, non-blocking).
+ * Mute flips the local WebRTC audio track via `setMuted` and asks the backend
+ * to gate the agent's leg. Either half failing can leave the button describing
+ * a state the agent is not in — on a SIP handset there is no local track at
+ * all, and un-muting can succeed locally while the leg stays gated — so both
+ * cases surface rather than resolve silently.
  *
  * This hook is intentionally decoupled from the phase machine in
  * `call-center-runtime` so the universal call-bar shell — and later the
@@ -49,6 +52,9 @@ export type ConsultTarget = {
   target_name?: string
 }
 
+/** Applies mute to the local audio track. Returns false when there is none —
+ *  an agent on a SIP handset — so the caller knows the backend is the only
+ *  thing that can mute them. */
 type SetMuted = (muted: boolean) => boolean
 
 /**
@@ -93,13 +99,48 @@ export function useCallControl(setMuted: SetMuted) {
     setPending(null)
   }, [])
 
+  /** Restore consult UI after page refresh (server still has consult state).
+   *  `state` mirrors the server's consult lifecycle: a still-ringing consult
+   *  restores to consult_ringing, an answered one to consult_active. */
+  const restoreConsult = useCallback(
+    (target?: {
+      target_id?: number | null
+      target_name?: string
+      state?: 'ringing' | 'active'
+    }) => {
+      const restored = target?.state === 'ringing' ? 'consult_ringing' : 'consult_active'
+      setMode((curr) =>
+        curr === 'consult_active' || curr === 'consult_ringing' ? curr : restored,
+      )
+      setConsultStart((prev) => prev ?? Date.now())
+      if (target?.target_id != null) {
+        setConsultTarget({
+          target_type: 'employee',
+          target_id: target.target_id,
+          target_name: target.target_name,
+        })
+      }
+    },
+    [],
+  )
+
   const toggleMute = useCallback(() => {
     const next = !muted
-    // Local WebRTC track is the source of truth; flip it first.
-    setMuted(next)
+    // Flip the local track first where there is one: it takes effect at once
+    // and survives a failed request. It returns false when the agent is on a
+    // device without a browser audio track, such as a SIP handset.
+    const appliedLocally = setMuted(next)
     setMutedState(next)
-    // Mirror to the operation trail; failures here don't affect audio.
-    void setCurrentCallMute(next).catch(() => {})
+    void setCurrentCallMute(next).catch(async (e) => {
+      // The two directions do not fail the same way. Muting with a local track
+      // already off leaves the agent genuinely silent, so a failed request
+      // changes nothing they need to act on. Un-muting is the dangerous one:
+      // the kernel may still be gating this leg, leaving them inaudible while
+      // the button says they are live — the same lie in the other direction.
+      if (appliedLocally && next) return
+      setMutedState(!next)
+      toast.error(await controlErrorMessage(e, next ? '静音失败' : '取消静音失败'))
+    })
   }, [muted, setMuted])
 
   const toggleHold = useCallback(async () => {
@@ -126,21 +167,20 @@ export function useCallControl(setMuted: SetMuted) {
   }, [mode, pending])
 
   const submitTransfer = useCallback(
-    async (target: CallControlTarget, targetName: string): Promise<boolean> => {
+    async (target: CallControlTarget): Promise<boolean> => {
       if (pending) return false
       setPending('transfer')
       setMode('transferring')
       try {
         const res = await transferCurrentCall(target)
         if (!res.ok) throw new Error('transfer_failed')
-        // A WebRTC (browser-ring) colleague target is still ringing off the
-        // request path; stay in "转接中" and let the cc.transfer_result socket
-        // event drive the final success/failure. Other targets complete here.
-        if (res.note === 'ringing_webrtc_target') {
-          return true
-        }
-        toast.success(`通话已转接给 ${targetName}`)
-        setMode('ended')
+        // Both SIP/external (`ringing_target`) and browser WebRTC colleague
+        // (`ringing_webrtc_target`) paths only start ringing here; the actual
+        // handoff finishes off the request path. Stay in "转接中" and let the
+        // cc.transfer_result socket event drive success/failure.
+        // Do not set mode to "ended" yet: releasing this agent's media leg
+        // while the target is still ringing drops the customer↔agent bridge
+        // peer and the media core ends the customer call with it.
         return true
       } catch (e) {
         // Original call is preserved by the backend on failure.
@@ -195,12 +235,32 @@ export function useCallControl(setMuted: SetMuted) {
    * on failure exit "咨询呼叫中" back to the single-customer call and toast.
    */
   const onConsultResult = useCallback(
-    (result: { ok: boolean; reason?: string; target_name?: string }) => {
+    (result: {
+      ok: boolean
+      reason?: string
+      target_name?: string
+      ended?: boolean
+      resumed?: boolean
+    }) => {
+      const reason = (result.reason || '').trim()
+      // Target hung up (normal consult end) — leave consult UI for 1:1.
+      // Also treat legacy payloads that used ok:false for this success path.
+      const consultEndedNormally =
+        (result.ok && result.ended) ||
+        (!result.ok && /结束咨询|恢复与客户/.test(reason))
+      if (consultEndedNormally) {
+        setMode('single')
+        setConsultTarget(null)
+        setConsultStart(null)
+        setPending(null)
+        toast.success(reason || '对方已结束咨询，已恢复与客户通话')
+        return
+      }
       if (result.ok) {
         setMode((curr) => (curr === 'consult_ringing' ? 'consult_active' : curr))
         return
       }
-      toast.error(result.reason || '发起咨询失败，客户通话仍在继续')
+      toast.error(reason || '发起咨询失败，客户通话仍在继续')
       setMode('single')
       setConsultTarget(null)
       setConsultStart(null)
@@ -237,6 +297,7 @@ export function useCallControl(setMuted: SetMuted) {
     try {
       const res = await endConsult()
       if (!res.ok) throw new Error('consult_end_failed')
+      toast.success('已结束咨询，已恢复与客户通话')
     } catch (e) {
       toast.error(await controlErrorMessage(e, '结束咨询失败'))
     } finally {
@@ -252,6 +313,12 @@ export function useCallControl(setMuted: SetMuted) {
     async (target: ConsultTarget): Promise<boolean> => {
       if (pending) return false
       setPending('conf_add')
+      // Optimistic: mirror consult/transfer — enter ringing as soon as the
+      // request is sent so the call bar never looks frozen during the slow
+      // unbridge/tone/originate path. cc.conference_result still owns the
+      // answered → conference transition; on API failure roll back below.
+      setMode('conference_ringing')
+      toast(`正在呼叫 ${target.target_name ?? '参与人'}…`)
       try {
         const res = await conferenceAdd({
           target_type: target.target_type,
@@ -259,13 +326,12 @@ export function useCallControl(setMuted: SetMuted) {
           number: target.number,
         })
         if (!res.ok) throw new Error('conf_add_failed')
-        // The participant is only ringing here; the room is created and the
-        // conference goes live once they answer, driven by cc.conference_result.
-        setMode('conference_ringing')
-        toast(`正在呼叫 ${target.target_name ?? '参与人'}…`)
+        // Stay in conference_ringing; the room goes live when they answer
+        // (cc.conference_result → onConferenceResult).
         return true
       } catch (e) {
         toast.error(await controlErrorMessage(e, '添加参与人失败'))
+        setMode('single')
         return false
       } finally {
         setPending(null)
@@ -369,6 +435,7 @@ export function useCallControl(setMuted: SetMuted) {
     consultTarget,
     pending,
     reset,
+    restoreConsult,
     toggleMute,
     toggleHold,
     submitTransfer,

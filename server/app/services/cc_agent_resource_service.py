@@ -3,6 +3,7 @@ Redis-backed real-time call-center agent resource state.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -10,19 +11,25 @@ from typing import Any
 import redis.asyncio as aioredis
 from redis.exceptions import WatchError
 
+from app.constants.call_center import (
+    ACTIVE_RESOURCE_STATES,
+    RESOURCE_STATES,
+    VISIBLE_STATUSES,
+    offer_accept_lock_key as _offer_accept_lock_key,
+    queue_rr_key as _queue_rr_key,
+    resource_key as _resource_key,
+)
 from app.core.exceptions import ConflictError, ValidationError
 
+logger = logging.getLogger(__name__)
 
-VISIBLE_STATUSES = {"ready", "busy", "break", "after_call_work", "offline"}
-RESOURCE_STATES = {
-    "idle",
-    "reserved",
-    "ringing",
-    "in_call",
-    "after_call_work",
-    "unavailable",
-}
-ACTIVE_RESOURCE_STATES = {"reserved", "ringing", "in_call"}
+# Re-export for existing importers (queue.py, tests, etc.).
+__all__ = [
+    "ACTIVE_RESOURCE_STATES",
+    "CcAgentResourceService",
+    "RESOURCE_STATES",
+    "VISIBLE_STATUSES",
+]
 
 
 class CcAgentResourceService:
@@ -37,15 +44,15 @@ class CcAgentResourceService:
 
     @staticmethod
     def key(tenant_id: int, employee_id: int) -> str:
-        return f"cc:agent:resource:{tenant_id}:{employee_id}"
+        return _resource_key(tenant_id, employee_id)
 
     @staticmethod
     def queue_rr_key(tenant_id: int, group_id: int, channel: str = "call_center") -> str:
-        return f"cc:queue:rr:{tenant_id}:group:{group_id}:{channel}"
+        return _queue_rr_key(tenant_id, group_id, channel)
 
     @staticmethod
     def offer_accept_lock_key(tenant_id: int, offer_id: str) -> str:
-        return f"cc:offer:accept-lock:{tenant_id}:{offer_id}"
+        return _offer_accept_lock_key(tenant_id, offer_id)
 
     @staticmethod
     def resource_for_visible(status: str) -> str:
@@ -54,6 +61,36 @@ class CcAgentResourceService:
         if status == "after_call_work":
             return "after_call_work"
         return "unavailable"
+
+    @staticmethod
+    def _log_transition(
+        *,
+        tenant_id: int,
+        employee_id: int,
+        from_state: str | None,
+        to_state: str,
+        reason: str,
+        call_id: str | None = None,
+        offer_id: str | None = None,
+        visible_from: str | None = None,
+        visible_to: str | None = None,
+        level: int = logging.INFO,
+    ) -> None:
+        """Structured resource-state transition log for Greptime / local debug."""
+        logger.log(
+            level,
+            "resource_transition tenant=%s employee=%s from=%s to=%s "
+            "visible_from=%s visible_to=%s call_id=%s offer_id=%s reason=%s",
+            tenant_id,
+            employee_id,
+            from_state or "-",
+            to_state,
+            visible_from or "-",
+            visible_to or "-",
+            call_id or "-",
+            offer_id or "-",
+            reason,
+        )
 
     @classmethod
     async def get_snapshot(
@@ -155,7 +192,18 @@ class CcAgentResourceService:
                     pipe.multi()
                     pipe.hset(key, mapping=mapping)
                     await pipe.execute()
-                    return cls._snapshot_from_raw(employee_id, mapping)
+                    snapshot = cls._snapshot_from_raw(employee_id, mapping)
+                    cls._log_transition(
+                        tenant_id=tenant_id,
+                        employee_id=employee_id,
+                        from_state=(current or {}).get("resource_state"),
+                        to_state=snapshot["resource_state"],
+                        visible_from=(current or {}).get("visible_status"),
+                        visible_to=snapshot["visible_status"],
+                        call_id=snapshot.get("current_call_id"),
+                        reason=f"set_visible_status:{status}",
+                    )
+                    return snapshot
                 except WatchError:
                     continue
         raise ConflictError("Call-center resource state changed, please retry")
@@ -245,7 +293,18 @@ class CcAgentResourceService:
                     pipe.multi()
                     pipe.hset(key, mapping=mapping)
                     await pipe.execute()
-                    return cls._snapshot_from_raw(employee_id, mapping)
+                    snapshot = cls._snapshot_from_raw(employee_id, mapping)
+                    cls._log_transition(
+                        tenant_id=tenant_id,
+                        employee_id=employee_id,
+                        from_state=current.get("resource_state"),
+                        to_state="ringing",
+                        visible_from=current.get("visible_status"),
+                        visible_to="busy",
+                        call_id=call_id,
+                        reason="bind_outbound_call",
+                    )
+                    return snapshot
                 except WatchError:
                     continue
         raise ConflictError("Call-center resource state changed, please retry")
@@ -277,8 +336,10 @@ class CcAgentResourceService:
                         or cls._is_expired(current)
                     ):
                         raise ConflictError("Offer reservation expired")
+                    # Busy while ringing so colleagues / status UI don't show the
+                    # agent as 就绪 during consult/transfer/inbound offer rings.
                     mapping = cls._base_mapping(
-                        visible_status="ready",
+                        visible_status="busy",
                         resource_state="ringing",
                         current_call_id=call_id,
                         offer_id=offer_id,
@@ -286,11 +347,27 @@ class CcAgentResourceService:
                         direction="inbound",
                         reserved_until=cls._now_epoch() + ttl,
                         last_assigned_at=current.get("last_assigned_at"),
+                        previous_visible_status=(
+                            current.get("previous_visible_status")
+                            or current.get("visible_status")
+                        ),
                     )
                     pipe.multi()
                     pipe.hset(key, mapping=mapping)
                     await pipe.execute()
-                    return cls._snapshot_from_raw(employee_id, mapping)
+                    snapshot = cls._snapshot_from_raw(employee_id, mapping)
+                    cls._log_transition(
+                        tenant_id=tenant_id,
+                        employee_id=employee_id,
+                        from_state=current.get("resource_state"),
+                        to_state="ringing",
+                        visible_from=current.get("visible_status"),
+                        visible_to="busy",
+                        call_id=call_id,
+                        offer_id=offer_id,
+                        reason="mark_ringing",
+                    )
+                    return snapshot
                 except WatchError:
                     continue
         raise ConflictError("Call-center resource state changed, please retry")
@@ -396,11 +473,62 @@ class CcAgentResourceService:
                     # expired". Once the resource is already in_call the offer is
                     # spent, so treat any repeat as a no-op regardless of call_id.
                     if current.get("resource_state") == "in_call":
+                        # Backfill stamp for sessions that entered in_call before
+                        # in_call_since existed (idempotent renew path).
+                        if not current.get("in_call_since"):
+                            mapping = cls._base_mapping(
+                                visible_status=current.get("visible_status") or "busy",
+                                resource_state="in_call",
+                                current_call_id=current.get("current_call_id") or call_id,
+                                offer_id=current.get("offer_id"),
+                                queue_id=current.get("queue_id"),
+                                direction=current.get("direction") or direction,
+                                reserved_until=current.get("reserved_until_epoch")
+                                or (cls._now_epoch() + cls.IN_CALL_LEASE_SEC),
+                                last_assigned_at=current.get("last_assigned_at"),
+                                previous_visible_status=current.get(
+                                    "previous_visible_status"
+                                ),
+                                in_call_since=cls._now_iso(),
+                            )
+                            pipe.multi()
+                            pipe.hset(key, mapping=mapping)
+                            await pipe.execute()
+                            snapshot = cls._snapshot_from_raw(employee_id, mapping)
+                            cls._log_transition(
+                                tenant_id=tenant_id,
+                                employee_id=employee_id,
+                                from_state="in_call",
+                                to_state="in_call",
+                                visible_from=current.get("visible_status"),
+                                visible_to=snapshot["visible_status"],
+                                call_id=snapshot.get("current_call_id"),
+                                offer_id=offer_id,
+                                reason="mark_in_call:backfill_in_call_since",
+                                level=logging.DEBUG,
+                            )
+                            return snapshot
+                        cls._log_transition(
+                            tenant_id=tenant_id,
+                            employee_id=employee_id,
+                            from_state="in_call",
+                            to_state="in_call",
+                            visible_from=current.get("visible_status"),
+                            visible_to=current.get("visible_status"),
+                            call_id=current.get("current_call_id") or call_id,
+                            offer_id=offer_id,
+                            reason="mark_in_call:idempotent_noop",
+                            level=logging.DEBUG,
+                        )
                         return current
                     if offer_id and current.get("offer_id") != offer_id:
                         raise ConflictError("Offer expired")
                     if current.get("resource_state") not in {"reserved", "ringing", "in_call"}:
                         raise ConflictError("Call resource not reserved")
+                    # Stamp once — consult targets have no CDR; browsers use this
+                    # to continue the live timer after a page refresh.
+                    from_state = current.get("resource_state")
+                    in_call_since = current.get("in_call_since") or cls._now_iso()
                     mapping = cls._base_mapping(
                         visible_status="busy",
                         resource_state="in_call",
@@ -408,11 +536,24 @@ class CcAgentResourceService:
                         direction=direction,
                         reserved_until=cls._now_epoch() + cls.IN_CALL_LEASE_SEC,
                         previous_visible_status=current.get("previous_visible_status"),
+                        in_call_since=in_call_since,
                     )
                     pipe.multi()
                     pipe.hset(key, mapping=mapping)
                     await pipe.execute()
-                    return cls._snapshot_from_raw(employee_id, mapping)
+                    snapshot = cls._snapshot_from_raw(employee_id, mapping)
+                    cls._log_transition(
+                        tenant_id=tenant_id,
+                        employee_id=employee_id,
+                        from_state=from_state,
+                        to_state="in_call",
+                        visible_from=current.get("visible_status"),
+                        visible_to="busy",
+                        call_id=call_id,
+                        offer_id=offer_id,
+                        reason="mark_in_call",
+                    )
+                    return snapshot
                 except WatchError:
                     continue
         raise ConflictError("Call-center resource state changed, please retry")
@@ -453,6 +594,7 @@ class CcAgentResourceService:
                         reserved_until=cls._now_epoch() + ttl,
                         last_assigned_at=current.get("last_assigned_at"),
                         previous_visible_status=current.get("previous_visible_status"),
+                        in_call_since=current.get("in_call_since"),
                     )
                     pipe.multi()
                     pipe.hset(key, mapping=mapping)
@@ -564,12 +706,36 @@ class CcAgentResourceService:
                         pipe.multi()
                         pipe.hset(key, mapping=mapping)
                         await pipe.execute()
-                        return cls._snapshot_from_raw(employee_id, mapping)
+                        snapshot = cls._snapshot_from_raw(employee_id, mapping)
+                        cls._log_transition(
+                            tenant_id=tenant_id,
+                            employee_id=employee_id,
+                            from_state=(current or {}).get("resource_state"),
+                            to_state="after_call_work",
+                            visible_from=(current or {}).get("visible_status"),
+                            visible_to="after_call_work",
+                            call_id=call_id,
+                            reason=f"mark_after_call_work:{reason}",
+                        )
+                        return snapshot
                     except WatchError:
                         continue
             raise ConflictError("Call-center resource state changed, please retry")
+        raw = await r.hgetall(key)
+        current = cls._snapshot_from_raw(employee_id, raw) if raw else None
         await r.hset(key, mapping=mapping)
-        return cls._snapshot_from_raw(employee_id, mapping)
+        snapshot = cls._snapshot_from_raw(employee_id, mapping)
+        cls._log_transition(
+            tenant_id=tenant_id,
+            employee_id=employee_id,
+            from_state=(current or {}).get("resource_state"),
+            to_state="after_call_work",
+            visible_from=(current or {}).get("visible_status"),
+            visible_to="after_call_work",
+            call_id=call_id,
+            reason=f"mark_after_call_work:{reason}",
+        )
+        return snapshot
 
     @classmethod
     async def release(
@@ -600,6 +766,9 @@ class CcAgentResourceService:
                         if current.get("resource_state") == "in_call" and not allow_in_call:
                             return current
                         visible_status = cls._release_visible_status(current)
+                    from_state = (current or {}).get("resource_state")
+                    from_visible = (current or {}).get("visible_status")
+                    from_call_id = (current or {}).get("current_call_id")
                     mapping = cls._base_mapping(
                         visible_status=visible_status,
                         resource_state=cls.resource_for_visible(visible_status),
@@ -609,7 +778,19 @@ class CcAgentResourceService:
                     pipe.multi()
                     pipe.hset(key, mapping=mapping)
                     await pipe.execute()
-                    return cls._snapshot_from_raw(employee_id, mapping)
+                    snapshot = cls._snapshot_from_raw(employee_id, mapping)
+                    cls._log_transition(
+                        tenant_id=tenant_id,
+                        employee_id=employee_id,
+                        from_state=from_state,
+                        to_state=snapshot["resource_state"],
+                        visible_from=from_visible,
+                        visible_to=snapshot["visible_status"],
+                        call_id=from_call_id,
+                        offer_id=expected_offer_id,
+                        reason=f"release:{reason}",
+                    )
+                    return snapshot
                 except WatchError:
                     continue
         raise ConflictError("Call-center resource state changed, please retry")
@@ -661,8 +842,22 @@ class CcAgentResourceService:
                 visible_status=visible_status,
                 resource_state=cls.resource_for_visible(visible_status),
             )
-        await r.hset(cls.key(tenant_id, employee_id), mapping=mapping)
-        return cls._snapshot_from_raw(employee_id, mapping)
+        key = cls.key(tenant_id, employee_id)
+        raw = await r.hgetall(key)
+        current = cls._snapshot_from_raw(employee_id, raw) if raw else None
+        await r.hset(key, mapping=mapping)
+        snapshot = cls._snapshot_from_raw(employee_id, mapping)
+        cls._log_transition(
+            tenant_id=tenant_id,
+            employee_id=employee_id,
+            from_state=(current or {}).get("resource_state"),
+            to_state=snapshot["resource_state"],
+            visible_from=(current or {}).get("visible_status"),
+            visible_to=snapshot["visible_status"],
+            call_id=snapshot.get("current_call_id") or active_call_id,
+            reason="recover_from_sources",
+        )
+        return snapshot
 
     @classmethod
     async def next_queue_index(
@@ -729,7 +924,19 @@ class CcAgentResourceService:
                     pipe.multi()
                     pipe.hset(key, mapping=mapping)
                     await pipe.execute()
-                    return cls._snapshot_from_raw(employee_id, mapping)
+                    snapshot = cls._snapshot_from_raw(employee_id, mapping)
+                    cls._log_transition(
+                        tenant_id=tenant_id,
+                        employee_id=employee_id,
+                        from_state=resource,
+                        to_state="reserved",
+                        visible_from=visible,
+                        visible_to=snapshot["visible_status"],
+                        call_id=call_id,
+                        offer_id=offer_id or None,
+                        reason=f"reserve:{direction}",
+                    )
+                    return snapshot
                 except WatchError:
                     continue
         raise ConflictError("Call-center resource state changed, please retry")
@@ -757,6 +964,7 @@ class CcAgentResourceService:
         last_released_at: str | None = None,
         last_release_reason: str | None = None,
         previous_visible_status: str | None = None,
+        in_call_since: str | datetime | None = None,
     ) -> dict[str, str]:
         now = CcAgentResourceService._now_iso()
         return {
@@ -771,6 +979,7 @@ class CcAgentResourceService:
             "last_released_at": CcAgentResourceService._format_datetime(last_released_at),
             "last_release_reason": last_release_reason or "",
             "previous_visible_status": previous_visible_status or "",
+            "in_call_since": CcAgentResourceService._format_datetime(in_call_since),
             "updated_at": now,
         }
 
@@ -807,6 +1016,7 @@ class CcAgentResourceService:
             "last_released_at": CcAgentResourceService._parse_datetime(val("last_released_at")),
             "last_release_reason": val("last_release_reason") or None,
             "previous_visible_status": val("previous_visible_status") or None,
+            "in_call_since": CcAgentResourceService._parse_datetime(val("in_call_since")),
             "resource_updated_at": CcAgentResourceService._parse_datetime(val("updated_at")),
         }
 

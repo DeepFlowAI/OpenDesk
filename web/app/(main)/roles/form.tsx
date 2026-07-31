@@ -82,6 +82,19 @@ export default function RoleForm({ initialData, readOnly = false, onSubmit }: Pr
     return map
   }, [nodes])
 
+  // Shared data_scope_resource (e.g. call_record) is one module-level setting.
+  // Show the scope picker only on the first checked permission that owns it.
+  const scopeDisplayPermissionByResource = useMemo(() => {
+    const map = new Map<string, string>()
+    const checked = new Set(permissions)
+    for (const node of nodes) {
+      const resource = node.data_scope_resource
+      if (!resource || !checked.has(node.key) || map.has(resource)) continue
+      map.set(resource, node.key)
+    }
+    return map
+  }, [nodes, permissions])
+
   const collectDependents = useCallback((key: string): string[] => {
     const direct = dependentsByRequirement.get(key) ?? []
     return direct.flatMap((child) => [child, ...collectDependents(child)])
@@ -233,7 +246,11 @@ export default function RoleForm({ initialData, readOnly = false, onSubmit }: Pr
                 {module.permissions.map((node) => {
                   const checked = permissions.includes(node.key)
                   const disabled = readOnly || Boolean(node.requires && !permissions.includes(node.requires))
-                  const scopeResource = node.data_scope_resource
+                  const scopeResource = node.data_scope_resource ?? null
+                  const showDataScope =
+                    checked &&
+                    scopeResource !== null &&
+                    scopeDisplayPermissionByResource.get(scopeResource) === node.key
                   return (
                     <div key={node.key} className="flex flex-col gap-3 px-4 py-3">
                       <button
@@ -258,7 +275,7 @@ export default function RoleForm({ initialData, readOnly = false, onSubmit }: Pr
                         </span>
                       </button>
 
-                      {checked && scopeResource && (
+                      {showDataScope && scopeResource && (
                         <div className="ml-7 flex flex-wrap items-center gap-2">
                           {(treeData?.data_scope_options ?? ['all', 'group', 'self']).map((scope) => (
                             <button

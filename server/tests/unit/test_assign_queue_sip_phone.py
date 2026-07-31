@@ -58,7 +58,7 @@ def _patch_common(monkeypatch, *, device_type, ext):
     from app.db import session as session_mod
     monkeypatch.setattr(session_mod, "AsyncSessionLocal", _fake_session)
 
-    async def fake_current_device(_db, _t, _e):
+    async def fake_current_device(_db, _t, _e, _r=None):
         return {"device_type": device_type}
 
     monkeypatch.setattr(
@@ -91,19 +91,26 @@ async def test_sip_phone_agent_rings_and_bridges_on_answer(monkeypatch):
     await telephony.connect()
     telephony.originate_response = {"call_id": "ext-leg", "status": "originating"}
     ext = SimpleNamespace(
-        sip_user_id="acme-1001", is_active=True, registration_status="registered",
+        sip_user_id="acme-1001",
+        is_active=True,
+        registration_status="registered",
+        current_occupant_employee_id=42,
     )
     _patch_common(monkeypatch, device_type="sip_phone", ext=ext)
 
     # Stub out the DB-write services used after off-hook.
     from app.services import call_record_service
     from app.services.cc_agent_status_service import CcAgentStatusService
+    from app.services.cc_agent_resource_service import CcAgentResourceService
     from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
     from app.services.system_settings_service import SystemSettingsService
 
     monkeypatch.setattr(call_record_service.CallRecordService, "mark_answered", AsyncMock())
     monkeypatch.setattr(CcAgentStatusService, "set_status", AsyncMock())
     monkeypatch.setattr(AgentWebRTCSessionService, "set_busy", AsyncMock())
+    monkeypatch.setattr(CcAgentResourceService, "mark_ringing", AsyncMock(return_value=None))
+    mark_in_call = AsyncMock(return_value=None)
+    monkeypatch.setattr(CcAgentResourceService, "mark_in_call", mark_in_call)
     monkeypatch.setattr(
         SystemSettingsService, "is_bridge_asr_enabled_managed", AsyncMock(return_value=True),
     )
@@ -123,9 +130,10 @@ async def test_sip_phone_agent_rings_and_bridges_on_answer(monkeypatch):
         orch._resolve_leg_wait("ext-leg", {"answered": True})
 
     answer_task = asyncio.create_task(answer_soon())
+    redis = MagicMock()
     result = await exe._try_ring_sip_phone_agent(
         ctx, {}, _node(), {"employee_id": 42},
-        "offer-1", 30.0, None, orch, MagicMock(),
+        "offer-1", 30.0, redis, orch, MagicMock(),
     )
     await answer_task
 
@@ -142,6 +150,11 @@ async def test_sip_phone_agent_rings_and_bridges_on_answer(monkeypatch):
     orch.notify_agent_call_answered.assert_awaited_once()
     assert orch.notify_agent_call_answered.await_args.kwargs["call_id"] == "cust-call"
     assert orch.notify_agent_call_answered.await_args.kwargs["employee_id"] == 42
+    # Redis must leave ringing so a page refresh restores 通话中, not 来电.
+    mark_in_call.assert_awaited_once()
+    assert mark_in_call.await_args.args[0] is redis
+    assert mark_in_call.await_args.kwargs["call_id"] == "cust-call"
+    assert mark_in_call.await_args.kwargs["offer_id"] == "offer-1"
 
 
 @pytest.mark.asyncio
@@ -150,7 +163,10 @@ async def test_sip_phone_no_answer_fails_without_bridge(monkeypatch):
     await telephony.connect()
     telephony.originate_response = {"call_id": "ext-leg", "status": "originating"}
     ext = SimpleNamespace(
-        sip_user_id="acme-1001", is_active=True, registration_status="registered",
+        sip_user_id="acme-1001",
+        is_active=True,
+        registration_status="registered",
+        current_occupant_employee_id=42,
     )
     _patch_common(monkeypatch, device_type="sip_phone", ext=ext)
 
@@ -185,7 +201,10 @@ async def test_sip_phone_caller_hangup_cancels_ring(monkeypatch):
     await telephony.connect()
     telephony.originate_response = {"call_id": "ext-leg", "status": "originating"}
     ext = SimpleNamespace(
-        sip_user_id="acme-1001", is_active=True, registration_status="registered",
+        sip_user_id="acme-1001",
+        is_active=True,
+        registration_status="registered",
+        current_occupant_employee_id=42,
     )
     _patch_common(monkeypatch, device_type="sip_phone", ext=ext)
 

@@ -69,6 +69,34 @@ async def test_close_if_stale_closes_bot_conversation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_close_if_stale_closes_handoff_confirmation(monkeypatch):
+    monkeypatch.setattr(settings, "OPEN_AGENT_BOT_TIMEOUT_SECONDS", 3600)
+    now = datetime(2026, 6, 23, 9, 1, tzinfo=timezone.utc)
+    conversation = _conversation(status=ConversationStatus.HANDOFF_PENDING.value)
+    confirmation_message = _message(created_at=now - timedelta(minutes=61))
+    end_conversation = AsyncMock(return_value=_conversation(status=ConversationStatus.CLOSED.value))
+
+    monkeypatch.setattr(
+        "app.services.open_agent_bot_timeout_service.MessageRepository.get_latest_open_agent_bot_activity",
+        AsyncMock(return_value=confirmation_message),
+    )
+    monkeypatch.setattr(
+        "app.services.open_agent_bot_timeout_service.MessageRepository.has_visitor_message_after",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "app.services.open_agent_bot_timeout_service.ConversationRepository.end_conversation",
+        end_conversation,
+    )
+    monkeypatch.setattr(OpenAgentBotTimeoutService, "_emit_conversation_ended", AsyncMock())
+
+    result = await OpenAgentBotTimeoutService.close_if_stale(AsyncMock(), conversation, now=now)
+
+    assert result is True
+    end_conversation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_close_if_stale_keeps_conversation_when_visitor_replied(monkeypatch):
     monkeypatch.setattr(settings, "OPEN_AGENT_BOT_TIMEOUT_SECONDS", 3600)
     now = datetime(2026, 6, 23, 9, 1, tzinfo=timezone.utc)
