@@ -1,11 +1,27 @@
 """
 System settings schemas
 """
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from zoneinfo import available_timezones
 
 
-SUPPORTED_LANGUAGES = {"zh", "en"}
+SUPPORTED_LANGUAGES = {
+    "zh",
+    "en",
+    "fr-FR",
+    "es-ES",
+    "es-419",
+    "pt-BR",
+    "pt-PT",
+    "it-IT",
+    "nl-NL",
+    "pl-PL",
+    "ru-RU",
+    "tr-TR",
+    "th-TH",
+    "vi-VN",
+    "id-ID",
+}
 VALID_TIMEZONES = available_timezones()
 
 
@@ -36,6 +52,10 @@ class CallTranscriptionSettingsUpdate(BaseModel):
     enabled: bool
 
 
+class CallWrapupSettingsUpdate(BaseModel):
+    seconds: int = Field(ge=0, le=60)
+
+
 class SystemSettingsResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -43,3 +63,7 @@ class SystemSettingsResponse(BaseModel):
     default_timezone: str
     organization_enabled: bool = False
     bridge_asr_enabled: bool = False
+    call_wrapup_seconds: int = 30
+    lingomaster_enabled: bool = False
+    lingomaster_visitor_prompt: str = ""
+    lingomaster_agent_prompt: str = ""

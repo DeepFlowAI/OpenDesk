@@ -7,6 +7,7 @@ import { IconArrowLeft, IconChevronDown, IconLogout } from '@tabler/icons-react'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
 import { avatarBackgroundForName, singleAvatarLetter } from '@/lib/avatar-fallback'
+import { LANGUAGE_OPTIONS } from '@/lib/languages'
 import { cn } from '@/lib/utils'
 
 type Props = {
@@ -101,20 +102,24 @@ function H5AccountMenu() {
           />
           <div className="absolute right-0 top-full z-50 mt-1 w-48 rounded-lg border border-border bg-popover p-1 shadow-lg">
             <p className="truncate border-b border-border px-3 py-2 text-sm font-medium">{displayName}</p>
-            <div className="flex gap-1 px-2 py-2">
-              {(['zh', 'en'] as const).map((value) => (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => setLocale(value)}
-                  className={cn(
-                    'h-9 flex-1 rounded-md text-xs transition-colors',
-                    locale === value ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground',
-                  )}
-                >
-                  {value === 'zh' ? '中文' : 'English'}
-                </button>
-              ))}
+            <div className="max-h-60 overflow-y-auto px-1 py-1">
+              <div className="flex flex-col gap-0.5">
+                {LANGUAGE_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => setLocale(opt.value)}
+                    className={cn(
+                      'flex h-9 w-full items-center rounded-md px-3 text-xs transition-colors',
+                      locale === opt.value
+                        ? 'bg-muted font-medium text-foreground'
+                        : 'text-muted-foreground hover:bg-muted',
+                    )}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
             </div>
             <button
               type="button"

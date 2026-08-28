@@ -29,6 +29,7 @@ import type {
   SipExtension,
   SipRegistrationSecret,
 } from '@/models/sip-extension'
+import type { Locale } from '@/lib/languages'
 
 const PER_PAGE = 20
 
@@ -44,7 +45,7 @@ async function readErrorMessage(error: unknown, fallback: string): Promise<strin
   return fallback
 }
 
-function formatDateTime(value: string | null, locale: 'zh' | 'en'): string {
+function formatDateTime(value: string | null, locale: Locale): string {
   if (!value) return '—'
   try {
     return new Date(value).toLocaleString(locale === 'zh' ? 'zh-CN' : 'en-US', {
@@ -139,7 +140,7 @@ export default function SipExtensionsPage() {
           `${t('se.reg.transport', locale)}: ${info.transport ?? ''}`,
           `${t('se.reg.userId', locale)}: ${info.sip_user_id}`,
           `${t('se.reg.authAccount', locale)}: ${info.auth_account}`,
-          `${t('se.reg.authPassword', locale)}: ${info.auth_password_masked}`,
+          `${t('se.reg.authPassword', locale)}: ${info.auth_password ?? ''}`,
         ].join('\n')
         const ok = await copyPlainTextToClipboard(text)
         if (ok) toast.success(t('se.copy.success', locale))
@@ -369,7 +370,7 @@ function ExtensionRow({
   onToggleActive,
 }: {
   item: SipExtension
-  locale: 'zh' | 'en'
+  locale: Locale
   onEdit: () => void
   onCopyInfo: () => void
   onReset: () => void

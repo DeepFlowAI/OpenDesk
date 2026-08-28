@@ -65,12 +65,17 @@ function SortableVisibleColumnRow({
   id,
   fieldName,
   onToggle,
+  locked,
 }: {
   id: string
   fieldName: string
   onToggle: () => void
+  locked: boolean
 }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id })
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id,
+    disabled: locked,
+  })
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -86,13 +91,16 @@ function SortableVisibleColumnRow({
       )}
     >
       <span
-        className="inline-flex shrink-0 cursor-grab touch-none select-none text-muted-foreground hover:text-foreground active:cursor-grabbing"
+        className={cn(
+          'inline-flex shrink-0 touch-none select-none text-muted-foreground',
+          locked ? 'cursor-not-allowed opacity-40' : 'cursor-grab hover:text-foreground active:cursor-grabbing',
+        )}
         {...attributes}
         {...listeners}
       >
         <IconGripVertical size={16} />
       </span>
-      <Switch checked={true} onCheckedChange={onToggle} />
+      <Switch checked={true} disabled={locked} onCheckedChange={onToggle} />
       <span className="min-w-0 flex-1 truncate text-sm text-foreground">{fieldName}</span>
     </div>
   )
@@ -106,6 +114,29 @@ export type WorkspaceColumnsDrawerProps = {
   onApply: (cols: WorkspaceColumnConfigItem[]) => void
   onReset: () => void
   onClose: () => void
+  requiredFieldKeys?: string[]
+}
+
+function normalizeRequiredColumns(
+  columns: WorkspaceColumnConfigItem[],
+  requiredFieldKeys: string[],
+): WorkspaceColumnConfigItem[] {
+  const requiredOrder = new Map(requiredFieldKeys.map((key, index) => [key, index]))
+  return columns
+    .map((column) => (
+      column.field_key && requiredOrder.has(column.field_key)
+        ? { ...column, visible: true }
+        : column
+    ))
+    .sort((a, b) => {
+      const aRequired = a.field_key ? requiredOrder.get(a.field_key) : undefined
+      const bRequired = b.field_key ? requiredOrder.get(b.field_key) : undefined
+      if (aRequired != null && bRequired != null) return aRequired - bRequired
+      if (aRequired != null) return -1
+      if (bRequired != null) return 1
+      return a.sort_order - b.sort_order
+    })
+    .map((column, index) => ({ ...column, sort_order: index }))
 }
 
 export function WorkspaceColumnsDrawer({
@@ -116,19 +147,22 @@ export function WorkspaceColumnsDrawer({
   onApply,
   onReset,
   onClose,
+  requiredFieldKeys = [],
 }: WorkspaceColumnsDrawerProps) {
   const isZh = locale === 'zh'
 
   const initialDraft = useMemo<WorkspaceColumnConfigItem[]>(() => {
-    if (currentOverride) return [...currentOverride]
-    if (baselineConfig && baselineConfig.length > 0) return [...baselineConfig]
-    return fields.map((f, idx) => ({
+    const columns = currentOverride
+      ?? (baselineConfig && baselineConfig.length > 0
+        ? baselineConfig
+        : fields.map((f, idx) => ({
       field_id: f.id,
       field_key: f.key,
       visible: true,
       sort_order: idx,
-    }))
-  }, [currentOverride, baselineConfig, fields])
+        })))
+    return normalizeRequiredColumns([...columns], requiredFieldKeys)
+  }, [currentOverride, baselineConfig, fields, requiredFieldKeys])
 
   const [draft, setDraft] = useState<WorkspaceColumnConfigItem[]>(initialDraft)
   const [searchTerm, setSearchTerm] = useState('')
@@ -158,6 +192,7 @@ export function WorkspaceColumnsDrawer({
   )
 
   const toggleVisibility = useCallback((col: WorkspaceColumnConfigItem) => {
+    if (col.field_key && requiredFieldKeys.includes(col.field_key)) return
     setDraft((prev) =>
       prev.map((c) => {
         const match = col.field_key
@@ -167,15 +202,21 @@ export function WorkspaceColumnsDrawer({
         return { ...c, visible: !c.visible }
       }),
     )
-  }, [])
+  }, [requiredFieldKeys])
 
   const handleShowAll = useCallback(() => {
     setDraft((prev) => prev.map((c) => ({ ...c, visible: true })))
   }, [])
 
   const handleHideAll = useCallback(() => {
-    setDraft((prev) => prev.map((c) => ({ ...c, visible: false })))
-  }, [])
+    setDraft((prev) => normalizeRequiredColumns(
+      prev.map((c) => ({
+        ...c,
+        visible: Boolean(c.field_key && requiredFieldKeys.includes(c.field_key)),
+      })),
+      requiredFieldKeys,
+    ))
+  }, [requiredFieldKeys])
 
   const handleReset = useCallback(() => {
     onReset()
@@ -183,9 +224,9 @@ export function WorkspaceColumnsDrawer({
   }, [onReset, onClose])
 
   const handleConfirm = useCallback(() => {
-    onApply(draft)
+    onApply(normalizeRequiredColumns(draft, requiredFieldKeys))
     onClose()
-  }, [draft, onApply, onClose])
+  }, [draft, onApply, onClose, requiredFieldKeys])
 
   const filterColumns = useCallback(
     (cols: WorkspaceColumnConfigItem[]) => {
@@ -222,15 +263,15 @@ export function WorkspaceColumnsDrawer({
           const merged = mergeColumnOrderBySubsequence(vis, filt, reordered)
           const updated = merged.map((c, i) => ({ ...c, sort_order: i }))
           const hiddenUpdated = hid.map((c, i) => ({ ...c, sort_order: updated.length + i }))
-          return [...updated, ...hiddenUpdated]
+          return normalizeRequiredColumns([...updated, ...hiddenUpdated], requiredFieldKeys)
         }
         const newVis = arrayMove(vis, oldIndex, newIndex)
         const updated = newVis.map((c, i) => ({ ...c, sort_order: i }))
         const hiddenUpdated = hid.map((c, i) => ({ ...c, sort_order: updated.length + i }))
-        return [...updated, ...hiddenUpdated]
+        return normalizeRequiredColumns([...updated, ...hiddenUpdated], requiredFieldKeys)
       })
     },
-    [searchTerm, getFieldName],
+    [searchTerm, getFieldName, requiredFieldKeys],
   )
 
   return (
@@ -246,7 +287,7 @@ export function WorkspaceColumnsDrawer({
           <button
             type="button"
             onClick={handleConfirm}
-            className="flex h-9 shrink-0 items-center rounded-lg bg-[#252525] px-4 text-sm font-medium text-white transition-colors hover:bg-[#252525]/90"
+            className="flex h-9 shrink-0 items-center rounded-lg bg-foreground px-4 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
           >
             {isZh ? '确定' : 'Confirm'}
           </button>
@@ -305,6 +346,7 @@ export function WorkspaceColumnsDrawer({
                         id={uid}
                         fieldName={getFieldName(col)}
                         onToggle={() => toggleVisibility(col)}
+                        locked={Boolean(col.field_key && requiredFieldKeys.includes(col.field_key))}
                       />
                     )
                   })}

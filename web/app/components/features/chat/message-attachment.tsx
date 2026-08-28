@@ -12,9 +12,14 @@ import {
 import { cn } from '@/lib/utils'
 import { parsePendingAttachmentContent } from '@/lib/pending-attachment'
 import {
-  canPlayH264Mp4,
-  isMp4VideoCandidate,
+  attachmentPreviewKind,
+  canPreviewAttachment,
+} from '@/app/components/features/file-preview/preview-kind'
+import {
+  isAppleMobileWebKit,
+  isInlineVideoCandidate,
   MessageVideoAttachment,
+  shouldAttemptInlineVideo,
 } from '@/app/components/features/chat/message-video-attachment'
 
 const PDFViewer = dynamic(
@@ -125,10 +130,6 @@ function formatSize(size: number): string {
   if (size < 1024) return `${size} B`
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
   return `${(size / 1024 / 1024).toFixed(1)} MB`
-}
-
-function isPdf(mimeType: string | undefined, filename: string | undefined): boolean {
-  return mimeType === 'application/pdf' || Boolean(filename?.toLowerCase().endsWith('.pdf'))
 }
 
 function getFileIconSrc(mimeType: string | undefined, filename: string): string | null {
@@ -313,13 +314,16 @@ export function MessageAttachment({
   const [lightboxIndex, setLightboxIndex] = useState(0)
   const [browserSupportsInlineVideo, setBrowserSupportsInlineVideo] = useState<boolean | null>(null)
   const [videoPlaybackFailed, setVideoPlaybackFailed] = useState(false)
-  const isPdfFile = isPdf(attachmentPayload?.mime_type, attachmentPayload?.name)
+  const [previewVideoFailed, setPreviewVideoFailed] = useState(false)
   const fileName = attachmentPayload?.name || '附件'
   const fileIconSrc = getFileIconSrc(attachmentPayload?.mime_type, fileName)
+  const previewKind = attachmentPreviewKind(attachmentPayload?.mime_type, attachmentPayload?.name)
+  const showPreviewButton = canPreviewAttachment(attachmentPayload?.mime_type, attachmentPayload?.name)
+  const isVideoFile = isInlineVideoCandidate(attachmentPayload)
   const inlineVideoCandidate = inlinePlayableVideo
     && !compact
     && !isImage
-    && isMp4VideoCandidate(attachmentPayload)
+    && isVideoFile
 
   useEffect(() => {
     setVideoPlaybackFailed(false)
@@ -327,8 +331,11 @@ export function MessageAttachment({
       setBrowserSupportsInlineVideo(null)
       return
     }
-    setBrowserSupportsInlineVideo(canPlayH264Mp4(document.createElement('video')))
-  }, [content, inlineVideoCandidate])
+    setBrowserSupportsInlineVideo(shouldAttemptInlineVideo(document.createElement('video'), {
+      isAppleMobile: isAppleMobileWebKit(),
+      file: attachmentPayload,
+    }))
+  }, [attachmentPayload, content, inlineVideoCandidate])
 
   useEffect(() => {
     if (!pendingPayload) return
@@ -577,19 +584,22 @@ export function MessageAttachment({
         </div>
       </div>
       <div className="mt-3 flex items-center gap-2">
-        <button
-          type="button"
-          className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-border text-xs hover:bg-muted disabled:opacity-50"
-          disabled={loading || error || !url}
-          aria-label="Preview file"
-          title="预览"
-          onClick={(event) => {
-            event.stopPropagation()
-            setPreviewOpen(true)
-          }}
-        >
-          <IconEye size={14} />
-        </button>
+        {showPreviewButton && (
+          <button
+            type="button"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-border text-xs hover:bg-muted disabled:opacity-50"
+            disabled={loading || error || !url}
+            aria-label="Preview file"
+            title="预览"
+            onClick={(event) => {
+              event.stopPropagation()
+              setPreviewVideoFailed(false)
+              setPreviewOpen(true)
+            }}
+          >
+            <IconEye size={14} />
+          </button>
+        )}
         <button
           type="button"
           className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-border text-xs hover:bg-muted disabled:opacity-50"
@@ -604,7 +614,7 @@ export function MessageAttachment({
           <IconDownload size={14} />
         </button>
       </div>
-      {previewOpen && url && (
+      {previewOpen && url && showPreviewButton && (
         <div
           className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/70 p-4"
           onClick={() => setPreviewOpen(false)}
@@ -624,7 +634,7 @@ export function MessageAttachment({
                 <IconX size={18} />
               </button>
             </div>
-            {isPdfFile ? (
+            {previewKind === 'pdf' ? (
               <PDFViewer
                 config={{
                   src: url,
@@ -634,11 +644,32 @@ export function MessageAttachment({
                 }}
                 className="min-h-0 flex-1 bg-white"
               />
-            ) : (
+            ) : previewKind === 'video' ? (
+              <div className="min-h-0 flex-1 bg-black">
+                {previewVideoFailed ? (
+                  <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+                    <IconFile size={36} className="text-white/50" />
+                    <div className="text-sm font-medium text-white">该文件暂时无法在线预览</div>
+                    <div className="max-w-md text-xs text-white/60">请下载文件后查看。</div>
+                  </div>
+                ) : (
+                  <video
+                    data-testid="attachment-video-preview"
+                    src={url}
+                    controls
+                    playsInline
+                    preload="metadata"
+                    aria-label={fileName}
+                    className="h-full w-full object-contain"
+                    onError={() => setPreviewVideoFailed(true)}
+                  />
+                )}
+              </div>
+            ) : previewKind === 'document' ? (
               <div className="min-h-0 flex-1 bg-white">
                 <JitDocumentViewer url={url} filename={fileName} />
               </div>
-            )}
+            ) : null}
           </div>
         </div>
       )}

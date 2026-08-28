@@ -1,5 +1,11 @@
 import { z } from 'zod'
 
+export const CN_MOBILE_REGEX = /^1[3-9]\d{9}$/
+
+export function isCnMobileNumber(value: string | null | undefined): boolean {
+  return !!value && CN_MOBILE_REGEX.test(value.trim())
+}
+
 export const TENANT_IDENTIFIER_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{1,127}$/
 const USERNAME_REGEX = /^[a-zA-Z0-9_]{4,32}$/
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/

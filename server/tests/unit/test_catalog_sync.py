@@ -191,6 +191,66 @@ async def test_build_wire_trunks_demotes_outbound_without_endpoints():
     assert "outbound" not in wire[0]["trunk_types"]
 
 
+@pytest.mark.asyncio
+async def test_push_snapshot_omits_foreign_owned_trunks():
+    client = MagicMock()
+    client.provider_id = "opendesk-test"
+    client.get_catalog = AsyncMock(
+        return_value={
+            "trunks": [
+                {"id": "shared", "provider_id": "opendesk"},
+                {"id": "virtual", "provider_id": "opendesk-test"},
+            ]
+        }
+    )
+    client.put_snapshot = AsyncMock(return_value={"revision": 2, "trunk_count": 1})
+    sync = CatalogSyncService(
+        telecom_client=client, lease_ttl_sec=90, stale_acceptable_sec=30,
+    )
+    sync._build_wire_trunks = AsyncMock(
+        return_value=[
+            {"id": "shared", "trunk_types": ["outbound"]},
+            {"id": "virtual", "trunk_types": ["outbound"]},
+        ]
+    )
+
+    await sync.push_snapshot()
+
+    pushed = client.put_snapshot.await_args.kwargs["trunks"]
+    assert [row["id"] for row in pushed] == ["virtual"]
+
+
+@pytest.mark.asyncio
+async def test_push_snapshot_retries_after_trunk_id_conflict():
+    client = MagicMock()
+    client.provider_id = "opendesk-test"
+    client.get_catalog = AsyncMock(return_value={"trunks": []})
+    client.put_snapshot = AsyncMock(
+        side_effect=[
+            TelecomAPIError(
+                409,
+                {"code": "trunk_id_conflict", "message": 'trunk_id "shared" already owned by provider "opendesk"'},
+            ),
+            {"revision": 3, "trunk_count": 1},
+        ]
+    )
+    sync = CatalogSyncService(
+        telecom_client=client, lease_ttl_sec=90, stale_acceptable_sec=30,
+    )
+    sync._build_wire_trunks = AsyncMock(
+        return_value=[
+            {"id": "shared", "trunk_types": ["outbound"]},
+            {"id": "virtual", "trunk_types": ["outbound"]},
+        ]
+    )
+
+    await sync.push_snapshot()
+
+    assert client.put_snapshot.await_count == 2
+    pushed = client.put_snapshot.await_args_list[1].kwargs["trunks"]
+    assert [row["id"] for row in pushed] == ["virtual"]
+
+
 def test_telecom_api_error_repr():
     err = TelecomAPIError(409, {"error": "stale_revision"})
     assert "409" in str(err)

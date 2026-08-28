@@ -234,7 +234,7 @@ export default function UserFieldForm({ initialData, isEdit, onSubmit }: UserFie
   )
 
   const selectedTypeLabel = form.field_type
-    ? FIELD_TYPE_LABELS[form.field_type as FieldType]?.[locale] ?? form.field_type
+    ? FIELD_TYPE_LABELS[form.field_type as FieldType]?.[locale === 'zh' ? 'zh' : 'en'] ?? form.field_type
     : ''
 
   const isSelect = (SELECT_FIELD_TYPES as readonly string[]).includes(form.field_type)
@@ -353,7 +353,7 @@ export default function UserFieldForm({ initialData, isEdit, onSubmit }: UserFie
                       ft === form.field_type ? 'font-medium text-foreground' : 'text-foreground/80',
                     )}
                   >
-                    {FIELD_TYPE_LABELS[ft]?.[locale] ?? ft}
+                    {FIELD_TYPE_LABELS[ft]?.[locale === 'zh' ? 'zh' : 'en'] ?? ft}
                   </button>
                 ))}
               </div>

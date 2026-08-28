@@ -55,6 +55,7 @@ export default function OutboundTaskTemplatesPage() {
                   <th className="px-4 py-3 font-medium">模板名称</th>
                   <th className="px-4 py-3 font-medium">说明</th>
                   <th className="px-4 py-3 font-medium">字段数</th>
+                  <th className="px-4 py-3 font-medium">外呼话术</th>
                   <th className="px-4 py-3 font-medium">更新时间</th>
                   <th className="w-20 px-4 py-3 font-medium">操作</th>
                 </tr>
@@ -69,6 +70,11 @@ export default function OutboundTaskTemplatesPage() {
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">{template.description || '-'}</td>
                     <td className="px-4 py-3">{template.fields.length}</td>
+                    <td className="px-4 py-3">
+                      <Link href={`/workspace/engagement/outbound-task-templates/${template.id}?tab=script`} className={template.has_script || template.script ? 'text-success hover:underline' : 'text-muted-foreground hover:underline'}>
+                        {template.has_script || template.script ? '已配置' : '未配置'}
+                      </Link>
+                    </td>
                     <td className="px-4 py-3">{formatDateTime(template.updated_at)}</td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">

@@ -30,9 +30,17 @@ import {
   IconX,
 } from '@tabler/icons-react'
 import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogFooter, DialogTitle } from '@/components/ui/dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { SafeHtml } from '@/components/safe-html'
 import { cn } from '@/lib/utils'
 import { quoteFromMessage } from '@/lib/message-quote'
+import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import {
   isRichTextPlainOnly,
   prepareRichTextMessageHtml,
@@ -48,9 +56,17 @@ import { useAgentKnowledgeInputSuggestionSetting } from '@/service/use-knowledge
 import {
   knowledgeDocumentHasComposerBody,
   knowledgeDocumentHasComposerSendableContent,
+  knowledgeDocumentHasInlineImage,
+  knowledgeDocumentHasSendableContent,
+  knowledgeDocumentNeedsSuggestionDialog,
   knowledgeHtmlToComposerText,
+  knowledgeHtmlToMessageText,
+  stripKnowledgeHtml,
 } from '@/app/components/features/knowledge/knowledge-utils'
-import { formatKnowledgeAttachmentSize } from '@/app/components/features/knowledge/knowledge-attachment-list'
+import {
+  formatKnowledgeAttachmentSize,
+  KnowledgeAttachmentList,
+} from '@/app/components/features/knowledge/knowledge-attachment-list'
 import { MessageQuotePreview } from '@/app/components/features/chat/message-quote'
 import type { Socket } from 'socket.io-client'
 import type { Message } from '@/models/conversation'
@@ -122,6 +138,34 @@ type KnowledgeSuggestionDraft = {
   documentTitle: string
   requestId: string
   attachments: KnowledgeDocumentAttachment[]
+}
+
+type KnowledgeSuggestionConfirm = {
+  document: KnowledgeDocument
+  requestId: string
+  replaceEnd: number
+}
+
+const KNOWLEDGE_SEND_MAX_LENGTH = 4000
+
+function plainTextRemainderToHtml(text: string): string {
+  const normalized = text.replace(/\r\n?/g, '\n')
+  if (!normalized.trim()) return ''
+  return normalized
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .split(/\n{2,}/)
+    .map((part) => `<p>${part.replace(/\n/g, '<br>')}</p>`)
+    .join('')
+}
+
+function sortedKnowledgeAttachments(
+  attachments: KnowledgeDocumentAttachment[],
+): KnowledgeDocumentAttachment[] {
+  return [...attachments].sort(
+    (left, right) => left.sort_order - right.sort_order || left.id - right.id,
+  )
 }
 
 type NavigatorWithUserAgentData = Navigator & {
@@ -353,6 +397,8 @@ export function AgentComposer({
   // message. Arrow keys or mouse hover set a concrete index to opt in.
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1)
   const [dismissedSuggestionPrefix, setDismissedSuggestionPrefix] = useState<string | null>(null)
+  const [suggestionConfirm, setSuggestionConfirm] = useState<KnowledgeSuggestionConfirm | null>(null)
+  const [suggestionConfirmSending, setSuggestionConfirmSending] = useState(false)
   const showModeSwitcher = canCreateInternalNote && canSendPublicReply
   const showInternalOnlyLabel = canCreateInternalNote && !canSendPublicReply
   const isInternalMode = composerMode === 'internal'
@@ -403,9 +449,15 @@ export function AgentComposer({
   }, { enabled: shouldFetchSuggestions })
   const suggestionDocuments = suggestionsQuery.data?.items ?? []
   const sendableSuggestionIndexes = useMemo(
-    () => suggestionDocuments.flatMap((document, index) => (
-      knowledgeDocumentHasComposerSendableContent(document, richTextMode ? 'rich_text' : 'text') ? [index] : []
-    )),
+    () => suggestionDocuments.flatMap((document, index) => {
+      if (knowledgeDocumentNeedsSuggestionDialog(document)) {
+        return knowledgeDocumentHasSendableContent(document) ? [index] : []
+      }
+      return knowledgeDocumentHasComposerSendableContent(
+        document,
+        richTextMode ? 'rich_text' : 'text',
+      ) ? [index] : []
+    }),
     [richTextMode, suggestionDocuments],
   )
   const showSuggestionPopover = suggestionPopoverEligible && Boolean(suggestionPrefix?.text)
@@ -774,30 +826,71 @@ export function AgentComposer({
     })
   }, [knowledgeDraft, knowledgeDraftSending, storeKnowledgeDraft])
 
-  const handleKnowledgeSuggestionUse = useCallback(
+  const closeSuggestionConfirm = useCallback(() => {
+    if (suggestionConfirmSending) return
+    setSuggestionConfirm(null)
+  }, [suggestionConfirmSending])
+
+  const openKnowledgeSuggestionConfirm = useCallback(
     (document: KnowledgeDocument) => {
-      const prefix = suggestionPrefix
-      const contentType = richTextMode ? 'rich_text' : 'text'
-      const messageText = knowledgeHtmlToComposerText(document.content_html)
-      const messageHtml = document.content_html.trim()
-      const hasMessageBody = knowledgeDocumentHasComposerBody(document, contentType)
-      const attachments = [...document.attachments].sort(
-        (left, right) => left.sort_order - right.sort_order || left.id - right.id,
-      )
-      if (!knowledgeDocumentHasComposerSendableContent(document, contentType)) {
+      if (!knowledgeDocumentHasSendableContent(document)) {
         toast.error(t('knowledgeInputSuggestion.draft.noSendableContent', locale))
         return
       }
-      if (richTextMode) {
-        const inserted = richTextComposerRef.current?.insertHtmlAtTextPrefix(
-          hasMessageBody ? messageHtml : '',
-          prefix?.replaceEnd ?? 0,
-        )
-        if (!inserted) return
-        setDismissedSuggestionPrefix(prefix?.text ?? null)
+      setSuggestionConfirm({
+        document,
+        requestId: createKnowledgeDraftRequestId(),
+        replaceEnd: suggestionPrefix?.replaceEnd ?? 0,
+      })
+      setDismissedSuggestionPrefix(suggestionPrefix?.text ?? null)
+      setSelectedSuggestionIndex(-1)
+    },
+    [locale, suggestionPrefix?.replaceEnd, suggestionPrefix?.text],
+  )
+
+  const applyKnowledgeSuggestionToComposer = useCallback(
+    (document: KnowledgeDocument, options?: { forceRichText?: boolean; replaceEnd?: number }) => {
+      const forceRichText = Boolean(options?.forceRichText)
+      const useRichText = forceRichText || richTextMode
+      const prefixReplaceEnd = options?.replaceEnd ?? suggestionPrefix?.replaceEnd ?? 0
+      const contentType = useRichText ? 'rich_text' : 'text'
+      const messageText = knowledgeHtmlToComposerText(document.content_html)
+      const messageHtml = document.content_html.trim()
+      const hasMessageBody = knowledgeDocumentHasComposerBody(document, contentType)
+      const attachments = sortedKnowledgeAttachments(document.attachments)
+
+      if (!forceRichText && !knowledgeDocumentHasComposerSendableContent(document, contentType)) {
+        toast.error(t('knowledgeInputSuggestion.draft.noSendableContent', locale))
+        return false
+      }
+      if (forceRichText && !showRichTextToggle) {
+        toast.error(t('knowledgeInputSuggestion.draft.noSendableContent', locale))
+        return false
+      }
+
+      if (useRichText) {
+        if (!richTextMode) {
+          const currentText = composer.getState().text
+          const remainderHtml = plainTextRemainderToHtml(
+            prefixReplaceEnd > 0 ? currentText.slice(prefixReplaceEnd) : '',
+          )
+          const bodyHtml = hasMessageBody ? messageHtml : ''
+          const nextHtml = `${bodyHtml || '<p></p>'}${remainderHtml}`
+          composer.setText('')
+          setRichTextDraft(nextHtml)
+          setRichTextMode(true)
+          setRichTextResetKey((key) => key + 1)
+        } else {
+          const inserted = richTextComposerRef.current?.insertHtmlAtTextPrefix(
+            hasMessageBody ? messageHtml : '',
+            prefixReplaceEnd,
+          )
+          if (!inserted) return false
+        }
+        setDismissedSuggestionPrefix(suggestionPrefix?.text ?? null)
       } else {
         const currentText = composer.getState().text
-        const replaceEnd = prefix?.replaceEnd ?? 0
+        const replaceEnd = prefixReplaceEnd
         const nextText = replaceEnd > 0
           ? `${hasMessageBody ? messageText : ''}${currentText.slice(replaceEnd)}`
           : `${currentText}${currentText.trim() && hasMessageBody ? '\n\n' : ''}${hasMessageBody ? messageText : ''}`
@@ -807,7 +900,7 @@ export function AgentComposer({
           rootRef.current?.querySelector<HTMLTextAreaElement>('textarea')
 
         composer.setText(nextText)
-        setDismissedSuggestionPrefix(prefix?.text ?? null)
+        setDismissedSuggestionPrefix(suggestionPrefix?.text ?? null)
         window.requestAnimationFrame(() => {
           textarea?.focus({ preventScroll: true })
           try {
@@ -825,6 +918,8 @@ export function AgentComposer({
           requestId: createKnowledgeDraftRequestId(),
           attachments,
         })
+      } else {
+        storeKnowledgeDraft(null)
       }
       toast.success(t(
         hasMessageBody
@@ -835,9 +930,79 @@ export function AgentComposer({
         locale,
         { count: attachments.length },
       ))
+      return true
     },
-    [composer, locale, richTextMode, storeKnowledgeDraft, suggestionPrefix],
+    [composer, locale, richTextMode, showRichTextToggle, storeKnowledgeDraft, suggestionPrefix?.text],
   )
+
+  const handleKnowledgeSuggestionUse = useCallback(
+    (document: KnowledgeDocument) => {
+      if (knowledgeDocumentNeedsSuggestionDialog(document)) {
+        openKnowledgeSuggestionConfirm(document)
+        return
+      }
+      applyKnowledgeSuggestionToComposer(document)
+    },
+    [applyKnowledgeSuggestionToComposer, openKnowledgeSuggestionConfirm],
+  )
+
+  const handleSuggestionConfirmUseRichText = useCallback(() => {
+    if (!suggestionConfirm || suggestionConfirmSending) return
+    const applied = applyKnowledgeSuggestionToComposer(suggestionConfirm.document, {
+      forceRichText: true,
+      replaceEnd: suggestionConfirm.replaceEnd,
+    })
+    if (applied) setSuggestionConfirm(null)
+  }, [applyKnowledgeSuggestionToComposer, suggestionConfirm, suggestionConfirmSending])
+
+  const handleSuggestionConfirmSend = useCallback(async () => {
+    if (!suggestionConfirm || suggestionConfirmSending || isInternalMode) return
+
+    const { document, requestId } = suggestionConfirm
+    const messageHtml = document.content_html.trim()
+    const messageText = knowledgeHtmlToMessageText(document.content_html)
+    const attachments = sortedKnowledgeAttachments(document.attachments)
+
+    if (!knowledgeDocumentHasSendableContent(document)) {
+      toast.error(t('knowledgeInputSuggestion.draft.noSendableContent', locale))
+      return
+    }
+    if (messageText.length > KNOWLEDGE_SEND_MAX_LENGTH) {
+      toast.error(t('ws.knowledge.contentTooLong', locale))
+      return
+    }
+
+    setSuggestionConfirmSending(true)
+    try {
+      const result = await onKnowledgeDraftSend({
+        bodyContent: messageHtml,
+        bodyText: messageText,
+        bodyContentType: 'rich_text',
+        attachments,
+        requestId,
+        onAttachmentPreparing: setKnowledgeAttachmentPreparingId,
+        onItemSent: () => {},
+      })
+
+      if (result.errorMessage) {
+        toast.error(t('knowledgeInputSuggestion.draft.partialFailed', locale, {
+          sent: result.sent,
+          total: result.total,
+        }))
+      } else {
+        setSuggestionConfirm(null)
+        toast.success(t('knowledgeInputSuggestion.draft.sent', locale))
+      }
+    } catch {
+      toast.error(t('knowledgeInputSuggestion.draft.partialFailed', locale, {
+        sent: 0,
+        total: attachments.length + (messageText || /<img\b/i.test(messageHtml) ? 1 : 0),
+      }))
+    } finally {
+      setKnowledgeAttachmentPreparingId(null)
+      setSuggestionConfirmSending(false)
+    }
+  }, [isInternalMode, locale, onKnowledgeDraftSend, suggestionConfirm, suggestionConfirmSending])
 
   const handleKnowledgeDraftSend = useCallback(async () => {
     const draft = knowledgeDraft
@@ -1074,9 +1239,12 @@ export function AgentComposer({
           {suggestionDocuments.map((document, index) => {
             const selected = index === selectedSuggestionIndex
             const attachmentCount = document.attachments.length
+            const hasImage = knowledgeDocumentHasInlineImage(document)
+            const needsDialog = knowledgeDocumentNeedsSuggestionDialog(document)
             const contentType = richTextMode ? 'rich_text' : 'text'
-            const hasMessageBody = knowledgeDocumentHasComposerBody(document, contentType)
-            const sendable = knowledgeDocumentHasComposerSendableContent(document, contentType)
+            const sendable = needsDialog
+              ? knowledgeDocumentHasSendableContent(document)
+              : knowledgeDocumentHasComposerSendableContent(document, contentType)
             return (
               <button
                 key={document.id}
@@ -1094,14 +1262,38 @@ export function AgentComposer({
                 onClick={() => handleKnowledgeSuggestionUse(document)}
               >
                 <span className="min-w-0 flex-1 truncate text-sm font-medium">{document.title}</span>
-                <span className="shrink-0 text-xs text-muted-foreground">
-                  {!sendable
-                    ? t('knowledgeInputSuggestion.draft.noSendableContentShort', locale)
-                    : attachmentCount > 0
-                      ? hasMessageBody
-                        ? t('knowledgeInputSuggestion.draft.attachmentCount', locale, { count: attachmentCount })
-                        : t('knowledgeInputSuggestion.draft.attachmentsOnly', locale, { count: attachmentCount })
-                      : null}
+                <span className="flex shrink-0 items-center gap-1.5 text-muted-foreground">
+                  {!sendable ? (
+                    <span className="text-xs">
+                      {t('knowledgeInputSuggestion.draft.noSendableContentShort', locale)}
+                    </span>
+                  ) : (
+                    <>
+                      {hasImage && (
+                        <span
+                          className="inline-flex h-5 w-5 items-center justify-center rounded-md bg-muted"
+                          title={t('knowledgeInputSuggestion.hasImage', locale)}
+                          aria-label={t('knowledgeInputSuggestion.hasImage', locale)}
+                        >
+                          <IconPhoto size={13} stroke={1.7} />
+                        </span>
+                      )}
+                      {attachmentCount > 0 && (
+                        <span
+                          className="inline-flex h-5 items-center gap-0.5 rounded-md bg-muted px-1"
+                          title={t('knowledgeInputSuggestion.hasAttachments', locale)}
+                          aria-label={t('knowledgeInputSuggestion.draft.attachmentCount', locale, {
+                            count: attachmentCount,
+                          })}
+                        >
+                          <IconPaperclip size={13} stroke={1.7} />
+                          {attachmentCount > 1 && (
+                            <span className="text-[11px] leading-none">{attachmentCount}</span>
+                          )}
+                        </span>
+                      )}
+                    </>
+                  )}
                 </span>
               </button>
             )
@@ -1429,6 +1621,83 @@ export function AgentComposer({
           )}
         </div>
       </ComposerPrimitive.Root>
+      <Dialog
+        open={suggestionConfirm != null}
+        onOpenChange={(open) => {
+          if (!open) closeSuggestionConfirm()
+        }}
+      >
+        <DialogContent
+          className="max-h-[calc(100vh-2rem)] min-w-0 w-[560px] max-w-[calc(100vw-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white p-0 shadow-lg ring-0"
+          showCloseButton={!suggestionConfirmSending}
+        >
+          {suggestionConfirm && (
+            <>
+              <DialogHeader className="min-w-0 px-5 pt-5">
+                <DialogTitle>{t('ws.knowledge.confirmTitle', locale)}</DialogTitle>
+              </DialogHeader>
+              <div className="min-w-0 overflow-hidden px-5 pb-2 pt-3">
+                {stripKnowledgeHtml(suggestionConfirm.document.content_html) && (
+                  <SafeHtml
+                    html={suggestionConfirm.document.content_html.trim()}
+                    className={cn(
+                      richTextListStyleClass,
+                      'max-h-56 min-w-0 overflow-auto rounded-lg border border-border bg-background p-3 text-sm leading-6 text-foreground [overflow-wrap:anywhere] [&_*]:max-w-full [&_*]:break-words [&_*]:[overflow-wrap:anywhere]',
+                    )}
+                  />
+                )}
+                {suggestionConfirm.document.attachments.length > 0 && (
+                  <div className={cn(stripKnowledgeHtml(suggestionConfirm.document.content_html) && 'mt-3')}>
+                    <p className="mb-2 text-xs font-medium text-muted-foreground">
+                      {locale === 'zh'
+                        ? `附件将逐个发送（${suggestionConfirm.document.attachments.length}）`
+                        : `Attachments will be sent separately (${suggestionConfirm.document.attachments.length})`}
+                    </p>
+                    <KnowledgeAttachmentList
+                      attachments={suggestionConfirm.document.attachments}
+                      isZh={locale === 'zh'}
+                      compact
+                    />
+                  </div>
+                )}
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {t('ws.knowledge.draftHint', locale)}
+                </p>
+              </div>
+              <DialogFooter className="min-w-0 rounded-b-2xl border-t border-[#E5E5E5] px-5">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={closeSuggestionConfirm}
+                  disabled={suggestionConfirmSending}
+                >
+                  {t('ws.common.cancel', locale)}
+                </Button>
+                {showRichTextToggle && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleSuggestionConfirmUseRichText}
+                    disabled={suggestionConfirmSending}
+                  >
+                    <IconTypography size={14} stroke={1.7} />
+                    {t('knowledgeInputSuggestion.useRichText', locale)}
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  autoFocus
+                  onClick={() => void handleSuggestionConfirmSend()}
+                  disabled={suggestionConfirmSending}
+                >
+                  {suggestionConfirmSending && <IconLoader2 size={14} className="animate-spin" />}
+                  {t('ws.knowledge.confirmSend', locale)}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
       <Dialog open={pastedAttachment != null} onOpenChange={(open) => !open && handlePastedAttachmentCancel()}>
         <DialogContent
           className="w-[520px] max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white p-0 shadow-lg ring-0"

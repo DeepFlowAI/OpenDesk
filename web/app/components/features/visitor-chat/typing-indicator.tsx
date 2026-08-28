@@ -1,5 +1,8 @@
 'use client'
 
+import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
+
 type TypingIndicatorProps = {
   agentBubbleBg?: string
   agentBubbleTextColor?: string
@@ -8,7 +11,7 @@ type TypingIndicatorProps = {
   showAvatar?: boolean
   agentAvatar?: string | null
   agentName?: string | null
-  locale?: string
+  locale?: Locale
 }
 
 function toCssBorderRadius(radius: number[]): string {
@@ -27,7 +30,7 @@ export function TypingIndicator({
   locale = 'zh',
 }: TypingIndicatorProps) {
   const radius = agentBubbleRadius || [10, 10, 0, 10]
-  const label = locale === 'zh' ? '输入中...' : 'Typing...'
+  const label = t('chat.typing', locale)
   const dotStyle = { backgroundColor: agentBubbleTextColor || 'var(--color-foreground)' }
 
   return (

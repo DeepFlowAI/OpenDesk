@@ -29,6 +29,10 @@ from app.libs.realtime.base import BaseRealtimeTransport
 from app.repositories.conversation_repository import ConversationRepository
 from app.services.channel_service import ChannelService
 from app.services.conversation_service import ConversationService
+from app.services.conversation_translation_service import (
+    ConversationTranslationService,
+    VisitorMessageTranslationResult,
+)
 from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_realtime_service import ConversationRealtimeService
 from app.services.open_agent_conversation_service import OpenAgentConversationService
@@ -79,6 +83,101 @@ def _log_rejected_connect(environ: dict, reason: str, token: str | None = None) 
 _VISITOR_START_LOCK_TTL_SECONDS = 10
 _VISITOR_START_LOCK_WAIT_SECONDS = 5.0
 _VISITOR_START_LOCK_POLL_SECONDS = 0.1
+
+
+async def _process_visitor_translation(
+    rt: BaseRealtimeTransport,
+    *,
+    tenant_id: int,
+    message_id: int,
+) -> None:
+    """Translate a persisted visitor message and update agent workspaces."""
+    try:
+        result = await ConversationTranslationService.process_visitor_message_managed(
+            tenant_id=tenant_id,
+            message_id=message_id,
+            on_pending=lambda pending: _emit_visitor_translation_result(
+                rt,
+                tenant_id=tenant_id,
+                result=pending,
+            ),
+        )
+        if result is None:
+            return
+        await _emit_visitor_translation_result(rt, tenant_id=tenant_id, result=result)
+    except Exception:
+        logger.exception(
+            "visitor_message_translation_failed tenant_id=%s message_id=%s",
+            tenant_id,
+            message_id,
+        )
+
+
+async def _emit_visitor_translation_result(
+    rt: BaseRealtimeTransport,
+    *,
+    tenant_id: int,
+    result: VisitorMessageTranslationResult,
+) -> None:
+    """Broadcast one translation state to every agent viewing the conversation."""
+    from app.repositories.conversation_collaboration_repository import ConversationCollaborationRepository
+
+    conversation = result.conversation
+    async with AsyncSessionLocal() as db:
+        collaborator_ids = await ConversationCollaborationRepository.get_active_collaborator_agent_ids(
+            db,
+            tenant_id=tenant_id,
+            conversation_id=conversation.id,
+        )
+    recipient_ids = set(collaborator_ids)
+    if conversation.agent_id:
+        recipient_ids.add(int(conversation.agent_id))
+
+    if result.settings_update is not None:
+        settings_payload = {
+            "conversation_id": conversation.id,
+            "settings": result.settings_update.model_dump(mode="json"),
+        }
+        for agent_id in recipient_ids:
+            await rt.emit(
+                "translation_settings_updated",
+                settings_payload,
+                room=f"agent:{tenant_id}:{agent_id}",
+                namespace="/chat",
+            )
+        await rt.emit(
+            "translation_settings_updated",
+            settings_payload,
+            room=f"conv:{conversation.id}",
+            namespace="/chat",
+        )
+
+    payload = result.message_payload
+    if payload is None:
+        return
+    for agent_id in recipient_ids:
+        await rt.emit(
+            "message_updated",
+            payload,
+            room=f"agent:{tenant_id}:{agent_id}",
+            namespace="/chat",
+        )
+    await rt.emit(
+        "message_updated",
+        payload,
+        room=f"conv:{conversation.id}",
+        namespace="/chat",
+    )
+    translation = (payload.get("metadata") or {}).get("translation") or {}
+    logger.info(
+        "lingomaster_visitor_translation_emitted tenant_id=%s conversation_id=%s message_id=%s "
+        "status=%s recipient_count=%s",
+        tenant_id,
+        conversation.id,
+        payload.get("id"),
+        translation.get("status"),
+        len(recipient_ids),
+    )
 
 
 @asynccontextmanager
@@ -387,6 +486,11 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             }
 
         conv = result["conversation"]
+        await ConversationTranslationService.set_browser_language_prior_managed(
+            int(tenant_id),
+            conv.id,
+            payload.get("locale") or payload.get("browser_language"),
+        )
         if (
             conv.tenant_id != tenant_id
             or conv.channel_id != int(channel_id)
@@ -602,6 +706,14 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                     room=f"agent:{tenant_id}:{recipient_agent_id}",
                     namespace="/chat",
                 )
+
+        asyncio.create_task(
+            _process_visitor_translation(
+                rt,
+                tenant_id=int(tenant_id),
+                message_id=int(msg_payload["id"]),
+            )
+        )
 
         return {"ok": True, "message": msg_payload}
 

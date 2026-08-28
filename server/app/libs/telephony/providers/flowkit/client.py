@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from collections import defaultdict
 from collections.abc import Callable
 from itertools import count
@@ -287,7 +288,8 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
     async def _reconnect_loop(self) -> None:
         delay = 1.0
         while not self._closing:
-            await asyncio.sleep(delay)
+            retry_delay = delay * random.uniform(0.8, 1.2)
+            await asyncio.sleep(retry_delay)
             try:
                 await self._open_and_handshake()
                 self._start_recv_loop()
@@ -308,17 +310,17 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
                     served = self._another_kernel_serving()
                     log = logger.info if served else logger.warning
                     log(
-                        "FlowKit reconnect failed url=%s err=%s; retrying in %ss%s",
+                        "FlowKit reconnect failed url=%s err=%s; retrying in %.1fs%s",
                         self._ws_url,
                         exc,
-                        delay,
+                        retry_delay,
                         " (another kernel is serving calls)" if served else "",
                     )
                 else:
                     logger.exception(
-                        "FlowKit reconnect failed url=%s; retrying in %ss",
+                        "FlowKit reconnect failed url=%s; retrying in %.1fs",
                         self._ws_url,
-                        delay,
+                        retry_delay,
                     )
                 delay = min(delay * 2, 30.0)
 
@@ -363,10 +365,21 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         result = await self._rpc("call.say", params)
         return result.get("play_id", "")
 
-    async def call_listen(self, call_id: str, *, timeout_ms: int | None = None) -> None:
+    async def call_listen(
+        self,
+        call_id: str,
+        *,
+        timeout_ms: int | None = None,
+        adaptive_barge_in: bool | None = None,
+        performance: dict | None = None,
+    ) -> None:
         params: dict = {"call_id": call_id}
         if timeout_ms is not None:
             params["timeout_ms"] = timeout_ms
+        if adaptive_barge_in is not None:
+            params["adaptive_barge_in"] = adaptive_barge_in
+        if performance is not None:
+            params["performance"] = performance
         await self._rpc("call.listen", params)
 
     async def call_stop(self, call_id: str, *, target: str = "all") -> None:
@@ -413,6 +426,7 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         transcribe: bool = True,
         *,
         keepalive_on_peer_hangup: bool = False,
+        user_call_id: str | None = None,
     ) -> None:
         params: dict[str, Any] = {"call_id": call_id, "other_call_id": other_call_id}
         # Omit when True to stay backward-compatible with kernels that default
@@ -421,6 +435,8 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
             params["transcribe"] = False
         if keepalive_on_peer_hangup:
             params["keepalive_on_peer_hangup"] = True
+        if user_call_id is not None:
+            params["user_call_id"] = user_call_id
         await self._rpc("call.bridge", params)
 
     async def call_connect_external_agent(
@@ -553,6 +569,7 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         trunk_id: str | None = None,
         timeout_ms: int | None = None,
         headers: dict[str, str] | None = None,
+        request_id: str | None = None,
     ) -> dict:
         params: dict[str, Any] = {}
         if uri:
@@ -567,7 +584,15 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
             params["timeout_ms"] = timeout_ms
         if headers:
             params["headers"] = headers
+        if request_id:
+            params["request_id"] = request_id
         return await self._rpc("call.originate", params)
+
+    async def originate_capacity(self) -> dict | None:
+        try:
+            return await self._rpc("system.capacity", {})
+        except TelephonyMethodNotFoundError:
+            return None
 
     async def extension_query(self, extension: str) -> dict:
         return await self._rpc("extension.query", {"extension": extension})
@@ -585,6 +610,17 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
     async def call_list(self) -> list[dict]:
         result = await self._rpc("call.list", {})
         return result.get("calls", [])
+
+    async def call_alive(self, call_id: str) -> bool | None:
+        if not self.is_ready:
+            return None
+        try:
+            calls = await self.call_list()
+        except Exception:  # noqa: BLE001
+            logger.warning("call_alive: call_list failed call_id=%s", call_id, exc_info=True)
+            return None
+        active_ids = {str(c.get("call_id")) for c in calls if c.get("call_id")}
+        return call_id in active_ids
 
     async def webrtc_offer(self, sdp: str, call_id: str | None = None) -> dict:
         params: dict = {"sdp": sdp}

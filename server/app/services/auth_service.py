@@ -121,6 +121,20 @@ class AuthService:
         return session_id[:8]
 
     @staticmethod
+    def _mask_password(password: str | None) -> str:
+        """Redact a password for diagnostic logs (keep length + first/last char)."""
+        if password is None:
+            return "(empty)"
+        n = len(password)
+        if n == 0:
+            return "(empty)"
+        if n == 1:
+            return f"* (len={n})"
+        if n == 2:
+            return f"** (len={n})"
+        return f"{password[0]}{'*' * (n - 2)}{password[-1]} (len={n})"
+
+    @staticmethod
     def _log_login_success(
         *,
         method: str,
@@ -160,6 +174,48 @@ class AuthService:
         )
 
     @staticmethod
+    def _log_login_failure(
+        *,
+        reason: str,
+        tenant_input: str,
+        username: str,
+        password: str | None,
+        tenant_id: int | None = None,
+        user_id: int | None = None,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> None:
+        ip = client_ip or "-"
+        ua = user_agent or "-"
+        masked = AuthService._mask_password(password)
+        tenant_id_s = str(tenant_id) if tenant_id is not None else "-"
+        user_id_s = str(user_id) if user_id is not None else "-"
+        extra = {
+            "auth_method": "password",
+            "reason": reason,
+            "tenant": tenant_input or "-",
+            "tenant_id": tenant_id_s,
+            "username": username or "-",
+            "password_masked": masked,
+            "user_id": user_id_s,
+            "client_ip": ip,
+            "user_agent": ua,
+        }
+        logger.warning(
+            "Login failed: reason=%s tenant=%s tenant_id=%s username=%s "
+            "password=%s user_id=%s client_ip=%s user_agent=%s",
+            reason,
+            tenant_input or "-",
+            tenant_id_s,
+            username or "-",
+            masked,
+            user_id_s,
+            ip,
+            ua,
+            extra=extra,
+        )
+
+    @staticmethod
     async def login(
         db: AsyncSession,
         data: LoginRequest,
@@ -170,18 +226,54 @@ class AuthService:
         """Authenticate user and return JWT token."""
         tenant = await TenantRepository.resolve_by_identifier(db, data.tenant)
         if not tenant or not tenant.is_active:
+            AuthService._log_login_failure(
+                reason="tenant_not_found",
+                tenant_input=data.tenant,
+                username=data.username,
+                password=data.password,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
             raise NotFoundError("Tenant not found")
 
         user = await EmployeeRepository.get_by_username_or_email(db, tenant.id, data.username)
         if not user:
+            AuthService._log_login_failure(
+                reason="user_not_found",
+                tenant_input=data.tenant,
+                username=data.username,
+                password=data.password,
+                tenant_id=tenant.id,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
             raise UnauthorizedError("Invalid credentials")
 
         if not verify_password(data.password, user.password_hash):
+            AuthService._log_login_failure(
+                reason="invalid_password",
+                tenant_input=data.tenant,
+                username=data.username,
+                password=data.password,
+                tenant_id=tenant.id,
+                user_id=user.id,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
             raise UnauthorizedError("Invalid credentials")
 
         if not user.is_active:
+            AuthService._log_login_failure(
+                reason="account_disabled",
+                tenant_input=data.tenant,
+                username=data.username,
+                password=data.password,
+                tenant_id=tenant.id,
+                user_id=user.id,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
             raise UnauthorizedError("Account is disabled")
-
         replaced_previous = bool(user.current_session_id)
         await EmployeeSessionService.disconnect_current_socket(tenant.id, user.id)
         session_id = EmployeeSessionService.generate_session_id()

@@ -47,3 +47,9 @@ htmlcov/
 
 # Generated from @embedpdf/pdfium before frontend dev/build.
 web/public/vendor/embedpdf/pdfium.wasm
+
+# React prototype review screenshots (regenerate with npm run prototype:shot)
+web/prototypes/screenshots/
+
+# Local throwaway test pages (not committed)
+private/temp-pages/

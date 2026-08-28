@@ -12,7 +12,12 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 
 from app.core.client_info import get_client_ip, get_user_agent
-from app.core.exceptions import SessionReplacedError, UnauthorizedError, register_exception_handlers
+from app.core.exceptions import (
+    NotFoundError,
+    SessionReplacedError,
+    UnauthorizedError,
+    register_exception_handlers,
+)
 from app.core.security import create_access_token, hash_password
 from app.schemas.auth import LoginRequest
 from app.services.auth_service import AuthService
@@ -277,6 +282,105 @@ async def test_login_success_logs_replaced_previous_true(monkeypatch, caplog):
     assert "replaced_previous=True" in record.getMessage()
     assert record.session_id == "newsess0"
     assert "oldsessionaabbcc" not in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("password", "expected"),
+    [
+        ("", "(empty)"),
+        ("a", "* (len=1)"),
+        ("ab", "** (len=2)"),
+        ("Test1234", "T******4 (len=8)"),
+    ],
+)
+def test_mask_password_redacts_middle(password, expected):
+    assert AuthService._mask_password(password) == expected
+
+
+@pytest.mark.asyncio
+async def test_login_failure_logs_invalid_password_with_account_fields(monkeypatch, caplog):
+    tenant, employee, _principal = _login_fixtures(current_session_id=None)
+    monkeypatch.setattr(
+        "app.services.auth_service.TenantRepository.resolve_by_identifier",
+        AsyncMock(return_value=tenant),
+    )
+    monkeypatch.setattr(
+        "app.services.auth_service.EmployeeRepository.get_by_username_or_email",
+        AsyncMock(return_value=employee),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.services.auth_service"):
+        with pytest.raises(UnauthorizedError, match="Invalid credentials"):
+            await AuthService.login(
+                AsyncMock(),
+                LoginRequest(tenant="membrane", username="8001", password="WrongPass"),
+                client_ip="203.0.113.50",
+                user_agent="pytest-login-fail",
+            )
+
+    record = next(r for r in caplog.records if "Login failed" in r.getMessage())
+    message = record.getMessage()
+    assert "reason=invalid_password" in message
+    assert "tenant=membrane" in message
+    assert "tenant_id=1" in message
+    assert "username=8001" in message
+    assert "password=W*******s (len=9)" in message
+    assert "WrongPass" not in message
+    assert record.reason == "invalid_password"
+    assert record.tenant == "membrane"
+    assert record.username == "8001"
+    assert record.password_masked == "W*******s (len=9)"
+    assert record.user_id == "42"
+    assert record.client_ip == "203.0.113.50"
+
+
+@pytest.mark.asyncio
+async def test_login_failure_logs_user_not_found(monkeypatch, caplog):
+    tenant = SimpleNamespace(id=7, is_active=True)
+    monkeypatch.setattr(
+        "app.services.auth_service.TenantRepository.resolve_by_identifier",
+        AsyncMock(return_value=tenant),
+    )
+    monkeypatch.setattr(
+        "app.services.auth_service.EmployeeRepository.get_by_username_or_email",
+        AsyncMock(return_value=None),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.services.auth_service"):
+        with pytest.raises(UnauthorizedError, match="Invalid credentials"):
+            await AuthService.login(
+                AsyncMock(),
+                LoginRequest(tenant="membrane", username="missing", password="Secret1"),
+                client_ip="198.51.100.9",
+            )
+
+    record = next(r for r in caplog.records if "Login failed" in r.getMessage())
+    assert record.reason == "user_not_found"
+    assert record.tenant_id == "7"
+    assert record.username == "missing"
+    assert record.user_id == "-"
+    assert "password=S*****1 (len=7)" in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_login_failure_logs_tenant_not_found(monkeypatch, caplog):
+    monkeypatch.setattr(
+        "app.services.auth_service.TenantRepository.resolve_by_identifier",
+        AsyncMock(return_value=None),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.services.auth_service"):
+        with pytest.raises(NotFoundError, match="Tenant not found"):
+            await AuthService.login(
+                AsyncMock(),
+                LoginRequest(tenant="no-such-tenant", username="8001", password="Abcd1234"),
+            )
+
+    record = next(r for r in caplog.records if "Login failed" in r.getMessage())
+    assert record.reason == "tenant_not_found"
+    assert record.tenant == "no-such-tenant"
+    assert record.username == "8001"
+    assert record.tenant_id == "-"
 
 
 def test_validate_employee_session_logs_both_session_prefixes(caplog):

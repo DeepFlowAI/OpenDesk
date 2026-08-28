@@ -6,6 +6,7 @@ a real WebSocket counterpart and runs against the production kernel. See
 the dev workflow §4.5.2 exclusion rule.
 """
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -99,6 +100,25 @@ class TestMockTelephonyClient:
         assert result == [{"call_id": "c1", "state": "ringing"}]
 
     @pytest.mark.asyncio
+    async def test_call_listen_records_per_call_performance(self):
+        client = MockTelephonyClient()
+        performance = {
+            "turn_detection_enabled": False,
+            "endpoint_silence_ms": 1000,
+        }
+
+        await client.call_listen(
+            "c1", adaptive_barge_in=True, performance=performance
+        )
+
+        assert ("call.listen", {
+            "call_id": "c1",
+            "timeout_ms": None,
+            "adaptive_barge_in": True,
+            "performance": performance,
+        }) in client.recorded
+
+    @pytest.mark.asyncio
     async def test_call_originate_with_trunk_id(self):
         client = MockTelephonyClient()
         await client.connect()
@@ -163,6 +183,34 @@ class TestTelephonyFactory:
 
 class TestFlowKitClientFailPending:
     """Unexpected WS close must fail in-flight RPCs immediately (not wait rpc_timeout)."""
+
+    @pytest.mark.asyncio
+    async def test_call_listen_forwards_per_call_performance(self):
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        client = FlowKitTelephonyClient(
+            ws_url="ws://127.0.0.1:1/ws",
+            sdk_name="test",
+            sdk_version="0",
+        )
+        client._rpc = AsyncMock(return_value={})
+        performance = {
+            "turn_detection_enabled": False,
+            "endpoint_silence_ms": 1000,
+        }
+
+        await client.call_listen(
+            "c1", adaptive_barge_in=True, performance=performance
+        )
+
+        client._rpc.assert_awaited_once_with(
+            "call.listen",
+            {
+                "call_id": "c1",
+                "adaptive_barge_in": True,
+                "performance": performance,
+            },
+        )
 
     @pytest.mark.asyncio
     async def test_fail_pending_sets_not_connected(self):

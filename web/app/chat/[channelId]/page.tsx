@@ -33,6 +33,7 @@ import { VisitorAssistPanel } from '@/app/components/features/visitor-chat/visit
 import { LegalFooter } from '@/components/legal-footer'
 import { IconLoader2, IconAlertTriangle } from '@tabler/icons-react'
 import type { Locale } from '@/context/locale-store'
+import { resolveVisitorLocale } from '@/lib/languages'
 import { t } from '@/utils/i18n'
 import type {
   Message,
@@ -52,6 +53,17 @@ import {
 } from '@/lib/visitor-message-alert'
 import { emitTestEvent, initTestEventChannel } from '@/lib/e2e-test-events'
 import { buildMessageDeliveryBatches } from '@/lib/message-delivery'
+import {
+  getVisitorPayloadKey,
+  mergeEmbedInitPayload,
+  resolveVisitorIdentitySource,
+  selectStoredVisitorCredential,
+  shouldAutoStartConversation,
+  type VisitorCredential,
+  type VisitorInitSource,
+} from '@/lib/visitor-session-credential'
+import { FormMessage } from '@/app/components/features/visitor-chat/form-message'
+import type { FormMessageSource } from '@/models/form-message'
 
 const HISTORY_PAGE_SIZE = 10
 const HISTORY_CLIENT_LIMIT = 200
@@ -63,14 +75,6 @@ const CONVERSATION_JOIN_RETRY_DELAYS_MS = [0, 600, 1800] as const
 type ConversationSubscriptionStatus = 'idle' | 'joining' | 'joined' | 'degraded'
 
 // ─── Utilities ───────────────────────────────────────────────────
-
-type VisitorCredential = {
-  visitorExternalId: string
-  visitorSecret: string
-  visitorSessionToken?: string
-  visitorSessionExpiresAt?: number
-  visitorPayloadKey?: string
-}
 
 type OfflineMessageQueueTarget = {
   queueType: OfflineMessageQueueType
@@ -94,8 +98,10 @@ type EmbedVisitorPayload = {
 
 type EmbedInitPayload = {
   visitor?: EmbedVisitorPayload | null
+  /** `undefined` = absent; `null` = explicit logout; string = active token */
   contextToken?: string | null
   sessionSummary?: Record<string, unknown> | null
+  initSource?: VisitorInitSource
 }
 
 type SearchParamsReader = Pick<URLSearchParams, 'get' | 'has'>
@@ -132,6 +138,11 @@ type VisitorEnvironment = {
 }
 
 const EMPTY_EMBED_INIT_PAYLOAD: EmbedInitPayload = {}
+// How long to wait for the SDK `init` message before falling back to an
+// identity-less session, and how much longer before that fallback is also
+// allowed to open a conversation (a stale host SDK may never send `init`).
+const EMBED_INIT_FALLBACK_MS = 3000
+const EMBED_INIT_GRACE_MS = 5000
 const URL_CONTEXT_TOKEN_PARAMS = ['contextToken', 'context_token'] as const
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -162,6 +173,27 @@ function sanitizeContextToken(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const token = value.trim()
   return token || null
+}
+
+/**
+ * Preserve absent vs explicit-null for contextToken.
+ * - missing field → undefined (safe to reuse stored identity)
+ * - null / empty string → null when allowExplicitNull, else undefined
+ * - non-empty string → token
+ */
+function sanitizeContextTokenField(
+  data: Record<string, unknown>,
+  allowExplicitNull: boolean,
+): string | null | undefined {
+  if (!Object.prototype.hasOwnProperty.call(data, 'contextToken')) return undefined
+  const raw = data.contextToken
+  if (raw === null || raw === '') {
+    return allowExplicitNull ? null : undefined
+  }
+  if (typeof raw !== 'string') {
+    return allowExplicitNull ? null : undefined
+  }
+  return sanitizeContextToken(raw) ?? (allowExplicitNull ? null : undefined)
 }
 
 function readUrlContextToken(searchParams: SearchParamsReader): string | null {
@@ -209,12 +241,28 @@ function sanitizeEmbedVisitor(value: unknown): EmbedVisitorPayload | null {
   return Object.keys(visitor).length > 0 ? visitor : null
 }
 
-function sanitizeEmbedPayload(data: Record<string, unknown>): EmbedInitPayload {
-  return {
-    visitor: sanitizeEmbedVisitor(data.visitor),
-    contextToken: sanitizeContextToken(data.contextToken),
-    sessionSummary: sanitizeContextObject(data.sessionSummary),
+function sanitizeEmbedPayload(
+  data: Record<string, unknown>,
+  options?: { allowExplicitNullToken?: boolean },
+): EmbedInitPayload {
+  const allowExplicitNullToken = Boolean(options?.allowExplicitNullToken)
+  const payload: EmbedInitPayload = { initSource: 'sdk' }
+
+  if (Object.prototype.hasOwnProperty.call(data, 'visitor')) {
+    payload.visitor = data.visitor == null ? null : sanitizeEmbedVisitor(data.visitor)
   }
+  if (Object.prototype.hasOwnProperty.call(data, 'contextToken')) {
+    const token = sanitizeContextTokenField(data, allowExplicitNullToken)
+    // Omit the key when the token is merely absent so update_context merges
+    // do not wipe a previously established identity.
+    if (token !== undefined) {
+      payload.contextToken = token
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'sessionSummary')) {
+    payload.sessionSummary = sanitizeContextObject(data.sessionSummary)
+  }
+  return payload
 }
 
 function browserLabel(name: string, version?: string): string {
@@ -279,13 +327,6 @@ const MAX_SESSION_RECOVERIES = 3
 
 // Max retries for a transient (non-auth) context-sync failure before giving up.
 const MAX_CONTEXT_SYNC_RETRIES = 3
-
-function getVisitorPayloadKey(payload?: EmbedInitPayload | null): string {
-  return JSON.stringify({
-    visitor: payload?.visitor || null,
-    contextToken: payload?.contextToken || null,
-  })
-}
 
 function readVisitorCredential(channelKey: string): VisitorCredential | null {
   const key = visitorCredentialStorageKey(channelKey)
@@ -371,7 +412,7 @@ function isHumanHandoffEventPayload(value: unknown): value is HumanHandoffEventP
   )
 }
 
-function restorePendingHumanHandoff(messages: Message[]) {
+function restorePendingHumanHandoff(messages: Message[], locale: Locale) {
   const confirmedToolCallIds = new Set<string>()
   for (const message of messages) {
     const metadata = message.metadata
@@ -403,7 +444,7 @@ function restorePendingHumanHandoff(messages: Message[]) {
     const brief =
       typeof payload.handoff.brief === 'string' && payload.handoff.brief.trim()
         ? payload.handoff.brief.trim()
-        : message.content || '这个问题需要人工客服进一步处理。'
+        : message.content || t('chat.handoff.needsAgent', locale)
     return {
       payload,
       brief,
@@ -412,13 +453,6 @@ function restorePendingHumanHandoff(messages: Message[]) {
     }
   }
   return null
-}
-
-function getLocale(preferredLocale?: string | null): Locale {
-  if (preferredLocale === 'zh' || preferredLocale === 'en') return preferredLocale
-  if (typeof navigator === 'undefined') return 'en'
-  const lang = navigator.language || 'en'
-  return lang.startsWith('zh') ? 'zh' : 'en'
 }
 
 function postEmbedMessage(
@@ -469,12 +503,25 @@ const defaultConfig: ChannelConfig = {
   embed_button_icon_color: null,
   send_button_bg_color: null,
   input_placeholder: null,
+  language_strategy: 'browser',
+  default_language: 'en',
   service_hours_enabled: false,
   service_hours_id: null,
   outside_service_hours_strategy: 'offline_message',
   offline_title: '当前客服不在线',
   offline_message: '您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。',
   leave_message_prompt: '请留下您的问题和联系方式，我们上线后会尽快联系您。',
+  leave_message_mode: 'conversation',
+  form_message_config: {
+    title: '请留下您的信息',
+    description: '请填写以下信息，我们会尽快与您联系。',
+    submit_label: '提交',
+    success_title: '提交成功',
+    success_description: '我们已收到您的信息，会尽快与您联系。',
+    show_ticket_number: true,
+    fields: [],
+  },
+  form_message_config_version: null,
   restricted_service_message: '抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。',
   queue_message: '您已进入人工客服队列。当前排队人数：{{current_queue_count}} 位，请稍候。客服接入后会立即回复您。',
   queue_full_message: '当前排队人数较多，暂时无法进入排队。您可以稍后再试，或点击留言，我们上线后会尽快联系您。',
@@ -517,7 +564,7 @@ function VisitorChatBootShell({
 }: {
   channel: ChannelPublicConfig
   config: ChannelConfig
-  locale: string
+  locale: Locale
   isMobile: boolean
   isEmbed: boolean
   onEmbedClose: () => void
@@ -526,7 +573,7 @@ function VisitorChatBootShell({
 }) {
   const placeholder =
     config.input_placeholder ||
-    (locale === 'zh' ? '输入消息...' : 'Type a message...')
+    t('chat.input.placeholder', locale)
 
   return (
     <>
@@ -575,16 +622,15 @@ export default function VisitorChatPage() {
   const embedInitRequired = isEmbed && Boolean(embedInstanceId)
   const embedActivationRequired = isPreload && Boolean(embedInstanceId)
   const preferredLocale = searchParams.get('locale')
-  const locale = useMemo(
-    () => getLocale(preferredLocale),
-    [preferredLocale],
-  )
   const urlContextToken = useMemo(
     () => embedInitRequired ? null : readUrlContextToken(searchParams),
     [embedInitRequired, searchParams],
   )
   const standaloneInitPayload = useMemo<EmbedInitPayload>(
-    () => urlContextToken ? { contextToken: urlContextToken } : EMPTY_EMBED_INIT_PAYLOAD,
+    () =>
+      urlContextToken
+        ? { contextToken: urlContextToken, initSource: 'standalone' }
+        : { initSource: 'standalone' },
     [urlContextToken],
   )
   const visitorEnvironment = useMemo(() => detectVisitorEnvironment(), [])
@@ -638,6 +684,11 @@ export default function VisitorChatPage() {
     data: channel,
     error: channelError,
   } = useChannelPublic(channelKey, visitorExternalId, conversationPublicId)
+  const locale = useMemo(
+    () => resolveVisitorLocale(preferredLocale, channel?.config),
+    [channel?.config.default_language, channel?.config.language_strategy, preferredLocale],
+  )
+  const channelLoaded = Boolean(channel)
   const { data: emojiConfig } = usePublicEmojiSettings()
 
   const [loadingMore, setLoadingMore] = useState(false)
@@ -682,6 +733,7 @@ export default function VisitorChatPage() {
     () => !embedActivationRequired,
   )
   const [embedComposerFocusRequest, setEmbedComposerFocusRequest] = useState(0)
+  const [embedInitGraceElapsed, setEmbedInitGraceElapsed] = useState(false)
   const startedRef = useRef(false)
   const customerReadInFlightRef = useRef<Set<string>>(new Set())
   const lastCustomerReadMessageRef = useRef<string | null>(null)
@@ -698,7 +750,8 @@ export default function VisitorChatPage() {
   // that a visitor with an unfinished conversation can always re-enter it,
   // regardless of whether any agent is currently online. The channel-level
   // availability hint is kept only as a fallback copy for the offline screen.
-  const isLeaveMessage = leaveMessageMode && !conversationPublicId
+  const isFormMessage = leaveMessageMode && channel?.config.leave_message_mode === 'form'
+  const isLeaveMessage = leaveMessageMode && (!conversationPublicId || isFormMessage)
   const queueFull = !!queueFullMessage && !isLeaveMessage && !startConversationError && !handoffQueueFullInline
   const isOffline = !!socketOfflineMessage && !conversationPublicId && !isLeaveMessage && !queueFull && !handoffQueueFullInline && !startConversationError
 
@@ -795,6 +848,7 @@ export default function VisitorChatPage() {
     setEmbedActivated(!embedActivationRequired)
     setEmbedInitPayload(embedInitRequired ? null : standaloneInitPayload)
     setEmbedComposerFocusRequest(0)
+    setEmbedInitGraceElapsed(false)
   }, [channelKey, embedActivationRequired, embedInstanceId, embedInitRequired, standaloneInitPayload])
 
   useEffect(() => {
@@ -812,14 +866,26 @@ export default function VisitorChatPage() {
         return
       }
 
-      const nextPayload = sanitizeEmbedPayload(data)
+      // Every frame message carries the SDK's current (possibly null) token, so a
+      // null value alone can't mean logout. Only the SDK's explicit clear flag does.
+      const explicitLogout =
+        data.type === 'update_context' && data.contextTokenCleared === true
+      const nextPayload = sanitizeEmbedPayload(data, {
+        allowExplicitNullToken: explicitLogout,
+      })
       if (data.type === 'update_context') {
+        if (explicitLogout && channelKey) {
+          clearVisitorCredential(channelKey)
+        }
         setEmbedInitPayload((current) => ({
           ...(current ?? EMPTY_EMBED_INIT_PAYLOAD),
           ...nextPayload,
+          initSource: 'sdk',
         }))
       } else {
-        setEmbedInitPayload((current) => current ?? nextPayload)
+        // init/open: first identity-bearing payload wins, but an empty 3s
+        // timeout fallback must not block a later SDK init that carries contextToken.
+        setEmbedInitPayload((current) => mergeEmbedInitPayload(current, nextPayload))
       }
       const shouldActivate = data.type === 'open' || data.active === true || data.preload !== true
       if (shouldActivate) {
@@ -834,15 +900,23 @@ export default function VisitorChatPage() {
     return () => {
       window.removeEventListener('message', handleMessage)
     }
-  }, [embedInitRequired, embedInstanceId])
+  }, [channelKey, embedInitRequired, embedInstanceId])
 
   useEffect(() => {
     if (!embedInitRequired || !embedReadyPosted || !embedActivated || embedInitPayload !== null) return
     const timer = window.setTimeout(() => {
-      setEmbedInitPayload((current) => current ?? EMPTY_EMBED_INIT_PAYLOAD)
-    }, 3000)
+      setEmbedInitPayload((current) => current ?? { initSource: 'timeout' })
+    }, EMBED_INIT_FALLBACK_MS)
     return () => window.clearTimeout(timer)
   }, [embedActivated, embedInitPayload, embedInitRequired, embedReadyPosted])
+
+  // The identity-less fallback holds off on opening a conversation so a late SDK
+  // `init` can supply contextToken first. If nothing arrives, open it anyway.
+  useEffect(() => {
+    if (embedInitPayload?.initSource !== 'timeout' || embedInitGraceElapsed) return
+    const timer = window.setTimeout(() => setEmbedInitGraceElapsed(true), EMBED_INIT_GRACE_MS)
+    return () => window.clearTimeout(timer)
+  }, [embedInitGraceElapsed, embedInitPayload])
 
   useEffect(() => {
     if (!isEmbed || !embedInstanceId || !channel || embedReadyPosted) return
@@ -877,7 +951,7 @@ export default function VisitorChatPage() {
 
   useEffect(() => {
     let cancelled = false
-    if (!channelKey || !embedActivated || (embedInitRequired && embedInitPayload === null)) return
+    if (!channelKey || !channelLoaded || !embedActivated || (embedInitRequired && embedInitPayload === null)) return
     const embedPayload = embedInitPayload ?? EMPTY_EMBED_INIT_PAYLOAD
     const embedVisitor = embedPayload.visitor
     const currentContextToken = embedPayload.contextToken || null
@@ -923,28 +997,30 @@ export default function VisitorChatPage() {
     lastSyncedContextTokenRef.current = null
 
     const createSession = async () => {
+      if (embedPayload.contextToken === null) {
+        clearVisitorCredential(channelKey)
+      }
       const stored = readVisitorCredential(channelKey)
-      const storedForRenewal = stored?.visitorPayloadKey === visitorPayloadKey ? stored : null
-      const storedToken = stored?.visitorSessionToken
-      const storedSessionExpiresAt = stored?.visitorSessionExpiresAt
-      const reusableToken =
-        storedToken &&
+      const storedForRenewal = selectStoredVisitorCredential(stored, embedPayload)
+      const storedToken = storedForRenewal?.visitorSessionToken
+      const storedSessionExpiresAt = storedForRenewal?.visitorSessionExpiresAt
+      const canReuseStoredToken =
+        typeof storedToken === 'string' &&
         typeof storedSessionExpiresAt === 'number' &&
-        storedSessionExpiresAt > Date.now() + 60 * 1000 &&
-        stored.visitorPayloadKey === visitorPayloadKey
+        storedSessionExpiresAt > Date.now() + 60 * 1000
 
-      if (stored && reusableToken) {
+      if (storedForRenewal && canReuseStoredToken) {
         return {
           session: {
-            visitor_external_id: stored.visitorExternalId,
+            visitor_external_id: storedForRenewal.visitorExternalId,
             visitor_session_token: storedToken,
-            visitor_secret: stored.visitorSecret,
+            visitor_secret: storedForRenewal.visitorSecret,
             expires_in: Math.max(
               0,
               Math.floor((storedSessionExpiresAt - Date.now()) / 1000),
             ),
           },
-          stored,
+          stored: storedForRenewal,
           reused: true,
         }
       }
@@ -987,6 +1063,12 @@ export default function VisitorChatPage() {
             has_context_token: Boolean(currentContextToken),
             has_visitor_payload: Boolean(embedVisitor),
             warning_count: session.context_warnings?.length ?? 0,
+            identity_source: resolveVisitorIdentitySource({
+              reused,
+              hadStoredCredential: Boolean(stored),
+              hasContextToken: Boolean(currentContextToken),
+            }),
+            init_source: embedPayload.initSource || 'standalone',
           },
         })
         const visitorSecret = session.visitor_secret || stored?.visitorSecret
@@ -1025,6 +1107,7 @@ export default function VisitorChatPage() {
       cancelled = true
     }
   }, [
+    channelLoaded,
     channelKey,
     embedActivated,
     embedInitPayload,
@@ -1047,6 +1130,9 @@ export default function VisitorChatPage() {
       ...(currentContextToken ? { contextToken: currentContextToken } : {}),
       ...(visitorEnvironment.system ? { system: visitorEnvironment.system } : {}),
       ...(visitorEnvironment.browser ? { browser: visitorEnvironment.browser } : {}),
+      ...((preferredLocale || (typeof navigator !== 'undefined' ? navigator.language : ''))
+        ? { locale: preferredLocale || navigator.language }
+        : {}),
     }
 
     if (!conversationPublicId && !socketOfflineMessage) {
@@ -1174,7 +1260,7 @@ export default function VisitorChatPage() {
                 res.conversation.status === 'handoff_pending'
                 && channel?.config.open_agent_handoff_behavior === 'confirm'
               ) {
-                setPendingHumanHandoff(restorePendingHumanHandoff(currentMessages))
+                setPendingHumanHandoff(restorePendingHumanHandoff(currentMessages, locale))
               } else {
                 setPendingHumanHandoff(null)
               }
@@ -1224,14 +1310,12 @@ export default function VisitorChatPage() {
             setStartConversationError(null)
             setSocketOfflineTitle(
               res.restricted_service_title
-              || (locale === 'zh' ? '当前暂时无法提供在线咨询' : 'Chat is temporarily unavailable'),
+              || t('chat.restricted.title', locale),
             )
             setSocketOfflineMessage(
               res.restricted_service_message
               || channel?.config.restricted_service_message
-              || (locale === 'zh'
-                ? '抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。'
-                : 'Sorry, online support is temporarily unavailable. If you need help, please contact the service provider through another published channel.'),
+              || t('chat.restricted.message', locale),
             )
           } else if (res.error === 'OFFLINE') {
             trackEvent('conversation_start_offline', {
@@ -1389,6 +1473,7 @@ export default function VisitorChatPage() {
     embedInitPayload,
     embedInstanceId,
     isEmbed,
+    preferredLocale,
     socket,
     connected,
     conversationPublicId,
@@ -1849,16 +1934,18 @@ export default function VisitorChatPage() {
     setCurrentQueueCount(null)
     setSocketOfflineTitle('')
     setSocketOfflineMessage('')
-    setConversationPublicId(null)
+    if (channel?.config.leave_message_mode !== 'form') setConversationPublicId(null)
     setOfflineMessagePublicId(null)
     setOfflineMessageSource('queue_full')
     setLeaveMessageMode(true)
     setLeaveMessagePrompt((current) => current || channel?.config.leave_message_prompt || '')
-    setMessages([])
-    setHasMore(false)
+    if (channel?.config.leave_message_mode !== 'form') {
+      setMessages([])
+      setHasMore(false)
+    }
     setEnded(false)
-    setConversationStatus(null)
-  }, [channel?.config.leave_message_prompt, setConversationPublicId, setHasMore, setMessages])
+    if (channel?.config.leave_message_mode !== 'form') setConversationStatus(null)
+  }, [channel?.config.leave_message_mode, channel?.config.leave_message_prompt, setConversationPublicId, setHasMore, setMessages])
 
   const handleQueueLeaveMessage = useCallback(async () => {
     if (!conversationPublicId || !visitorSessionToken || queueLeaveMessageLoading) return
@@ -1875,7 +1962,7 @@ export default function VisitorChatPage() {
       setCurrentQueueCount(null)
       setSocketOfflineTitle('')
       setSocketOfflineMessage('')
-      setConversationPublicId(null)
+      if (!result.deferred) setConversationPublicId(null)
       setOfflineMessagePublicId(null)
       setOfflineMessageSource(result.source)
       setOfflineMessageQueueTarget({
@@ -1884,14 +1971,14 @@ export default function VisitorChatPage() {
       })
       setLeaveMessageMode(true)
       setLeaveMessagePrompt(result.leave_message_prompt || channel?.config.leave_message_prompt || '')
-      setMessages([])
-      setHasMore(false)
+      if (!result.deferred) {
+        setMessages([])
+        setHasMore(false)
+      }
       setEnded(false)
-      setConversationStatus(null)
+      if (!result.deferred) setConversationStatus(null)
     } catch {
-      window.alert(locale === 'zh'
-        ? '暂时无法进入留言，请稍后再试'
-        : 'Unable to switch to leave a message. Please try again.')
+      window.alert(t('chat.leaveMessage.unavailable', locale))
     } finally {
       setQueueLeaveMessageLoading(false)
     }
@@ -1927,24 +2014,36 @@ export default function VisitorChatPage() {
     setCurrentQueueCount(null)
     setSocketOfflineTitle('')
     setSocketOfflineMessage('')
-    setConversationPublicId(null)
+    if (channel?.config.leave_message_mode !== 'form') setConversationPublicId(null)
     setOfflineMessagePublicId(null)
     setOfflineMessageSource(null)
     setOfflineMessageQueueTarget(null)
     setLeaveMessageMode(true)
     setLeaveMessagePrompt(prompt || channel?.config.leave_message_prompt || '')
-    setMessages([])
-    setHasMore(false)
+    if (channel?.config.leave_message_mode !== 'form') {
+      setMessages([])
+      setHasMore(false)
+    }
     setEnded(false)
-    setConversationStatus(null)
+    if (channel?.config.leave_message_mode !== 'form') setConversationStatus(null)
     setPendingHumanHandoff(null)
   }, [
+    channel?.config.leave_message_mode,
     channel?.config.leave_message_prompt,
     setConversationPublicId,
     setHasMore,
     setMessages,
     setPendingHumanHandoff,
   ])
+
+  const handleContinueBotFromForm = useCallback(() => {
+    setLeaveMessageMode(false)
+    setOfflineMessageSource(null)
+    setOfflineMessageQueueTarget(null)
+    setLeaveMessagePrompt('')
+    setQueueFullMessage('')
+    setHandoffQueueFullInline(false)
+  }, [])
 
   const handleHandoffQueueFull = useCallback((payload: {
     queue_full_message?: string
@@ -2021,19 +2120,25 @@ export default function VisitorChatPage() {
 
     let cancelled = false
     const embedPayload = embedInitPayload ?? EMPTY_EMBED_INIT_PAYLOAD
-    const stored = readVisitorCredential(channelKey)
+    if (embedPayload.contextToken === null) {
+      clearVisitorCredential(channelKey)
+    }
+    const storedForRenewal = selectStoredVisitorCredential(
+      readVisitorCredential(channelKey),
+      embedPayload,
+    )
 
     createVisitorSession({
       channelKey,
-      visitorExternalId: stored?.visitorExternalId,
-      visitorSecret: stored?.visitorSecret,
+      visitorExternalId: storedForRenewal?.visitorExternalId,
+      visitorSecret: storedForRenewal?.visitorSecret,
       visitorName: embedPayload.visitor?.name,
       metadata: embedPayload.visitor?.metadata,
       contextToken: embedPayload.contextToken || null,
     })
       .then((session) => {
         if (cancelled) return
-        const visitorSecret = session.visitor_secret || stored?.visitorSecret
+        const visitorSecret = session.visitor_secret || storedForRenewal?.visitorSecret
         if (visitorSecret) {
           writeVisitorCredential(channelKey, {
             visitorExternalId: session.visitor_external_id,
@@ -2075,9 +2180,22 @@ export default function VisitorChatPage() {
     // unwanted session. A fresh conversation only happens when the visitor taps
     // the restart button (handleRestartConversation).
     if (ended) return
+    // The identity-less fallback waits out the grace period first: a late SDK
+    // init with contextToken would otherwise create a second conversation.
+    const embedPayload = embedInitPayload ?? EMPTY_EMBED_INIT_PAYLOAD
+    if (!shouldAutoStartConversation(embedPayload, embedInitGraceElapsed)) return
     startedRef.current = true
     void startConversation()
-  }, [socket, connected, embedActivated, startConversation, unreadReplyChecked, ended])
+  }, [
+    socket,
+    connected,
+    embedActivated,
+    embedInitPayload,
+    embedInitGraceElapsed,
+    startConversation,
+    unreadReplyChecked,
+    ended,
+  ])
 
   useEffect(() => {
     if (!socket) return
@@ -2440,8 +2558,8 @@ export default function VisitorChatPage() {
     && config.assist_panel_react_code?.trim(),
   )
   const historyAvailable = channel?.has_conversation_history === true || historyConversations.length > 0
-
-  const footerLocale: Locale = locale === 'zh' ? 'zh' : 'en'
+  const formMessageSource: FormMessageSource = offlineMessageSource
+    ?? (conversationPublicId ? 'bot_handoff' : 'outside_service_hours')
 
   useEffect(() => {
     if (!isEmbed) return
@@ -2476,12 +2594,10 @@ export default function VisitorChatPage() {
         <div className="flex flex-1 flex-col items-center justify-center gap-4">
           <IconAlertTriangle size={48} className="text-destructive" />
           <p className="text-sm text-muted-foreground">
-            {locale === 'zh'
-              ? '该对话链接无效或已失效'
-              : 'This conversation link is invalid or expired'}
+            {t('chat.invalidLink', locale)}
           </p>
         </div>
-        <LegalFooter locale={footerLocale} compact />
+        <LegalFooter locale={locale} compact />
       </div>
     )
   }
@@ -2511,7 +2627,7 @@ export default function VisitorChatPage() {
             </div>
           )}
         </div>
-        <LegalFooter locale={footerLocale} compact />
+        <LegalFooter locale={locale} compact />
       </div>
     )
   }
@@ -2525,12 +2641,10 @@ export default function VisitorChatPage() {
         <div className="flex flex-1 flex-col items-center justify-center gap-4">
           <IconAlertTriangle size={48} className="text-destructive" />
           <p className="text-sm text-muted-foreground">
-            {locale === 'zh'
-              ? '该对话链接无效或已失效'
-              : 'This conversation link is invalid or expired'}
+            {t('chat.invalidLink', locale)}
           </p>
         </div>
-        <LegalFooter locale={footerLocale} compact />
+        <LegalFooter locale={locale} compact />
       </div>
     )
   }
@@ -2540,26 +2654,50 @@ export default function VisitorChatPage() {
       {/* ── Connection status bar ── */}
       {showConnectionStatus && (
         <div className="absolute left-0 right-0 top-0 z-50 border-b border-amber-200/50 bg-[#f4ebd4] px-4 py-1 text-center text-xs text-stone-800">
-          {locale === 'zh'
-            ? '连接断开，正在重连...'
-            : 'Connection lost, reconnecting...'}
+          {t('chat.connection.reconnecting', locale)}
         </div>
       )}
       {showSubscriptionRecovery && (
         <div className="absolute left-0 right-0 top-0 z-50 border-b border-amber-200/50 bg-[#f4ebd4] px-4 py-1 text-center text-xs text-stone-800">
-          {locale === 'zh' ? '实时消息连接异常。' : 'Real-time message connection failed. '}
+          {t('chat.connection.failed', locale)}{' '}
           <button
             type="button"
             className="font-medium underline underline-offset-2"
             onClick={() => setConversationSubscriptionRetryNonce((value) => value + 1)}
           >
-            {locale === 'zh' ? '重新连接' : 'Retry'}
+            {t('chat.connection.retry', locale)}
           </button>
         </div>
       )}
 
       {/* ── Chat container (backed by assistant-ui runtime) ── */}
-      {showAssistPanel ? (
+      {isFormMessage ? (
+        <div className={chatContainerClassName}>
+          <ChatHeader
+            channel={channel}
+            isMobile={isMobile}
+            isEmbed={isEmbed}
+            onEmbedClose={handleEmbedClose}
+            locale={locale}
+            messageSoundEnabled={messageSoundEnabled}
+            onMessageSoundEnabledChange={handleMessageSoundEnabledChange}
+          />
+          <FormMessage
+            visitorSessionToken={visitorSessionToken}
+            locale={locale}
+            source={formMessageSource}
+            conversationPublicId={conversationPublicId}
+            queueType={offlineMessageQueueTarget?.queueType}
+            queueId={offlineMessageQueueTarget?.queueId}
+            onContinueConversation={
+              conversationPublicId
+              && (conversationStatus === 'bot' || conversationStatus === 'handoff_pending')
+                ? handleContinueBotFromForm
+                : undefined
+            }
+          />
+        </div>
+      ) : showAssistPanel ? (
         <VisitorChatRuntimeProvider
           socket={socket}
           channel={channel}
@@ -2723,7 +2861,7 @@ export default function VisitorChatPage() {
       {/* AGPL §13: visitors interacting with this network service must be
           offered the Corresponding Source. Compact variant keeps the chat UX
           uncluttered on both mobile and desktop. */}
-      <LegalFooter locale={footerLocale} compact />
+      <LegalFooter locale={locale} compact />
     </div>
   )
 }

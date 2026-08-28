@@ -89,6 +89,19 @@ class OffersMixin:
         except Exception:  # noqa: BLE001
             pass
 
+    async def discard_call_state(self, call_id: str) -> None:
+        """Forget a call the kernel has already torn down.
+
+        Per-call state (workflow, ownership lock, prompt waiter) is normally
+        dropped by the kernel's ``call.hangup`` handler. When the kernel reports
+        the leg as unknown, that event will never arrive, so terminal paths call
+        this instead — otherwise the workflow lingers for the life of the
+        process and blocks shutdown drain.
+        """
+        await self._release_call(call_id)
+        self.cancel_play_wait(call_id)
+        self._workflows.pop(call_id, None)
+
     # ─────────── Cross-node agent offer resolution (multi-node) ───────────
 
     async def deliver_offer_decision(self, offer_id: str, decision: dict) -> bool:
@@ -173,6 +186,7 @@ class OffersMixin:
         self._draining = False
         # Register handlers before connect so events are not missed once the
         # WS comes up (including after a deferred initial reconnect).
+        self.personal_auto_outbound.register_events()
         self.telephony.on_event("call.incoming", self._on_incoming)
         self.telephony.on_event("call.dtmf", self._route_event)
         self.telephony.on_event("call.play_end", self._route_event)
@@ -208,6 +222,14 @@ class OffersMixin:
         self.telephony.on_event("extension.unregistered", self._on_extension_unregistered)
         self.telephony.on_reconnected(self._on_reconnect)
         await self.telephony.connect()
+        if self.telephony.is_ready:
+            try:
+                active_ids, complete = await self._reconcile_active_call_ids()
+                await self.personal_auto_outbound.restore_running_sessions(
+                    active_ids, complete=complete
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("personal auto-outbound startup reconcile failed")
         await self._start_catalog_sync()
         import asyncio as _aio_offer
         self._offer_sub_task = _aio_offer.create_task(
@@ -241,6 +263,16 @@ class OffersMixin:
 
         import asyncio as _aio
 
+        # A workflow whose call already ended is a leftover that nothing will
+        # ever clear, and waiting on it would stall shutdown for the full
+        # timeout. Its CDR and agent were released by whatever ended the call,
+        # so only the in-memory state needs dropping.
+        for call_id in await self._ended_call_ids(list(self._workflows)):
+            logger.warning(
+                "Drain: dropping stale workflow for already-ended call_id=%s", call_id
+            )
+            await self.discard_call_state(call_id)
+
         deadline = _time.monotonic() + max(0.0, float(timeout))
         while self._workflows:
             remaining = deadline - _time.monotonic()
@@ -260,6 +292,28 @@ class OffersMixin:
         for call_id in leftover:
             await self._force_finalize_drained_call(call_id)
         return len(leftover)
+
+    async def _ended_call_ids(self, call_ids: list[str]) -> list[str]:
+        """Of the given calls, those whose CDR is already closed."""
+        if not call_ids:
+            return []
+        try:
+            async with _orch.AsyncSessionLocal() as db:
+                from sqlalchemy import select
+                from app.models.call_record import CallRecord
+
+                rows = (
+                    await db.execute(
+                        select(CallRecord.call_id).where(
+                            CallRecord.call_id.in_(call_ids),
+                            CallRecord.lifecycle_status == "ended",
+                        )
+                    )
+                ).scalars().all()
+            return list(rows)
+        except Exception:  # noqa: BLE001
+            logger.exception("Drain: stale workflow lookup failed")
+            return []
 
     async def _force_finalize_drained_call(self, call_id: str) -> None:
         """Best-effort OpenDesk-side cleanup when drain times out.
@@ -331,6 +385,7 @@ class OffersMixin:
         if self._catalog_sync is not None:
             await self._catalog_sync.stop()
             self._catalog_sync = None
+        await self.personal_auto_outbound.stop()
         await self.telephony.disconnect()
         self._workflows.clear()
         self._started = False

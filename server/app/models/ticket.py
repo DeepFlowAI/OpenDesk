@@ -1,7 +1,7 @@
 """
 Ticket model — work order / ticket entity with dynamic slot columns
 """
-from sqlalchemy import Integer, String, Text, ForeignKey, Index
+from sqlalchemy import BigInteger, Integer, String, Text, ForeignKey, Index
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -25,7 +25,7 @@ class Ticket(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
     ticket_number: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     layout_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("fd_form_layouts.id", ondelete="SET NULL"), nullable=True)
     conversation_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True)
-    call_record_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("call_records.id", ondelete="SET NULL"), nullable=True)
+    call_record_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("call_records.id", ondelete="SET NULL"), nullable=True)
     user_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     agent_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
     assignee_group_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employee_groups.id", ondelete="SET NULL"), nullable=True)

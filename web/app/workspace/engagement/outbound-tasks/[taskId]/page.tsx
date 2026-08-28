@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { IconArrowLeft, IconPlus, IconTrash, IconUpload, IconUserCheck } from '@tabler/icons-react'
 import { toast } from 'sonner'
 import {
@@ -12,6 +12,7 @@ import {
   TargetStatusBadge,
   TaskStatusBadge,
 } from '@/app/components/features/engagement/outbound-task-ui'
+import { OutboundScriptSnapshot } from '@/app/components/features/engagement/outbound-script-snapshot'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useEmployees } from '@/service/use-employees'
 import {
@@ -26,7 +27,7 @@ import {
 } from '@/service/use-outbound-tasks'
 import type { OutboundTargetImportResponse, OutboundTaskField } from '@/models/outbound-task'
 
-type DetailTab = 'targets' | 'records'
+type DetailTab = 'targets' | 'script' | 'records'
 type TargetActionModal = 'add' | 'import' | 'assign' | 'delete' | null
 
 export default function OutboundTaskDetailPage() {
@@ -47,6 +48,17 @@ export default function OutboundTaskDetailPage() {
   const bulkAssign = useBulkAssignOutboundTargets(taskId)
   const bulkDelete = useBulkDeleteOutboundTargets(taskId)
   const transition = useTransitionOutboundTask()
+
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('tab') === 'script') setActiveTab('script')
+  }, [])
+
+  const selectTab = (tab: DetailTab) => {
+    setActiveTab(tab)
+    const url = new URL(window.location.href)
+    url.searchParams.set('tab', tab)
+    window.history.replaceState(window.history.state, '', url)
+  }
 
   const employeeNameById = useMemo(() => {
     const map = new Map<number, string>()
@@ -224,7 +236,7 @@ export default function OutboundTaskDetailPage() {
                     type="button"
                     role="tab"
                     aria-selected={activeTab === 'targets'}
-                    onClick={() => setActiveTab('targets')}
+                    onClick={() => selectTab('targets')}
                     className={`border-b-2 px-1 pb-3 text-sm font-medium transition-colors ${
                       activeTab === 'targets'
                         ? 'border-foreground text-foreground'
@@ -237,8 +249,17 @@ export default function OutboundTaskDetailPage() {
                   <button
                     type="button"
                     role="tab"
+                    aria-selected={activeTab === 'script'}
+                    onClick={() => selectTab('script')}
+                    className={`border-b-2 px-1 pb-3 text-sm font-medium transition-colors ${activeTab === 'script' ? 'border-foreground text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+                  >
+                    外呼话术
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
                     aria-selected={activeTab === 'records'}
-                    onClick={() => setActiveTab('records')}
+                    onClick={() => selectTab('records')}
                     className={`border-b-2 px-1 pb-3 text-sm font-medium transition-colors ${
                       activeTab === 'records'
                         ? 'border-foreground text-foreground'
@@ -298,6 +319,8 @@ export default function OutboundTaskDetailPage() {
                       </table>
                     </div>
                   )
+                ) : activeTab === 'script' ? (
+                  <OutboundScriptSnapshot script={task.script_snapshot} templateName={task.template_name} />
                 ) : (
                   (records?.items.length ?? 0) === 0 ? (
                     <EmptyState title="暂无外呼记录" />

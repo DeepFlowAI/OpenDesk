@@ -3,7 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { type ComponentType } from 'react'
-import { IconActivity, IconChartBar, IconHeadset, IconInbox, IconMessageCircle, IconPhone } from '@tabler/icons-react'
+import { IconActivity, IconChartBar, IconChartHistogram, IconHeadset, IconInbox, IconMessage, IconMessageCircle, IconPhone } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
@@ -13,7 +13,7 @@ import {
   WORKSPACE_RECORD_NAV_GROUPS,
   type WorkspaceRecordIconKey,
 } from '@/config/workspace-permissions'
-import { hasAnyPermission } from '@/utils/permissions'
+import { hasAllPermissions, hasAnyPermission } from '@/utils/permissions'
 
 type SubNavItem = {
   labelKey: string
@@ -21,6 +21,7 @@ type SubNavItem = {
   iconKey: WorkspaceRecordIconKey
   permissions: string[]
   requiresReports?: boolean
+  requireAll?: boolean
 }
 
 type SubNavGroup = {
@@ -35,6 +36,8 @@ const RECORD_NAV_ICONS: Record<WorkspaceRecordIconKey, ComponentType<{ size?: nu
   callMonitor: IconHeadset,
   calls: IconPhone,
   callReports: IconChartBar,
+  smsRecords: IconMessage,
+  dashboards: IconChartHistogram,
 }
 
 export default function RecordsLayout({ children }: { children: React.ReactNode }) {
@@ -48,7 +51,9 @@ export default function RecordsLayout({ children }: { children: React.ReactNode 
     .map((group) => ({
       items: group.items.filter((item) => {
         if (item.requiresReports && !reportsEnabled) return false
-        return hasAnyPermission(user, item.permissions)
+        return item.requireAll
+          ? hasAllPermissions(user, item.permissions)
+          : hasAnyPermission(user, item.permissions)
       }),
     }))
     .filter((group) => group.items.length > 0)

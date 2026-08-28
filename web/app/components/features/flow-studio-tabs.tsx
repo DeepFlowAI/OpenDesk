@@ -5,7 +5,7 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 
-export type FlowStudioTab = 'routing-rules' | 'voice-flows'
+export type FlowStudioTab = 'routing-rules' | 'voice-flows' | 'satisfaction-flows'
 
 type FlowStudioTabsProps = {
   active: FlowStudioTab
@@ -27,6 +27,12 @@ export function FlowStudioTabs({ active }: FlowStudioTabsProps) {
       </Link>
       <Link href="/flow-studio/voice-flows" className={tabClass(active === 'voice-flows')}>
         {t('fs.tab.voiceFlows', locale)}
+      </Link>
+      <Link
+        href="/flow-studio/satisfaction-flows"
+        className={tabClass(active === 'satisfaction-flows')}
+      >
+        {t('fs.tab.satisfactionFlows', locale)}
       </Link>
     </div>
   )

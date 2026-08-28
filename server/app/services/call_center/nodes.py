@@ -217,11 +217,23 @@ class PlayExecutor(BaseNodeExecutor):
         if not started:
             return goto_or_end(ctx, node["id"], "next")
 
+        # Play_ends from an earlier utterance (e.g. a condition node looping
+        # back into this node) must not satisfy the wait below, or the new
+        # prompt is skipped after its first syllables.
+        wf = ctx.variables.get("__workflow__")
+        if wf is not None:
+            wf.clear_buffered("call.play_end")
+
         async def _on_play_end(ctx_: ExecutionContext, node_: dict, _data: dict) -> NextStep:
             # call.play_end can fire a beat before the last audio drains from the
             # jitter buffer; pause briefly so the next prompt doesn't clip the
             # tail (e.g. the final character of the welcome).
             await _drain_tail()
+            # Late/duplicate play_ends buffered during the drain are stale for
+            # whatever node runs next; drop them before moving on.
+            wf_ = ctx_.variables.get("__workflow__")
+            if wf_ is not None:
+                wf_.clear_buffered("call.play_end")
             return goto_or_end(ctx_, node_["id"], "next")
 
         return WaitForEvent(method="call.play_end", on_event=_on_play_end)
@@ -428,6 +440,19 @@ class AssignQueueExecutor(BaseNodeExecutor):
         "agent_no_answer": "暂无坐席接听，请稍后再拨。",
     }
 
+    _DEFAULT_QUEUE_PROMPT = "正在为您转接，请稍候。"
+
+    @classmethod
+    def _queue_prompt(cls, data: dict) -> str | None:
+        """Resolve the transfer prompt. Missing key falls back to the default;
+        an explicit empty string disables the prompt entirely (returns None)."""
+        value = data.get("queue_prompt_text")
+        if value is None:
+            return cls._DEFAULT_QUEUE_PROMPT
+        if isinstance(value, str) and not value:
+            return None
+        return str(value)
+
     async def execute(self, ctx: ExecutionContext, node: dict) -> NextStep:
         import asyncio
         import logging
@@ -572,7 +597,7 @@ class AssignQueueExecutor(BaseNodeExecutor):
 
             queue_wait_s = float(data.get("queue_wait_seconds") or 60)
             retry_s = max(1.0, float(data.get("queue_wait_retry_seconds") or 5))
-            hold_prompt = data.get("queue_prompt_text") or "正在为您转接，请稍候。"
+            hold_prompt = self._queue_prompt(data)
             waited = 0.0
             since_prompt = float("inf")  # play the hold prompt on the first pass
             while (
@@ -580,7 +605,7 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 and waited < queue_wait_s
                 and not ctx.variables.get("sys._workflow_ended")
             ):
-                if since_prompt >= 15.0:
+                if hold_prompt is not None and since_prompt >= 15.0:
                     await self._say(ctx, hold_prompt)
                     since_prompt = 0.0
                 await asyncio.sleep(retry_s)
@@ -646,6 +671,24 @@ class AssignQueueExecutor(BaseNodeExecutor):
         # accept. WebRTC agents fall through to the unchanged browser-offer path
         # below. Gating strictly on the picked agent's current device keeps the
         # existing WebRTC inbound path byte-for-byte identical.
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=ctx.tenant_id,
+            call_id=ctx.call_id,
+            event_id=f"opendesk:agent-offer-started:{offer_id}",
+            event_type="agent_offer_started",
+            event_category="queue",
+            actor_type="system",
+            source="opendesk",
+            operation_id=offer_id,
+            target_type="employee",
+            target_id=str(pick["employee_id"]),
+            target_name_snapshot=pick.get("name"),
+            queue_type=selected.queue_type,
+            queue_id=selected.queue_id,
+            result=None,
+        )
         sip_agent_leg = await self._try_ring_sip_phone_agent(
             ctx, data, node, pick, offer_id, timeout_s, redis, orchestrator, log,
         )
@@ -657,17 +700,36 @@ class AssignQueueExecutor(BaseNodeExecutor):
         queue_id = ctx.variables.get("sys._assigned_queue_id")
 
         try:
+            offer_payload = {
+                "offer_id": offer_id,
+                "call_id": ctx.call_id,
+                "from": ctx.variables.get("sys.caller_number", ""),
+                "to": ctx.variables.get("sys.called_number", ""),
+                "queue_type": queue_type,
+                "queue_id": queue_id,
+            }
+            # Auto-outbound agent / IVR-transfer offers tag the push so the
+            # workspace can distinguish them from ordinary inbound (auto-answer).
+            if ctx.variables.get("sys._auto_outbound_source"):
+                offer_payload["source"] = ctx.variables.get("sys._auto_outbound_source")
+                task_id = ctx.variables.get("sys._auto_outbound_task_id")
+                if task_id is not None:
+                    offer_payload["task_id"] = task_id
+                record_id = ctx.variables.get("sys._auto_outbound_record_id")
+                if record_id is not None:
+                    offer_payload["record_id"] = record_id
+                if ctx.variables.get("sys._auto_outbound_source") == "personal_auto_outbound":
+                    primary_agent_id = ctx.variables.get("sys._personal_primary_agent_id")
+                    offer_payload["personal_assignment_type"] = (
+                        "primary"
+                        if primary_agent_id is not None
+                        and int(primary_agent_id) == int(pick["employee_id"])
+                        else "fallback"
+                    )
             pushed = await orchestrator.notify_agent_incoming(
                 tenant_id=ctx.tenant_id,
                 employee_id=pick["employee_id"],
-                payload={
-                    "offer_id": offer_id,
-                    "call_id": ctx.call_id,
-                    "from": ctx.variables.get("sys.caller_number", ""),
-                    "to": ctx.variables.get("sys.called_number", ""),
-                    "queue_type": queue_type,
-                    "queue_id": queue_id,
-                },
+                payload=offer_payload,
             )
         except Exception:  # noqa: BLE001
             log.exception("assign_queue: notify push failed")
@@ -710,17 +772,28 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 await self._say(ctx, self._failure_prompt(data, "agent_no_answer"))
                 return goto_or_end(ctx, node["id"], "timeout")
 
+        # Subscribe before starting playback: short/cached prompts may emit
+        # call.play_end before call_say returns. Registering afterwards loses
+        # that edge and lets the bridge timeout overlap the prompt tail.
+        # A None prompt means the prompt is explicitly disabled: register no
+        # waiter and play nothing (the bridge consumer tolerates a missing waiter).
+        prompt = self._queue_prompt(data)
         prompt_task: asyncio.Task | None = None
-        if data.get("prompt_play_mode") == "loop":
-            prompt_task = asyncio.create_task(
-                self._play_waiting_prompt(ctx, data),
-                name=f"assign-queue-prompt:{ctx.call_id}",
-            )
-        else:
-            await self._say(ctx, data.get("queue_prompt_text") or "正在为您转接，请稍候。")
-        # Let bridging wait (bounded) for this prompt to finish before cutting
-        # the caller off mid-word.
-        ctx.variables["sys._prompt_play_waiter"] = orchestrator.register_play_wait(ctx.call_id)
+        if prompt is not None:
+            prompt_waiter = orchestrator.register_play_wait(ctx.call_id)
+            ctx.variables["sys._prompt_play_waiter"] = prompt_waiter
+            if data.get("prompt_play_mode") == "loop":
+                prompt_task = asyncio.create_task(
+                    self._play_waiting_prompt(ctx, data),
+                    name=f"assign-queue-prompt:{ctx.call_id}",
+                )
+            else:
+                try:
+                    await self._say(ctx, prompt)
+                except Exception:
+                    orchestrator.cancel_play_wait(ctx.call_id)
+                    ctx.variables.pop("sys._prompt_play_waiter", None)
+                    raise
 
         # Record the in-flight offer so the orchestrator can withdraw it (stop
         # the agent's browser ringing + free the agent) if the caller hangs up
@@ -763,6 +836,27 @@ class AssignQueueExecutor(BaseNodeExecutor):
             ctx.variables.pop("sys._pending_offer_employee_id", None)
 
         if not decision or not decision.get("accept"):
+            decision_reason = (decision or {}).get("reason") or "offer_timeout"
+            rejected = decision is not None and decision_reason not in {"offer_timeout", "timeout"}
+            await CallTrajectoryService.append_for_call_id_best_effort(
+                tenant_id=ctx.tenant_id,
+                call_id=ctx.call_id,
+                event_id=f"opendesk:agent-offer-result:{offer_id}",
+                event_type="agent_offer_rejected" if rejected else "agent_offer_timeout",
+                event_category="queue",
+                actor_type="agent" if rejected else "system",
+                actor_id=str(pick["employee_id"]) if rejected else None,
+                actor_name_snapshot=pick.get("name") if rejected else None,
+                source="opendesk",
+                operation_id=offer_id,
+                target_type="employee",
+                target_id=str(pick["employee_id"]),
+                target_name_snapshot=pick.get("name"),
+                queue_type=queue_type,
+                queue_id=queue_id,
+                result="rejected" if rejected else "timeout",
+                reason_code="agent_rejected" if rejected else "agent_no_answer",
+            )
             log.info(
                 "assign_queue: offer not accepted (decision=%s) call_id=%s",
                 decision, ctx.call_id,
@@ -780,6 +874,42 @@ class AssignQueueExecutor(BaseNodeExecutor):
             return goto_or_end(ctx, node["id"], "timeout")
 
         webrtc_call_id = decision["webrtc_call_id"]
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=ctx.tenant_id,
+            call_id=ctx.call_id,
+            event_id=f"opendesk:agent-offer-result:{offer_id}",
+            event_type="agent_offer_accepted",
+            event_category="queue",
+            actor_type="agent",
+            actor_id=str(pick["employee_id"]),
+            actor_name_snapshot=pick.get("name"),
+            source="opendesk",
+            operation_id=offer_id,
+            call_leg_id=webrtc_call_id,
+            participant_role="serving_agent",
+            target_type="employee",
+            target_id=str(pick["employee_id"]),
+            target_name_snapshot=pick.get("name"),
+            queue_type=queue_type,
+            queue_id=queue_id,
+            result="succeeded",
+            reason_code="normal",
+        )
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=ctx.tenant_id,
+            call_id=ctx.call_id,
+            event_id=f"opendesk:queue-exited:{offer_id}",
+            event_type="queue_exited",
+            event_category="queue",
+            actor_type="system",
+            source="opendesk",
+            operation_id=offer_id,
+            queue_type=queue_type,
+            queue_id=queue_id,
+            result="succeeded",
+            reason_code="agent_accepted",
+        )
 
         # CDR + status updates AFTER the agent commits.
         async with AsyncSessionLocal() as db:
@@ -885,6 +1015,24 @@ class AssignQueueExecutor(BaseNodeExecutor):
         incoming_pushed = False
 
         async def _fail(reason: str) -> NextStep:
+            from app.services.call_trajectory_service import CallTrajectoryService
+
+            await CallTrajectoryService.append_for_call_id_best_effort(
+                tenant_id=ctx.tenant_id,
+                call_id=ctx.call_id,
+                event_id=f"opendesk:agent-offer-result:{offer_id}",
+                event_type="agent_offer_timeout",
+                event_category="queue",
+                actor_type="system",
+                source="opendesk",
+                operation_id=offer_id,
+                target_type="employee",
+                target_id=str(employee_id),
+                target_name_snapshot=pick.get("name"),
+                result="timeout",
+                reason_code="agent_no_answer",
+                reason_detail=reason,
+            )
             if redis is not None:
                 await CcAgentResourceService.release(
                     redis, ctx.tenant_id, employee_id,
@@ -953,29 +1101,55 @@ class AssignQueueExecutor(BaseNodeExecutor):
         # Let the agent's workspace show the incoming call (physical phone is
         # already ringing; no accept button is required).
         try:
+            sip_payload = {
+                "offer_id": offer_id, "call_id": ctx.call_id,
+                "from": ctx.variables.get("sys.caller_number", ""),
+                "to": ctx.variables.get("sys.called_number", ""),
+                "device_type": DEVICE_SIP_PHONE,
+            }
+            if ctx.variables.get("sys._auto_outbound_source"):
+                sip_payload["source"] = ctx.variables.get("sys._auto_outbound_source")
+                task_id = ctx.variables.get("sys._auto_outbound_task_id")
+                if task_id is not None:
+                    sip_payload["task_id"] = task_id
+                record_id = ctx.variables.get("sys._auto_outbound_record_id")
+                if record_id is not None:
+                    sip_payload["record_id"] = record_id
+                if ctx.variables.get("sys._auto_outbound_source") == "personal_auto_outbound":
+                    primary_agent_id = ctx.variables.get("sys._personal_primary_agent_id")
+                    sip_payload["personal_assignment_type"] = (
+                        "primary"
+                        if primary_agent_id is not None
+                        and int(primary_agent_id) == int(employee_id)
+                        else "fallback"
+                    )
             await orchestrator.notify_agent_incoming(
                 tenant_id=ctx.tenant_id, employee_id=employee_id,
-                payload={
-                    "offer_id": offer_id, "call_id": ctx.call_id,
-                    "from": ctx.variables.get("sys.caller_number", ""),
-                    "to": ctx.variables.get("sys.called_number", ""),
-                    "device_type": DEVICE_SIP_PHONE,
-                },
+                payload=sip_payload,
             )
             incoming_pushed = True
         except Exception:  # noqa: BLE001
             log.exception("assign_queue: SIP-phone incoming notify failed")
+        # See the WebRTC offer path above: the completion subscription must
+        # exist before playback can emit its terminal event. A None prompt is
+        # explicitly disabled: register no waiter and play nothing.
+        prompt = self._queue_prompt(data)
         prompt_task: asyncio.Task | None = None
-        if data.get("prompt_play_mode") == "loop":
-            prompt_task = asyncio.create_task(
-                self._play_waiting_prompt(ctx, data),
-                name=f"assign-queue-prompt:{ctx.call_id}",
-            )
-        else:
-            await self._say(ctx, data.get("queue_prompt_text") or "正在为您转接，请稍候。")
-        # Let bridging wait (bounded) for this prompt to finish before cutting
-        # the caller off mid-word.
-        ctx.variables["sys._prompt_play_waiter"] = orchestrator.register_play_wait(ctx.call_id)
+        if prompt is not None:
+            prompt_waiter = orchestrator.register_play_wait(ctx.call_id)
+            ctx.variables["sys._prompt_play_waiter"] = prompt_waiter
+            if data.get("prompt_play_mode") == "loop":
+                prompt_task = asyncio.create_task(
+                    self._play_waiting_prompt(ctx, data),
+                    name=f"assign-queue-prompt:{ctx.call_id}",
+                )
+            else:
+                try:
+                    await self._say(ctx, prompt)
+                except Exception:
+                    orchestrator.cancel_play_wait(ctx.call_id)
+                    ctx.variables.pop("sys._prompt_play_waiter", None)
+                    raise
         try:
             decision = await asyncio.wait_for(waiter, timeout=timeout_s)
         except asyncio.TimeoutError:
@@ -999,6 +1173,42 @@ class AssignQueueExecutor(BaseNodeExecutor):
                 employee_id, ctx.call_id,
             )
             return await _fail(decision.get("reason") or "offer_timeout")
+
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=ctx.tenant_id,
+            call_id=ctx.call_id,
+            event_id=f"opendesk:agent-offer-result:{offer_id}",
+            event_type="agent_offer_accepted",
+            event_category="queue",
+            actor_type="agent",
+            actor_id=str(employee_id),
+            actor_name_snapshot=pick.get("name"),
+            source="opendesk",
+            operation_id=offer_id,
+            call_leg_id=agent_leg_call_id,
+            participant_role="serving_agent",
+            target_type="employee",
+            target_id=str(employee_id),
+            target_name_snapshot=pick.get("name"),
+            result="succeeded",
+            reason_code="normal",
+        )
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=ctx.tenant_id,
+            call_id=ctx.call_id,
+            event_id=f"opendesk:queue-exited:{offer_id}",
+            event_type="queue_exited",
+            event_category="queue",
+            actor_type="system",
+            source="opendesk",
+            operation_id=offer_id,
+            queue_type=ctx.variables.get("sys._assigned_queue_type"),
+            queue_id=ctx.variables.get("sys._assigned_queue_id"),
+            result="succeeded",
+            reason_code="agent_accepted",
+        )
 
         # Off-hook: commit CDR + status, then bridge caller ↔ extension leg.
         async with AsyncSessionLocal() as db:
@@ -1107,7 +1317,16 @@ class AssignQueueExecutor(BaseNodeExecutor):
             # buffer) plays out before we stop + bridge.
             await _drain_tail()
             await ctx.telephony.call_stop(ctx.call_id)
-            await ctx.telephony.call_bridge(ctx.call_id, webrtc_call_id, transcribe=transcribe)
+            # keepalive: if the agent browser drops (refresh / crash), FlowKit
+            # leaves the customer leg up so media-reconnect can re-bridge
+            # instead of dropping the caller.
+            await ctx.telephony.call_bridge(
+                ctx.call_id,
+                webrtc_call_id,
+                transcribe=transcribe,
+                keepalive_on_peer_hangup=True,
+                user_call_id=ctx.call_id,
+            )
         except TelephonyRPCError as exc:
             if exc.code == -32002:
                 log.warning(
@@ -1140,6 +1359,17 @@ class AssignQueueExecutor(BaseNodeExecutor):
             )
 
         async def _on_bridged(ctx_: ExecutionContext, node_: dict, _ev: dict) -> NextStep:
+            from app.db.session import AsyncSessionLocal
+            from app.services.call_record_service import CallRecordService
+
+            async with AsyncSessionLocal() as db:
+                await CallRecordService.mark_reception_started(
+                    db,
+                    ctx_.tenant_id,
+                    ctx_.call_id,
+                    agent_id=employee_id,
+                    agent_leg_id=webrtc_call_id,
+                )
             return End("bridged")
 
         return WaitForEvent(method="call.bridged", on_event=_on_bridged)
@@ -1264,7 +1494,9 @@ class AssignQueueExecutor(BaseNodeExecutor):
         import asyncio
 
         interval = float(data.get("prompt_loop_interval_seconds") or 15)
-        prompt = data.get("queue_prompt_text") or "正在为您转接，请稍候。"
+        prompt = self._queue_prompt(data)
+        if prompt is None:
+            return
         while True:
             await self._say(ctx, prompt)
             await asyncio.sleep(interval)
@@ -1372,6 +1604,25 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
                 reason="voicespeed_connect_failed",
             )
 
+        # Flag the CDR as bot-served (best-effort, short session, before the wait).
+        try:
+            from app.services.call_record_service import CallRecordService
+
+            async with AsyncSessionLocal() as db:
+                await CallRecordService.mark_bot_served(
+                    db,
+                    ctx.tenant_id,
+                    ctx.call_id,
+                    agent_id=agent_id,
+                    agent_name=(data.get("agent_name") or "").strip() or None,
+                )
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "voicespeed: bot_served mark failed call_id=%s", ctx.call_id,
+                exc_info=True,
+            )
+
         # (d) Conversation is running in the kernel — wait holding NO db session.
         return self._wait()
 
@@ -1387,8 +1638,21 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
         method = ev.get("_event_method", "")
         data = node.get("data") or {}
         if method == "call.external_agent.handoff":
+            await self._record_bot_event(
+                ctx,
+                event_type="bot_handoff_requested",
+                result="succeeded",
+                reason_code="bot_handoff",
+            )
             return await self._handle_handoff(ctx, node, ev)
         if method == "call.external_agent.failed":
+            await self._record_bot_event(
+                ctx,
+                event_type="bot_ended",
+                result="failed",
+                reason_code="system_error",
+                reason_detail=str(ev.get("code") or ev.get("message") or "voicespeed_failed"),
+            )
             log.info(
                 "voicespeed: bridge failed call_id=%s code=%s message=%s",
                 ctx.call_id, ev.get("code"), ev.get("message"),
@@ -1399,6 +1663,13 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
                 reason="voicespeed_connect_failed",
             )
         if method == "call.external_agent.ended":
+            await self._record_bot_event(
+                ctx,
+                event_type="bot_ended",
+                result="succeeded",
+                reason_code="bot_completed",
+                reason_detail=str(ev.get("reason") or "voicespeed_ended"),
+            )
             log.info(
                 "voicespeed: bridge ended call_id=%s reason=%s",
                 ctx.call_id, ev.get("reason"),
@@ -1431,9 +1702,47 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
         )
         target = edge_target(ctx, node["id"], "handoff")
         if target:
+            await self._record_bot_event(
+                ctx,
+                event_type="bot_handoff_succeeded",
+                result="succeeded",
+                reason_code="bot_handoff",
+            )
+            await self._record_bot_event(
+                ctx,
+                event_type="bot_ended",
+                result="succeeded",
+                reason_code="bot_handoff",
+            )
             return Goto(target)
         log.info("voicespeed: handoff with no outlet — ending call_id=%s", ctx.call_id)
         return await self._terminate(ctx, None, reason="voicespeed_handoff_no_outlet")
+
+    @staticmethod
+    async def _record_bot_event(
+        ctx: ExecutionContext,
+        *,
+        event_type: str,
+        result: str,
+        reason_code: str,
+        reason_detail: str | None = None,
+    ) -> None:
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=ctx.tenant_id,
+            call_id=ctx.call_id,
+            event_id=f"voicespeed:{event_type}:{ctx.call_id}",
+            event_type=event_type,
+            event_category="bot",
+            actor_type="bot",
+            source="voicespeed",
+            call_leg_id=ctx.call_id,
+            participant_role="bot",
+            result=result,
+            reason_code=reason_code,
+            reason_detail=reason_detail,
+        )
 
     async def _terminate(
         self, ctx: ExecutionContext, text: str | None, *, reason: str,

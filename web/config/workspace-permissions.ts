@@ -4,6 +4,8 @@ export type WorkspaceNavIconKey =
   | 'call'
   | 'engagement'
   | 'records'
+  | 'learning'
+  | 'scheduling'
   | 'contacts'
   | 'knowledge'
 
@@ -12,6 +14,9 @@ export type WorkspaceNavItem = {
   href: string
   iconKey: WorkspaceNavIconKey
   permissions: string[]
+  permissionSets?: string[][]
+  /** Open in a new browser tab so the current workspace page stays intact. */
+  openInNewTab?: boolean
 }
 
 export type WorkspaceRecordIconKey =
@@ -22,12 +27,15 @@ export type WorkspaceRecordIconKey =
   | 'callMonitor'
   | 'calls'
   | 'callReports'
+  | 'smsRecords'
+  | 'dashboards'
 
 export type WorkspaceRecordNavItem = {
   labelKey: string
   href: string
   iconKey: WorkspaceRecordIconKey
   permissions: string[]
+  requireAll?: boolean
   requiresReports?: boolean
 }
 
@@ -38,6 +46,8 @@ export type WorkspaceRecordNavGroup = {
 export type WorkspaceRouteRule = {
   prefix: string
   permissions: string[]
+  requireAll?: boolean
+  permissionSets?: string[][]
 }
 
 export const WORKSPACE_NAV_ITEMS: WorkspaceNavItem[] = [
@@ -63,7 +73,12 @@ export const WORKSPACE_NAV_ITEMS: WorkspaceNavItem[] = [
     labelKey: 'ws.nav.engagement',
     href: '/workspace/engagement/outbound-tasks',
     iconKey: 'engagement',
-    permissions: ['engagement.outbound_task.manage', 'engagement.outbound_task.create'],
+    permissions: [
+      'engagement.outbound_task.manage',
+      'engagement.outbound_task.create',
+      'engagement.auto_outbound_task.manage',
+      'engagement.auto_outbound_task.create',
+    ],
   },
   {
     labelKey: 'ws.nav.records',
@@ -77,7 +92,23 @@ export const WORKSPACE_NAV_ITEMS: WorkspaceNavItem[] = [
       'call.monitor.view',
       'call.record.view',
       'call.report.view',
+      'call.sms_record.view',
     ],
+    permissionSets: [['report.dashboard.view', 'ticket.workspace.view']],
+  },
+  {
+    labelKey: 'ws.nav.learning',
+    href: '/learning',
+    iconKey: 'learning',
+    permissions: ['learning.center.use'],
+    openInNewTab: true,
+  },
+  {
+    labelKey: 'ws.nav.scheduling',
+    href: '/scheduling',
+    iconKey: 'scheduling',
+    permissions: ['scheduling.my.view', 'scheduling.center.manage'],
+    openInNewTab: true,
   },
   {
     labelKey: 'ws.nav.contacts',
@@ -146,11 +177,29 @@ export const WORKSPACE_RECORD_NAV_GROUPS: WorkspaceRecordNavGroup[] = [
         permissions: ['call.report.view'],
         requiresReports: true,
       },
+      {
+        labelKey: 'ws.records.nav.smsRecords',
+        href: '/workspace/records/sms',
+        iconKey: 'smsRecords',
+        permissions: ['call.sms_record.view'],
+      },
+    ],
+  },
+  {
+    items: [
+      {
+        labelKey: 'ws.records.nav.dashboards',
+        href: '/workspace/records/dashboards',
+        iconKey: 'dashboards',
+        permissions: ['report.dashboard.view', 'ticket.workspace.view'],
+        requireAll: true,
+      },
     ],
   },
 ]
 
 export const WORKSPACE_ROUTE_RULES: WorkspaceRouteRule[] = [
+  { prefix: '/workspace/records/dashboards', permissions: ['report.dashboard.view', 'ticket.workspace.view'], requireAll: true },
   { prefix: '/workspace/records/online-monitor', permissions: ['chat.online_monitor.view'] },
   { prefix: '/workspace/records/session-reports', permissions: ['chat.session_report.view'] },
   { prefix: '/workspace/records/offline-messages', permissions: ['chat.offline_message.view'] },
@@ -158,6 +207,7 @@ export const WORKSPACE_ROUTE_RULES: WorkspaceRouteRule[] = [
   { prefix: '/workspace/records/call-reports', permissions: ['call.report.view'] },
   { prefix: '/workspace/records/sessions', permissions: ['chat.session_record.view'] },
   { prefix: '/workspace/records/calls', permissions: ['call.record.view'] },
+  { prefix: '/workspace/records/sms', permissions: ['call.sms_record.view'] },
   {
     prefix: '/workspace/records',
     permissions: [
@@ -168,11 +218,25 @@ export const WORKSPACE_ROUTE_RULES: WorkspaceRouteRule[] = [
       'call.monitor.view',
       'call.record.view',
       'call.report.view',
+      'call.sms_record.view',
     ],
+    permissionSets: [['report.dashboard.view', 'ticket.workspace.view']],
   },
   { prefix: '/workspace/chat', permissions: ['chat.workspace.use'] },
   { prefix: '/workspace/engagement/outbound-task-templates', permissions: ['engagement.outbound_task.template.manage'] },
-  { prefix: '/workspace/engagement', permissions: ['engagement.outbound_task.manage', 'engagement.outbound_task.create'] },
+  {
+    prefix: '/workspace/engagement/auto-outbound-tasks',
+    permissions: ['engagement.auto_outbound_task.manage', 'engagement.auto_outbound_task.create'],
+  },
+  {
+    prefix: '/workspace/engagement',
+    permissions: [
+      'engagement.outbound_task.manage',
+      'engagement.outbound_task.create',
+      'engagement.auto_outbound_task.manage',
+      'engagement.auto_outbound_task.create',
+    ],
+  },
   { prefix: '/workspace/call/outbound-tasks', permissions: ['engagement.outbound_task.execute'] },
   { prefix: '/workspace/call', permissions: ['call.workspace.use'] },
   { prefix: '/workspace/tickets', permissions: ['ticket.workspace.view'] },
@@ -190,13 +254,13 @@ export function getWorkspaceRouteRule(pathname: string): WorkspaceRouteRule | nu
 }
 
 export function getDefaultWorkspaceRecordPath(
-  canAccess: (permissions: string[]) => boolean,
+  canAccess: (permissions: string[], requireAll?: boolean) => boolean,
   reportsEnabled: boolean,
 ): string {
   for (const group of WORKSPACE_RECORD_NAV_GROUPS) {
     for (const item of group.items) {
       if (item.requiresReports && !reportsEnabled) continue
-      if (canAccess(item.permissions)) return item.href
+      if (canAccess(item.permissions, item.requireAll)) return item.href
     }
   }
   return '/403'

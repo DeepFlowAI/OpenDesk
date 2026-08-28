@@ -18,8 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.configs.settings import settings
 from app.core.security import hash_password
 from app.models.employee import Employee
+from app.models.system_settings import SystemSettings
 from app.models.tenant import Tenant
 from app.services.role_service import RoleService
+from app.services.scheduling_service import seed_preset_shifts
 from app.services.tenant_init_service import init_tenant_data
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,12 @@ async def seed_system_defaults(db: AsyncSession) -> None:
     for tenant_id in tenant_ids:
         await RoleService.ensure_system_roles(db, tenant_id)
         await RoleService.backfill_employee_roles(db, tenant_id)
+        settings_row = (
+            await db.execute(
+                select(SystemSettings.default_language).where(SystemSettings.tenant_id == tenant_id)
+            )
+        ).scalar_one_or_none()
+        await seed_preset_shifts(db, tenant_id, settings_row or "zh")
 
 
 async def _ensure_default_tenant(db: AsyncSession) -> None:

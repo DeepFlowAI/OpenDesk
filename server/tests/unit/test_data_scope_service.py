@@ -63,14 +63,77 @@ class TestDataScopeService:
         conversation.group_id = 100
         assert DataScopeService.conversation_in_scope(principal, conversation, []) is True
 
-    def test_call_record_self_scope(self):
+    @pytest.mark.asyncio
+    async def test_call_record_self_scope_uses_access_fact(self):
         principal = _principal(data_scopes={"call_record": "self"})
         row = MagicMock(spec=CallRecord)
-        row.agent_id = 10
-        row.employee_group_id = None
-        assert DataScopeService.call_record_in_scope(principal, row, []) is True
-        row.agent_id = 11
-        assert DataScopeService.call_record_in_scope(principal, row, []) is False
+        row.id = 77
+        allowed_result = MagicMock()
+        allowed_result.scalar_one_or_none.return_value = 1
+        denied_result = MagicMock()
+        denied_result.scalar_one_or_none.return_value = None
+        db = AsyncMock()
+        db.execute.side_effect = [allowed_result, denied_result]
+
+        assert await DataScopeService.call_record_in_scope(db, principal, row) is True
+        assert await DataScopeService.call_record_in_scope(db, principal, row) is False
+
+    def test_call_record_group_predicate_uses_current_group_ids(self):
+        principal = _principal(
+            data_scopes={"call_record": "group"},
+            group_ids=[100, 101],
+        )
+        predicate = DataScopeService.build_call_record_predicate(principal)
+        compiled = predicate.compile()
+
+        assert "call_record_access_scopes" in str(compiled)
+        assert "subject_type" in str(compiled)
+        assert 1 in compiled.params.values()
+        assert "employee_group" in compiled.params.values()
+        assert [100, 101] in compiled.params.values()
+
+    def test_call_record_all_scope_has_no_predicate(self):
+        principal = _principal(data_scopes={"call_record": "all"})
+        assert DataScopeService.build_call_record_predicate(principal) is None
+
+    @pytest.mark.asyncio
+    async def test_call_record_ids_in_scope_all_returns_everything(self):
+        principal = _principal(data_scopes={"call_record": "all"})
+        db = AsyncMock()
+
+        result = await DataScopeService.call_record_ids_in_scope(db, principal, [3, 1, 3])
+
+        assert result == {1, 3}
+        db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_call_record_ids_in_scope_self_queries_access_fact(self):
+        principal = _principal(data_scopes={"call_record": "self"})
+        db = AsyncMock()
+        db.execute.return_value = [(2,)]
+
+        result = await DataScopeService.call_record_ids_in_scope(db, principal, [1, 2])
+
+        assert result == {2}
+        db.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_call_record_ids_in_scope_empty_subject_ids_returns_empty(self):
+        principal = _principal(data_scopes={"call_record": "group"}, group_ids=[])
+        db = AsyncMock()
+
+        result = await DataScopeService.call_record_ids_in_scope(db, principal, [1, 2])
+
+        assert result == set()
+        db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_call_record_ids_in_scope_empty_input_returns_empty(self):
+        principal = _principal(data_scopes={"call_record": "all"})
+        db = AsyncMock()
+
+        assert await DataScopeService.call_record_ids_in_scope(db, principal, []) == set()
+        db.execute.assert_not_called()
 
     def test_resolve_agent_filter_self_forces_current_user(self):
         principal = _principal(data_scopes={"session_record": "self"})

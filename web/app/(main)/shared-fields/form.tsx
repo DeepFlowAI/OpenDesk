@@ -257,7 +257,7 @@ export default function SharedFieldForm({ initialData, isEdit, onSubmit }: Share
   )
 
   const selectedTypeLabel = form.field_type
-    ? FIELD_TYPE_LABELS[form.field_type as FieldType]?.[locale] ?? form.field_type
+    ? FIELD_TYPE_LABELS[form.field_type as FieldType]?.[locale === 'zh' ? 'zh' : 'en'] ?? form.field_type
     : ''
 
   const isSelect = (SELECT_FIELD_TYPES as readonly string[]).includes(form.field_type)
@@ -336,7 +336,7 @@ export default function SharedFieldForm({ initialData, isEdit, onSubmit }: Share
         <div className="flex items-center gap-4">
           {ALL_MODULES.map((mod) => {
             const checked = form.applicable_modules.includes(mod)
-            const label = APPLICABLE_MODULE_LABELS[mod]?.[locale] ?? mod
+            const label = APPLICABLE_MODULE_LABELS[mod]?.[locale === 'zh' ? 'zh' : 'en'] ?? mod
             return (
               <label key={mod} className="flex cursor-pointer items-center gap-2 text-sm text-foreground/80">
                 <input
@@ -403,7 +403,7 @@ export default function SharedFieldForm({ initialData, isEdit, onSubmit }: Share
                       ft === form.field_type ? 'font-medium text-foreground' : 'text-foreground/80',
                     )}
                   >
-                    {FIELD_TYPE_LABELS[ft]?.[locale] ?? ft}
+                    {FIELD_TYPE_LABELS[ft]?.[locale === 'zh' ? 'zh' : 'en'] ?? ft}
                   </button>
                 ))}
               </div>

@@ -3,6 +3,7 @@ export type SystemSettings = {
   default_timezone: string
   organization_enabled: boolean
   bridge_asr_enabled: boolean
+  call_wrapup_seconds: number
 }
 
 export type UpdateSystemSettingsPayload = {
@@ -16,4 +17,8 @@ export type UpdateOrganizationSettingsPayload = {
 
 export type UpdateCallTranscriptionPayload = {
   enabled: boolean
+}
+
+export type UpdateCallWrapupPayload = {
+  seconds: number
 }

@@ -7,6 +7,9 @@ that NO database session is held while the kernel runs the conversation
 (CLAUDE.md rule #8). In v2 the kernel owns ASR/TTS/barge-in and calls the
 agent's turn endpoint; OpenDesk only kicks it off and routes the events.
 """
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from app.libs.telephony.providers.mock.client import MockTelephonyClient
@@ -253,7 +256,7 @@ class TestVoiceSpeedManagedSession:
                 assert SessionTracker.active is False
                 SessionTracker.active = True
                 SessionTracker.opens += 1
-                return object()
+                return SimpleNamespace(commit=AsyncMock())
 
             async def __aexit__(self, *_exc):
                 SessionTracker.active = False
@@ -262,6 +265,16 @@ class TestVoiceSpeedManagedSession:
 
         monkeypatch.setattr(
             "app.db.session.AsyncSessionLocal", lambda: TrackingSessionCtx(),
+        )
+
+        # The bot-served CDR mark is exercised separately; here it must simply
+        # run inside its own short session, not leak into the converse wait.
+        async def _mark_bot_served(db, *_a, **_k):
+            assert SessionTracker.active is True
+
+        monkeypatch.setattr(
+            "app.services.call_record_service.CallRecordService.mark_bot_served",
+            _mark_bot_served,
         )
 
         async def _creds(_db, _tenant_id):
@@ -301,8 +314,11 @@ class TestVoiceSpeedManagedSession:
         # Conversing → we end on a WaitForEvent holding no db session.
         assert isinstance(step, WaitForEvent)
         assert tel.active_at_converse is False
-        assert SessionTracker.opens == 1
+        # Two short sessions: credentials read + bot-served CDR mark. Both must
+        # be closed before the wait begins.
+        assert SessionTracker.opens == 2
         assert SessionTracker.opens == SessionTracker.closes
+        assert SessionTracker.active is False
 
 
 class TestVoiceSpeedEventOrderingRace:

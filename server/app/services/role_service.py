@@ -68,7 +68,11 @@ class RoleService:
             )
             changed = True
         if changed:
+            # Persist here. Callers such as GET /roles/options only flush in a
+            # request session that rolls back on exit, which left new tenants
+            # with ghost system-role IDs and broke employee create.
             await db.flush()
+            await db.commit()
 
     @staticmethod
     async def backfill_employee_roles(db: AsyncSession, tenant_id: int) -> None:

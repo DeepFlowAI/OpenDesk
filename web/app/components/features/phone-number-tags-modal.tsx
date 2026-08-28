@@ -6,11 +6,12 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 import type { OutboundTimeSlot, PhoneCallType, TenantPhoneNumber } from '@/models/tenant-phone-number'
+import type { Locale } from '@/lib/languages'
 
 const MAX_TAGS = 20
 const MAX_TAG_LENGTH = 32
 
-function CallTypeBadge({ type, locale }: { type: PhoneCallType; locale: 'zh' | 'en' }) {
+function CallTypeBadge({ type, locale }: { type: PhoneCallType; locale: Locale }) {
   const label = type === 'inbound' ? t('pn.type.inbound', locale) : t('pn.type.outbound', locale)
   const className =
     type === 'inbound' ? 'bg-blue-50 text-blue-700' : 'bg-green-50 text-green-700'
@@ -287,7 +288,7 @@ export function CallTypeBadges({
   locale,
 }: {
   types: PhoneCallType[]
-  locale: 'zh' | 'en'
+  locale: Locale
 }) {
   if (types.length === 0) return <span className="text-sm text-muted-foreground">—</span>
   return (

@@ -76,8 +76,18 @@ async def test_relays_user_and_agent_text_to_bridged_agent(monkeypatch):
         ),
         (
             "cc.transcript",
+            {"call_id": "call-1", "role": "user", "text": "你好", "final": True, "seq": None},
+            "embedded-call-agent:7:42",
+        ),
+        (
+            "cc.transcript",
             {"call_id": "call-1", "role": "agent", "text": "您好，请问", "final": True, "seq": None},
             "agent:7:42",
+        ),
+        (
+            "cc.transcript",
+            {"call_id": "call-1", "role": "agent", "text": "您好，请问", "final": True, "seq": None},
+            "embedded-call-agent:7:42",
         ),
     ]
 
@@ -95,12 +105,16 @@ async def test_speech_partial_is_not_final_speech_end_is(monkeypatch):
         CallEvent("call.speech_end", {"call_id": "call-1", "text": "我想退款"})
     )
 
-    partial, final = transport.emits
+    partial, embedded_partial, final, embedded_final = transport.emits
     assert partial[1]["final"] is False
     assert partial[1]["role"] == "user"
     assert partial[1]["seq"] == 3
+    assert embedded_partial[1] == partial[1]
+    assert embedded_partial[2] == "embedded-call-agent:1:2"
     assert final[1]["final"] is True
     assert final[1]["text"] == "我想退款"
+    assert embedded_final[1] == final[1]
+    assert embedded_final[2] == "embedded-call-agent:1:2"
 
 
 @pytest.mark.asyncio
@@ -133,8 +147,18 @@ async def test_bridge_transcript_uses_explicit_speaker_and_final(monkeypatch):
         ),
         (
             "cc.transcript",
+            {"call_id": "call-1", "role": "agent", "text": "您好", "final": False, "seq": 1},
+            "embedded-call-agent:3:9",
+        ),
+        (
+            "cc.transcript",
             {"call_id": "call-1", "role": "user", "text": "我要退款", "final": True, "seq": None},
             "agent:3:9",
+        ),
+        (
+            "cc.transcript",
+            {"call_id": "call-1", "role": "user", "text": "我要退款", "final": True, "seq": None},
+            "embedded-call-agent:3:9",
         ),
     ]
 

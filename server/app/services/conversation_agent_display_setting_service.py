@@ -11,10 +11,12 @@ from app.models.conversation_agent_display_setting import ConversationAgentDispl
 from app.repositories.conversation_agent_display_setting_repository import (
     ConversationAgentDisplaySettingRepository,
 )
+from app.repositories.employee_repository import EmployeeRepository
 from app.schemas.conversation_agent_display_setting import (
     AgentDisplayMode,
     ConversationAgentDisplaySettingPayload,
     ConversationAgentDisplaySettingResponse,
+    ConversationAgentDisplayTargetResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,21 @@ class ConversationAgentDisplaySettingService:
     async def get_display_mode(db: AsyncSession, tenant_id: int) -> AgentDisplayMode:
         current = await ConversationAgentDisplaySettingService.get_current(db, tenant_id)
         return current.display_mode
+
+    @staticmethod
+    async def get_agent_target(
+        db: AsyncSession,
+        tenant_id: int,
+        agent_id: int,
+    ) -> ConversationAgentDisplayTargetResponse:
+        current = await ConversationAgentDisplaySettingService.get_current(db, tenant_id)
+        agent = await EmployeeRepository.get_by_id(db, agent_id)
+        if agent is not None and agent.tenant_id != tenant_id:
+            agent = None
+        return ConversationAgentDisplayTargetResponse(
+            display_mode=current.display_mode,
+            sender_name=ConversationAgentDisplaySettingService.resolve_agent_name(agent, current.display_mode),
+        )
 
     @staticmethod
     async def save(

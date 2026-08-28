@@ -259,10 +259,17 @@ class PhoneNumberService:
             await PhoneNumberService._assert_tenant_assignable(db, payload.tenant_id)
         _assert_tenant_assignment_allowed(payload.status, payload.tenant_id)
         final_status = _normalize_status_with_tenant(payload.status, payload.tenant_id)
+        phone_id = (payload.id or "").strip() or f"pn_{uuid.uuid4().hex[:12]}"
+        if await PhoneNumberRepository.get_by_id(db, phone_id):
+            raise BusinessError(
+                "Phone number id already exists",
+                status_code=409,
+                code="DUPLICATE_PHONE_NUMBER_ID",
+            )
         row = await PhoneNumberRepository.create(
             db,
             {
-                "id": f"pn_{uuid.uuid4().hex[:12]}",
+                "id": phone_id,
                 "phone_number": payload.phone_number.strip(),
                 "call_types": list(payload.call_types),
                 "trunk_id": payload.trunk_id or None,

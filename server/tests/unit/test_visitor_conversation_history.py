@@ -1,7 +1,7 @@
 """
 Unit tests for visitor conversation history.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, ANY
 
@@ -439,6 +439,11 @@ async def test_create_from_visitor_persists_matched_welcome_message(monkeypatch)
 
     assert result["is_new"] is True
     assert create_message.await_count == 2
+    system_data = create_message.await_args_list[0].args[1]
+    assert system_data["metadata_"] == {
+        "event_type": "conversation_started",
+        "started_by": "visitor",
+    }
     welcome_data = create_message.await_args_list[1].args[1]
     assert welcome_data["sender_type"] == "system"
     assert welcome_data["content_type"] == "welcome"
@@ -2061,12 +2066,14 @@ async def test_get_agent_history_conversations_limits_to_recent_closed_items(mon
         get_history,
     )
 
+    before_call = datetime.now(timezone.utc)
     result = await ConversationService.get_agent_history_conversations(
         AsyncMock(),
         tenant_id=10,
         agent_id=30,
         limit=20,
     )
+    after_call = datetime.now(timezone.utc)
 
     assert result["total"] == 1
     assert result["has_more"] is False
@@ -2075,6 +2082,8 @@ async def test_get_agent_history_conversations_limits_to_recent_closed_items(mon
     assert get_history.await_args.kwargs["tenant_id"] == 10
     assert get_history.await_args.kwargs["agent_id"] == 30
     assert get_history.await_args.kwargs["limit"] == 21
+    assert before_call - timedelta(days=30) <= get_history.await_args.kwargs["ended_since"]
+    assert get_history.await_args.kwargs["ended_since"] <= after_call - timedelta(days=30)
 
 
 @pytest.mark.asyncio

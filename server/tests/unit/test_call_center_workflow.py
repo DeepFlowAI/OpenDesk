@@ -4,9 +4,12 @@ Unit tests for the voice-flow workflow + node executors.
 Uses MockTelephonyClient so we can assert which RPCs got called in what order
 without touching FlowKit.
 """
+import asyncio
+
 import pytest
 
 from app.libs.telephony.providers.mock.client import MockTelephonyClient
+from app.services.call_center import nodes as nodes_mod
 from app.services.call_center.workflow import VoiceFlowWorkflow
 
 
@@ -72,6 +75,29 @@ def _graph_collect_then_condition() -> dict:
     }
 
 
+def _graph_condition_play_loop() -> dict:
+    return {
+        "version": 1,
+        "nodes": [
+            {"id": "s", "type": "start", "data": {}, "position": {"x": 0, "y": 0}},
+            {
+                "id": "cond", "type": "condition", "position": {"x": 100, "y": 0},
+                "data": {"groups": []},
+            },
+            {
+                "id": "p", "type": "play", "position": {"x": 200, "y": 0},
+                "data": {"prompt": {"kind": "tts", "text": "hello"}},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source": "s", "target": "cond", "source_handle": "next"},
+            {"id": "e2", "source": "cond", "target": "p", "source_handle": "default"},
+            {"id": "e3", "source": "p", "target": "cond", "source_handle": "next"},
+        ],
+        "variables": [],
+    }
+
+
 class TestWorkflow:
 
     @pytest.mark.asyncio
@@ -116,9 +142,11 @@ class TestWorkflow:
         assert wf.ctx.variables["ui"] == "1"
 
     @pytest.mark.asyncio
-    async def test_event_before_wait_is_buffered_then_consumed(self):
-        # An event that arrives before the node registers its WaitForEvent must
-        # be stashed and consumed once the wait is registered, not dropped.
+    async def test_stale_play_end_before_play_is_dropped(self, monkeypatch):
+        # A play_end that arrived before the play node ran is stale (call.say
+        # returns when the utterance is accepted, not finished): the play node
+        # must drop it instead of letting it skip the fresh utterance's wait.
+        monkeypatch.setattr(nodes_mod, "_PLAY_TAIL_DRAIN_SECONDS", 0.01)
         tel = MockTelephonyClient()
         await tel.connect()
         wf = VoiceFlowWorkflow(
@@ -132,9 +160,46 @@ class TestWorkflow:
         assert wf.done.is_set() is False  # buffered, not lost
 
         await wf.start()
-        # play node registers its wait → buffered play_end consumed → hangup.
+        # Stale play_end dropped → still waiting for the real one.
+        assert wf.done.is_set() is False
+        await wf.handle_event("call.play_end", {"call_id": "call-1"})
         assert wf.done.is_set() is True
         assert any(m == "call.hangup" for m, _ in tel.recorded)
+
+    @pytest.mark.asyncio
+    async def test_condition_play_loop_ignores_stale_play_end(self, monkeypatch):
+        # condition → play → back to condition must replay the full prompt each
+        # cycle; a duplicate play_end buffered during the tail drain must not
+        # cut the next utterance short (the "loops playing first syllables" bug).
+        monkeypatch.setattr(nodes_mod, "_PLAY_TAIL_DRAIN_SECONDS", 0.01)
+        tel = MockTelephonyClient()
+        await tel.connect()
+        wf = VoiceFlowWorkflow(
+            call_id="loop-1",
+            tenant_id=1,
+            graph=_graph_condition_play_loop(),
+            telephony=tel,
+        )
+        await wf.start()
+        says = lambda: [m for m, _ in tel.recorded if m == "call.say"]  # noqa: E731
+        assert len(says()) == 1  # first cycle playing
+        assert wf.done.is_set() is False
+
+        # play_end resumes the workflow; while the tail drain sleeps, a
+        # duplicate play_end arrives and is buffered (no waiter registered).
+        first = asyncio.create_task(wf.handle_event("call.play_end", {"call_id": "loop-1"}))
+        await asyncio.sleep(0.001)
+        await wf.handle_event("call.play_end", {"call_id": "loop-1"})
+        await first
+
+        # The stale duplicate must not satisfy the second cycle's wait:
+        # exactly one more say, then the workflow parks on a fresh play_end.
+        assert len(says()) == 2
+        assert wf.done.is_set() is False
+
+        await wf.handle_event("call.play_end", {"call_id": "loop-1"})
+        assert len(says()) == 3
+        assert wf.done.is_set() is False
 
     @pytest.mark.asyncio
     async def test_collect_then_default_branch(self):

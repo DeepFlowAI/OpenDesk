@@ -29,6 +29,9 @@ import {
   reconnectCurrentCallMedia,
 } from '@/service/use-call-center'
 import { mapOutboundFailure } from '@/app/components/features/call-center/outbound-failure-message'
+import { isCurrentCallGoneError } from '@/lib/media-reconnect-error'
+
+export type MediaReconnectResult = string | false | 'ended'
 
 type LegState = 'idle' | 'connecting' | 'ready' | 'failed' | 'closed'
 
@@ -95,6 +98,7 @@ export function useWebRTCLeg() {
   const pendingLocalCandidates = useRef<RTCIceCandidate[]>([])
   const callIdRef = useRef<string | null>(null)
   const isClosingRef = useRef(false)
+  const generationRef = useRef(0)
 
   const ensureRemoteAudio = useCallback(() => {
     if (remoteAudioRef.current) return remoteAudioRef.current
@@ -156,6 +160,9 @@ export function useWebRTCLeg() {
         if (pc.connectionState === 'failed' && !isClosingRef.current) {
           setError('ICE 连接失败（UDP 16384-32767 可能不通）')
           setState('failed')
+          // The leg is unrecoverable — release the mic immediately instead of
+          // holding it until a server hangup event (or unmount) arrives.
+          teardownPc()
         }
       }
       pc.oniceconnectionstatechange = () => {
@@ -262,6 +269,9 @@ export function useWebRTCLeg() {
         if (pc.connectionState === 'failed' && !isClosingRef.current) {
           setError('ICE 连接失败（UDP 16384-32767 可能不通）')
           setState('failed')
+          // The leg is unrecoverable — release the mic immediately instead of
+          // holding it until a server hangup event (or unmount) arrives.
+          teardownPc()
         }
       }
       pc.oniceconnectionstatechange = () => {
@@ -360,6 +370,7 @@ export function useWebRTCLeg() {
 
   const goOffline = useCallback(() => {
     log('goOffline')
+    generationRef.current += 1
     teardownPc()
     setCallId(null)
     setError(null)
@@ -369,11 +380,24 @@ export function useWebRTCLeg() {
   /**
    * Rebuild a media leg for an already-active customer call (page refresh /
    * media_eof / consult re-bridge failure). Tears down any dead PC first.
+   *
+   * Returns the new WebRTC call id, `false` on a real failure, or `'ended'`
+   * when the customer call is already gone (hangup race / 404) — callers
+   * must not toast that as a WebRTC outage.
    */
-  const reconnectMedia = useCallback(async (): Promise<string | false> => {
+  const reconnectMedia = useCallback(async (): Promise<MediaReconnectResult> => {
     if (state === 'connecting') {
       log('reconnectMedia: already connecting — ignoring')
       return false
+    }
+    const generation = generationRef.current
+    const abortIfEnded = (): 'ended' | null => {
+      if (generationRef.current === generation) return null
+      log('reconnectMedia: aborted (call already ending)')
+      teardownPc()
+      setError(null)
+      setState('closed')
+      return 'ended'
     }
     teardownPc()
     setState('connecting')
@@ -383,6 +407,11 @@ export function useWebRTCLeg() {
     try {
       log('step 1: getUserMedia(audio)')
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const endedAfterMic = abortIfEnded()
+      if (endedAfterMic) {
+        stream.getTracks().forEach((t) => t.stop())
+        return endedAfterMic
+      }
       streamRef.current = stream
 
       log('step 2: new RTCPeerConnection')
@@ -403,6 +432,9 @@ export function useWebRTCLeg() {
         if (pc.connectionState === 'failed' && !isClosingRef.current) {
           setError('ICE 连接失败（UDP 16384-32767 可能不通）')
           setState('failed')
+          // The leg is unrecoverable — release the mic immediately instead of
+          // holding it until a server hangup event (or unmount) arrives.
+          teardownPc()
         }
       }
       pc.onicecandidate = async (ev) => {
@@ -426,9 +458,13 @@ export function useWebRTCLeg() {
       log('step 3: createOffer + setLocalDescription')
       const offer = await pc.createOffer({ offerToReceiveAudio: true })
       await pc.setLocalDescription(offer)
+      const endedAfterOffer = abortIfEnded()
+      if (endedAfterOffer) return endedAfterOffer
 
       log('step 4: POST /current-call/media-reconnect')
       const result = await reconnectCurrentCallMedia(offer.sdp ?? '')
+      const endedAfterPost = abortIfEnded()
+      if (endedAfterPost) return endedAfterPost
       if (!result.call_id) {
         throw new Error('media_reconnect_no_call_id')
       }
@@ -447,10 +483,18 @@ export function useWebRTCLeg() {
 
       log('step 5: setRemoteDescription(answer)')
       await pc.setRemoteDescription({ type: 'answer', sdp: result.sdp || '' })
+      if (abortIfEnded()) return 'ended'
       setState('ready')
       log('reconnectMedia ✓ ready')
       return result.call_id
     } catch (e: unknown) {
+      if ((await isCurrentCallGoneError(e)) || abortIfEnded()) {
+        log('reconnectMedia: current call already gone')
+        teardownPc()
+        setError(null)
+        setState('closed')
+        return 'ended'
+      }
       const msg = e instanceof Error ? e.message : String(e) || 'unknown error'
       console.error('[webrtc-leg] reconnectMedia FAILED:', e)
       setError(msg)

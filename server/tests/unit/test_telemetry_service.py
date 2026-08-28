@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.schemas.telemetry import TelemetryBatchRequest
-from app.services.telemetry_service import TelemetryService
+from app.services.telemetry_service import (
+    TelemetryService,
+    _log_hits,
+    _log_suppressed,
+)
 
 
 def _batch(events):
@@ -81,6 +85,46 @@ async def test_ingest_app_logs_staff_auth_event(caplog):
     assert record.tenant_id == "2"
     assert record.user_id == "7"
     assert record.props_trigger == "refresh_after_api_401"
+
+
+@pytest.mark.asyncio
+async def test_ingest_app_throttles_info_events_per_device(caplog):
+    """A busy agent must not consume another agent's INFO budget.
+
+    Call-center events are the audit trail for a stuck workspace, so one
+    workstation flooding them cannot be allowed to hide another workstation's.
+    """
+    _log_hits.clear()
+    _log_suppressed.clear()
+
+    busy = _batch([
+        {"name": "cc_socket_event", "ts": 1760000000000} for _ in range(30)
+    ])
+    await TelemetryService.ingest_app(
+        body=busy,
+        user_payload={"user_id": 7, "tenant_id": 2},
+    )
+
+    caplog.clear()
+    other_device = TelemetryBatchRequest(
+        common={
+            "session_id": "sess_2",
+            "device_id": "dev_2",
+            "sdk_name": "opendesk-web",
+        },
+        events=[{"name": "cc_socket_event", "ts": 1760000000001}],
+    )
+    result = await TelemetryService.ingest_app(
+        body=other_device,
+        user_payload={"user_id": 8, "tenant_id": 2},
+    )
+
+    assert result.accepted == 1
+    logged = [
+        item for item in caplog.records
+        if item.name == "app.frontend.event" and item.device_id == "dev_2"
+    ]
+    assert len(logged) == 1
 
 
 @pytest.mark.asyncio

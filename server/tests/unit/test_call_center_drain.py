@@ -42,7 +42,89 @@ async def test_draining_skips_incoming_without_claiming(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_drain_waits_until_workflows_empty():
+async def test_outbound_sip_incoming_event_is_not_routed_as_customer_inbound(monkeypatch):
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake)
+    orch = await _node("node-outbound")
+
+    await orch._on_incoming(
+        CallEvent(
+            method="call.incoming",
+            data={
+                "call_id": "c-outbound-1",
+                "transport": "sip",
+                "direction": "outbound",
+                "from": "20260526",
+                "to": "sip:tenant-9001",
+            },
+        )
+    )
+
+    assert await fake.exists(orch._call_owner_key("c-outbound-1")) == 0
+    assert "c-outbound-1" not in orch._workflows
+
+
+@pytest.mark.asyncio
+async def test_pending_personal_extension_is_not_routed_as_customer_inbound(monkeypatch):
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake)
+    orch = await _node("node-personal")
+    orch._personal_outbound_extensions.add("tenant-9001")
+
+    await orch._on_incoming(
+        CallEvent(
+            method="call.incoming",
+            data={
+                "call_id": "c-personal-1",
+                "transport": "sip",
+                "from": "20260526",
+                "to": "sip:tenant-9001@registrar",
+            },
+        )
+    )
+
+    assert await fake.exists(orch._call_owner_key("c-personal-1")) == 0
+    assert "c-personal-1" not in orch._workflows
+    assert "tenant-9001" not in orch._personal_outbound_extensions
+
+
+@pytest.mark.asyncio
+async def test_pending_personal_extension_claims_mirrored_sip_event_without_to(monkeypatch):
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake)
+    orch = await _node("node-personal-no-to")
+    orch._personal_outbound_extensions.add("tenant-9001")
+
+    await orch._on_incoming(
+        CallEvent(
+            method="call.incoming",
+            data={"call_id": "c-personal-no-to", "transport": "sip"},
+        )
+    )
+
+    assert await fake.exists(orch._call_owner_key("c-personal-no-to")) == 0
+    assert "c-personal-no-to" not in orch._workflows
+    assert not orch._personal_outbound_extensions
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_until_workflows_empty(monkeypatch):
+    # The stale-workflow sweep reads CDRs; this call is still live, so it finds
+    # nothing and drain falls through to waiting.
+    db = MagicMock()
+    db.execute = AsyncMock(
+        return_value=MagicMock(scalars=MagicMock(return_value=MagicMock(all=list)))
+    )
+
+    class _FakeCM:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _FakeCM())
+
     orch = await _node("node-drain")
     mock_wf = MagicMock()
     mock_wf.bridged_agent_info.return_value = None
@@ -62,6 +144,45 @@ async def test_drain_waits_until_workflows_empty():
     assert orch._draining is True
     assert orch.telephony.is_ready is True
     assert orch.telephony._ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_drain_drops_stale_workflow_for_ended_call(monkeypatch):
+    """A workflow left behind by a call that already ended must not hold up
+    shutdown for the whole drain timeout."""
+
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake)
+
+    orch = await _node("node-drain")
+    await orch._claim_call("c-zombie")
+    mock_wf = MagicMock()
+    orch._workflows["c-zombie"] = mock_wf
+
+    db = MagicMock()
+    db.execute = AsyncMock(
+        return_value=MagicMock(
+            scalars=MagicMock(return_value=MagicMock(all=lambda: ["c-zombie"]))
+        )
+    )
+
+    class _FakeCM:
+        async def __aenter__(self):
+            return db
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _FakeCM())
+
+    leftover = await orch.drain(timeout=5.0)
+
+    assert leftover == 0
+    assert "c-zombie" not in orch._workflows
+    assert await fake.exists(orch._call_owner_key("c-zombie")) == 0
+    # Dropped as stale, not force-finalized as a live call: the agent and CDR
+    # were already settled by whatever ended the call.
+    mock_wf.on_call_hangup.assert_not_called()
 
 
 @pytest.mark.asyncio

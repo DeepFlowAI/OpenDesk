@@ -22,6 +22,7 @@ from app.core.exceptions import NotFoundError, ValidationError, ConflictError
 from app.enums import FieldDomain, FieldType, FieldSource
 from app.repositories.fd_field_definition_repository import FdFieldDefinitionRepository
 from app.repositories.fd_system_field_override_repository import FdSystemFieldOverrideRepository
+from app.services.custom_dashboard_service import CustomDashboardService
 from app.schemas.fd_field_definition import (
     FdFieldDefinitionCreate,
     FdFieldDefinitionUpdate,
@@ -566,6 +567,22 @@ class FdFieldDefinitionService:
             raise NotFoundError("Field definition not found")
         if item.source == FieldSource.SYSTEM:
             raise ValidationError("Cannot delete system field")
+
+        used_by_ticket = (
+            item.domain == FieldDomain.SHARED_POOL
+            and "ticket" in (item.applicable_modules or [])
+        )
+        if used_by_ticket:
+            references = await CustomDashboardService.find_field_references(
+                db,
+                tenant_id,
+                f"custom:{item.field_key}",
+            )
+            if references:
+                raise ValidationError(
+                    "Field is used by custom dashboards",
+                    details={"references": references},
+                )
 
         await FdFieldDefinitionRepository.delete(db, item)
 

@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 
 from app.configs.settings import settings
-from app.constants.call_center import ACTIVE_CALL_RECORD_STATES, CcSocketEvent
+from app.constants.call_center import CcSocketEvent
 from app.services.call_center.agent_notify import emit_to_agent
 from app.core.trace import (
     build_traceparent,
@@ -47,6 +47,7 @@ from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
 from app.services.call_center.catalog_sync import CatalogSyncService
 from app.services.call_center.nodes import build_voicespeed_direct_graph
 from app.services.call_center.routing import match_routing_rule
+from app.services.call_center.satisfaction_workflow import SatisfactionWorkflow
 from app.services.call_center.workflow import VoiceFlowWorkflow
 from app.services.call_record_service import CallRecordService
 from app.services.call_transcript_service import CallTranscriptService
@@ -86,6 +87,9 @@ class SipOutboundDialParams:
     trunk_id: str
     device_type: str
     device_identifier: str | None
+    call_source: str = "agent_dial"
+    custom_business_info: str | None = None
+    external_context: dict | None = None
 
 
 class CallCenterOrchestrator(
@@ -100,7 +104,11 @@ class CallCenterOrchestrator(
         import asyncio as _asyncio
 
         self.telephony: BaseTelephonyClient = telephony or get_telephony_client()
-        self._workflows: dict[str, VoiceFlowWorkflow] = {}
+        from app.services.personal_auto_outbound_runtime import PersonalAutoOutboundRuntime
+
+        self.personal_auto_outbound = PersonalAutoOutboundRuntime(self.telephony, self)
+        self._personal_outbound_extensions: set[str] = set()
+        self._workflows: dict[str, VoiceFlowWorkflow | SatisfactionWorkflow] = {}
         self._started = False
         # True while this process is draining for blue/green shutdown: skip
         # claiming new inbound calls so a sibling node can own them.
@@ -128,11 +136,17 @@ class CallCenterOrchestrator(
         # rejects faster than the agent's browser can complete WebRTC setup
         # (sub-100ms 480/486 responses are common on misconfigured trunks).
         self._outbound_ended: dict[str, tuple[str | None, int | None]] = {}
+        self._outbound_ended_details: dict[str, dict[str, object]] = {}
         # Pairs an outbound SIP call_id with the agent's WebRTC leg call_id.
         # Set when the agent's browser POSTs /dial-webrtc/offer right after
         # dial. Consumed by _on_outbound_answered to fire call.bridge so
         # audio flows the instant the carrier picks up. Cleared in _on_hangup.
         self._outbound_webrtc_pairs: dict[str, str] = {}
+        # Outbound answer and WebRTC pairing are independent events and may
+        # arrive in either order. These sets are the local L1 for the shared
+        # Redis state used to join the legs exactly once.
+        self._outbound_answered: set[str] = set()
+        self._outbound_bridge_claims: set[str] = set()
         # Legs whose answered/hangup a caller is awaiting (SIP-phone agent leg
         # in the two-stage originate). call_id → Future resolved with
         # {"answered": bool} on call.answered / call.hangup. Only used for the
@@ -169,10 +183,51 @@ class CallCenterOrchestrator(
         # Future lives on the call's owner node).
         self._offer_sub_task: _asyncio.Task | None = None
 
-    def active_workflow(self, call_id: str) -> VoiceFlowWorkflow | None:
+    def active_workflow(
+        self, call_id: str
+    ) -> VoiceFlowWorkflow | SatisfactionWorkflow | None:
         """The live workflow driving a call, or None once the call has ended."""
 
         return self._workflows.get(call_id)
+
+    def install_satisfaction_workflow(
+        self, prepared
+    ) -> SatisfactionWorkflow:
+        """Replace a completed routing workflow with a prepared survey runtime."""
+
+        current = self._workflows.get(prepared.call_id)
+        if isinstance(current, SatisfactionWorkflow):
+            if current.execution_id == prepared.execution_id:
+                return current
+            raise RuntimeError("A different satisfaction workflow is already active")
+        if current is not None and not current.done.is_set():
+            raise RuntimeError("The call routing workflow is still active")
+        workflow = SatisfactionWorkflow(
+            prepared=prepared,
+            telephony=self.telephony,
+        )
+        self._workflows[prepared.call_id] = workflow
+        return workflow
+
+    def remove_satisfaction_workflow(
+        self, call_id: str, execution_id: int
+    ) -> None:
+        """Remove an unstarted/failed survey without touching another runtime."""
+
+        current = self._workflows.get(call_id)
+        if (
+            isinstance(current, SatisfactionWorkflow)
+            and current.execution_id == execution_id
+        ):
+            self._workflows.pop(call_id, None)
+
+    def restore_workflow(self, call_id: str, workflow) -> None:
+        """Restore the completed routing workflow after a failed handoff."""
+
+        if workflow is None:
+            self._workflows.pop(call_id, None)
+        else:
+            self._workflows[call_id] = workflow
 
     # A call is owned by exactly one orchestrator node. TTL only needs to
     # outlive event delivery for the call; the owner clears it on hangup.
@@ -193,6 +248,8 @@ class CallCenterOrchestrator(
     _OUTBOUND_ORIGINATOR_PREFIX = "cc:outbound:originator"
     _OUTBOUND_ENDED_PREFIX = "cc:outbound:ended"
     _OUTBOUND_WEBRTC_PREFIX = "cc:outbound:webrtc"
+    _OUTBOUND_ANSWERED_PREFIX = "cc:outbound:answered"
+    _OUTBOUND_BRIDGED_PREFIX = "cc:outbound:bridged"
     _OUTBOUND_STATE_TTL_SEC = 6 * 60 * 60
 
     # Time we keep a call's trace context after hangup so late events
@@ -210,6 +267,14 @@ class CallCenterOrchestrator(
     @staticmethod
     def _outbound_webrtc_key(outbound_call_id: str) -> str:
         return f"{CallCenterOrchestrator._OUTBOUND_WEBRTC_PREFIX}:{outbound_call_id}"
+
+    @staticmethod
+    def _outbound_answered_key(call_id: str) -> str:
+        return f"{CallCenterOrchestrator._OUTBOUND_ANSWERED_PREFIX}:{call_id}"
+
+    @staticmethod
+    def _outbound_bridged_key(call_id: str) -> str:
+        return f"{CallCenterOrchestrator._OUTBOUND_BRIDGED_PREFIX}:{call_id}"
 
 
 # ────────────────── Singleton accessor ──────────────────

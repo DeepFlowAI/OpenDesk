@@ -32,6 +32,7 @@ class UserInfo(BaseModel):
     is_super_admin: bool = False
     group_ids: list[int] = Field(default_factory=list)
     preferences: dict[str, Any] = Field(default_factory=dict)
+    default_language: str = "system"
 
 
 class UserPreferencesUpdate(BaseModel):

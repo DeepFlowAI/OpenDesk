@@ -35,6 +35,7 @@ import { TransferConversationModal } from '@/app/components/features/chat/transf
 import { InviteCollaboratorModal } from '@/app/components/features/chat/invite-collaborator-modal'
 import { KnowledgeDocumentCreateDialog } from '@/app/components/features/knowledge/knowledge-document-create-dialog'
 import { RobotQaCreateDialog } from '@/app/components/features/chat/robot-qa-create-dialog'
+import { ConversationTranslationControl } from '@/app/components/features/chat/conversation-translation-control'
 import { stripKnowledgeHtml } from '@/app/components/features/knowledge/knowledge-utils'
 import {
   WorkspaceMessageBubble,
@@ -810,6 +811,7 @@ export function AgentThread({
     canTransfer,
     canEndConversation,
     canInviteCollaborator,
+    canSendPublicReply,
     canStartNewConversation,
     startNewConversationDisabledReason,
     startingNewConversation,
@@ -1002,6 +1004,11 @@ export function AgentThread({
             </span>
           )}
           <VisitorWebStatusBadge conversation={conversation} socket={socket} />
+          <ConversationTranslationControl
+            conversationId={conversation.id}
+            canManage={canSendPublicReply && !isClosed}
+            socket={socket}
+          />
           {conversation.is_timeout_locked && (
             <span className="shrink-0 rounded border border-[#D6D6D6] bg-[#F0F0F0] px-2 py-0.5 text-[12px] font-medium text-[#555555]">
               {t('ws.chat.timeoutLocked', locale)}

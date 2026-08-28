@@ -4,12 +4,16 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { IconCheck, IconChevronDown } from '@tabler/icons-react'
 
 import type { TenantPhoneNumber } from '@/models/tenant-phone-number'
-import { useTenantPhoneNumbers } from '@/service/use-tenant-phone-numbers'
+import { useMyOutboundNumbers } from '@/service/use-tenant-phone-numbers'
+import { resolvePreferredOutboundNumber } from '@/lib/call-outbound-number'
 import { cn } from '@/lib/utils'
+
+export type OutboundNumberChangeSource = 'auto' | 'user'
 
 type OutboundNumberSelectProps = {
   value: string
-  onChange: (id: string, phoneNumber: string) => void
+  preferredId?: string
+  onChange: (id: string, phoneNumber: string, source: OutboundNumberChangeSource) => void
   disabled?: boolean
 }
 
@@ -57,10 +61,15 @@ function NumberTags({
   )
 }
 
-export function OutboundNumberSelect({ value, onChange, disabled }: OutboundNumberSelectProps) {
+export function OutboundNumberSelect({
+  value,
+  preferredId,
+  onChange,
+  disabled,
+}: OutboundNumberSelectProps) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
-  const { data, isLoading } = useTenantPhoneNumbers({ page: 1, per_page: 100 })
+  const { data, isLoading } = useMyOutboundNumbers()
 
   const outboundNumbers = useMemo(
     () => (data?.items ?? []).filter((item) => item.call_types.includes('outbound')),
@@ -72,10 +81,10 @@ export function OutboundNumberSelect({ value, onChange, disabled }: OutboundNumb
   )
 
   useEffect(() => {
-    if (value || outboundNumbers.length === 0) return
-    const first = outboundNumbers[0]
-    onChange(first.id, first.phone_number)
-  }, [value, outboundNumbers, onChange])
+    const next = resolvePreferredOutboundNumber(outboundNumbers, preferredId)
+    if (!next || next.id === value) return
+    onChange(next.id, next.phone_number, 'auto')
+  }, [value, preferredId, outboundNumbers, onChange])
 
   useEffect(() => {
     if (!open) return
@@ -173,7 +182,7 @@ export function OutboundNumberSelect({ value, onChange, disabled }: OutboundNumb
                 role="option"
                 aria-selected={active}
                 onClick={() => {
-                  onChange(item.id, item.phone_number)
+                  onChange(item.id, item.phone_number, 'user')
                   setOpen(false)
                 }}
                 className={cn(

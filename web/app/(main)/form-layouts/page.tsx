@@ -5,8 +5,9 @@ import { IconArrowRight } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { useFormLayouts } from '@/service/use-form-layouts'
+import type { Locale } from '@/lib/languages'
 
-function SceneBadge({ scene, locale }: { scene: string; locale: 'zh' | 'en' }) {
+function SceneBadge({ scene, locale }: { scene: string; locale: Locale }) {
   const key = scene === 'new_ticket' ? 'fl.scene.new_ticket' : 'fl.scene.ticket_detail'
   const bg =
     scene === 'new_ticket'
@@ -19,7 +20,7 @@ function SceneBadge({ scene, locale }: { scene: string; locale: 'zh' | 'en' }) {
   )
 }
 
-function formatDate(iso: string, locale: 'zh' | 'en') {
+function formatDate(iso: string, locale: Locale) {
   const d = new Date(iso)
   if (locale === 'zh') {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`

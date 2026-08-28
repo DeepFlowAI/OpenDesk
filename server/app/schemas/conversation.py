@@ -71,6 +71,7 @@ class ConversationResponse(BaseModel):
     viewer_relation: Literal["own", "peer", "collaborator"] | None = None
     collaborated_by_current_user: bool = False
     collaborators: list[AgentBrief] = Field(default_factory=list)
+    lingomaster_settings: dict = Field(default_factory=dict)
     created_at: datetime | None = None
 
 

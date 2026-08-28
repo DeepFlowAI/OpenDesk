@@ -1,0 +1,12 @@
+# Keep the Docker build context aligned with a clean checkout. Without this,
+# a host/remote `node_modules` (or `.next`) copied via `COPY . .` can overwrite
+# the `npm ci` layer from the deps stage and break the production build.
+node_modules
+.next
+.git
+coverage
+.turbo
+*.tsbuildinfo
+npm-debug.log*
+.env*.local
+.DS_Store

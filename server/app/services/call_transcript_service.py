@@ -6,6 +6,7 @@ partials are stored). Reads go through the call record so tenant + data-scope
 enforcement is shared with the rest of the call-record API.
 """
 from sqlalchemy.ext.asyncio import AsyncSession
+from uuid import UUID
 
 from app.repositories.call_transcript_repository import CallTranscriptRepository
 from app.schemas.call_center import CallTranscriptResponse, CallTranscriptSegmentSchema
@@ -33,12 +34,17 @@ class CallTranscriptService:
     @staticmethod
     async def get_for_record(
         db: AsyncSession,
-        record_id: int,
+        public_id: UUID,
         tenant_id: int,
         principal: EffectivePrincipal | None = None,
     ) -> CallTranscriptResponse:
         # Enforces existence, tenant ownership and data scope (raises NotFoundError).
-        record = await CallRecordService.get_by_id(db, record_id, tenant_id, principal)
+        record = await CallRecordService.get_by_public_id(
+            db,
+            public_id,
+            tenant_id,
+            principal,
+        )
         call_id = record["call_id"]
         segments = await CallTranscriptRepository.list_for_call(db, tenant_id, call_id)
         return CallTranscriptResponse(

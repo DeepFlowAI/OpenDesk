@@ -10,6 +10,7 @@ import { hasPermission } from '@/utils/permissions'
 import { useEmployee, useUpdateEmployee } from '@/service/use-employees'
 import { useQueuePolicies, useUpsertQueuePolicy } from '@/service/use-queue-policies'
 import EmployeeForm from '@/app/(main)/employees/form'
+import { readEmployeeErrorMessage } from '@/app/(main)/employees/read-error-message'
 import type { UpdateEmployeePayload } from '@/models/employee'
 import type { QueuePolicyUpsertPayload } from '@/models/queue-policy'
 
@@ -49,9 +50,10 @@ export default function EditEmployeePage() {
         }
         setToast({ type: 'success', text: t('emp.saveSuccess', locale) })
         setTimeout(() => setToast(null), 3000)
-      } catch {
-        setToast({ type: 'error', text: t('emp.saveFailed', locale) })
-        setTimeout(() => setToast(null), 3000)
+      } catch (error) {
+        const message = await readEmployeeErrorMessage(error, t('emp.saveFailed', locale))
+        setToast({ type: 'error', text: message })
+        setTimeout(() => setToast(null), 5000)
       }
     },
     [canEdit, updateMutation, employeeId, locale, user?.id, updateUser, upsertQueuePolicyMutation]

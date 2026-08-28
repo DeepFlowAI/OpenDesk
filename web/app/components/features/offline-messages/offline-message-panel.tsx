@@ -62,6 +62,7 @@ import { FieldValueDisplay } from '@/app/components/features/field-system/field-
 import { getDataScope, hasPermission } from '@/utils/permissions'
 import { t } from '@/utils/i18n'
 import type { Socket } from 'socket.io-client'
+import type { Locale } from '@/lib/languages'
 
 type OfflineAssignedOptions = { openConversation?: boolean; messageSent?: boolean }
 
@@ -967,7 +968,7 @@ function OfflineMessageUserInfoSection({
   isError,
   onRetry,
 }: {
-  locale: 'zh' | 'en'
+  locale: Locale
   visitorId: number
   user: User | null
   fields: UnifiedField[]

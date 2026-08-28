@@ -50,6 +50,35 @@ from app.models.sip_trunk import SipTrunk
 logger = logging.getLogger(__name__)
 
 
+def _trunk_id_conflict(exc: TelecomAPIError) -> str | None:
+    """Return the colliding trunk id when FlowKit rejects a shared snapshot."""
+
+    if exc.status != 409:
+        return None
+    body = exc.body
+    if isinstance(body, dict):
+        code = str(body.get("code") or body.get("error") or "")
+        text = str(body.get("message") or body.get("detail") or body)
+        if "trunk_id_conflict" not in code and "already owned" not in text:
+            return None
+        for key in ("trunk_id", "id"):
+            value = body.get(key)
+            if value:
+                return str(value)
+    else:
+        text = str(body)
+        if "trunk_id_conflict" not in text and "already owned" not in text:
+            return None
+    marker = "trunk_id="
+    if marker in text:
+        return text.split(marker, 1)[1].split()[0].strip("\"'")
+    # FlowKit: trunk_id "xxx" already owned by provider "yyy"
+    token = 'trunk_id "'
+    if token in text:
+        return text.split(token, 1)[1].split('"', 1)[0]
+    return None
+
+
 class CatalogSyncService:
     """Background catalog-sync loop bound to one FlowKitTelecomClient."""
 
@@ -128,27 +157,81 @@ class CatalogSyncService:
         return asyncio.create_task(self._heartbeat_loop(), name="telecom-heartbeat")
 
     async def push_snapshot(self) -> None:
-        """Build a snapshot from the SipTrunk table and PUT it to FlowKit."""
+        """Build a snapshot from the SipTrunk table and PUT it to FlowKit.
 
-        trunks = await self._build_wire_trunks()
+        Trunk IDs are global on the kernel. Another OpenDesk sharing the same
+        FlowKit may already own a dual-written id, so those rows are omitted
+        (originate still finds them by id). This environment only registers
+        trunks nobody else owns — typically the virtual SIP ones on test.
+        """
+
+        trunks = await self._omit_foreign_owned_trunks(await self._build_wire_trunks())
         self._revision = max(self._revision + 1, int(time.time()))
         try:
-            resp = await self._client.put_snapshot(
-                revision=self._revision,
-                lease_ttl_sec=self._lease_ttl_sec,
-                stale_acceptable_sec=self._stale_acceptable_sec,
-                trunks=trunks,
-            )
-            self._last_snapshot_at = time.time()
-            self._last_snapshot_error = None
-            logger.info(
-                "Catalog snapshot pushed: revision=%s trunks=%d",
-                resp.get("revision"), resp.get("trunk_count", len(trunks)),
-            )
+            resp = await self._put_snapshot(trunks)
         except TelecomAPIError as exc:
-            self._last_snapshot_error = str(exc)
-            logger.error("Catalog snapshot rejected: %s", exc)
-            raise
+            conflict_id = _trunk_id_conflict(exc)
+            if conflict_id is None:
+                self._last_snapshot_error = str(exc)
+                logger.error("Catalog snapshot rejected: %s", exc)
+                raise
+            trunks = [row for row in trunks if row.get("id") != conflict_id]
+            logger.warning(
+                "Catalog snapshot dropped trunk_id=%s owned by another provider; retrying",
+                conflict_id,
+            )
+            self._revision = max(self._revision + 1, int(time.time()))
+            try:
+                resp = await self._put_snapshot(trunks)
+            except TelecomAPIError as retry_exc:
+                self._last_snapshot_error = str(retry_exc)
+                logger.error("Catalog snapshot rejected: %s", retry_exc)
+                raise
+        self._last_snapshot_at = time.time()
+        self._last_snapshot_error = None
+        logger.info(
+            "Catalog snapshot pushed: revision=%s trunks=%d provider_id=%s",
+            resp.get("revision"),
+            resp.get("trunk_count", len(trunks)),
+            self._client.provider_id,
+        )
+
+    async def _put_snapshot(self, trunks: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self._client.put_snapshot(
+            revision=self._revision,
+            lease_ttl_sec=self._lease_ttl_sec,
+            stale_acceptable_sec=self._stale_acceptable_sec,
+            trunks=trunks,
+        )
+
+    async def _omit_foreign_owned_trunks(
+        self, trunks: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        try:
+            catalog = await self._client.get_catalog()
+        except Exception:  # noqa: BLE001
+            logger.warning("Catalog read failed; pushing local trunks as-is")
+            return trunks
+        mine = self._client.provider_id
+        foreign = {
+            str(row.get("id"))
+            for row in (catalog.get("trunks") or [])
+            if isinstance(row, dict)
+            and row.get("id")
+            and row.get("provider_id")
+            and row.get("provider_id") != mine
+        }
+        if not foreign:
+            return trunks
+        kept = [row for row in trunks if row.get("id") not in foreign]
+        dropped = [row.get("id") for row in trunks if row.get("id") in foreign]
+        if dropped:
+            logger.info(
+                "Catalog snapshot skipped %d trunk(s) owned by another provider: %s",
+                len(dropped),
+                ",".join(str(item) for item in dropped),
+            )
+        return kept
 
     async def reload(self) -> None:
         """Public reload entry-point — call after admin CRUD on trunks."""

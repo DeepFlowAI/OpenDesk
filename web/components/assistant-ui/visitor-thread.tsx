@@ -18,7 +18,6 @@ import { resolveVisitorSystemEventContent } from '@/lib/workspace-agent-display'
 import {
   isVisitorQueueEnteredContent,
   isVisitorQueueEnteredMessage,
-  QUEUE_ENTERED_SYSTEM_MESSAGE,
 } from '@/lib/visitor-queue-notice'
 import {
   HandoffQueueFullCard,
@@ -41,6 +40,7 @@ import { SatisfactionSurveyModal } from '@/app/components/features/satisfaction-
 import { VisitorAnnouncement } from '@/app/components/features/visitor-chat/announcement'
 import { submitPublicSatisfaction } from '@/service/use-satisfaction-survey'
 import { isLeaveMessagePromptMessage, leaveMessagePromptToPlainText } from '@/lib/offline-message-event'
+import type { Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { SatisfactionSubmissionPayload } from '@/models/satisfaction-survey'
 import type {
@@ -60,31 +60,7 @@ import {
   isValidOpenAgentWelcomeBlock,
 } from '@/lib/open-agent-welcome-message'
 import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
-
-// ─── Timestamp formatting (reused from original) ────────────────
-
-function formatTimestamp(date: Date, locale: string): string {
-  const now = new Date()
-  const time = date.toLocaleTimeString(locale === 'zh' ? 'zh-CN' : 'en-US', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  })
-
-  const diffDays = Math.floor(
-    (now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24),
-  )
-  if (diffDays === 0 && now.getDate() === date.getDate()) return time
-  if (diffDays <= 1 && now.getDate() - date.getDate() === 1) {
-    return locale === 'zh' ? `昨天 ${time}` : `Yesterday ${time}`
-  }
-  if (date.getFullYear() === now.getFullYear()) {
-    const m = String(date.getMonth() + 1).padStart(2, '0')
-    const d = String(date.getDate()).padStart(2, '0')
-    return `${m}-${d} ${time}`
-  }
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${time}`
-}
+import { formatMessageTime } from '@/lib/message-time'
 
 function shouldShowTimestamp(cur: Message, prev: Message | null): boolean {
   if (!prev) return true
@@ -202,11 +178,11 @@ function isDefaultQueueMessage(html: string): boolean {
 
 function displaySystemMessageContent(
   content: string,
-  metadata?: Record<string, unknown>,
-  locale = 'zh',
+  metadata: Record<string, unknown> | undefined,
+  locale: Locale,
 ): string {
   if (isVisitorQueueEnteredContent(content)) {
-    return QUEUE_ENTERED_SYSTEM_MESSAGE
+    return t('chat.queue.entered', locale)
   }
   return resolveVisitorSystemEventContent(content, metadata, locale)
 }
@@ -216,19 +192,15 @@ function QueueStatusNotice({
   html,
   currentQueueCount,
 }: {
-  locale: string
+  locale: Locale
   html: string
   currentQueueCount: number | null
 }) {
   const showDefaultCopy = isDefaultQueueMessage(html)
   const renderedHtml = renderQueueMessage(showDefaultCopy ? DEFAULT_QUEUE_MESSAGE : html, currentQueueCount)
   const queueCountLabel = currentQueueCount == null
-    ? locale === 'zh'
-      ? '正在为您安排人工客服，请稍候。客服接入后会立即回复您。'
-      : 'We are arranging a human support agent. They will reply as soon as they join.'
-    : locale === 'zh'
-      ? `当前排队人数：${currentQueueCount} 位，请稍候。客服接入后会立即回复您。`
-      : `Current queue: ${currentQueueCount}. A support agent will reply as soon as they join.`
+    ? t('chat.queue.waiting', locale)
+    : t('chat.queue.waitingWithCount', locale, { count: currentQueueCount })
 
   return (
     <div className="px-5 py-1">
@@ -236,7 +208,7 @@ function QueueStatusNotice({
         {showDefaultCopy ? (
           <div className="min-w-0 text-sm leading-6">
             <p className="font-medium text-foreground">
-              {locale === 'zh' ? '您已进入人工客服队列' : 'You are in the human support queue'}
+              {t('chat.queue.entered', locale)}
             </p>
             <p className="text-muted-foreground">{queueCountLabel}</p>
           </div>
@@ -256,24 +228,22 @@ function UnreadReplyDivider({
   unread,
   timestamp,
 }: {
-  locale: string
+  locale: Locale
   unread: boolean
   timestamp?: string | null
 }) {
-  const timeLabel = timestamp ? formatTimestamp(new Date(timestamp), locale) : null
+  const timeLabel = timestamp ? formatMessageTime(new Date(timestamp), locale) : null
   return (
     <div className="px-5 py-2">
       <div className="flex items-center gap-3 text-xs text-muted-foreground">
         <div className="h-px flex-1 bg-border" />
         <div className="flex max-w-[80%] items-center gap-2">
           <span className="truncate">
-            {locale === 'zh'
-              ? '你的留言已进入在线会话，可直接沟通'
-              : 'Your message is now an online conversation. You can reply here.'}
+            {t('chat.offlineReply.connected', locale)}
           </span>
           {unread && (
             <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-foreground">
-              {locale === 'zh' ? '未读' : 'Unread'}
+              {t('chat.unread', locale)}
             </span>
           )}
           {timeLabel && <span className="hidden shrink-0 sm:inline">{timeLabel}</span>}
@@ -371,14 +341,12 @@ function HistoryConversationBlock({
 }: {
   conversation: VisitorConversationHistoryItem | VisitorUnreadOfflineReplyItem
   config: ReturnType<typeof useVisitorChatConfig>['config']
-  locale: string
+  locale: Locale
 }) {
   const startedAt = conversation.started_at || conversation.created_at || conversation.last_message_at
   const dividerLabel = startedAt
-    ? `${formatTimestamp(new Date(startedAt), locale)} ${locale === 'zh' ? '历史会话' : 'Past conversation'}`
-    : locale === 'zh'
-      ? '历史会话'
-      : 'Past conversation'
+    ? `${formatMessageTime(new Date(startedAt), locale)} ${t('chat.history.pastConversation', locale)}`
+    : t('chat.history.pastConversation', locale)
   const hasAgentUnread = (conversation.agent_unread_message_ids?.length ?? 0) > 0
 
   return (
@@ -393,13 +361,13 @@ function HistoryConversationBlock({
         <ConversationDivider
           label={dividerLabel}
           unreadLabel={
-            hasAgentUnread ? (locale === 'zh' ? '有新回复' : 'New replies') : null
+            hasAgentUnread ? t('chat.history.newReplies', locale) : null
           }
         />
       )}
       {conversation.messages_truncated && (
         <SystemMessage
-          content={locale === 'zh' ? '仅显示最近 200 条消息' : 'Showing latest 200 messages'}
+          content={t('chat.history.latest200', locale)}
         />
       )}
       {conversation.messages.map((msg, idx) => {
@@ -447,7 +415,7 @@ function HistoryConversationBlock({
           >
             {shouldShowTimestamp(msg, prev) && (
               <div className="py-2 text-center text-[10px] text-muted-foreground">
-                {formatTimestamp(new Date(msg.created_at), locale)}
+                {formatMessageTime(new Date(msg.created_at), locale)}
               </div>
             )}
             <MessageBubble
@@ -607,7 +575,7 @@ export function VisitorThread({
     && Boolean(conversationPublicId)
     && config.queue_show_leave_message_button
   const queueLeaveMessageButtonLabel = config.queue_leave_message_button_label
-    || (locale === 'zh' ? '留言' : 'Leave a message')
+    || t('chat.leaveMessage.button', locale)
   const queueLeaveMessageButton = showQueueLeaveMessageButton ? (
     <div className="flex justify-center px-5 pb-1">
       <button
@@ -647,12 +615,12 @@ export function VisitorThread({
   const invitationLabel = useMemo(() => {
     const types = satisfactionInvitation?.survey_types ?? []
     if (types.includes('service') && types.includes('product')) {
-      return locale === 'zh' ? '评价本次体验' : 'Rate this experience'
+      return t('chat.survey.invite.experience', locale)
     }
     if (types.includes('product')) {
-      return locale === 'zh' ? '评价产品体验' : 'Rate product experience'
+      return t('chat.survey.invite.product', locale)
     }
-    return locale === 'zh' ? '评价本次服务' : 'Rate this service'
+    return t('chat.survey.invite.service', locale)
   }, [locale, satisfactionInvitation?.survey_types])
   const showFloatingInvitation =
     satisfactionInvitation && (ended || satisfactionInvitation.invitation_source !== 'visitor')
@@ -693,7 +661,7 @@ export function VisitorThread({
         const record = await onSatisfactionInitiate()
         if (record) setSurveyOpen(true)
       } catch {
-        window.alert(locale === 'zh' ? '暂时无法打开满意度评价，请重试' : 'Unable to open rating. Please retry.')
+        window.alert(t('chat.survey.openFailed', locale))
       }
     })()
   }, [locale, onSatisfactionInitiate, satisfactionInvitation])
@@ -723,7 +691,7 @@ export function VisitorThread({
         onSatisfactionSubmitted()
       }, 1500)
     } catch {
-      setSurveyError(locale === 'zh' ? '提交失败，请重试' : 'Failed to submit, please retry')
+      setSurveyError(t('chat.survey.submitFailed', locale))
     } finally {
       setSurveySubmitting(false)
     }
@@ -796,21 +764,13 @@ export function VisitorThread({
       >
         {!initializing && unreadReplyError && (
           <SystemMessage
-            content={
-              locale === 'zh'
-                ? '部分历史回复暂时无法加载'
-                : 'Some previous replies could not be loaded'
-            }
+            content={t('chat.history.loadFailed', locale)}
           />
         )}
 
         {!initializing && unreadReplyHasMore && !historyLoaded && (
           <HistoryActionButton
-            label={
-              locale === 'zh'
-                ? '还有更多历史留言回复，可查看历史会话'
-                : 'More message replies are available in conversation history'
-            }
+            label={t('chat.history.moreReplies', locale)}
             loading={historyLoading}
             onClick={() => void loadHistoryWithAnchor()}
           />
@@ -829,12 +789,8 @@ export function VisitorThread({
           <HistoryActionButton
             label={
               historyError
-                ? locale === 'zh'
-                  ? '加载失败，点击重试'
-                  : 'Failed to load, tap to retry'
-                : locale === 'zh'
-                  ? '查看历史会话'
-                  : 'View previous conversations'
+                ? t('chat.history.retry', locale)
+                : t('chat.history.view', locale)
             }
             loading={historyLoading}
             onClick={() => void loadHistoryWithAnchor()}
@@ -845,12 +801,8 @@ export function VisitorThread({
           <HistoryActionButton
             label={
               historyError
-                ? locale === 'zh'
-                  ? '加载失败，点击重试'
-                  : 'Failed to load, tap to retry'
-                : locale === 'zh'
-                  ? '更多历史会话'
-                  : 'Load more conversations'
+                ? t('chat.history.retry', locale)
+                : t('chat.history.loadMore', locale)
             }
             loading={historyLoading}
             onClick={() => void loadHistoryWithAnchor(oldestHistoryId)}
@@ -861,12 +813,8 @@ export function VisitorThread({
           <HistoryActionButton
             label={
               historyLimitReached
-                ? locale === 'zh'
-                  ? '已加载较多历史，建议刷新或联系客服查阅更早记录'
-                  : 'You have loaded a lot of history, please refresh or contact support for older records'
-                : locale === 'zh'
-                  ? '已无更多历史会话'
-                  : 'No more conversations'
+                ? t('chat.history.limitReached', locale)
+                : t('chat.history.noMore', locale)
             }
             disabled
           />
@@ -882,7 +830,7 @@ export function VisitorThread({
         ))}
 
         {!initializing && showCurrentDivider && (
-          <ConversationDivider label={locale === 'zh' ? '当前会话' : 'Current conversation'} />
+          <ConversationDivider label={t('chat.history.current', locale)} />
         )}
 
         {initializing ? (
@@ -904,7 +852,7 @@ export function VisitorThread({
             <div className="w-full max-w-[520px] rounded-xl border border-border bg-card p-6 shadow-sm">
               <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
                 <IconAlertCircle size={18} className="text-amber-600" />
-                {offlineTitle || (locale === 'zh' ? '当前客服不在线' : 'Support is offline')}
+                {offlineTitle || t('chat.offline.title', locale)}
               </div>
               <SafeHtml
                 className="prose prose-sm max-w-none text-sm leading-6 text-muted-foreground"
@@ -917,7 +865,7 @@ export function VisitorThread({
             <div className="w-full max-w-[520px] rounded-xl border border-border bg-card p-6 shadow-sm">
               <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
                 <IconAlertCircle size={18} className="text-amber-600" />
-                {locale === 'zh' ? '排队人数已满' : 'Queue is full'}
+                {t('chat.queue.full', locale)}
               </div>
               <SafeHtml
                 className="prose prose-sm max-w-none text-sm leading-6 text-muted-foreground"
@@ -930,7 +878,7 @@ export function VisitorThread({
                   className="mt-5 rounded-lg bg-[var(--opendesk-send-button-bg)] px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
                   style={sendButtonStyle}
                 >
-                  {queueFullLeaveMessageButtonLabel || (locale === 'zh' ? '留言' : 'Leave a message')}
+                  {queueFullLeaveMessageButtonLabel || t('chat.leaveMessage.button', locale)}
                 </button>
               )}
             </div>
@@ -976,10 +924,8 @@ export function VisitorThread({
               >
                 {loadingMore ? (
                   <IconLoader2 size={14} className="animate-spin" />
-                ) : locale === 'zh' ? (
-                  '加载更多'
                 ) : (
-                  'Load more'
+                  t('chat.loadMore', locale)
                 )}
               </button>
             )}
@@ -1029,7 +975,7 @@ export function VisitorThread({
                     >
                       {meta?.showTimestamp && message.createdAt && (
                         <div className="py-2 text-center text-[10px] text-muted-foreground">
-                          {formatTimestamp(message.createdAt, locale)}
+                          {formatMessageTime(message.createdAt, locale)}
                         </div>
                       )}
 
@@ -1166,14 +1112,14 @@ export function VisitorThread({
               className="flex min-h-5 items-center gap-2"
             >
               <IconStar size={14} className="fill-current" aria-hidden />
-              <span>{surveyCollapsed ? (locale === 'zh' ? '评价' : 'Rate') : invitationLabel}</span>
+              <span>{surveyCollapsed ? t('chat.survey.rate', locale) : invitationLabel}</span>
             </button>
             {!surveyCollapsed && (
               <button
                 type="button"
                 onClick={() => setSurveyCollapsed(true)}
                 className="flex h-5 w-5 items-center justify-center rounded-full text-primary-foreground/80 hover:bg-primary-foreground/10 hover:text-primary-foreground"
-                aria-label={locale === 'zh' ? '收起评价入口' : 'Collapse survey entry'}
+                aria-label={t('chat.survey.collapse', locale)}
               >
                 <IconX size={13} aria-hidden />
               </button>
@@ -1224,7 +1170,7 @@ function ConversationEndedPanel({
   sendButtonBgColor,
   onRestartConversation,
 }: {
-  locale: string
+  locale: Locale
   sendButtonBgColor: string | null
   onRestartConversation: () => Promise<void>
 }) {
@@ -1246,7 +1192,7 @@ function ConversationEndedPanel({
     <div className="shrink-0 bg-background px-3 py-2 sm:px-4 sm:py-3">
       <div className="flex min-h-[92px] items-center justify-between gap-3 rounded-[14px] border border-border bg-background px-4 py-3 sm:rounded-2xl">
         <span className="text-sm text-muted-foreground">
-          {locale === 'zh' ? '会话已结束' : 'Conversation ended'}
+          {t('chat.ended', locale)}
         </span>
         <button
           type="button"
@@ -1256,12 +1202,8 @@ function ConversationEndedPanel({
           style={restartButtonStyle}
         >
           {restarting
-            ? locale === 'zh'
-              ? '重启中...'
-              : 'Restarting...'
-            : locale === 'zh'
-              ? '重启会话'
-              : 'Restart'}
+            ? t('chat.restarting', locale)
+            : t('chat.restart', locale)}
         </button>
       </div>
     </div>

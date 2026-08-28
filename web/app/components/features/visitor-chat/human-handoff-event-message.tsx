@@ -2,7 +2,9 @@
 
 import type { CSSProperties } from 'react'
 import type { ChannelConfig } from '@/models/channel'
+import type { Locale } from '@/context/locale-store'
 import { SafeHtml } from '@/components/safe-html'
+import { t } from '@/utils/i18n'
 
 export type HandoffEventType =
   | 'confirm_requested'
@@ -12,7 +14,7 @@ export type HandoffEventType =
 export type HandoffConfirmCardState = 'active' | 'confirming' | 'dismissed' | null
 
 type HumanHandoffConfirmCardProps = {
-  locale: string
+  locale: Locale
   handoffLabel: string
   state: 'active' | 'confirming' | 'dismissed'
   onConfirm: () => void
@@ -22,7 +24,7 @@ type HumanHandoffConfirmCardProps = {
 type HumanHandoffEventMessageProps = {
   content: string
   config: ChannelConfig
-  locale: string
+  locale: Locale
   handoffEventType?: HandoffEventType | null
   confirmCardState?: HandoffConfirmCardState
   onConfirmHandoff?: () => void
@@ -127,15 +129,15 @@ export function collectConfirmedHandoffToolCallIds(
 
 function resolveEventLabel(
   handoffEventType: HandoffEventType | null,
-  locale: string,
+  locale: Locale,
 ): string {
   if (handoffEventType === 'auto_triggered') {
-    return locale === 'zh' ? '机器人自动触发转人工' : 'Bot auto-triggered human handoff'
+    return t('chat.handoff.autoTriggered', locale)
   }
   if (handoffEventType === 'confirmed_by_visitor') {
-    return locale === 'zh' ? '用户已确认转人工' : 'Visitor confirmed human handoff'
+    return t('chat.handoff.confirmed', locale)
   }
-  return locale === 'zh' ? '请求用户确认转人工' : 'Human handoff confirmation requested'
+  return t('chat.handoff.requested', locale)
 }
 
 function HumanHandoffConfirmCard({
@@ -152,7 +154,7 @@ function HumanHandoffConfirmCard({
   return (
     <div className="mx-5 mt-2 rounded-xl border border-border bg-card p-3 text-sm shadow-sm">
       <p className="mb-3 font-medium leading-5 text-foreground">
-        {locale === 'zh' ? '是否需要为您转接人工客服？' : 'Would you like to transfer to human support?'}
+        {t('chat.handoff.confirmPrompt', locale)}
       </p>
       <div className="grid grid-cols-2 gap-2">
         <button
@@ -163,7 +165,7 @@ function HumanHandoffConfirmCard({
           onClick={onConfirm}
         >
           {isConfirming
-            ? (locale === 'zh' ? '转接中...' : 'Connecting...')
+            ? t('chat.handoff.connectingDots', locale)
             : handoffLabel}
         </button>
         <button
@@ -177,7 +179,7 @@ function HumanHandoffConfirmCard({
           }
           onClick={onDismiss}
         >
-          {locale === 'zh' ? '继续咨询智能助手' : 'Keep chatting'}
+          {t('chat.handoff.keepChatting', locale)}
         </button>
       </div>
     </div>
@@ -185,7 +187,7 @@ function HumanHandoffConfirmCard({
 }
 
 type HandoffQueueFullCardProps = {
-  locale: string
+  locale: Locale
   message: string
   showLeaveMessageButton: boolean
   leaveMessageButtonLabel: string
@@ -206,8 +208,8 @@ export function HandoffQueueFullCard({
   const cardStyle = {
     '--opendesk-send-button-bg': sendButtonBgColor || 'var(--color-primary)',
   } as CSSProperties
-  const continueLabel = locale === 'zh' ? '继续咨询智能助手' : 'Keep chatting'
-  const leaveLabel = leaveMessageButtonLabel || (locale === 'zh' ? '留言' : 'Leave a message')
+  const continueLabel = t('chat.handoff.keepChatting', locale)
+  const leaveLabel = leaveMessageButtonLabel || t('chat.leaveMessage.button', locale)
 
   return (
     <div
@@ -253,7 +255,7 @@ export function HumanHandoffEventMessage({
   onDismissHandoff,
 }: HumanHandoffEventMessageProps) {
   const eventLabel = resolveEventLabel(handoffEventType, locale)
-  const handoffLabel = config.open_agent_handoff_label || (locale === 'zh' ? '转人工' : 'Human support')
+  const handoffLabel = config.open_agent_handoff_label || t('chat.handoff.button', locale)
   const handoffButtonStyle = {
     '--opendesk-send-button-bg': config.send_button_bg_color || 'var(--color-primary)',
   } as CSSProperties

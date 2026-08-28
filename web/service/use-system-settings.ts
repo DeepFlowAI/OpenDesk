@@ -5,6 +5,7 @@ import type {
   UpdateSystemSettingsPayload,
   UpdateOrganizationSettingsPayload,
   UpdateCallTranscriptionPayload,
+  UpdateCallWrapupPayload,
 } from '@/models/system-settings'
 
 const NS = 'system-settings'
@@ -14,10 +15,11 @@ export const systemSettingsKeys = {
   detail: () => [...systemSettingsKeys.all, 'detail'] as const,
 }
 
-export const useSystemSettings = () =>
+export const useSystemSettings = (enabled = true) =>
   useQuery({
     queryKey: systemSettingsKeys.detail(),
     queryFn: () => get<SystemSettings>('v1/system-settings'),
+    enabled,
   })
 
 export const useUpdateSystemSettings = () => {
@@ -47,6 +49,18 @@ export const useUpdateCallTranscription = () => {
   return useMutation({
     mutationFn: (data: UpdateCallTranscriptionPayload) =>
       put<SystemSettings>('v1/system-settings/call-transcription', { json: data }),
+    onSuccess: (data) => {
+      qc.setQueryData(systemSettingsKeys.detail(), data)
+      qc.invalidateQueries({ queryKey: systemSettingsKeys.detail() })
+    },
+  })
+}
+
+export const useUpdateCallWrapup = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: UpdateCallWrapupPayload) =>
+      put<SystemSettings>('v1/system-settings/call-wrapup', { json: data }),
     onSuccess: (data) => {
       qc.setQueryData(systemSettingsKeys.detail(), data)
       qc.invalidateQueries({ queryKey: systemSettingsKeys.detail() })

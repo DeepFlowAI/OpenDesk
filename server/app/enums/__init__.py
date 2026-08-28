@@ -37,6 +37,11 @@ class AgentOnlineStatus(str, enum.Enum):
     OFFLINE = "offline"
 
 
+class ScheduleShiftType(str, enum.Enum):
+    WORK = "work"
+    LEAVE = "leave"
+
+
 class QueueChannel(str, enum.Enum):
     ONLINE_CHAT = "online_chat"
     CALL_CENTER = "call_center"

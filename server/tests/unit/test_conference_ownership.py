@@ -153,6 +153,7 @@ class _ResourceTracker:
     def __init__(self):
         self.force_released: list[tuple[int, int, str]] = []
         self.marked_in_call: list[tuple[int, int, str]] = []
+        self.rekeyed: list[tuple[int, int, str]] = []
         self.after_call_work: list[tuple[int, int, str, str]] = []
 
     def install(self, monkeypatch):
@@ -164,7 +165,11 @@ class _ResourceTracker:
             self.marked_in_call.append((tenant_id, employee_id, call_id))
             return {"resource_state": "in_call"}
 
-        async def _acw(_r, tenant_id, employee_id, *, call_id, reason):
+        async def _rekey_current_call(_r, tenant_id, employee_id, *, call_id):
+            self.rekeyed.append((tenant_id, employee_id, call_id))
+            return {"resource_state": "in_call", "current_call_id": call_id}
+
+        async def _acw(_r, tenant_id, employee_id, *, call_id, reason, wrap_up_seconds=None):
             self.after_call_work.append((tenant_id, employee_id, call_id, reason))
             return {"resource_state": "after_call_work"}
 
@@ -177,6 +182,11 @@ class _ResourceTracker:
             ccs_module.CcAgentResourceService,
             "mark_in_call",
             staticmethod(_mark_in_call),
+        )
+        monkeypatch.setattr(
+            ccs_module.CcAgentResourceService,
+            "rekey_current_call",
+            staticmethod(_rekey_current_call),
         )
         monkeypatch.setattr(
             ccs_module.CcAgentResourceService,
@@ -262,13 +272,18 @@ async def test_conference_leave_hands_over_to_colleague(monkeypatch):
     assert tracker.force_released == []
     assert (
         "call.bridge",
-        {"call_id": "sip-customer", "other_call_id": "colleague-leg", "transcribe": True},
+        {
+            "call_id": "sip-customer",
+            "other_call_id": "colleague-leg",
+            "transcribe": True,
+            "keepalive_on_peer_hangup": True,
+        },
     ) in tel.recorded
     assert reassigned == [(7, "sip-customer", 99)]
     assert wf.bridged_agent_info()["employee_id"] == 99
     colleague_legs = await ccs_module._legs(7, 99)
     assert colleague_legs.agent_media_call_id == "colleague-leg"
-    assert (7, 99, "sip-customer") in tracker.marked_in_call
+    assert (7, 99, "sip-customer") in tracker.rekeyed
     assert (7, 99) in orch.republished
     assert (7, 42, "sip-customer", "left_conference") in tracker.after_call_work
     assert (7, 42, "after_call_work") in pg_sync

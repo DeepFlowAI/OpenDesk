@@ -29,6 +29,8 @@ import { MessageAttachment, type MessageAttachmentGalleryItem } from '@/app/comp
 import { MessageQuoteBlock } from '@/app/components/features/chat/message-quote'
 import { OpenAgentFeedbackStatus } from '@/app/components/features/chat/open-agent-feedback'
 import { RichTextMessageContent } from '@/app/components/features/chat/rich-text-message-content'
+import { TranslatedMessageContent } from '@/app/components/features/chat/translated-message-content'
+import { getMessageTranslation } from '@/lib/lingomaster'
 import {
   OpenAgentTextBlockView,
   OpenAgentTraceBlocks,
@@ -38,6 +40,7 @@ import {
   stripOpenAgentThinkSections,
 } from '@/app/components/features/chat/open-agent-trace-blocks'
 import { OpenAgentWelcomeMessage } from '@/app/components/features/visitor-chat/welcome-message'
+import { formatMessageTime } from '@/lib/message-time'
 import type { Message } from '@/models/conversation'
 import type { SessionRecordMessage } from '@/models/session-record'
 
@@ -122,11 +125,6 @@ export function sessionRecordMessageToMessage(record: SessionRecordMessage): Mes
 }
 
 // ─── Time helpers ────────────────────────────────────────────────
-
-function formatShortTime(dateStr: string): string {
-  const d = new Date(dateStr)
-  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
-}
 
 function formatFullTime(dateStr: string): string {
   const d = new Date(dateStr)
@@ -376,6 +374,7 @@ export function WorkspaceMessageBubble({
   const attachmentContentType =
     message.content_type === 'image' ? 'image' : message.content_type === 'file' ? 'file' : null
   const isRichText = message.content_type === 'rich_text'
+  const translation = getMessageTranslation(message.metadata)
   const textBlocks = isBot ? getOpenAgentTextBlocks(message.metadata) : []
   const thinkingBlocks = isBot ? getOpenAgentThinkingBlocks(message.metadata) : []
   const visibleToolBlocks = isBot ? getVisibleOpenAgentToolBlocks(message.metadata) : []
@@ -383,7 +382,7 @@ export function WorkspaceMessageBubble({
     isBot && (textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0)
   const hasMessageText = message.content.trim().length > 0
 
-  const shortTime = formatShortTime(message.created_at)
+  const shortTime = formatMessageTime(message.created_at, locale)
   const fullTimeTitle = mode === 'record' ? formatFullTime(message.created_at) : undefined
 
   // 1. Recalled
@@ -702,6 +701,16 @@ export function WorkspaceMessageBubble({
                 imageGallery={attachmentContentType === 'image' ? imageGallery : undefined}
                 currentImageId={attachmentContentType === 'image' ? String(message.id) : undefined}
                 inlinePlayableVideo={inlinePlayableVideo}
+              />
+            </div>
+          ) : translation ? (
+            <div className={bubbleClassName}>
+              {embeddedQuoteBlock}
+              <TranslatedMessageContent
+                content={message.content}
+                isRichText={isRichText}
+                translation={translation}
+                locale={locale}
               />
             </div>
           ) : isRichText ? (

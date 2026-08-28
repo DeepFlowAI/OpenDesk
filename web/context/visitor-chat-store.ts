@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { io, Socket } from 'socket.io-client'
+import { dedupeMessagesById } from '@/lib/message-list'
 import type { Message } from '@/models/conversation'
 import type { SatisfactionSurveyRecord } from '@/models/satisfaction-survey'
 import type { HumanHandoffEventPayload } from '@/service/use-open-agent-conversation'
@@ -9,6 +10,66 @@ const VISITOR_PRESENCE_PING_INTERVAL_MS = 8_000
 
 let optimisticSeq = 0
 let presencePingTimer: ReturnType<typeof setInterval> | null = null
+
+export function parseAttachmentFileId(content: string): string | null {
+  try {
+    const payload = JSON.parse(content) as { file_id?: unknown }
+    return typeof payload.file_id === 'string' && payload.file_id ? payload.file_id : null
+  } catch {
+    return null
+  }
+}
+
+export function findOptimisticVisitorIndex(messages: Message[], incoming: Message): number {
+  const clientMessageId = incoming.metadata?.client_message_id
+  if (typeof clientMessageId === 'string' && clientMessageId) {
+    const byClientId = messages.findIndex(
+      (message) =>
+        message.id < 0
+        && message.sender_type === 'visitor'
+        && message.metadata?.client_message_id === clientMessageId,
+    )
+    if (byClientId !== -1) return byClientId
+  }
+
+  const incomingFileId = (
+    incoming.content_type === 'image' || incoming.content_type === 'file'
+  )
+    ? parseAttachmentFileId(incoming.content)
+    : null
+  if (incomingFileId) {
+    const byFileId = messages.findIndex(
+      (message) =>
+        message.id < 0
+        && message.sender_type === 'visitor'
+        && (message.content_type === 'image' || message.content_type === 'file')
+        && parseAttachmentFileId(message.content) === incomingFileId,
+    )
+    if (byFileId !== -1) return byFileId
+  }
+
+  const byExactContent = messages.findIndex(
+    (message) =>
+      message.id < 0
+      && message.sender_type === 'visitor'
+      && message.content === incoming.content,
+  )
+  if (byExactContent !== -1) return byExactContent
+
+  if (incoming.content_type === 'image' || incoming.content_type === 'file') {
+    const pendingOfType = messages.filter(
+      (message) =>
+        message.id < 0
+        && message.sender_type === 'visitor'
+        && message.content_type === incoming.content_type,
+    )
+    if (pendingOfType.length === 1) {
+      return messages.indexOf(pendingOfType[0])
+    }
+  }
+
+  return -1
+}
 
 function mergeMessageUpdate(current: Message, incoming: Message): Message {
   const merged: Message = { ...current, ...incoming }
@@ -364,10 +425,8 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
       }
 
       if (msg.sender_type === 'visitor') {
-        // Fallback: replace optimistic placeholder if callback hasn't fired yet
-        const idx = state.messages.findIndex(
-          (m) => m.id < 0 && m.content === msg.content && m.sender_type === 'visitor',
-        )
+        // Replace the local placeholder when the room echo arrives before the send ack.
+        const idx = findOptimisticVisitorIndex(state.messages, msg)
         if (idx !== -1) {
           const updated = [...state.messages]
           updated[idx] = { ...msg, status: msg.status ?? 'delivered' }
@@ -498,7 +557,7 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     )
     set({ messages: mergeMessageLists(current, msgs) })
   },
-  prependMessages: (msgs) => set({ messages: [...msgs, ...get().messages] }),
+  prependMessages: (msgs) => set({ messages: dedupeMessagesById([...msgs, ...get().messages]) }),
 
   addMessage: (msg) => {
     const state = get()
@@ -621,10 +680,14 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
 
   confirmOptimisticMessage: (tempId, serverMsg) => {
     const state = get()
-    const updated = state.messages.map((m) =>
-      m.id === tempId ? { ...serverMsg, status: serverMsg.status ?? 'delivered' as const } : m,
-    )
-    set({ messages: updated })
+    const confirmed = { ...serverMsg, status: serverMsg.status ?? 'delivered' as const }
+    if (state.messages.some((message) => message.id === serverMsg.id)) {
+      set({ messages: state.messages.filter((message) => message.id !== tempId) })
+      return
+    }
+    set({
+      messages: state.messages.map((message) => (message.id === tempId ? confirmed : message)),
+    })
   },
 
   markOptimisticDelivered: (tempId) => {

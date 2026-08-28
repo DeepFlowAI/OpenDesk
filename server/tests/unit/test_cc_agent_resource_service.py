@@ -82,9 +82,46 @@ async def test_inbound_reserve_ringing_and_in_call(fake_redis):
 
 
 @pytest.mark.asyncio
-async def test_manual_status_change_force_releases_stuck_resource(fake_redis, monkeypatch):
-    """A leaked in_call (4h lease) must not lock an agent out of switching
-    status — a manual status change force-releases the stuck resource."""
+async def test_manual_status_change_rejected_during_real_call(fake_redis, monkeypatch):
+    """A real in_call (backed by an active call record) must block manual
+    status changes — the agent stays busy until the call ends."""
+
+    await CcAgentResourceService.set_visible_status(fake_redis, 7, 42, "ready")
+    await CcAgentResourceService.reserve_inbound(
+        fake_redis, 7, 42, call_id="call-1", offer_id="o1", queue_id=9, ttl_seconds=300,
+    )
+    await CcAgentResourceService.mark_in_call(
+        fake_redis, 7, 42, call_id="call-1", direction="inbound", offer_id="o1",
+    )
+
+    async def _get_latest_active(*_a, **_k):
+        return SimpleNamespace(call_id="call-1", direction="inbound", state="in_progress")
+
+    async def _no_active_session(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.cc_agent_status_service.CallRecordRepository.get_latest_active_for_agent",
+        _get_latest_active,
+    )
+    monkeypatch.setattr(
+        "app.services.cc_agent_status_service.AgentWebRTCSessionRepository.get_active",
+        _no_active_session,
+    )
+
+    with pytest.raises(ConflictError):
+        await CcAgentStatusService.set_status(
+            db=None, tenant_id=7, employee_id=42, status="ready", reason=None, r=fake_redis,
+        )
+
+    snap = await CcAgentResourceService.get_snapshot(fake_redis, 7, 42)
+    assert snap["resource_state"] == "in_call"
+
+
+@pytest.mark.asyncio
+async def test_manual_status_change_allowed_after_ghost_reconcile(fake_redis, monkeypatch):
+    """A leaked in_call (no active call record or WebRTC session) is healed by
+    reconcile_agent, so the manual status change succeeds on retry."""
 
     await CcAgentResourceService.set_visible_status(fake_redis, 7, 42, "ready")
     await CcAgentResourceService.reserve_inbound(
@@ -97,6 +134,28 @@ async def test_manual_status_change_force_releases_stuck_resource(fake_redis, mo
     # status change is rejected.
     with pytest.raises(ConflictError):
         await CcAgentResourceService.set_visible_status(fake_redis, 7, 42, "ready")
+
+    async def _no_active_call(*_a, **_k):
+        return None
+
+    async def _no_active_session(*_a, **_k):
+        return None
+
+    async def _no_consult_host(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.cc_agent_status_service.CallRecordRepository.get_latest_active_for_agent",
+        _no_active_call,
+    )
+    monkeypatch.setattr(
+        "app.services.cc_agent_status_service.AgentWebRTCSessionRepository.get_active",
+        _no_active_session,
+    )
+    monkeypatch.setattr(
+        "app.services.call_center.call_control_service.CallControlService._find_consult_host_for_target",
+        _no_consult_host,
+    )
 
     async def _sync_pg(_db, tenant_id, employee_id, status, reason=None):
         return {
@@ -171,6 +230,70 @@ async def test_mark_in_call_idempotent_across_different_call_ids(fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_rekey_current_call_updates_occupied_resource(fake_redis):
+    """Blind transfer to a browser-ring colleague: they answered on the
+    internal consult leg (``internal:<offer>``) and own the customer call now.
+    Re-keying must update current_call_id even though the resource is already
+    in_call (where mark_in_call is a deliberate no-op), or the customer's own
+    hangup finalize would trip 'Call resource belongs to another call'.
+
+    The occupied hash is forged directly (the local fakeredis env breaks the
+    watch/multi path used by reserve_inbound+mark_in_call)."""
+
+    svc = CcAgentResourceService
+    key = svc.key(7, 42)
+    await fake_redis.hset(
+        key,
+        mapping=svc._base_mapping(
+            visible_status="busy",
+            resource_state="in_call",
+            current_call_id="internal:offer-1",
+            offer_id=None,
+            queue_id=None,
+            direction="inbound",
+            reserved_until=svc._now_epoch() + 3600,
+            in_call_since=svc._now_iso(),
+        ),
+    )
+    before = svc._snapshot_from_raw(42, await fake_redis.hgetall(key))
+
+    rekeyed = await svc.rekey_current_call(fake_redis, 7, 42, call_id="customer-call")
+    assert rekeyed is not None
+    assert rekeyed["resource_state"] == "in_call"
+    assert rekeyed["current_call_id"] == "customer-call"
+    assert rekeyed.get("in_call_since") == before.get("in_call_since")
+
+    # The customer's hangup finalize now passes the ownership guard.
+    released = await svc.mark_after_call_work(
+        fake_redis, 7, 42, call_id="customer-call", reason="call_hangup",
+    )
+    assert released["resource_state"] == "after_call_work"
+
+
+@pytest.mark.asyncio
+async def test_rekey_current_call_noop_when_same_or_unoccupied(fake_redis):
+    svc = CcAgentResourceService
+
+    # Nothing occupied → no-op, no resource created.
+    result = await svc.rekey_current_call(fake_redis, 7, 42, call_id="customer-call")
+    assert result is None or result.get("current_call_id") != "customer-call"
+
+    await fake_redis.hset(
+        svc.key(7, 42),
+        mapping=svc._base_mapping(
+            visible_status="busy",
+            resource_state="in_call",
+            current_call_id="call-1",
+            direction="inbound",
+            reserved_until=svc._now_epoch() + 3600,
+        ),
+    )
+    same = await svc.rekey_current_call(fake_redis, 7, 42, call_id="call-1")
+    assert same is not None
+    assert same["current_call_id"] == "call-1"
+
+
+@pytest.mark.asyncio
 async def test_manual_status_change_rejected_while_ringing(fake_redis):
     await CcAgentResourceService.set_visible_status(
         fake_redis, tenant_id=7, employee_id=42, status="ready"
@@ -220,6 +343,41 @@ async def test_release_ringing_returns_ready_idle(fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_reserve_outbound_rejects_offline(fake_redis):
+    await CcAgentResourceService.set_visible_status(
+        fake_redis, tenant_id=7, employee_id=42, status="offline"
+    )
+
+    with pytest.raises(ConflictError, match="离线"):
+        await CcAgentResourceService.reserve_outbound(
+            fake_redis,
+            7,
+            42,
+            reservation_id="outbound-token",
+            ttl_seconds=30,
+        )
+
+
+@pytest.mark.asyncio
+async def test_reserve_inbound_skips_offline(fake_redis):
+    await CcAgentResourceService.set_visible_status(
+        fake_redis, tenant_id=7, employee_id=42, status="offline"
+    )
+
+    reserved = await CcAgentResourceService.reserve_inbound(
+        fake_redis,
+        7,
+        42,
+        call_id="call-1",
+        offer_id="offer-1",
+        queue_id=9,
+        ttl_seconds=30,
+    )
+
+    assert reserved is None
+
+
+@pytest.mark.asyncio
 async def test_outbound_release_restores_previous_visible_status(fake_redis):
     await CcAgentResourceService.set_visible_status(
         fake_redis, tenant_id=7, employee_id=42, status="break"
@@ -266,6 +424,7 @@ async def _seed_in_call(fake_redis, tenant=7, emp=42):
 async def test_get_for_employee_reports_busy_while_in_call(fake_redis, monkeypatch):
     """Consult target: PG may stay ready; API must still report busy from Redis."""
     import app.services.cc_agent_status_service as css_mod
+    from app.services.call_workspace_context_service import CallWorkspaceContextService
 
     await _seed_in_call(fake_redis)
     monkeypatch.setattr(
@@ -292,12 +451,100 @@ async def test_get_for_employee_reports_busy_while_in_call(fake_redis, monkeypat
             }
         ),
     )
+    monkeypatch.setattr(
+        css_mod.CallRecordRepository,
+        "get_by_call_id",
+        AsyncMock(return_value=SimpleNamespace(id=99, call_source="auto_outbound")),
+    )
+    monkeypatch.setattr(
+        CallWorkspaceContextService,
+        "get_auto_outbound_context",
+        AsyncMock(
+            return_value={
+                "source": "auto_outbound",
+                "task_id": 12,
+                "record_id": 34,
+            }
+        ),
+    )
 
     status = await CcAgentStatusService.get_for_employee(
         db=None, tenant_id=7, employee_id=42, r=fake_redis,
     )
     assert status["status"] == "busy"
     assert status["resource_state"] == "in_call"
+    assert status["source"] == "auto_outbound"
+    assert status["task_id"] == 12
+    assert status["record_id"] == 34
+
+
+@pytest.mark.asyncio
+async def test_get_for_employee_restores_auto_outbound_context_during_wrap_up(
+    fake_redis, monkeypatch
+):
+    """The wrap-up workspace must keep its task record tab after hangup."""
+    import app.services.cc_agent_status_service as css_mod
+    from app.services.call_workspace_context_service import CallWorkspaceContextService
+
+    await _seed_in_call(fake_redis)
+    await CcAgentResourceService.mark_after_call_work(
+        fake_redis,
+        7,
+        42,
+        call_id="c1",
+        reason="call_hangup",
+    )
+    monkeypatch.setattr(
+        css_mod.AgentStatusRepository,
+        "get_for_employee",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                employee_id=42,
+                status="after_call_work",
+                reason=None,
+                status_changed_at=None,
+                updated_at=None,
+            )
+        ),
+    )
+    call_record = SimpleNamespace(id=99, call_source="auto_outbound")
+    get_call_record = AsyncMock(return_value=call_record)
+    monkeypatch.setattr(
+        css_mod.CallRecordRepository,
+        "get_by_call_id",
+        get_call_record,
+    )
+    get_context = AsyncMock(
+        return_value={
+            "source": "auto_outbound",
+            "task_id": 12,
+            "record_id": 34,
+        }
+    )
+    monkeypatch.setattr(
+        CallWorkspaceContextService,
+        "get_auto_outbound_context",
+        get_context,
+    )
+
+    status = await CcAgentStatusService.get_for_employee(
+        db=None,
+        tenant_id=7,
+        employee_id=42,
+        r=fake_redis,
+    )
+
+    assert status["resource_state"] == "after_call_work"
+    assert status["wrap_up_call_id"] == "c1"
+    assert status["source"] == "auto_outbound"
+    assert status["task_id"] == 12
+    assert status["record_id"] == 34
+    get_call_record.assert_awaited_once_with(None, "c1", 7)
+    get_context.assert_awaited_once_with(
+        None,
+        tenant_id=7,
+        call_record=call_record,
+    )
 
 
 @pytest.mark.asyncio
@@ -484,10 +731,10 @@ async def test_resource_transition_logs_from_to_call_id(fake_redis, caplog):
 
 def test_call_center_constants_active_sets_align():
     from app.constants.call_center import (
-        ACTIVE_CALL_RECORD_STATES,
+        ACTIVE_CALL_LIFECYCLE_STATUSES,
         ACTIVE_RESOURCE_STATES,
         AgentResourceState,
-        CallRecordState,
+        CallLifecycleStatus,
     )
 
     assert ACTIVE_RESOURCE_STATES == {
@@ -495,8 +742,4 @@ def test_call_center_constants_active_sets_align():
         AgentResourceState.RINGING.value,
         AgentResourceState.IN_CALL.value,
     }
-    assert ACTIVE_CALL_RECORD_STATES == {
-        CallRecordState.RINGING.value,
-        CallRecordState.QUEUED.value,
-        CallRecordState.IN_PROGRESS.value,
-    }
+    assert ACTIVE_CALL_LIFECYCLE_STATUSES == {CallLifecycleStatus.ACTIVE.value}

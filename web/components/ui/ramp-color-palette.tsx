@@ -33,7 +33,7 @@ export function RampColorPalette({ selectedColor, onSelect, onClear, className }
   const sel = normalizeHex(selectedColor)
 
   return (
-    <div className={cn('flex flex-col gap-2', className)}>
+    <div className={cn('flex min-w-[220px] flex-col gap-2', className)}>
       {onClear && (
         <button
           type="button"
@@ -46,9 +46,9 @@ export function RampColorPalette({ selectedColor, onSelect, onClear, className }
       )}
 
       {/* Padding so borders (not ring/box-shadow) are not clipped by overflow */}
-      <div className="flex max-h-[min(280px,45vh)] flex-col gap-1 overflow-y-auto px-1 pb-0.5 pt-1">
+      <div className="flex max-h-[min(280px,45vh)] flex-col gap-1 overflow-x-hidden overflow-y-auto px-1 pb-0.5 pt-1">
         {COLOR_RAMPS.map((row, ri) => (
-          <div key={ri} className="flex gap-0.5">
+          <div key={ri} className="grid w-full grid-cols-10 gap-0.5">
             {row.map((hex, ci) => {
               const active = sel === hex.toLowerCase()
               return (
@@ -56,7 +56,7 @@ export function RampColorPalette({ selectedColor, onSelect, onClear, className }
                   key={`${ri}-${ci}`}
                   type="button"
                   className={cn(
-                    'box-border h-5 w-5 shrink-0 rounded-sm border border-transparent transition-transform hover:z-10 hover:scale-110',
+                    'box-border aspect-square min-w-0 w-full rounded-sm border border-transparent transition-transform hover:z-10 hover:scale-110',
                     isLightHex(hex) && !active && 'border-border/60',
                     active && 'z-10 border-2 border-foreground',
                   )}

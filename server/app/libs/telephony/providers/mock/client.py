@@ -132,8 +132,20 @@ class MockTelephonyClient(BaseTelephonyClient):
         ))
         return play_id
 
-    async def call_listen(self, call_id: str, *, timeout_ms: int | None = None) -> None:
-        self.recorded.append(("call.listen", {"call_id": call_id, "timeout_ms": timeout_ms}))
+    async def call_listen(
+        self,
+        call_id: str,
+        *,
+        timeout_ms: int | None = None,
+        adaptive_barge_in: bool | None = None,
+        performance: dict | None = None,
+    ) -> None:
+        params = {"call_id": call_id, "timeout_ms": timeout_ms}
+        if adaptive_barge_in is not None:
+            params["adaptive_barge_in"] = adaptive_barge_in
+        if performance is not None:
+            params["performance"] = performance
+        self.recorded.append(("call.listen", params))
 
     async def call_stop(self, call_id: str, *, target: str = "all") -> None:
         self.recorded.append(("call.stop", {"call_id": call_id, "target": target}))
@@ -177,6 +189,7 @@ class MockTelephonyClient(BaseTelephonyClient):
         transcribe: bool = True,
         *,
         keepalive_on_peer_hangup: bool = False,
+        user_call_id: str | None = None,
     ) -> None:
         # Mirror FlowKit client: only surface keepalive when enabled.
         args = {
@@ -186,6 +199,8 @@ class MockTelephonyClient(BaseTelephonyClient):
         }
         if keepalive_on_peer_hangup:
             args["keepalive_on_peer_hangup"] = True
+        if user_call_id is not None:
+            args["user_call_id"] = user_call_id
         self.recorded.append(("call.bridge", args))
         if self.bridge_error is not None:
             raise self.bridge_error
@@ -335,6 +350,7 @@ class MockTelephonyClient(BaseTelephonyClient):
         trunk_id: str | None = None,
         timeout_ms: int | None = None,
         headers: dict[str, str] | None = None,
+        request_id: str | None = None,
     ) -> dict:
         params: dict[str, Any] = {}
         if uri:
@@ -349,8 +365,13 @@ class MockTelephonyClient(BaseTelephonyClient):
             params["timeout_ms"] = timeout_ms
         if headers:
             params["headers"] = headers
+        if request_id:
+            params["request_id"] = request_id
         self.recorded.append(("call.originate", params))
         return self.originate_response
+
+    async def originate_capacity(self) -> dict | None:
+        return getattr(self, "originate_capacity_response", None)
 
     async def extension_query(self, extension: str) -> dict:
         self.recorded.append(("extension.query", {"extension": extension}))
@@ -373,6 +394,17 @@ class MockTelephonyClient(BaseTelephonyClient):
     async def call_list(self) -> list[dict]:
         self.recorded.append(("call.list", {}))
         return self.call_list_response
+
+    async def call_alive(self, call_id: str) -> bool | None:
+        self.recorded.append(("call.alive", {"call_id": call_id}))
+        if not self.is_ready:
+            return None
+        try:
+            calls = await self.call_list()
+        except Exception:  # noqa: BLE001
+            return None
+        active_ids = {str(c.get("call_id")) for c in calls if c.get("call_id")}
+        return call_id in active_ids
 
     async def webrtc_offer(self, sdp: str, call_id: str | None = None) -> dict:
         self.recorded.append(("webrtc.offer", {"sdp": sdp, "call_id": call_id}))

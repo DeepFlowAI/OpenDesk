@@ -71,6 +71,57 @@ class MessageRepository:
         return items
 
     @staticmethod
+    async def get_translation_history(
+        db: AsyncSession,
+        conversation_id: int,
+        *,
+        before_message_id: int | None = None,
+    ) -> list[Message]:
+        """Return public visitor/agent text messages in chronological order."""
+        query = select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.sender_type.in_([
+                MessageSenderType.VISITOR.value,
+                MessageSenderType.AGENT.value,
+            ]),
+            Message.content_type.in_([
+                MessageContentType.TEXT.value,
+                MessageContentType.RICH_TEXT.value,
+            ]),
+            Message.is_recalled.is_(False),
+        )
+        if before_message_id is not None:
+            query = query.where(Message.id < before_message_id)
+        result = await db.execute(query.order_by(Message.id.asc()))
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_recent_visitor_text_messages(
+        db: AsyncSession,
+        conversation_id: int,
+        *,
+        limit: int,
+    ) -> list[Message]:
+        query = (
+            select(Message)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.sender_type == MessageSenderType.VISITOR.value,
+                Message.content_type.in_([
+                    MessageContentType.TEXT.value,
+                    MessageContentType.RICH_TEXT.value,
+                ]),
+                Message.is_recalled.is_(False),
+            )
+            .order_by(Message.id.desc())
+            .limit(limit)
+        )
+        result = await db.execute(query)
+        items = list(result.scalars().all())
+        items.reverse()
+        return items
+
+    @staticmethod
     async def create(db: AsyncSession, data: dict) -> Message:
         item = Message(**data)
         db.add(item)

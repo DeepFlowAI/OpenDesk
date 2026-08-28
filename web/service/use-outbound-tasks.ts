@@ -9,8 +9,11 @@ import type {
   CreateOutboundTargetPayload,
   CreateOutboundTaskPayload,
   CreateOutboundTemplatePayload,
+  MyOutboundTargetRecordsResponse,
+  MyOutboundTaskListResponse,
   OutboundRecord,
   OutboundRecordListResponse,
+  OutboundScript,
   OutboundTarget,
   OutboundTargetImportResponse,
   OutboundTargetListResponse,
@@ -75,7 +78,8 @@ export const useUpdateOutboundTaskTemplate = () => {
   return useMutation({
     mutationFn: ({ id, data }: { id: number; data: UpdateOutboundTemplatePayload }) =>
       put<OutboundTaskTemplate>(`v1/engagement/outbound-task-templates/${id}`, { json: data }),
-    onSuccess: (_, v) => {
+    onSuccess: (updated, v) => {
+      qc.setQueryData(outboundTaskKeys.template(v.id), updated)
       qc.invalidateQueries({ queryKey: outboundTaskKeys.template(v.id) })
       qc.invalidateQueries({ queryKey: [...outboundTaskKeys.all, 'templates'] })
     },
@@ -203,6 +207,27 @@ export const useMyOutboundTargets = (params?: ListParams) =>
   useQuery({
     queryKey: outboundTaskKeys.myTargets(params),
     queryFn: () => get<OutboundTargetListResponse>('v1/engagement/my-outbound-targets', { searchParams: searchParams(params) }),
+  })
+
+export const useMyOutboundTasks = () =>
+  useQuery({
+    queryKey: [...outboundTaskKeys.all, 'my-tasks'] as const,
+    queryFn: () => get<MyOutboundTaskListResponse>('v1/engagement/my-outbound-tasks'),
+  })
+
+export const useMyOutboundTargetRecords = (targetId: number, enabled = true) =>
+  useQuery({
+    queryKey: [...outboundTaskKeys.all, 'my-target-records', targetId] as const,
+    queryFn: () => get<MyOutboundTargetRecordsResponse>(`v1/engagement/my-outbound-targets/${targetId}/records`),
+    enabled: enabled && Number.isFinite(targetId) && targetId > 0,
+  })
+
+export const useMyOutboundTargetScript = (targetId: number, enabled: boolean) =>
+  useQuery({
+    queryKey: [...outboundTaskKeys.all, 'my-target-script', targetId] as const,
+    queryFn: () => get<OutboundScript>(`v1/engagement/my-outbound-targets/${targetId}/script`),
+    enabled: enabled && Number.isFinite(targetId) && targetId > 0,
+    staleTime: Infinity,
   })
 
 export const useUpdateMyOutboundTarget = () => {

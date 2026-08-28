@@ -61,3 +61,14 @@ class AliyunOSSClient(BaseStorageClient):
         if download_name:
             params["response-content-disposition"] = f'attachment; filename="{download_name}"'
         return bucket.sign_url("GET", key, expires_seconds, params=params)
+
+    async def get_presigned_upload_url(
+        self,
+        key: str,
+        content_type: str = "application/octet-stream",
+        expires_seconds: int = 900,
+    ) -> str:
+        """Create a short-lived signed URL for direct client PUT uploads."""
+        bucket = _get_bucket()
+        headers = {"Content-Type": content_type}
+        return bucket.sign_url("PUT", key, expires_seconds, headers=headers)

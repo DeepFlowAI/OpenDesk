@@ -19,6 +19,7 @@ import {
   useSetMyCurrentCallDevice,
 } from '@/service/use-agent-devices'
 import type { AgentCallDevice, CallDeviceType } from '@/models/call-device'
+import type { Locale } from '@/lib/languages'
 
 /**
  * Call-device selector for the call-center workspace. Renders the devices the
@@ -191,7 +192,7 @@ export function CallDeviceSelector() {
   )
 }
 
-function deviceLabel(device: AgentCallDevice, locale: 'zh' | 'en'): string {
+function deviceLabel(device: AgentCallDevice, locale: Locale): string {
   if (device.device_type === 'sip_phone' && device.extension_number) {
     return `${device.name} · ${device.extension_number}`
   }
@@ -210,7 +211,7 @@ function DeviceIcon({ type }: { type: CallDeviceType | null }) {
  * only signal — the accessible name and title carry the connection text and
  * last-updated time as well.
  */
-function HeartbeatDot({ device, locale }: { device: AgentCallDevice; locale: 'zh' | 'en' }) {
+function HeartbeatDot({ device, locale }: { device: AgentCallDevice; locale: Locale }) {
   const connected = device.registration_status === 'registered' && device.available
   const statusText = connected ? t('se.device.connected', locale) : t('se.device.disconnected', locale)
   const reason = !connected && device.unavailable_reason ? ` · ${device.unavailable_reason}` : ''

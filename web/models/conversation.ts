@@ -52,6 +52,7 @@ export type Conversation = {
   viewer_relation?: 'own' | 'peer' | 'collaborator' | null
   collaborated_by_current_user?: boolean
   collaborators?: AgentBrief[]
+  lingomaster_settings?: Record<string, unknown>
   created_at: string | null
 }
 
@@ -99,6 +100,13 @@ export type MessageMetadata = Record<string, unknown> & {
   quote?: MessageQuote
   client_message_id?: string
   retry_quoted_message_id?: number
+  translation?: {
+    status: 'pending' | 'translated' | 'failed'
+    source_language: string
+    target_language: string
+    translated_text?: string
+    direction: 'visitor_to_agent' | 'agent_to_visitor'
+  }
 }
 
 export type OpenAgentThinkingBlock = {

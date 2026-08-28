@@ -53,7 +53,7 @@ class FakeSessionContext:
         assert SessionTracker.active is False
         SessionTracker.active = True
         SessionTracker.opens += 1
-        return object()
+        return SimpleNamespace(commit=AsyncMock(), refresh=AsyncMock())
 
     async def __aexit__(self, *_exc_info):
         SessionTracker.active = False
@@ -276,7 +276,8 @@ async def test_managed_channel_create_closes_db_before_open_agent_http(monkeypat
                 pages=1,
             )
 
-    async def _fake_create(_db, payload):
+    async def _fake_create(_db, payload, commit=True):
+        assert commit is False
         create_calls.append(payload)
         return SimpleNamespace(
             id=42,
@@ -406,7 +407,8 @@ async def test_managed_channel_update_closes_db_before_open_agent_http(monkeypat
                 is_enabled=True,
             )
 
-    async def _fake_update(_db, item, payload):
+    async def _fake_update(_db, item, payload, commit=True):
+        assert commit is False
         update_calls.append((item.id, payload))
         return SimpleNamespace(
             id=item.id,

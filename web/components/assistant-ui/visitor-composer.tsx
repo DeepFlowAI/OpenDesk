@@ -9,6 +9,7 @@ import {
   type ChangeEvent,
   type ClipboardEvent as ReactClipboardEvent,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { ComposerPrimitive, useComposerRuntime } from '@assistant-ui/react'
@@ -24,6 +25,14 @@ import { quoteFromMessage } from '@/lib/message-quote'
 
 const MAX_ROWS = 3
 const LINE_HEIGHT = 22
+
+type NativeComposerKeyEvent = Pick<KeyboardEvent, 'key' | 'isComposing' | 'keyCode'>
+
+export function isImeConfirmKey(event: NativeComposerKeyEvent): boolean {
+  // Safari may end composition before emitting the Enter keydown. In that
+  // event, isComposing is false but keyCode 229 still identifies IME input.
+  return event.key === 'Enter' && (event.isComposing || event.keyCode === 229)
+}
 
 type PastedAttachmentPreview = {
   file: File
@@ -165,6 +174,7 @@ export function VisitorComposer({
   const [pastedAttachment, setPastedAttachment] = useState<PastedAttachmentPreview | null>(null)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const fileSendLockRef = useRef(false)
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastInsertIdRef = useRef<number | null>(null)
 
@@ -193,11 +203,10 @@ export function VisitorComposer({
   }, [])
 
   const placeholder =
-    (offlineMode ? (locale === 'zh' ? '请输入留言...' : 'Leave a message...') : null) ||
+    (offlineMode ? t('chat.input.offlinePlaceholder', locale) : null) ||
     (botMode ? config.open_agent_input_placeholder : config.input_placeholder) ||
-    (locale === 'zh' ? '输入消息...' : 'Type a message...')
-  const disabledText =
-    locale === 'zh' ? '会话已结束' : 'Conversation ended'
+    t('chat.input.placeholder', locale)
+  const disabledText = t('chat.ended', locale)
   const sendButtonStyle = {
     '--opendesk-send-button-bg': config.send_button_bg_color || 'var(--color-primary)',
   } as CSSProperties
@@ -207,6 +216,10 @@ export function VisitorComposer({
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current)
     typingTimerRef.current = setTimeout(() => onTyping(content), 300)
   }, [onTyping])
+
+  const handleInputKeyDown = useCallback((event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (isImeConfirmKey(event.nativeEvent)) event.preventDefault()
+  }, [])
 
   // When the input transitions to empty (message sent or draft cleared), cancel
   // any pending typing emit and immediately tell the agent to stop the "visitor
@@ -281,8 +294,9 @@ export function VisitorComposer({
     async (e: ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0]
       e.target.value = ''
-      if (!file) return
+      if (!file || fileSendLockRef.current) return
 
+      fileSendLockRef.current = true
       setUploading(true)
       setUploadError(null)
       try {
@@ -290,6 +304,7 @@ export function VisitorComposer({
       } catch {
         setUploadError(t('ws.chat.attachmentUploadFailed', locale))
       } finally {
+        fileSendLockRef.current = false
         setUploading(false)
       }
     },
@@ -382,7 +397,7 @@ export function VisitorComposer({
     <div ref={rootRef} className="shrink-0 bg-background px-3 py-2 sm:px-4 sm:py-3">
       {handoffRouting && (
         <div className="mb-2 rounded-lg bg-primary/10 px-3 py-2 text-center text-xs font-medium text-primary">
-          {locale === 'zh' ? '正在为您转接人工客服' : 'Connecting you to a human agent…'}
+          {t('chat.handoff.connecting', locale)}
         </div>
       )}
       {showCustomButtonBar && (
@@ -416,7 +431,7 @@ export function VisitorComposer({
               onClick={() => void onRequestHumanHandoff(null)}
               disabled={disabled || botRunning || handoffRouting}
             >
-              {config.open_agent_handoff_label || (locale === 'zh' ? '转人工' : 'Human support')}
+              {config.open_agent_handoff_label || t('chat.handoff.button', locale)}
             </button>
           )}
         </div>
@@ -450,6 +465,7 @@ export function VisitorComposer({
           rows={1}
           maxRows={MAX_ROWS}
           onChange={handleTypingDebounce}
+          onKeyDown={handleInputKeyDown}
           onPaste={handlePaste}
           // iOS Safari auto-zooms the page when a focused input's font-size is
           // below 16px; force 16px on touch devices to prevent that zoom.
@@ -467,8 +483,8 @@ export function VisitorComposer({
                 className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                 onClick={handleImageSelect}
                 disabled={disabled || uploading || botRunning || handoffRouting}
-                aria-label={locale === 'zh' ? '上传附件' : 'Upload attachment'}
-                title={locale === 'zh' ? '上传附件' : 'Upload attachment'}
+                aria-label={t('chat.attachment.upload', locale)}
+                title={t('chat.attachment.upload', locale)}
               >
                 {uploading ? <IconLoader2 size={18} className="animate-spin" /> : <IconPaperclip size={18} />}
               </button>
@@ -479,8 +495,8 @@ export function VisitorComposer({
                 className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                 onClick={onSatisfactionClick}
                 disabled={disabled || satisfactionLoading}
-                aria-label={locale === 'zh' ? '满意度评价' : 'Rate this conversation'}
-                title={locale === 'zh' ? '满意度评价' : 'Rate this conversation'}
+                aria-label={t('chat.survey.rateConversation', locale)}
+                title={t('chat.survey.rateConversation', locale)}
               >
                 {satisfactionLoading ? (
                   <IconLoader2 size={18} className="animate-spin" />

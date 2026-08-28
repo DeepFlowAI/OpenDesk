@@ -81,6 +81,70 @@ async def _open_agent_bot_timeout_worker() -> None:
         await asyncio.sleep(interval)
 
 
+async def _sms_bulk_send_worker() -> None:
+    from app.services.sms_bulk_send_service import SmsBulkSendService
+
+    logger = logging.getLogger(__name__)
+    interval = settings.SMS_BULK_SEND_SCAN_INTERVAL_SECONDS
+    while True:
+        try:
+            stats = await SmsBulkSendService.run_tick()
+            if any(stats.values()):
+                logger.info("sms_bulk_send_tick %s", stats)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Bulk SMS send tick failed")
+        await asyncio.sleep(interval)
+
+
+async def _event_delivery_worker() -> None:
+    from app.services.event_delivery_service import EventDeliveryService
+
+    logger = logging.getLogger(__name__)
+    interval = settings.EVENT_DELIVERY_SCAN_INTERVAL_SECONDS
+    loop = asyncio.get_running_loop()
+    next_cleanup_at = 0.0
+    while True:
+        try:
+            stats = await EventDeliveryService.run_tick()
+            if any(stats.values()):
+                logger.info("event_delivery_tick %s", stats)
+            if loop.time() >= next_cleanup_at:
+                deleted = await EventDeliveryService.cleanup_completed()
+                if deleted:
+                    logger.info("event_delivery_cleanup deleted=%s", deleted)
+                next_cleanup_at = (
+                    loop.time() + settings.EVENT_DELIVERY_CLEANUP_INTERVAL_SECONDS
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Event delivery scan failed")
+        await asyncio.sleep(interval)
+
+
+async def _call_wrapup_timeout_worker() -> None:
+    from app.services.call_wrapup_timeout_service import CallWrapupTimeoutService
+
+    logger = logging.getLogger(__name__)
+    interval = settings.CALL_WRAPUP_TIMEOUT_SCAN_INTERVAL_SECONDS
+    while True:
+        try:
+            from app.db.redis import redis_client
+
+            processed = await CallWrapupTimeoutService.process_expired(
+                redis_client.client
+            )
+            if processed:
+                logger.info("call_wrapup_timeout_scan processed=%s", processed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Call wrap-up timeout scan failed")
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     assert_safe_production_config()
@@ -104,6 +168,52 @@ async def lifespan(app: FastAPI):
             _open_agent_bot_timeout_worker(),
             name="open-agent-bot-timeout-worker",
         )
+    sms_bulk_send_task = None
+    if settings.SMS_BULK_SEND_WORKER_ENABLED:
+        sms_bulk_send_task = asyncio.create_task(
+            _sms_bulk_send_worker(),
+            name="sms-bulk-send-worker",
+        )
+    event_delivery_task = None
+    if settings.EVENT_DELIVERY_WORKER_ENABLED:
+        event_delivery_task = asyncio.create_task(
+            _event_delivery_worker(),
+            name="event-delivery-worker",
+        )
+    wrapup_timeout_task = None
+    if settings.CALL_WRAPUP_TIMEOUT_WORKER_ENABLED and settings.REDIS_URL:
+        wrapup_timeout_task = asyncio.create_task(
+            _call_wrapup_timeout_worker(),
+            name="call-wrapup-timeout-worker",
+        )
+
+    auto_outbound_engine = None
+    if settings.AUTO_OUTBOUND_DIAL_WORKER_ENABLED and settings.REDIS_URL:
+        try:
+            from app.db.redis import redis_client as _ao_redis
+            from app.services.auto_outbound import AutoOutboundDialEngine, set_dial_engine
+            from app.services.auto_outbound.capacity import DialCapacityPlanner
+            from app.services.auto_outbound.reception import ReceptionDispatcher
+
+            _ao_client = _ao_redis.client
+            auto_outbound_engine = AutoOutboundDialEngine(
+                redis=_ao_client,
+                reception=ReceptionDispatcher(redis=_ao_client),
+                pacing_resolver=DialCapacityPlanner(redis=_ao_client),
+            )
+            set_dial_engine(auto_outbound_engine)
+            await auto_outbound_engine.start()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception(
+                "Auto outbound dial worker failed to start; continuing without it"
+            )
+            auto_outbound_engine = None
+            try:
+                from app.services.auto_outbound import set_dial_engine
+
+                set_dial_engine(None)
+            except Exception:  # noqa: BLE001
+                pass
 
     # Optional: call-center orchestrator. Off by default in OSS to avoid
     # crashing the app when no telephony kernel is reachable.
@@ -130,6 +240,23 @@ async def lifespan(app: FastAPI):
         bot_timeout_task.cancel()
         with suppress(asyncio.CancelledError):
             await bot_timeout_task
+    if sms_bulk_send_task is not None:
+        sms_bulk_send_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sms_bulk_send_task
+    if event_delivery_task is not None:
+        event_delivery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await event_delivery_task
+    if wrapup_timeout_task is not None:
+        wrapup_timeout_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await wrapup_timeout_task
+    if auto_outbound_engine is not None:
+        try:
+            await auto_outbound_engine.stop()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("Auto outbound dial worker stop failed")
 
     # Shutdown call center: drain in-flight call workflows first so blue/green
     # rollouts do not tear down orchestration mid-call, then disconnect.
@@ -140,6 +267,16 @@ async def lifespan(app: FastAPI):
             logging.getLogger(__name__).exception("Call center orchestrator drain failed")
         try:
             await orchestrator.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Keep the stopped engine registered while orchestration drains so terminal
+    # call events can still finalize auto-outbound records and release slots.
+    if auto_outbound_engine is not None:
+        try:
+            from app.services.auto_outbound import set_dial_engine
+
+            set_dial_engine(None)
         except Exception:  # noqa: BLE001
             pass
 

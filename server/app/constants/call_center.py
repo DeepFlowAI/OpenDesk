@@ -30,16 +30,31 @@ class AgentResourceState(str, enum.Enum):
     UNAVAILABLE = "unavailable"
 
 
-class CallRecordState(str, enum.Enum):
-    """PG call_records.state."""
+class CallLifecycleStatus(str, enum.Enum):
+    ACTIVE = "active"
+    ENDED = "ended"
 
-    RINGING = "ringing"
-    QUEUED = "queued"
-    IN_PROGRESS = "in_progress"
+
+class CallFinalizationStatus(str, enum.Enum):
+    PENDING = "pending"
     COMPLETED = "completed"
-    MISSED = "missed"
+    INCOMPLETE = "incomplete"
     FAILED = "failed"
-    CANCELED = "canceled"
+
+
+class CallSource(str, enum.Enum):
+    INBOUND = "inbound"
+    AGENT_DIAL = "agent_dial"
+    MANUAL_OUTBOUND_TASK = "manual_outbound_task"
+    AUTO_OUTBOUND = "auto_outbound"
+
+
+class CallRecordingStatus(str, enum.Enum):
+    NONE = "none"
+    RECORDING = "recording"
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    FAILED = "failed"
 
 
 class ConsultState(str, enum.Enum):
@@ -68,6 +83,8 @@ class CcSocketEvent(str, enum.Enum):
     DEVICE_REGISTRATION_CHANGED = "cc.device_registration_changed"
     WEBRTC_ICE = "cc.webrtc.ice"
     TRANSCRIPT = "cc.transcript"
+    WRAP_UP_STARTED = "cc.wrap_up_started"
+    WRAP_UP_TIMEOUT = "cc.wrap_up_timeout"
 
 
 VISIBLE_STATUSES: frozenset[str] = frozenset(s.value for s in AgentStatus)
@@ -79,19 +96,19 @@ ACTIVE_RESOURCE_STATES: frozenset[str] = frozenset(
         AgentResourceState.IN_CALL.value,
     }
 )
-# CallRecord states while the agent is still handling the call.
-ACTIVE_CALL_RECORD_STATES: frozenset[str] = frozenset(
-    {
-        CallRecordState.RINGING.value,
-        CallRecordState.QUEUED.value,
-        CallRecordState.IN_PROGRESS.value,
-    }
+ACTIVE_CALL_LIFECYCLE_STATUSES: frozenset[str] = frozenset(
+    {CallLifecycleStatus.ACTIVE.value}
 )
 
 
 def agent_socket_room(tenant_id: int, employee_id: int) -> str:
     """Socket.IO room for a workspace agent under namespace=/chat."""
     return f"agent:{tenant_id}:{employee_id}"
+
+
+def embedded_call_socket_room(tenant_id: int, employee_id: int) -> str:
+    """Receive-only Socket.IO room for embedded call surfaces."""
+    return f"embedded-call-agent:{tenant_id}:{employee_id}"
 
 
 def resource_key(tenant_id: int, employee_id: int) -> str:

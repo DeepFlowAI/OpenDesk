@@ -5,7 +5,7 @@ Unit tests for the SIP-extension "reverse integration" against the kernel:
   and the `extension=` originate variant) on the mock client
 - -32601 "method not found" mapping to TelephonyMethodNotFoundError
 - kernel extension.registered / extension.unregistered writeback
-- registrar_info resolution preferring the kernel over settings
+- registrar_info resolution preferring SIP_REGISTRAR_* over the kernel
 - outbound two-stage originate for a SIP-phone agent
 - inbound assign_queue SIP-phone gating (never touches the WebRTC path)
 """
@@ -191,7 +191,8 @@ class TestRegistrationWriteback:
 
 class TestRegistrarResolution:
     @pytest.mark.asyncio
-    async def test_prefers_kernel_over_settings(self, monkeypatch):
+    async def test_prefers_settings_over_kernel(self, monkeypatch):
+        from app.configs import settings as settings_module
         from app.libs.telephony import factory
         from app.services.sip_extension_service import SipExtensionService
 
@@ -200,6 +201,29 @@ class TestRegistrarResolution:
             "host": "kernel.sip", "port": 6060, "transport": "tcp",
         }
         monkeypatch.setattr(factory, "_instance", client)
+        monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_HOST", "public.sip")
+        monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_PORT", 5070)
+        monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_TRANSPORT", "udp")
+
+        host, port, transport = await SipExtensionService._resolve_registrar_endpoint()
+        assert host == "public.sip"
+        assert port == 5070
+        assert transport == "udp"
+
+    @pytest.mark.asyncio
+    async def test_kernel_fills_unset_settings_fields(self, monkeypatch):
+        from app.configs import settings as settings_module
+        from app.libs.telephony import factory
+        from app.services.sip_extension_service import SipExtensionService
+
+        client = MockTelephonyClient()
+        client.registrar_info_response = {
+            "host": "kernel.sip", "port": 6060, "transport": "tcp",
+        }
+        monkeypatch.setattr(factory, "_instance", client)
+        monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_HOST", "")
+        monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_PORT", None)
+        monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_TRANSPORT", "")
 
         host, port, transport = await SipExtensionService._resolve_registrar_endpoint()
         assert host == "kernel.sip"
@@ -232,6 +256,8 @@ class TestRegistrarResolution:
         client.registrar_info_error = TelephonyMethodNotFoundError(-32601, "nope")
         monkeypatch.setattr(factory, "_instance", client)
         monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_HOST", "deploy.sip")
+        monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_PORT", None)
+        monkeypatch.setattr(settings_module.settings, "SIP_REGISTRAR_TRANSPORT", "")
 
         host, _port, _transport = await SipExtensionService._resolve_registrar_endpoint()
         assert host == "deploy.sip"

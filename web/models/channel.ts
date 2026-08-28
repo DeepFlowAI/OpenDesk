@@ -1,6 +1,7 @@
 import type { WelcomeMessagePublic } from '@/models/welcome-message-rule'
 import type { ConversationAnnouncementPublic } from '@/models/conversation-announcement'
 import type { ConversationReadStatusPublicConfig } from '@/models/conversation-read-status'
+import type { Locale } from '@/lib/languages'
 
 export type OpenAgentWelcomeMessageBlock =
   | {
@@ -58,6 +59,24 @@ export type ChannelCustomButton = {
   enabled: boolean
 }
 
+export type ChannelLanguageStrategy = 'browser' | 'fixed'
+
+export type ChannelFormFieldConfig = {
+  field_key: string | null
+  field_id: number | null
+  required: boolean
+}
+
+export type ChannelFormMessageConfig = {
+  title: string
+  description: string
+  submit_label: string
+  success_title: string
+  success_description: string
+  show_ticket_number: boolean
+  fields: ChannelFormFieldConfig[]
+}
+
 export type ChannelConfig = {
   title: string | null
   document_title: string | null
@@ -80,12 +99,17 @@ export type ChannelConfig = {
   embed_button_icon_color: string | null
   send_button_bg_color: string | null
   input_placeholder: string | null
+  language_strategy: ChannelLanguageStrategy
+  default_language: Locale
   service_hours_enabled: boolean
   service_hours_id: number | null
   outside_service_hours_strategy: 'offline_message' | 'leave_message'
   offline_title: string
   offline_message: string
   leave_message_prompt: string
+  leave_message_mode: 'conversation' | 'form'
+  form_message_config: ChannelFormMessageConfig
+  form_message_config_version: number | null
   restricted_service_message: string
   queue_message: string
   queue_full_message: string

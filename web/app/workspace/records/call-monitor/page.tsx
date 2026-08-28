@@ -11,6 +11,7 @@ import { useCallMonitor } from '@/service/use-call-monitor'
 import { useSystemInfo } from '@/service/use-system'
 import { t } from '@/utils/i18n'
 import { hasPermission } from '@/utils/permissions'
+import type { Locale } from '@/lib/languages'
 
 function formatTime(asOf?: string | null): string {
   if (!asOf) return '—'
@@ -20,7 +21,7 @@ function formatTime(asOf?: string | null): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-function formatRangeLabel(asOf: string | undefined, locale: 'zh' | 'en', fallback?: string): string {
+function formatRangeLabel(asOf: string | undefined, locale: Locale, fallback?: string): string {
   if (!asOf) return fallback ?? ''
   const d = new Date(asOf)
   if (Number.isNaN(d.getTime())) return fallback ?? ''

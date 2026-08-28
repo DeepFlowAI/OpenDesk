@@ -7,6 +7,17 @@ from app.libs.telephony.base import TelephonyRPCError
 from app.routers.v1 import call_center
 from app.schemas.call_center import AcceptOfferRequest, RejectOfferRequest
 from app.services.cc_agent_resource_service import CcAgentResourceService
+from app.services.cc_agent_status_service import CcAgentStatusService
+
+
+class _FakeSession:
+    """Stand-in for AsyncSessionLocal(): the PG write itself is patched out."""
+
+    async def __aenter__(self):
+        return object()
+
+    async def __aexit__(self, *_exc):
+        return False
 
 
 class _FakeOrchestrator:
@@ -98,6 +109,51 @@ async def test_reject_offer_requires_current_agent_owner(monkeypatch):
     assert owner_snapshot is not None
     assert owner_snapshot["offer_id"] == "offer-1"
     assert owner_snapshot["resource_state"] == "ringing"
+
+
+@pytest.mark.asyncio
+async def test_reject_offer_moves_agent_to_busy(monkeypatch):
+    """Rejecting takes the agent out of the ready pool.
+
+    Otherwise the queue can hand the same call straight back and the agent is
+    stuck in "rejected and here it is again"; the requirement is that they go
+    busy and return to ready themselves.
+    """
+
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    fake_orchestrator = _FakeOrchestrator()
+    monkeypatch.setattr(
+        "app.services.call_center.orchestrator.get_orchestrator",
+        lambda: fake_orchestrator,
+    )
+    monkeypatch.setattr(call_center, "AsyncSessionLocal", _FakeSession)
+    pg_statuses: list[str] = []
+
+    async def _sync_pg_status(_db, _tenant_id, _employee_id, status, _reason=None):
+        pg_statuses.append(status)
+        return {"status": status}
+
+    monkeypatch.setattr(CcAgentStatusService, "sync_pg_status", _sync_pg_status)
+    await _prepare_ringing_offer(fake_redis)
+
+    response = await call_center.reject_offer(
+        RejectOfferRequest(offer_id="offer-1"),
+        current_user={"tenant_id": 7, "user_id": 42},
+        r=fake_redis,
+    )
+
+    snapshot = await CcAgentResourceService.get_snapshot(fake_redis, 7, 42)
+    assert response == {"ok": True}
+    assert snapshot is not None
+    assert snapshot["visible_status"] == "busy"
+    assert snapshot["resource_state"] not in {"reserved", "ringing", "in_call"}
+    # PG carries the status the workspace reads back, so it has to agree.
+    assert pg_statuses == ["busy"]
+    # The workflow is told only after the agent is out of the pool, so the
+    # retry that follows cannot pick them again.
+    assert fake_orchestrator.decisions == [
+        ("offer-1", {"accept": False, "reason": "rejected"})
+    ]
 
 
 @pytest.mark.asyncio

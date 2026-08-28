@@ -2,28 +2,43 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { IconClipboardList, IconTemplate } from '@tabler/icons-react'
+import { IconClipboardList, IconMessage2, IconPhoneOutgoing, IconTemplate } from '@tabler/icons-react'
 import { useAuthStore } from '@/context/auth-store'
+import { useLocaleStore } from '@/context/locale-store'
 import { hasAnyPermission } from '@/utils/permissions'
 import { cn } from '@/lib/utils'
+import { t } from '@/utils/i18n'
 
 const items = [
   {
     href: '/workspace/engagement/outbound-tasks',
-    label: '人工外呼任务',
+    labelKey: 'ws.engagement.nav.manual',
     icon: IconClipboardList,
     permissions: ['engagement.outbound_task.manage', 'engagement.outbound_task.create'],
   },
   {
+    href: '/workspace/engagement/auto-outbound-tasks',
+    labelKey: 'ws.engagement.nav.auto',
+    icon: IconPhoneOutgoing,
+    permissions: ['engagement.auto_outbound_task.manage', 'engagement.auto_outbound_task.create'],
+  },
+  {
     href: '/workspace/engagement/outbound-task-templates',
-    label: '外呼任务模板',
+    labelKey: 'ws.engagement.nav.templates',
     icon: IconTemplate,
     permissions: ['engagement.outbound_task.template.manage'],
+  },
+  {
+    href: '/workspace/engagement/sms-tasks',
+    labelKey: 'ws.engagement.nav.sms',
+    icon: IconMessage2,
+    permissions: ['engagement.sms_task.manage', 'engagement.sms_task.create'],
   },
 ]
 
 export default function EngagementLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
+  const { locale } = useLocaleStore()
   const user = useAuthStore((state) => state.user)
   const visibleItems = items.filter((item) => hasAnyPermission(user, item.permissions))
 
@@ -46,7 +61,7 @@ export default function EngagementLayout({ children }: { children: React.ReactNo
                 )}
               >
                 <Icon size={18} className="shrink-0" />
-                {item.label}
+                {t(item.labelKey, locale)}
               </Link>
             )
           })}

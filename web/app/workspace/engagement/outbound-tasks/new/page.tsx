@@ -4,10 +4,12 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { IconArrowLeft, IconSend } from '@tabler/icons-react'
+import { IconArrowLeft, IconPlayerPlay, IconSend } from '@tabler/icons-react'
 import { EmptyState } from '@/app/components/features/engagement/outbound-task-ui'
+import { OutboundScriptRunner } from '@/app/components/features/engagement/outbound-script-runner'
 import { useAuthStore } from '@/context/auth-store'
-import { useCreateOutboundTask, useOutboundTaskTemplates } from '@/service/use-outbound-tasks'
+import { useCreateOutboundTask, useOutboundTaskTemplate, useOutboundTaskTemplates } from '@/service/use-outbound-tasks'
+import { FIELD_TYPE_LABELS } from '@/types/field-enums'
 
 export default function NewOutboundTaskPage() {
   const router = useRouter()
@@ -20,10 +22,12 @@ export default function NewOutboundTaskPage() {
   const [description, setDescription] = useState('')
   const [dueAt, setDueAt] = useState('')
   const [allowSelfClaim, setAllowSelfClaim] = useState(false)
+  const [scriptPreviewOpen, setScriptPreviewOpen] = useState(false)
   const selectedTemplate = useMemo(
     () => templates?.items.find((item) => item.id === (templateId || firstTemplateId)) ?? null,
     [firstTemplateId, templateId, templates?.items],
   )
+  const { data: selectedTemplateDetail, isFetching: isScriptLoading } = useOutboundTaskTemplate(selectedTemplate?.id ?? 0)
 
   const handleSubmit = async (publish: boolean) => {
     if (!selectedTemplate) {
@@ -59,10 +63,7 @@ export default function NewOutboundTaskPage() {
           <Link href="/workspace/engagement/outbound-tasks" className="rounded-md p-2 hover:bg-muted">
             <IconArrowLeft size={18} />
           </Link>
-          <div>
-            <h1 className="text-xl font-semibold text-foreground">新建人工外呼任务</h1>
-            <p className="mt-1 text-sm text-muted-foreground">选择模板并复制字段结构</p>
-          </div>
+          <h1 className="text-xl font-semibold text-foreground">新建人工外呼任务</h1>
         </div>
       </header>
 
@@ -105,12 +106,19 @@ export default function NewOutboundTaskPage() {
             </section>
 
             <section className="rounded-lg border border-border p-5">
+              <div className="flex items-center justify-between gap-4">
+                <div><h2 className="text-base font-semibold">外呼话术</h2><p className="mt-1 text-sm text-muted-foreground">{isScriptLoading ? '话术加载中...' : selectedTemplateDetail?.script ? `已配置 · ${selectedTemplateDetail.script.nodes.length} 个节点` : '所选模板未配置外呼话术'}</p></div>
+                {selectedTemplateDetail?.script && <button type="button" onClick={() => setScriptPreviewOpen(true)} className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm"><IconPlayerPlay size={16} />预览话术</button>}
+              </div>
+            </section>
+
+            <section className="rounded-lg border border-border p-5">
               <h2 className="mb-3 text-base font-semibold">任务字段结构</h2>
               <div className="grid gap-2">
                 {selectedTemplate?.fields.map((field) => (
                   <div key={field.key} className="flex items-center justify-between rounded-md border border-border px-3 py-2 text-sm">
                     <span>{field.name}</span>
-                    <span className="text-muted-foreground">{field.field_type}{field.agent_editable ? ' · 客服可编辑' : ''}</span>
+                    <span className="text-muted-foreground">{FIELD_TYPE_LABELS[field.field_type]?.zh ?? field.field_type}{field.agent_editable ? ' · 客服可编辑' : ''}</span>
                   </div>
                 ))}
               </div>
@@ -126,6 +134,7 @@ export default function NewOutboundTaskPage() {
           </div>
         )}
       </main>
+      {selectedTemplateDetail?.script && <OutboundScriptRunner open={scriptPreviewOpen} script={selectedTemplateDetail.script} title="预览话术流程" subtitle={selectedTemplateDetail.name} onClose={() => setScriptPreviewOpen(false)} />}
     </div>
   )
 }

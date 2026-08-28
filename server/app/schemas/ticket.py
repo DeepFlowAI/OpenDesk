@@ -3,12 +3,37 @@ Pydantic schemas for ticket CRUD + workspace queries
 """
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.base import TimestampSchema, PaginatedResponse
 from app.schemas.ticket_view import ConditionItem
 
 CustomFieldValue = str | int | float | bool | list | dict | None
+
+
+class TicketFormSubmissionFieldSnapshot(BaseModel):
+    field_key: str | None = None
+    field_id: int | None = None
+    name: str
+    field_type: str
+    required: bool = False
+    sort_order: int = 0
+    value: Any = None
+    type_config: dict[str, Any] = Field(default_factory=dict)
+    options: list[dict[str, Any]] = Field(default_factory=list)
+    tree_nodes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TicketFormSubmissionResponse(BaseModel):
+    channel_id: int
+    channel_name: str
+    source: str
+    submitted_at: datetime
+    conversation_public_id: str | None = None
+    field_snapshot: list[TicketFormSubmissionFieldSnapshot] = Field(default_factory=list)
 
 
 class RelatedTicketResponse(BaseModel):
@@ -28,6 +53,7 @@ class TicketResponse(TimestampSchema):
     conversation_public_id: str | None = None
     call_record_id: int | None = None
     call_record_call_id: str | None = None
+    call_record_public_id: str | None = None
     user_id: int | None = None
     agent_id: int | None = None
     assignee_group_id: int | None = None
@@ -38,6 +64,7 @@ class TicketResponse(TimestampSchema):
     created_by: dict | None = None
     updated_by: dict | None = None
     custom_fields: dict[str, CustomFieldValue] = Field(default_factory=dict)
+    form_submission: TicketFormSubmissionResponse | None = None
 
 
 class TicketCreate(BaseModel):

@@ -23,11 +23,12 @@ import {
 } from '@/service/use-api-keys'
 import type { ApiKeyRecord, ApiKeySecretResponse } from '@/models/api-key'
 import { cn } from '@/lib/utils'
+import type { Locale } from '@/lib/languages'
 
 type ConfirmAction = 'disable' | 'enable' | 'rotate' | 'delete'
 type ConfirmTarget = { action: ConfirmAction; item: ApiKeyRecord }
 
-function formatDate(value: string | null, locale: 'zh' | 'en') {
+function formatDate(value: string | null, locale: Locale) {
   if (!value) return '-'
   try {
     return new Date(value).toLocaleString(locale === 'zh' ? 'zh-CN' : 'en-US', {

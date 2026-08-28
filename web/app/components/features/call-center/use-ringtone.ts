@@ -10,7 +10,7 @@
  * we'd play this the agent has already interacted with the workspace
  * (clicked "就绪" / accepted mic permission), so playback works.
  */
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 
 export function useRingtone() {
   const ctxRef = useRef<AudioContext | null>(null)
@@ -81,5 +81,5 @@ export function useRingtone() {
 
   useEffect(() => () => stop(), [stop])
 
-  return { start, stop }
+  return useMemo(() => ({ start, stop }), [start, stop])
 }

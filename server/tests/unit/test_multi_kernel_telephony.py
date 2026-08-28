@@ -294,3 +294,119 @@ async def test_single_kernel_deployment_still_warns(caplog):
     record = await _one_failed_reconnect(_client("ws://only/ws"), caplog)
 
     assert record.levelno == logging.WARNING
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff_adds_jitter(monkeypatch):
+    client = _client("ws://only/ws")
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def _refused() -> None:
+        client._closing = True
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    monkeypatch.setattr(_flowkit_client.random, "uniform", lambda _low, _high: 1.2)
+    client._open_and_handshake = _refused  # type: ignore[method-assign]
+
+    await client._reconnect_loop()
+
+    assert sleeps == [1.2]
+
+
+@pytest.mark.asyncio
+async def test_new_reconnect_loop_resets_base_delay(monkeypatch):
+    client = _client("ws://only/ws")
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    attempts = 0
+
+    async def _connect_then_stop() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            if attempts == 2:
+                client._closing = True
+            raise ConnectionRefusedError(111, "Connection refused")
+        client._closing = True
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    monkeypatch.setattr(_flowkit_client.random, "uniform", lambda _low, _high: 1.0)
+    client._open_and_handshake = _connect_then_stop  # type: ignore[method-assign]
+    client._start_recv_loop = lambda: None  # type: ignore[method-assign]
+
+    await client._reconnect_loop()
+    client._closing = False
+    await client._reconnect_loop()
+
+    assert sleeps == [1.0, 2.0, 1.0]
+
+
+# ─────────── call_alive three-state probe ───────────
+
+
+@pytest.mark.asyncio
+async def test_mock_call_alive_empty_list_is_false():
+    tel = MockTelephonyClient()
+    await tel.connect()
+    tel.call_list_response = []
+    assert await tel.call_alive("cust-1") is False
+    assert ("call.alive", {"call_id": "cust-1"}) in tel.recorded
+
+
+@pytest.mark.asyncio
+async def test_mock_call_alive_not_ready_is_none():
+    tel = MockTelephonyClient()
+    tel.call_list_response = [{"call_id": "cust-1"}]
+    assert await tel.call_alive("cust-1") is None
+
+
+@pytest.mark.asyncio
+async def test_multi_call_alive_owner_not_ready_is_none(monkeypatch):
+    multi, k0, k1 = _multi(monkeypatch)
+    await multi.connect()
+    multi._call_kernel["cust-1"] = 0
+    await k0.disconnect()
+    k1.call_list_response = [{"call_id": "other"}]
+
+    assert await multi.call_alive("cust-1") is None
+    assert "call.alive" not in {r[0] for r in k1.recorded}
+
+
+@pytest.mark.asyncio
+async def test_multi_call_alive_unknown_owner_incomplete_coverage_is_none(monkeypatch):
+    multi, k0, k1 = _multi(monkeypatch)
+    await multi.connect()
+    await k1.disconnect()
+    k0.call_list_response = []
+
+    assert await multi.call_alive("cust-1") is None
+
+
+@pytest.mark.asyncio
+async def test_multi_call_alive_owner_says_absent_is_false(monkeypatch):
+    multi, k0, k1 = _multi(monkeypatch)
+    await multi.connect()
+    multi._call_kernel["cust-1"] = 0
+    k0.call_list_response = [{"call_id": "other"}]
+    k1.call_list_response = [{"call_id": "cust-1"}]  # must not be consulted
+
+    assert await multi.call_alive("cust-1") is False
+    assert ("call.alive", {"call_id": "cust-1"}) in k0.recorded
+    assert "call.alive" not in {r[0] for r in k1.recorded}
+
+
+@pytest.mark.asyncio
+async def test_multi_call_alive_unknown_owner_full_coverage_finds_call(monkeypatch):
+    multi, k0, k1 = _multi(monkeypatch)
+    await multi.connect()
+    k0.call_list_response = []
+    k1.call_list_response = [{"call_id": "cust-1"}]
+
+    assert await multi.call_alive("cust-1") is True

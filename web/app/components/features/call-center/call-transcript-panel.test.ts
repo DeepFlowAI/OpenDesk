@@ -119,6 +119,28 @@ describe('applyTranscriptEvent', () => {
     })
   })
 
+  it('appends a new bubble when a non-prefix shorter partial starts a new utterance', () => {
+    // Previous utterance never got its final; the next sentence must not
+    // replace its text — the transcript only grows.
+    const prev = [bubble({ id: 1, role: 'agent', text: '您好，请问有什么可以帮您' })]
+    const next = applyTranscriptEvent(prev, {
+      role: 'agent',
+      text: '我这边看',
+      final: false,
+    })
+    expect(next).toHaveLength(2)
+    expect(next[0]).toMatchObject({
+      id: 1,
+      text: '您好，请问有什么可以帮您',
+      final: true,
+    })
+    expect(next[1]).toMatchObject({
+      role: 'agent',
+      text: '我这边看',
+      final: false,
+    })
+  })
+
   it('creates a finalized bubble when that role has no open bubble', () => {
     const prev = [bubble({ id: 1, role: 'user', text: '你好', final: true })]
     const next = applyTranscriptEvent(prev, {

@@ -54,7 +54,7 @@ export interface UpdateSipExtensionPayload {
   bound_employee_ids?: number[]
 }
 
-/** Registration info that includes the one-time plaintext password. */
+/** Full registration info available to extension administrators. */
 export interface SipRegistrationSecret {
   registration_server: string | null
   registration_port: string | null

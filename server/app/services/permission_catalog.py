@@ -32,9 +32,13 @@ PERMISSION_TREE: list[dict] = [
                 "name_en": "Call Center",
                 "permissions": [
                     {"key": "call.workspace.use", "name": "启用呼叫中心工作台", "name_en": "Use call workspace", "type": "switch"},
+                    {"key": "call.embed.use", "name": "使用嵌入式通话", "name_en": "Use embedded calling", "type": "action", "requires": "call.workspace.use"},
+                    {"key": "call.personal_auto_outbound.use", "name": "使用个人自动外呼", "name_en": "Use personal auto outbound", "type": "action", "requires": "call.workspace.use"},
+                    {"key": "call.dial.outbound", "name": "外呼拨号", "name_en": "Outbound dialing", "type": "action", "requires": "call.workspace.use"},
                     {"key": "call.operation.transfer", "name": "通话转接", "name_en": "Transfer calls", "type": "action", "requires": "call.workspace.use"},
                     {"key": "call.operation.consult", "name": "通话咨询", "name_en": "Consult on calls", "type": "action", "requires": "call.workspace.use"},
                     {"key": "call.operation.conference", "name": "多方通话", "name_en": "Conference calls", "type": "action", "requires": "call.workspace.use"},
+                    {"key": "call.operation.satisfaction_invite", "name": "邀请满意度评价", "name_en": "Invite satisfaction survey", "type": "action", "requires": "call.workspace.use"},
                     {"key": "call.record.view", "name": "查看通话记录", "name_en": "View call records", "type": "menu", "requires": "call.workspace.use", "data_scope_resource": "call_record"},
                     {"key": "call.record.export", "name": "导出通话记录", "name_en": "Export call records", "type": "action", "requires": "call.record.view"},
                     {"key": "call.monitor.view", "name": "查看呼叫监控", "name_en": "View call monitor", "type": "menu", "requires": "call.workspace.use", "data_scope_resource": "call_record"},
@@ -45,6 +49,8 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "call.monitor.force_hangup", "name": "强制挂断通话", "name_en": "Force end calls", "type": "action", "requires": "call.monitor.listen", "data_scope_resource": "call_record"},
                     {"key": "call.report.view", "name": "查看通话报表", "name_en": "View call reports", "type": "menu", "requires": "call.workspace.use"},
                     {"key": "call.report.export", "name": "导出通话报表", "name_en": "Export call reports", "type": "action", "requires": "call.report.view"},
+                    {"key": "call.workspace.sms.send", "name": "工作台发送短信", "name_en": "Send SMS from workspace", "type": "action"},
+                    {"key": "call.sms_record.view", "name": "查看短信发送记录", "name_en": "View SMS send records", "type": "menu"},
                 ],
             },
             {
@@ -56,6 +62,11 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "engagement.outbound_task.create", "name": "新建外呼任务", "name_en": "Create outbound tasks", "type": "action"},
                     {"key": "engagement.outbound_task.execute", "name": "执行外呼任务", "name_en": "Execute outbound tasks", "type": "action", "requires": "call.workspace.use"},
                     {"key": "engagement.outbound_task.template.manage", "name": "管理外呼任务模板", "name_en": "Manage outbound task templates", "type": "manage", "requires": "engagement.outbound_task.manage"},
+                    {"key": "engagement.auto_outbound_task.manage", "name": "管理全部自动外呼任务", "name_en": "Manage all auto outbound tasks", "type": "manage"},
+                    {"key": "engagement.auto_outbound_task.create", "name": "新建自动外呼任务", "name_en": "Create auto outbound tasks", "type": "action"},
+                    {"key": "engagement.auto_outbound_task.subscription.manage", "name": "配置自动外呼任务事件订阅", "name_en": "Manage auto outbound task event subscriptions", "type": "action", "requires": "engagement.auto_outbound_task.manage"},
+                    {"key": "engagement.sms_task.manage", "name": "管理全部短信群发任务", "name_en": "Manage all bulk SMS tasks", "type": "manage"},
+                    {"key": "engagement.sms_task.create", "name": "新建短信群发任务", "name_en": "Create bulk SMS tasks", "type": "action"},
                 ],
             },
             {
@@ -83,6 +94,25 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "chat.online_monitor.view", "name": "查看在线监控", "name_en": "View online monitor", "type": "menu", "requires": "chat.workspace.use"},
                     {"key": "chat.session_report.view", "name": "查看会话报表", "name_en": "View session reports", "type": "menu", "requires": "chat.workspace.use"},
                     {"key": "chat.session_report.export", "name": "导出会话报表", "name_en": "Export session reports", "type": "action", "requires": "chat.session_report.view"},
+                ],
+            },
+            {
+                "key": "learning",
+                "name": "学习中心",
+                "name_en": "Learning Center",
+                "permissions": [
+                    {"key": "learning.center.use", "name": "使用学习中心", "name_en": "Use learning center", "type": "menu"},
+                    {"key": "learning.course.manage", "name": "管理课程", "name_en": "Manage courses", "type": "manage", "requires": "learning.center.use"},
+                    {"key": "learning.exam.manage", "name": "管理考试", "name_en": "Manage exams", "type": "manage", "requires": "learning.center.use"},
+                ],
+            },
+            {
+                "key": "scheduling",
+                "name": "排班中心",
+                "name_en": "Scheduling Center",
+                "permissions": [
+                    {"key": "scheduling.my.view", "name": "查看我的排班", "name_en": "View my schedule", "type": "menu"},
+                    {"key": "scheduling.center.manage", "name": "管理排班中心", "name_en": "Manage scheduling center", "type": "manage"},
                 ],
             },
             {
@@ -115,6 +145,19 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "ticket.workspace.delete", "name": "删除工单", "name_en": "Delete tickets", "type": "action", "requires": "ticket.workspace.view"},
                     {"key": "ticket.workspace.comment", "name": "工单评论", "name_en": "Comment on tickets", "type": "action", "requires": "ticket.workspace.view"},
                     {"key": "ticket.workspace.export", "name": "导出工单", "name_en": "Export tickets", "type": "action", "requires": "ticket.workspace.view"},
+                ],
+            },
+            {
+                "key": "report",
+                "name": "服务运营",
+                "name_en": "Service Operations",
+                "permissions": [
+                    {
+                        "key": "report.dashboard.view",
+                        "name": "查看自定义仪表盘",
+                        "name_en": "View custom dashboards",
+                        "type": "menu",
+                    },
                 ],
             },
             {
@@ -172,7 +215,9 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "call.admin.number.manage", "name": "管理号码", "name_en": "Manage phone numbers", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.extension.manage", "name": "管理 SIP 分机", "name_en": "Manage SIP extensions", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.settings.manage", "name": "管理呼叫中心设置", "name_en": "Manage call center settings", "type": "manage", "requires": "admin.access"},
+                    {"key": "call.admin.embed.manage", "name": "管理嵌入式通话", "name_en": "Manage embedded calling", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.summary_config.manage", "name": "管理通话纪要配置", "name_en": "Manage call summaries", "type": "manage", "requires": "admin.access"},
+                    {"key": "call.admin.sms.manage", "name": "管理短信", "name_en": "Manage SMS", "type": "manage", "requires": "admin.access"},
                 ],
             },
             {
@@ -184,6 +229,7 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "chat.admin.channel.manage", "name": "管理渠道", "name_en": "Manage channels", "type": "manage", "requires": "admin.access"},
                     {"key": "chat.admin.routing.manage", "name": "管理对话路由", "name_en": "Manage session routing", "type": "manage", "requires": "admin.access"},
                     {"key": "chat.admin.summary_config.manage", "name": "管理会话纪要配置", "name_en": "Manage session summaries", "type": "manage", "requires": "admin.access"},
+                    {"key": "chat.admin.lingomaster.manage", "name": "多语言大师配置", "name_en": "Manage LingoMaster", "type": "manage", "requires": "admin.access"},
                     {"key": "chat.admin.satisfaction.manage", "name": "管理满意度配置", "name_en": "Manage satisfaction", "type": "manage", "requires": "admin.access"},
                 ],
             },
@@ -208,6 +254,20 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "ticket.admin.shared_field.manage", "name": "管理共享字段", "name_en": "Manage shared fields", "type": "manage", "requires": "admin.access"},
                     {"key": "ticket.admin.view.manage", "name": "管理工单视图", "name_en": "Manage ticket views", "type": "manage", "requires": "admin.access"},
                     {"key": "ticket.admin.workflow.manage", "name": "管理工单工作流", "name_en": "Manage ticket workflows", "type": "manage", "requires": "admin.access"},
+                ],
+            },
+            {
+                "key": "report_admin",
+                "name": "数据分析",
+                "name_en": "Analytics",
+                "permissions": [
+                    {
+                        "key": "report.dashboard.manage",
+                        "name": "管理自定义仪表盘",
+                        "name_en": "Manage custom dashboards",
+                        "type": "manage",
+                        "requires": "admin.access",
+                    },
                 ],
             },
             {
@@ -266,9 +326,15 @@ ADMIN_DATA_SCOPES = {key: "all" for key in DATA_SCOPE_KEYS}
 AGENT_DATA_SCOPES = {key: "self" for key in DATA_SCOPE_KEYS}
 AGENT_DATA_SCOPES["offline_message"] = "group"
 
+ADMIN_PERMISSION_KEYS = sorted(ALL_PERMISSION_KEYS - {"scheduling.my.view"})
+
 AGENT_PERMISSION_KEYS = [
     "chat.workspace.use",
     "call.workspace.use",
+    "call.embed.use",
+    "call.personal_auto_outbound.use",
+    "call.dial.outbound",
+    "call.operation.satisfaction_invite",
     "ticket.workspace.view",
     "ticket.workspace.create",
     "ticket.workspace.edit",
@@ -284,6 +350,9 @@ AGENT_PERMISSION_KEYS = [
     "chat.queue.view",
     "chat.queue.assign_self",
     "call.record.view",
+    "call.workspace.sms.send",
+    "call.sms_record.view",
+    "learning.center.use",
     "engagement.outbound_task.execute",
     "chat.conversation.transfer",
     "chat.conversation.lock",
@@ -297,7 +366,7 @@ SYSTEM_ROLE_PRESETS = {
     "admin": {
         "name": "管理员",
         "description": "系统内置管理员角色",
-        "permissions": sorted(ALL_PERMISSION_KEYS),
+        "permissions": ADMIN_PERMISSION_KEYS,
         "data_scopes": ADMIN_DATA_SCOPES,
     },
     "agent": {

@@ -37,6 +37,123 @@ from app.services.channel_service import ChannelService
 from app.services.conversation_service import ConversationService
 
 
+@pytest.mark.asyncio
+async def test_persist_channel_creates_new_version_when_field_snapshot_changes(monkeypatch):
+    db = AsyncMock()
+    channel = SimpleNamespace(id=3, tenant_id=7, config={})
+    snapshot = {
+        "title": "Form",
+        "fields": [{"field_key": "title", "required": True, "definition": {"name": "New title"}}],
+    }
+    create_version = AsyncMock()
+    update_channel = AsyncMock(return_value=channel)
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService._build_form_config_snapshot",
+        AsyncMock(return_value=snapshot),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelFormConfigVersionRepository.get_by_channel_version",
+        AsyncMock(return_value=SimpleNamespace(config={**snapshot, "fields": []})),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelFormConfigVersionRepository.create",
+        create_version,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelRepository.update",
+        update_channel,
+    )
+
+    await ChannelService._persist_channel_with_form_version(
+        db,
+        item=channel,
+        payload={
+            "tenant_id": 7,
+            "config": {
+                "leave_message_mode": "form",
+                "form_message_config_version": 1,
+                "form_message_config": {
+                    "title": "Form",
+                    "fields": [{"field_key": "title", "required": True}],
+                },
+            },
+        },
+        previous_config={
+            "leave_message_mode": "form",
+            "form_message_config_version": 1,
+            "form_message_config": {
+                "title": "Form",
+                "fields": [{"field_key": "title", "required": True}],
+            },
+        },
+        create=False,
+    )
+
+    assert update_channel.await_args.args[2]["config"]["form_message_config_version"] == 2
+    create_version.assert_awaited_once()
+    assert create_version.await_args.kwargs["version"] == 2
+    assert create_version.await_args.kwargs["config"] == snapshot
+
+
+@pytest.mark.asyncio
+async def test_persist_channel_reuses_version_when_form_snapshot_is_unchanged(monkeypatch):
+    db = AsyncMock()
+    channel = SimpleNamespace(id=18, tenant_id=7, config={})
+    snapshot = {
+        "title": "Form",
+        "fields": [{"field_key": "title", "required": True, "definition": {"name": "Title"}}],
+    }
+    create_version = AsyncMock()
+    update_channel = AsyncMock(return_value=channel)
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService._build_form_config_snapshot",
+        AsyncMock(return_value=snapshot),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelFormConfigVersionRepository.get_by_channel_version",
+        AsyncMock(return_value=SimpleNamespace(config=snapshot)),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelFormConfigVersionRepository.create",
+        create_version,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelRepository.update",
+        update_channel,
+    )
+
+    await ChannelService._persist_channel_with_form_version(
+        db,
+        item=channel,
+        payload={
+            "tenant_id": 7,
+            "config": {
+                "language_strategy": "fixed",
+                "default_language": "fr-FR",
+                "leave_message_mode": "form",
+                "form_message_config": {
+                    "title": "Form",
+                    "fields": [{"field_key": "title", "required": True}],
+                },
+            },
+        },
+        previous_config={
+            "language_strategy": "browser",
+            "default_language": "en",
+            "leave_message_mode": "form",
+            "form_message_config_version": 1,
+            "form_message_config": {
+                "title": "Form",
+                "fields": [{"field_key": "title", "required": True}],
+            },
+        },
+        create=False,
+    )
+
+    assert update_channel.await_args.args[2]["config"]["form_message_config_version"] == 1
+    create_version.assert_not_awaited()
+
+
 def _service_hours(**overrides):
     data = {
         "id": 1,
@@ -70,6 +187,8 @@ def test_channel_config_uses_default_offline_message():
     assert config.use_agent_avatar is False
     assert config.agent_default_avatar_url is None
     assert config.send_button_bg_color is None
+    assert config.language_strategy == "browser"
+    assert config.default_language == "en"
     assert config.open_agent_enabled is False
     assert config.open_agent_bot_strategy == "always"
     assert config.open_agent_avatar_url is None
@@ -85,6 +204,96 @@ def test_channel_config_uses_default_offline_message():
     assert config.assist_panel_title is None
     assert config.assist_panel_react_code is None
     assert config.assist_panel_config == {}
+    assert config.leave_message_mode == "conversation"
+    assert config.form_message_config.fields == []
+    assert config.form_message_config_version is None
+
+
+def test_channel_config_requires_form_fields_and_required_field():
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(leave_message_mode="form")
+
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(
+            leave_message_mode="form",
+            form_message_config={
+                "fields": [{"field_key": "title", "required": False}],
+            },
+        )
+
+    config = ChannelConfig(
+        leave_message_mode="form",
+        form_message_config={
+            "fields": [{"field_key": "title", "required": True}],
+        },
+    )
+
+    assert config.form_message_config.fields[0].field_key == "title"
+
+
+def test_channel_config_rejects_duplicate_or_ambiguous_form_field_references():
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(
+            form_message_config={
+                "fields": [
+                    {"field_key": "title", "required": True},
+                    {"field_key": "title", "required": False},
+                ],
+            },
+        )
+
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(
+            form_message_config={
+                "fields": [{"field_key": "title", "field_id": 1, "required": True}],
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_build_form_config_snapshot_rejects_internal_ticket_fields(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.channel_service.FdFieldDefinitionService.get_unified_list",
+        AsyncMock(return_value={
+            "items": [
+                {
+                    "key": "status",
+                    "id": None,
+                    "domain": "ticket",
+                    "source": "system",
+                    "name": "状态",
+                    "field_type": "single_select",
+                    "type_config": {},
+                    "status": "active",
+                    "sort_order": 1,
+                    "options": [],
+                    "tree_nodes": [],
+                },
+            ],
+        }),
+    )
+
+    with pytest.raises(ValidationError):
+        await ChannelService._build_form_config_snapshot(
+            AsyncMock(),
+            7,
+            {"fields": [{"field_key": "status", "field_id": None, "required": True}]},
+        )
+
+
+def test_channel_config_accepts_fixed_language_strategy():
+    config = ChannelConfig(language_strategy="fixed", default_language="fr-FR")
+
+    assert config.language_strategy == "fixed"
+    assert config.default_language == "fr-FR"
+
+
+def test_channel_config_rejects_invalid_language_settings():
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(language_strategy="unsupported")
+
+    with pytest.raises(PydanticValidationError):
+        ChannelConfig(default_language="de-DE")
 
 
 def test_generate_copy_name_uses_next_available_suffix():
@@ -821,5 +1030,97 @@ async def test_create_visitor_session_uses_context_identity(monkeypatch):
     assert response["visitor_secret"]
     assert response["context_warnings"] == ["CUSTOMER_MATCH_CONFLICT:email_phone"]
     payload = decode_access_token(response["visitor_session_token"])
+    assert payload["visitor_external_id"] == "mall_user_1"
+    assert payload["visitor_name"] == "Ada"
+
+
+@pytest.mark.asyncio
+async def test_create_visitor_session_prefers_context_over_stale_visitor_id(monkeypatch):
+    channel = SimpleNamespace(
+        id=10,
+        tenant_id=7,
+        channel_key="ch_abcdefghijklmnopqrstuvwxyzabcdef",
+        channel_key_version=1,
+        public_access_enabled=True,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.get_public_channel_by_key",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.WebSdkContextService.resolve_visitor_identity",
+        AsyncMock(return_value=VisitorIdentityResolution(
+            visitor_external_id="mall_user_1",
+            visitor_name="Ada",
+        )),
+    )
+
+    anonymous = await ChannelService.create_visitor_session(
+        AsyncMock(),
+        channel.channel_key,
+        VisitorSessionRequest(),
+    )
+    assert anonymous["visitor_external_id"].startswith("v_")
+
+    upgraded = await ChannelService.create_visitor_session(
+        AsyncMock(),
+        channel.channel_key,
+        VisitorSessionRequest(
+            visitor_external_id=anonymous["visitor_external_id"],
+            visitor_secret=anonymous["visitor_secret"],
+            contextToken="odctx_test",
+        ),
+    )
+
+    assert upgraded["visitor_external_id"] == "mall_user_1"
+    assert upgraded["visitor_secret"]
+    assert upgraded["visitor_secret"] != anonymous["visitor_secret"]
+    payload = decode_access_token(upgraded["visitor_session_token"])
+    assert payload["visitor_external_id"] == "mall_user_1"
+    assert payload["visitor_name"] == "Ada"
+
+
+@pytest.mark.asyncio
+async def test_create_visitor_session_keeps_secret_when_context_matches_stored_id(monkeypatch):
+    channel = SimpleNamespace(
+        id=10,
+        tenant_id=7,
+        channel_key="ch_abcdefghijklmnopqrstuvwxyzabcdef",
+        channel_key_version=1,
+        public_access_enabled=True,
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.ChannelService.get_public_channel_by_key",
+        AsyncMock(return_value=channel),
+    )
+    monkeypatch.setattr(
+        "app.services.channel_service.WebSdkContextService.resolve_visitor_identity",
+        AsyncMock(return_value=VisitorIdentityResolution(
+            visitor_external_id="mall_user_1",
+            visitor_name="Ada",
+        )),
+    )
+
+    issued = await ChannelService.create_visitor_session(
+        AsyncMock(),
+        channel.channel_key,
+        VisitorSessionRequest(contextToken="odctx_test"),
+    )
+    assert issued["visitor_external_id"] == "mall_user_1"
+    assert issued["visitor_secret"]
+
+    renewed = await ChannelService.create_visitor_session(
+        AsyncMock(),
+        channel.channel_key,
+        VisitorSessionRequest(
+            visitor_external_id=issued["visitor_external_id"],
+            visitor_secret=issued["visitor_secret"],
+            contextToken="odctx_test",
+        ),
+    )
+
+    assert renewed["visitor_external_id"] == "mall_user_1"
+    assert renewed["visitor_secret"] is None
+    payload = decode_access_token(renewed["visitor_session_token"])
     assert payload["visitor_external_id"] == "mall_user_1"
     assert payload["visitor_name"] == "Ada"

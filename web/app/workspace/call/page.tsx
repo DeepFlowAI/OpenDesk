@@ -13,14 +13,16 @@
  * UI phases:
  *   mic_check → granted → idle → incoming → on_call → wrap_up
  */
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import {
+  IconArrowLeft,
   IconCheck,
   IconChevronDown,
   IconClipboardList,
   IconDownload,
+  IconMessage,
   IconMicrophoneOff,
   IconPhone,
   IconPhoneIncoming,
@@ -31,9 +33,15 @@ import {
 import { toast } from 'sonner'
 
 import { AgentCallBar } from '@/app/components/features/call-center/agent-call-bar'
+import { controlErrorMessage } from '@/app/components/features/call-center/use-call-control'
+import { AutoOutboundBusinessPanel } from '@/app/components/features/call-center/auto-outbound-business-panel'
 import { CallDeviceSelector } from '@/app/components/features/call-center/call-device-selector'
 import { DialBar } from '@/app/components/features/call-center/dial-bar'
+import { SendSmsDialog } from '@/app/components/features/call-center/send-sms-dialog'
 import { MyOutboundTargetsView } from '@/app/components/features/call-center/my-outbound-targets-view'
+import { PersonalAutoOutboundView } from '@/app/components/features/call-center/personal-auto-outbound-view'
+import { PersonalAutoOutboundBusinessPanel } from '@/app/components/features/call-center/personal-auto-outbound-business-panel'
+import { PersonalAutoOutboundTaskPop } from '@/app/components/features/call-center/personal-auto-outbound-task-pop'
 import {
   CallTranscriptHistory,
   CallTranscriptPanel,
@@ -42,11 +50,20 @@ import { CallUserInfoPanel } from '@/app/components/features/call-center/call-us
 import {
   callRecordCustomerNumber,
   callRecordServiceNumber,
+  selectDisplayRecording,
 } from '@/app/components/features/call-center/call-record-utils'
 import {
   formatCallRecordState,
+  formatHangupReason,
   formatWebRtcDeviceError,
 } from '@/lib/call-record-labels'
+import {
+  autoOutboundIncomingForCallRecord,
+  isAutoOutboundIncoming,
+  isPersonalAutoOutboundIncoming,
+  shouldAutoAcceptAutoOutbound,
+  shouldShowAutoOutboundBusinessTab,
+} from '@/lib/auto-outbound-incoming'
 import { CallSummaryFields } from '@/app/components/features/call-summary/call-summary-fields'
 import { CallTicketDraftPanel } from '@/app/components/features/call-summary/call-ticket-draft-panel'
 import {
@@ -54,12 +71,32 @@ import {
   useCallCenterRuntime,
 } from '@/context/call-center-runtime'
 import { useAuthStore } from '@/context/auth-store'
+import { useLocaleStore } from '@/context/locale-store'
 import { cn } from '@/lib/utils'
-import { useCallRecord, useResetAgentStatus } from '@/service/use-call-center'
+import { dialOutbound, useCallRecord, useResetAgentStatus } from '@/service/use-call-center'
 import { useMyCallDevices, useMyCurrentCallDevice } from '@/service/use-agent-devices'
 import { useSystemInfo } from '@/service/use-system'
+import { useWorkspaceEmbeddedPages } from '@/service/use-embedded-pages'
+import { EmbeddedPagePanel } from '@/app/components/features/chat/embedded-page-panel'
+import { t } from '@/utils/i18n'
 import type { AgentStatus } from '@/models/call-center'
+import type { EmbeddedPageContext } from '@/models/embedded-page'
 import { hasPermission } from '@/utils/permissions'
+import { isCnMobileNumber } from '@/utils/validators'
+import type { OutboundTarget } from '@/models/outbound-task'
+import { useSmsWorkspaceTemplates } from '@/service/use-sms'
+import {
+  callWorkspaceHref,
+  nextAnchorAfterDialNumberChange,
+  nextAnchorAfterIdle,
+  resolveCallWorkspaceRoute,
+  taskDialBlockReason,
+  type CallWorkspaceAnchor,
+  type CallWorkspaceMainView,
+  type CallWorkspaceRouteEvent,
+} from '@/lib/call-workspace-view'
+
+type PopTab = 'system' | `embedded:${number}`
 
 const STATUS_OPTIONS: {
   value: AgentStatus
@@ -88,13 +125,17 @@ export default function CallWorkspacePage() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const currentUser = useAuthStore((state) => state.user)
+  const { locale } = useLocaleStore()
   const { data: systemInfo } = useSystemInfo()
   const {
     mic,
     leg,
+    callControl,
     phase,
     incoming,
     callStart,
+    screenPopIncoming,
+    screenPopCallStart,
     now,
     status,
     records,
@@ -102,7 +143,9 @@ export default function CallWorkspacePage() {
     setRecordsPage,
     selectedRecordId,
     setSelectedRecordId,
+    draftDialNumber,
     setDraftDialNumber,
+    draftOutboundNumber,
     setDraftOutboundNumber,
     callSummaryTab,
     setCallSummaryTab,
@@ -113,6 +156,7 @@ export default function CallWorkspacePage() {
     screenPopNumber,
     showEmptyCallState,
     statusChangePending,
+    wrapUpUntil,
     setAgentStatus,
     accept,
     reject,
@@ -120,6 +164,40 @@ export default function CallWorkspacePage() {
     completeWrapUp,
     handleDialStarted,
   } = useCallCenterRuntime()
+  const isAutoOutbound = isAutoOutboundIncoming(screenPopIncoming)
+  const autoOutboundBusinessIncoming = selectedRecord
+    ? autoOutboundIncomingForCallRecord(selectedRecord)
+    : screenPopIncoming
+  const showAutoOutboundTab = shouldShowAutoOutboundBusinessTab(autoOutboundBusinessIncoming)
+  const showPersonalAutoOutboundTab =
+    isPersonalAutoOutboundIncoming(screenPopIncoming) &&
+    Number(screenPopIncoming?.record_id) > 0
+  const autoAccepting =
+    phase === 'incoming' &&
+    shouldAutoAcceptAutoOutbound({
+      source: incoming?.source,
+      deviceType: incoming?.device_type,
+    })
+  const autoOutboundUserNumber =
+    screenPopIncoming?.to ||
+    screenPopIncoming?.customer_from ||
+    screenPopIncoming?.from ||
+    '未知号码'
+  const callTypeInboundLabel = isPersonalAutoOutboundIncoming(screenPopIncoming)
+    ? t(screenPopIncoming?.personal_assignment_type === 'fallback' ? 'personalAuto.callTypeFallback' : 'personalAuto.callTypePrimary', locale)
+    : isAutoOutbound
+    ? t('ws.autoOutbound.agent.callType', locale)
+    : '呼入'
+  const screenPopDuration = formatDuration(
+    currentRecord?.customer_agent_talk_duration_ms ??
+      (screenPopCallStart ? Math.max(0, now - screenPopCallStart) : 0),
+  )
+  const screenPopDurationLabel =
+    phase === 'outbound_ringing'
+      ? '拨号中...'
+      : phase === 'incoming'
+        ? '响铃中...'
+        : screenPopDuration
   const { data: devicesData } = useMyCallDevices({ refetchInterval: 15_000 })
   const { data: currentDevice } = useMyCurrentCallDevice()
   const resetStatus = useResetAgentStatus()
@@ -127,28 +205,206 @@ export default function CallWorkspacePage() {
   const [callCenterNoticeDismissed, setCallCenterNoticeDismissed] = useState(false)
   const statusDropdownRef = useRef<HTMLDivElement>(null)
   const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
+  const canDialOutbound = hasPermission(currentUser, 'call.dial.outbound')
+  const canSendSms = hasPermission(currentUser, 'call.workspace.sms.send')
+  const workspaceSmsTemplatesQuery = useSmsWorkspaceTemplates({ enabled: canSendSms })
+  const workspaceSmsTemplates = workspaceSmsTemplatesQuery.data?.items ?? []
+  const showSmsEntry = canSendSms && workspaceSmsTemplates.length > 0
+  const [smsDialog, setSmsDialog] = useState<{
+    phone: string
+    phoneReadonly: boolean
+    callId: string | null
+  } | null>(null)
+  const callCustomerNumber = incoming?.direction === 'outbound' ? incoming?.to : incoming?.from
+  const callSmsDisabledReason = isCnMobileNumber(callCustomerNumber)
+    ? null
+    : t('sms.send.disabledNoCallNumber', locale)
+  // The in-call strip shares the console's semantic tone instead of stacking a
+  // taller card under the dial area.
+  const onCallStripClass =
+    callControl.mode === 'hold' ||
+    callControl.mode === 'consult_ringing' ||
+    callControl.mode === 'consult_active'
+      ? 'border-warning/30 bg-warning/10'
+      : callControl.mode === 'transferring' || callControl.mode === 'conference_ringing'
+        ? 'border-border bg-muted/40'
+        : 'border-success/30 bg-success/10'
   const canExecuteOutboundTasks = hasPermission(currentUser, 'engagement.outbound_task.execute')
+  const canPersonalAutoOutbound = hasPermission(currentUser, 'call.personal_auto_outbound.use')
+  const requestedView = searchParams.get('view')
+  const requestedTaskId = useMemo(() => {
+    const raw = Number(searchParams.get('taskId'))
+    return Number.isInteger(raw) && raw > 0 ? raw : null
+  }, [searchParams])
   const showingOutboundTasks =
-    canExecuteOutboundTasks && searchParams.get('view') === 'outbound-tasks'
+    canExecuteOutboundTasks && requestedView === 'outbound-tasks'
+  const showingPersonalAutoOutbound =
+    canPersonalAutoOutbound && requestedView === 'personal-auto-outbound'
+  const currentMainView: CallWorkspaceMainView = showingPersonalAutoOutbound
+    ? 'personal-auto-outbound'
+    : showingOutboundTasks
+      ? 'outbound-tasks'
+      : 'screen-pop'
+  const [workspaceAnchor, setWorkspaceAnchor] = useState<CallWorkspaceAnchor>(null)
+  // In-memory only: switching to the screen pop keeps the task view mounted
+  // (and the URL unchanged), so drafts survive and a refresh returns to the task.
+  const [screenPopOverride, setScreenPopOverride] = useState(false)
+  const [draftOutboundId, setDraftOutboundId] = useState('')
+  const workspaceRouteRef = useRef({ view: currentMainView, anchor: workspaceAnchor, urlTaskId: requestedTaskId })
+  workspaceRouteRef.current = { view: currentMainView, anchor: workspaceAnchor, urlTaskId: requestedTaskId }
+  const taskDialRef = useRef({
+    phase,
+    canDialOutbound,
+    hasUsableDevice: false,
+    micChecking: mic.state === 'checking',
+    outboundNumberId: '',
+    outboundNumber: '',
+    agentStatus: 'offline',
+  })
+  const applyWorkspaceRoute = useCallback((event: CallWorkspaceRouteEvent) => {
+    const { view, anchor, urlTaskId } = workspaceRouteRef.current
+    const next = resolveCallWorkspaceRoute({ currentView: view, anchor, event })
+    setWorkspaceAnchor(next.anchor)
+    // Also navigate when the anchored task differs from the task in the URL —
+    // e.g. the agent returned to the task list mid-call, then reselects the
+    // live call and lands back on that task's exec page.
+    const taskIdChanged =
+      next.view === 'outbound-tasks' &&
+      view === 'outbound-tasks' &&
+      (next.anchor?.taskId ?? urlTaskId) !== urlTaskId
+    if (next.view !== view || taskIdChanged) {
+      router.push(callWorkspaceHref(next.view, next.anchor))
+    }
+  }, [router])
+  useEffect(() => {
+    if (requestedView === 'personal-auto-outbound' && !canPersonalAutoOutbound) {
+      router.replace('/403')
+    }
+  }, [canPersonalAutoOutbound, requestedView, router])
+  useEffect(() => {
+    if (phase !== 'incoming' || !incoming) return
+    applyWorkspaceRoute({
+      type: 'incoming',
+      source: incoming.source,
+      callId: incoming.call_id,
+    })
+  }, [applyWorkspaceRoute, incoming, phase])
+  useEffect(() => {
+    if (phase === 'idle' || phase === 'mic_check' || phase === 'mic_denied') {
+      setWorkspaceAnchor((current) => nextAnchorAfterIdle(current))
+    }
+  }, [phase])
+  useEffect(() => {
+    if (!showingOutboundTasks) setScreenPopOverride(false)
+  }, [showingOutboundTasks])
+  // A task call that ends drops back to the task view's wrap-up screen by default.
+  useEffect(() => {
+    if (phase === 'wrap_up' && workspaceAnchor?.view === 'outbound-tasks') {
+      setScreenPopOverride(false)
+    }
+  }, [phase, workspaceAnchor?.view])
   // Selecting the live call's own record must still show the live panel +
   // realtime transcript (not HistoryDetail). Only other records count as history.
   const isViewingHistory = Boolean(
     selectedRecord &&
-      !(incoming?.call_id && selectedRecord.call_id === incoming.call_id),
+      !(
+        screenPopIncoming?.call_id &&
+        selectedRecord.call_id === screenPopIncoming.call_id
+      ),
   )
   const viewingHistoryDuringLiveCall =
     isViewingHistory &&
-    !!incoming?.call_id &&
+    !!screenPopIncoming?.call_id &&
     (phase === 'on_call' ||
       phase === 'incoming' ||
       phase === 'wrap_up' ||
       phase === 'outbound_ringing')
 
+  const embeddedPagesQuery = useWorkspaceEmbeddedPages('call_screen_pop')
+  const embeddedPages = useMemo(() => embeddedPagesQuery.data?.items ?? [], [embeddedPagesQuery.data?.items])
+  const embeddedAgent = embeddedPagesQuery.data?.agent ?? null
+  const [popTab, setPopTab] = useState<PopTab>('system')
+  const [mountedEmbeddedIds, setMountedEmbeddedIds] = useState<ReadonlySet<number>>(new Set())
+  const showPopTabs = embeddedPages.length > 0
+  // If the active embedded page gets disabled or deleted, fall back to the system pop.
+  const visiblePopTab: PopTab =
+    popTab.startsWith('embedded:') && !embeddedPages.some((page) => `embedded:${page.id}` === popTab)
+      ? 'system'
+      : popTab
+
+  const prevPopCallIdRef = useRef<string | null>(null)
+  const popTabDecisionRef = useRef<string | null>(null)
+  useEffect(() => {
+    const callId = screenPopIncoming?.call_id ?? null
+    if (callId !== prevPopCallIdRef.current) {
+      prevPopCallIdRef.current = callId
+      popTabDecisionRef.current = null
+    }
+    if (!callId) return
+    if (popTabDecisionRef.current === callId) return
+    // Wait for the page list so default focus is honored on first pop; viewing a
+    // history record never re-triggers it (applied when the agent returns to the live call).
+    if (embeddedPagesQuery.isPending || isViewingHistory) return
+    popTabDecisionRef.current = callId
+    const defaultFocusPage = embeddedPages.find((page) => page.default_focus)
+    setPopTab(defaultFocusPage ? `embedded:${defaultFocusPage.id}` : 'system')
+  }, [screenPopIncoming?.call_id, embeddedPages, embeddedPagesQuery.isPending, isViewingHistory])
+
+  useEffect(() => {
+    if (!visiblePopTab.startsWith('embedded:')) return
+    const id = Number(visiblePopTab.slice('embedded:'.length))
+    setMountedEmbeddedIds((prev) => {
+      if (prev.has(id)) return prev
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+  }, [visiblePopTab])
+
+  const embeddedContext = useMemo<EmbeddedPageContext>(() => {
+    const record = callRecordForTicket
+    return {
+      location: 'call_screen_pop',
+      agent: embeddedAgent
+        ? { id: embeddedAgent.id, name: embeddedAgent.name, email: embeddedAgent.email }
+        : null,
+      conversation: null,
+      visitor: null,
+      call:
+        record || screenPopIncoming
+          ? {
+              recordId: record?.id ?? 0,
+              direction: record?.direction ?? screenPopIncoming?.direction ?? 'inbound',
+              customerNumber: record ? callRecordCustomerNumber(record) ?? '' : screenPopNumber,
+              queueId: record?.last_queue?.queue_id ?? screenPopIncoming?.queue_id ?? null,
+              startedAt:
+                record?.started_at ??
+                (screenPopCallStart ? new Date(screenPopCallStart).toISOString() : null),
+            }
+          : null,
+      user: record?.user_id
+        ? { id: record.user_id, name: record.user_name ?? '', phone: record.user_phone }
+        : null,
+    }
+  }, [
+    callRecordForTicket,
+    embeddedAgent,
+    screenPopIncoming,
+    screenPopNumber,
+    screenPopCallStart,
+  ])
+
   useEffect(() => {
     if (!canCreateTicket && callSummaryTab === 'ticket') {
       setCallSummaryTab('summary')
     }
-  }, [canCreateTicket, callSummaryTab, setCallSummaryTab])
+    if (!showAutoOutboundTab && callSummaryTab === 'auto_outbound') {
+      setCallSummaryTab('summary')
+    }
+    if (!showPersonalAutoOutboundTab && callSummaryTab === 'personal_auto_outbound') {
+      setCallSummaryTab('summary')
+    }
+  }, [canCreateTicket, callSummaryTab, setCallSummaryTab, showAutoOutboundTab, showPersonalAutoOutboundTab])
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -174,7 +430,10 @@ export default function CallWorkspacePage() {
         ? 'busy'
         : (status?.status ?? 'offline')
   const currentStatusOption = STATUS_OPTIONS.find((o) => o.value === currentStatus) ?? STATUS_OPTIONS[4]
-  const statusSelectorDisabled = statusChangePending || mic.state === 'checking'
+  const statusFrozen =
+    phase === 'incoming' || phase === 'outbound_ringing' || phase === 'on_call'
+  const statusSelectorDisabled =
+    statusChangePending || mic.state === 'checking' || statusFrozen
 
   // A usable current device is required before the agent can go "ready" or dial.
   // The server enforces the same rule (409); the UI disables it as a first line.
@@ -182,6 +441,51 @@ export default function CallWorkspacePage() {
     (device) => device.device_type === currentDevice?.device_type,
   )
   const hasUsableDevice = !!currentDevice?.device_type && !!activeDevice?.available
+  const dialBlockedOffline = currentStatus === 'offline'
+  taskDialRef.current = {
+    phase,
+    canDialOutbound,
+    hasUsableDevice,
+    micChecking: mic.state === 'checking',
+    outboundNumberId: draftOutboundId,
+    outboundNumber: draftOutboundNumber,
+    agentStatus: currentStatus,
+  }
+  const startTaskCall = useCallback(async (phone: string, taskId?: number) => {
+    const destination = phone.trim()
+    setDraftDialNumber(destination)
+    applyWorkspaceRoute({ type: 'task-call-armed', phone: destination, taskId })
+    const blocked = taskDialBlockReason(taskDialRef.current)
+    if (blocked) {
+      toast.error(blocked)
+      return
+    }
+    try {
+      const resp = await dialOutbound({
+        outbound_phone_number_id: taskDialRef.current.outboundNumberId,
+        destination,
+      })
+      applyWorkspaceRoute({
+        type: 'dial-started',
+        destination,
+        callId: resp.call_id,
+      })
+      await handleDialStarted({
+        callId: resp.call_id,
+        destination,
+        outboundNumber: taskDialRef.current.outboundNumber,
+      })
+    } catch (err) {
+      toast.error(await controlErrorMessage(err, '外呼失败'))
+    }
+  }, [applyWorkspaceRoute, handleDialStarted, setDraftDialNumber])
+
+  // Pure UI switch: prefill the dial number so the idle screen pop resolves the
+  // customer by number; a live call keeps its own context via `incoming`.
+  const openScreenPopFromTask = useCallback((target: OutboundTarget) => {
+    setDraftDialNumber(target.phone_number)
+    setScreenPopOverride(true)
+  }, [setDraftDialNumber])
 
   return (
     <div className="flex h-full flex-col">
@@ -282,13 +586,15 @@ export default function CallWorkspacePage() {
                   : leg.state === 'connecting'
                     ? '正在接通...'
                     : '通话中'
-              : leg.state === 'connecting'
-                ? '正在接通...'
-                : phase === 'wrap_up'
-                  ? '整理中 · 完成本次记录后恢复就绪'
-                  : status?.status === 'ready'
-                  ? '已就绪 · 等待来电'
-                  : '请切换至「就绪」开始接收来电'}
+              : phase === 'incoming' || phase === 'outbound_ringing'
+                ? '振铃中 · 无法切换状态'
+                : leg.state === 'connecting'
+                  ? '正在接通...'
+                  : phase === 'wrap_up'
+                    ? '整理中 · 完成本次记录后恢复就绪'
+                    : status?.status === 'ready'
+                      ? '已就绪 · 等待来电'
+                      : '请切换至「就绪」开始接收来电'}
           </p>
           {leg.error && (
             <p className="mt-1 rounded bg-red-50 px-2 py-1 text-[11px] text-red-700">
@@ -311,14 +617,25 @@ export default function CallWorkspacePage() {
               href="/workspace/call?view=outbound-tasks"
               aria-current={showingOutboundTasks ? 'page' : undefined}
               className={cn(
-                'mt-3 flex h-9 items-center justify-center gap-2 rounded-md border text-sm font-medium transition-colors',
-                showingOutboundTasks
-                  ? 'border-primary/30 bg-primary/10 text-primary'
-                  : 'border-border bg-white hover:bg-muted/50',
+                'mt-3 flex h-9 items-center justify-center gap-2 rounded-md border border-border text-sm font-medium transition-colors',
+                showingOutboundTasks ? 'bg-muted/50' : 'bg-white hover:bg-muted/50',
               )}
             >
               <IconClipboardList size={16} />
-              我的外呼对象
+              {t('ws.outboundExec.entry', locale)}
+            </Link>
+          )}
+          {canPersonalAutoOutbound && (
+            <Link
+              href="/workspace/call?view=personal-auto-outbound"
+              aria-current={showingPersonalAutoOutbound ? 'page' : undefined}
+              className={cn(
+                'mt-2 flex h-9 items-center justify-center gap-2 rounded-md border border-border text-sm font-medium transition-colors',
+                showingPersonalAutoOutbound ? 'bg-muted/50' : 'bg-white hover:bg-muted/50',
+              )}
+            >
+              <IconPhoneOutgoing size={16} />
+              {t('personalAuto.title', locale)}
             </Link>
           )}
         </div>
@@ -339,6 +656,7 @@ export default function CallWorkspacePage() {
                   phase === 'outbound_ringing')
               const active =
                 !showingOutboundTasks &&
+                !showingPersonalAutoOutbound &&
                 (selectedRecordId === r.id || (selectedRecordId == null && isCurrentLive))
               return (
                 <button
@@ -348,10 +666,10 @@ export default function CallWorkspacePage() {
                     // Clicking the live call should restore the live panel
                     // (incl. realtime transcript), not HistoryDetail.
                     setSelectedRecordId(isCurrentLive ? null : r.id)
-                    if (showingOutboundTasks) router.push('/workspace/call')
+                    applyWorkspaceRoute({ type: 'select-recent', isCurrentLive })
                   }}
-                  className={`my-1 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${
-                    active ? 'bg-primary/10 ring-1 ring-primary/40' : 'hover:bg-muted'
+                  className={`my-1 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm outline-none transition ${
+                    active ? 'bg-muted' : 'hover:bg-muted'
                   }`}
                 >
                   {r.direction === 'inbound' ? (
@@ -411,7 +729,7 @@ export default function CallWorkspacePage() {
               : phase === 'outbound_ringing'
                 ? 'border-sky-300 bg-sky-50'
                 : phase === 'on_call'
-                  ? 'border-green-200 bg-green-50'
+                  ? onCallStripClass
                   : phase === 'wrap_up'
                     ? 'bg-muted'
                     : 'bg-white'
@@ -433,15 +751,59 @@ export default function CallWorkspacePage() {
               </button>
             </div>
           )}
-          {phase === 'idle' && (
+          {phase === 'idle' && canDialOutbound && (
             <DialBar
-              disabled={mic.state === 'checking' || !hasUsableDevice}
+              value={draftDialNumber}
+              disabled={mic.state === 'checking' || !hasUsableDevice || dialBlockedOffline}
               statusHint={
-                !hasUsableDevice ? '请先选择可用呼叫设备' : leg.state === 'ready' ? '等待来电' : undefined
+                !hasUsableDevice
+                  ? '请先选择可用呼叫设备'
+                  : dialBlockedOffline
+                    ? '请先将客服状态切换为就绪'
+                    : leg.state === 'ready'
+                      ? '等待来电'
+                      : undefined
               }
-              onDialNumberChange={setDraftDialNumber}
-              onOutboundNumberChange={(_, phoneNumber) => setDraftOutboundNumber(phoneNumber)}
-              onDialStarted={(info) => void handleDialStarted(info)}
+              smsButton={
+                showSmsEntry ? (
+                  <button
+                    type="button"
+                    disabled={!isCnMobileNumber(draftDialNumber)}
+                    title={
+                      isCnMobileNumber(draftDialNumber)
+                        ? t('sms.send.entry', locale)
+                        : t('sms.send.disabledNoNumber', locale)
+                    }
+                    aria-label={t('sms.send.entry', locale)}
+                    onClick={() =>
+                      setSmsDialog({
+                        phone: draftDialNumber.trim(),
+                        phoneReadonly: false,
+                        callId: null,
+                      })
+                    }
+                    className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-border bg-background text-foreground shadow-sm transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <IconMessage size={18} />
+                  </button>
+                ) : undefined
+              }
+              onDialNumberChange={(number) => {
+                setDraftDialNumber(number)
+                setWorkspaceAnchor((current) => nextAnchorAfterDialNumberChange(current, number))
+              }}
+              onOutboundNumberChange={(id, phoneNumber) => {
+                setDraftOutboundId(id)
+                setDraftOutboundNumber(phoneNumber)
+              }}
+              onDialStarted={(info) => {
+                applyWorkspaceRoute({
+                  type: 'dial-started',
+                  destination: info.destination,
+                  callId: info.callId,
+                })
+                void handleDialStarted(info)
+              }}
             />
           )}
           {phase === 'incoming' && incoming && (
@@ -457,7 +819,9 @@ export default function CallWorkspacePage() {
                       ? '转接请求'
                       : incoming.call_type === 'internal_conference'
                         ? '会议邀请'
-                        : '来电'}
+                        : autoAccepting
+                          ? t('ws.autoOutbound.agent.connecting', locale)
+                          : '来电'}
                 </span>
               </div>
               {incoming.call_type === 'internal_consult' ||
@@ -476,9 +840,16 @@ export default function CallWorkspacePage() {
                 />
               ) : (
                 <>
-                  <Field label="通话类型" value="呼入" />
-                  <Field label="用户号码" value={incoming.from || '未知号码'} strong />
-                  <Field label="服务号码" value={incoming.to || '—'} />
+                  <Field label="通话类型" value={callTypeInboundLabel} />
+                  <Field
+                    label="用户号码"
+                    value={isAutoOutbound ? autoOutboundUserNumber : (incoming.from || '未知号码')}
+                    strong
+                  />
+                  <Field
+                    label="服务号码"
+                    value={isAutoOutbound ? (incoming.from || '—') : (incoming.to || '—')}
+                  />
                 </>
               )}
               <Field
@@ -493,28 +864,38 @@ export default function CallWorkspacePage() {
                     话机响铃中
                   </span>
                 )}
-                <button
-                  type="button"
-                  onClick={reject}
-                  disabled={leg.state === 'connecting'}
-                  className="rounded-full bg-red-500 p-2.5 text-white disabled:opacity-50"
-                  title="拒接"
-                >
-                  <IconPhoneOff size={16} />
-                </button>
-                {/* A desk phone is answered by lifting the handset; the browser
-                    has no leg to accept, so an 接听 button here would do
-                    nothing. Rejecting still works — that runs server-side. */}
-                {incoming.device_type !== 'sip_phone' && (
-                  <button
-                    type="button"
-                    onClick={accept}
-                    disabled={leg.state === 'connecting'}
-                    title={leg.state === 'connecting' ? '正在接通...' : '接听'}
-                    className="rounded-full bg-green-500 p-2.5 text-white disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <IconPhone size={16} />
-                  </button>
+                {autoAccepting ? (
+                  <span className="whitespace-nowrap text-xs text-muted-foreground">
+                    {leg.state === 'connecting'
+                      ? t('ws.autoOutbound.agent.connecting', locale)
+                      : t('ws.autoOutbound.agent.autoAnswer', locale)}
+                  </span>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={reject}
+                      disabled={leg.state === 'connecting'}
+                      className="rounded-full bg-red-500 p-2.5 text-white disabled:opacity-50"
+                      title="拒接"
+                    >
+                      <IconPhoneOff size={16} />
+                    </button>
+                    {/* A desk phone is answered by lifting the handset; the browser
+                        has no leg to accept, so an 接听 button here would do
+                        nothing. Rejecting still works — that runs server-side. */}
+                    {incoming.device_type !== 'sip_phone' && (
+                      <button
+                        type="button"
+                        onClick={accept}
+                        disabled={leg.state === 'connecting'}
+                        title={leg.state === 'connecting' ? '正在接通...' : '接听'}
+                        className="rounded-full bg-green-500 p-2.5 text-white disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <IconPhone size={16} />
+                      </button>
+                    )}
+                  </>
                 )}
               </div>
             </div>
@@ -559,7 +940,21 @@ export default function CallWorkspacePage() {
               </div>
             </div>
           )}
-          {phase === 'on_call' && incoming && <AgentCallBar />}
+          {phase === 'on_call' && incoming && (
+            <AgentCallBar
+              onSendSms={
+                showSmsEntry
+                  ? () =>
+                      setSmsDialog({
+                        phone: callCustomerNumber ?? '',
+                        phoneReadonly: true,
+                        callId: incoming.call_id ?? null,
+                      })
+                  : undefined
+              }
+              smsDisabledReason={showSmsEntry ? callSmsDisabledReason : null}
+            />
+          )}
           {phase === 'wrap_up' && (
             <div className="flex items-center gap-6">
               <div className="flex items-center gap-2">
@@ -573,7 +968,32 @@ export default function CallWorkspacePage() {
                   </p>
                 </div>
               </div>
-              <button type="button" onClick={completeWrapUp} className="ml-auto rounded-full bg-green-500 p-2.5 text-white">
+              {showSmsEntry && (
+                <button
+                  type="button"
+                  disabled={!!callSmsDisabledReason}
+                  title={callSmsDisabledReason ?? t('sms.send.entry', locale)}
+                  aria-label={t('sms.send.entry', locale)}
+                  onClick={() =>
+                    setSmsDialog({
+                      phone: callCustomerNumber ?? '',
+                      phoneReadonly: true,
+                      callId: incoming?.call_id ?? null,
+                    })
+                  }
+                  className="ml-auto grid h-10 w-10 place-items-center rounded-lg border border-border bg-background text-foreground shadow-sm transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <IconMessage size={16} />
+                </button>
+              )}
+              {wrapUpUntil != null && (
+                <span className={`font-mono text-sm tabular-nums text-muted-foreground${showSmsEntry ? '' : ' ml-auto'}`}>
+                  {t('cs.wrapupRemaining', locale, {
+                    time: formatDuration(Math.max(0, wrapUpUntil - now)),
+                  })}
+                </span>
+              )}
+              <button type="button" onClick={completeWrapUp} className={showSmsEntry || wrapUpUntil != null ? 'rounded-full bg-green-500 p-2.5 text-white' : 'ml-auto rounded-full bg-green-500 p-2.5 text-white'}>
                 <IconCheck size={16} />
               </button>
             </div>
@@ -581,13 +1001,98 @@ export default function CallWorkspacePage() {
         </div>
 
         {/* Aux info area */}
-        {showingOutboundTasks ? (
+        {showingPersonalAutoOutbound ? (
           <div className="min-h-0 flex-1">
-            <MyOutboundTargetsView onStartCall={() => router.push('/workspace/call')} />
+            <PersonalAutoOutboundView
+              initialTaskId={requestedTaskId}
+              agentReady={currentStatus === 'ready'}
+              deviceAvailable={hasUsableDevice}
+              incoming={incoming}
+              phase={phase}
+              onWrapupSubmitted={completeWrapUp}
+            />
+          </div>
+        ) : isPersonalAutoOutboundIncoming(incoming) &&
+          (phase === 'incoming' || phase === 'on_call' || phase === 'wrap_up') ? (
+          <div className="min-h-0 flex-1 overflow-y-auto bg-background p-6">
+            <PersonalAutoOutboundTaskPop
+              incoming={incoming}
+              phase={phase}
+              onSubmitted={completeWrapUp}
+            />
           </div>
         ) : (
-          <div className={`flex min-h-0 flex-1 ${showEmptyCallState ? 'bg-white' : 'bg-muted p-5'}`}>
-          {showEmptyCallState ? (
+          <>
+          {showingOutboundTasks && (
+            <div className={screenPopOverride ? 'hidden' : 'min-h-0 flex-1'}>
+              <MyOutboundTargetsView
+                taskId={requestedTaskId}
+                onStartCall={startTaskCall}
+                onOpenScreenPop={openScreenPopFromTask}
+              />
+            </div>
+          )}
+          {(!showingOutboundTasks || screenPopOverride) && (
+          <div className={`flex min-h-0 flex-1 flex-col ${visiblePopTab === 'system' && showEmptyCallState ? 'bg-white' : 'bg-muted p-5'}`}>
+          {screenPopOverride && showingOutboundTasks && (
+            <div className={visiblePopTab === 'system' && showEmptyCallState ? 'shrink-0 px-5 pt-5 pb-4' : 'shrink-0 pb-4'}>
+              <button
+                type="button"
+                onClick={() => setScreenPopOverride(false)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-primary shadow-sm hover:bg-muted"
+              >
+                <IconArrowLeft size={13} />
+                {t('ws.outboundExec.screenPop.back', locale)}
+              </button>
+            </div>
+          )}
+          {showPopTabs && (
+            <div className={`flex shrink-0 ${visiblePopTab === 'system' && showEmptyCallState ? 'px-5 pt-5 pb-4' : 'pb-4'}`}>
+              <div className="flex rounded-md border border-border bg-background p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setPopTab('system')}
+                  className={cn(
+                    'rounded px-3 py-1.5 text-xs font-medium transition-colors',
+                    visiblePopTab === 'system'
+                      ? 'bg-primary text-primary-foreground'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {t('ep.ws.systemPop', locale)}
+                </button>
+                {embeddedPages.map((page) => (
+                  <button
+                    key={page.id}
+                    type="button"
+                    onClick={() => setPopTab(`embedded:${page.id}`)}
+                    className={cn(
+                      'max-w-[160px] truncate rounded px-3 py-1.5 text-xs font-medium transition-colors',
+                      visiblePopTab === `embedded:${page.id}`
+                        ? 'bg-primary text-primary-foreground'
+                        : 'text-muted-foreground hover:text-foreground',
+                    )}
+                  >
+                    {page.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {visiblePopTab !== 'system' ? (
+            <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border bg-white">
+              {embeddedPages
+                .filter((page) => mountedEmbeddedIds.has(page.id))
+                .map((page) => (
+                  <EmbeddedPagePanel
+                    key={page.id}
+                    page={page}
+                    context={embeddedContext}
+                    hidden={visiblePopTab !== `embedded:${page.id}`}
+                  />
+                ))}
+            </section>
+          ) : showEmptyCallState ? (
             <div className="min-h-0 flex-1 overflow-y-auto">
               <CallWorkspaceEmptyState />
             </div>
@@ -612,69 +1117,59 @@ export default function CallWorkspacePage() {
                 </div>
                 {isViewingHistory ? (
                   <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-                    <HistoryDetail recordId={selectedRecord!.id} />
+                    <HistoryDetail recordId={selectedRecord!.public_id} />
                   </div>
                 ) : (
                   <>
                     <div className="shrink-0">
-                      {incoming?.direction === 'outbound' ? (
+                      {screenPopIncoming?.direction === 'outbound' ? (
                         <dl className="grid grid-cols-2 gap-y-2 text-sm">
                           <Dt>通话类型</Dt><Dd>呼出</Dd>
-                          <Dt>外呼号码</Dt><Dd>{incoming?.from || '—'}</Dd>
-                          <Dt>被叫号码</Dt><Dd>{incoming?.to || '—'}</Dd>
-                          <Dt>通话时长</Dt>
-                          <Dd>
-                            {phase === 'outbound_ringing'
-                              ? '拨号中...'
-                              : formatDuration(callStart ? Date.now() - callStart : 0)}
-                          </Dd>
+                          <Dt>外呼号码</Dt><Dd>{screenPopIncoming?.from || '—'}</Dd>
+                          <Dt>被叫号码</Dt><Dd>{screenPopIncoming?.to || '—'}</Dd>
+                          <Dt>通话时长</Dt><Dd>{screenPopDurationLabel}</Dd>
                           <Dt>发起时间</Dt>
-                          <Dd>{callStart ? new Date(callStart).toLocaleTimeString() : '—'}</Dd>
+                          <Dd>{screenPopCallStart ? new Date(screenPopCallStart).toLocaleTimeString() : '—'}</Dd>
                           <Dt>通话 ID</Dt>
                           <Dd>
-                            {incoming?.call_id ? (
-                              <code className="font-mono text-xs">{incoming.call_id}</code>
+                            {screenPopIncoming?.call_id ? (
+                              <code className="font-mono text-xs">{screenPopIncoming.call_id}</code>
                             ) : (
                               '—'
                             )}
                           </Dd>
                         </dl>
-                      ) : incoming?.call_type === 'internal_consult' ||
-                        incoming?.call_type === 'internal_transfer' ||
-                        incoming?.call_type === 'internal_conference' ? (
+                      ) : screenPopIncoming?.call_type === 'internal_consult' ||
+                        screenPopIncoming?.call_type === 'internal_transfer' ||
+                        screenPopIncoming?.call_type === 'internal_conference' ? (
                         <dl className="grid grid-cols-2 gap-y-2 text-sm">
                           <Dt>通话类型</Dt>
                           <Dd>
-                            {incoming.call_type === 'internal_transfer'
+                            {screenPopIncoming.call_type === 'internal_transfer'
                               ? '转接'
-                              : incoming.call_type === 'internal_conference'
+                              : screenPopIncoming.call_type === 'internal_conference'
                                 ? '会议'
                                 : '咨询'}
                           </Dd>
                           <Dt>
-                            {incoming.call_type === 'internal_transfer'
+                            {screenPopIncoming.call_type === 'internal_transfer'
                               ? '转接自'
-                              : incoming.call_type === 'internal_conference'
+                              : screenPopIncoming.call_type === 'internal_conference'
                                 ? '邀请自'
                                 : '咨询自'}
                           </Dt>
-                          <Dd>{incoming.from || '同事'}</Dd>
+                          <Dd>{screenPopIncoming.from || '同事'}</Dd>
                           <Dt>用户号码</Dt>
-                          <Dd>{incoming.customer_from || '未知号码'}</Dd>
+                          <Dd>{screenPopIncoming.customer_from || '未知号码'}</Dd>
                           <Dt>服务号码</Dt>
-                          <Dd>{incoming.customer_to || '—'}</Dd>
-                          <Dt>通话时长</Dt>
-                          <Dd>
-                            {phase === 'incoming'
-                              ? '响铃中...'
-                              : formatDuration(callStart ? Date.now() - callStart : 0)}
-                          </Dd>
+                          <Dd>{screenPopIncoming.customer_to || '—'}</Dd>
+                          <Dt>通话时长</Dt><Dd>{screenPopDurationLabel}</Dd>
                           <Dt>来电时间</Dt>
-                          <Dd>{callStart ? new Date(callStart).toLocaleTimeString() : '—'}</Dd>
+                          <Dd>{screenPopCallStart ? new Date(screenPopCallStart).toLocaleTimeString() : '—'}</Dd>
                           <Dt>客户通话 ID</Dt>
                           <Dd>
-                            {incoming.source_call_id ? (
-                              <code className="font-mono text-xs">{incoming.source_call_id}</code>
+                            {screenPopIncoming.source_call_id ? (
+                              <code className="font-mono text-xs">{screenPopIncoming.source_call_id}</code>
                             ) : (
                               '—'
                             )}
@@ -682,21 +1177,26 @@ export default function CallWorkspacePage() {
                         </dl>
                       ) : (
                         <dl className="grid grid-cols-2 gap-y-2 text-sm">
-                          <Dt>通话类型</Dt><Dd>呼入</Dd>
-                          <Dt>用户号码</Dt><Dd>{incoming?.from || '未知号码'}</Dd>
-                          <Dt>服务号码</Dt><Dd>{incoming?.to || '—'}</Dd>
-                          <Dt>通话时长</Dt>
+                          <Dt>通话类型</Dt><Dd>{callTypeInboundLabel}</Dd>
+                          <Dt>用户号码</Dt>
                           <Dd>
-                            {phase === 'incoming'
-                              ? '响铃中...'
-                              : formatDuration(callStart ? Date.now() - callStart : 0)}
+                            {isAutoOutbound
+                              ? autoOutboundUserNumber
+                              : (screenPopIncoming?.from || '未知号码')}
                           </Dd>
+                          <Dt>服务号码</Dt>
+                          <Dd>
+                            {isAutoOutbound
+                              ? (screenPopIncoming?.from || '—')
+                              : (screenPopIncoming?.to || '—')}
+                          </Dd>
+                          <Dt>通话时长</Dt><Dd>{screenPopDurationLabel}</Dd>
                           <Dt>来电时间</Dt>
-                          <Dd>{callStart ? new Date(callStart).toLocaleTimeString() : '—'}</Dd>
+                          <Dd>{screenPopCallStart ? new Date(screenPopCallStart).toLocaleTimeString() : '—'}</Dd>
                           <Dt>通话 ID</Dt>
                           <Dd>
-                            {incoming?.call_id ? (
-                              <code className="font-mono text-xs">{incoming.call_id}</code>
+                            {screenPopIncoming?.call_id ? (
+                              <code className="font-mono text-xs">{screenPopIncoming.call_id}</code>
                             ) : (
                               '—'
                             )}
@@ -704,13 +1204,13 @@ export default function CallWorkspacePage() {
                         </dl>
                       )}
                     </div>
-                    {incoming?.call_id &&
-                      (phase === 'on_call' || phase === 'wrap_up') && (
+                    {screenPopIncoming?.call_id &&
+                      (phase === 'on_call' || phase === 'wrap_up' || phase === 'idle') && (
                         <CallTranscriptPanel
-                          callId={incoming.call_id}
+                          callId={screenPopIncoming.call_id}
                           live={phase === 'on_call'}
-                          fallbackRecordId={currentRecord?.id}
-                          sourceCallId={incoming.source_call_id}
+                          fallbackRecordId={currentRecord?.public_id}
+                          sourceCallId={screenPopIncoming.source_call_id}
                         />
                       )}
                   </>
@@ -720,12 +1220,14 @@ export default function CallWorkspacePage() {
               <section className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-white p-5 xl:h-full">
                 <div className="min-h-0 flex-1 overflow-y-auto">
                 <CallUserInfoPanel
-                  recordId={callSummaryRecordId}
+                  recordId={callRecordForTicket?.public_id}
                   fallbackNumber={screenPopNumber}
                   userRef={
                     callSummaryRecordId
                       ? null
-                      : (incoming?.user_public_id ?? incoming?.user_id ?? null)
+                      : (screenPopIncoming?.user_public_id ??
+                        screenPopIncoming?.user_id ??
+                        null)
                   }
                 />
                 </div>
@@ -733,7 +1235,7 @@ export default function CallWorkspacePage() {
 
               <section className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-white p-5 xl:h-full">
                 <div className="min-h-0 flex-1 overflow-y-auto">
-                {callRecordForTicket && (
+                {(callRecordForTicket || showAutoOutboundTab || showPersonalAutoOutboundTab) && (
                   <div className="mb-3 flex items-center border-b border-border pb-2">
                     <div className="flex shrink-0 rounded-md border border-border bg-muted p-0.5">
                       <button
@@ -762,10 +1264,52 @@ export default function CallWorkspacePage() {
                           新建工单
                         </button>
                       )}
+                      {showAutoOutboundTab && (
+                        <button
+                          type="button"
+                          onClick={() => setCallSummaryTab('auto_outbound')}
+                          className={cn(
+                            'rounded px-2 py-1 text-xs font-medium transition-colors',
+                            callSummaryTab === 'auto_outbound'
+                              ? 'bg-white text-foreground shadow-sm'
+                              : 'text-muted-foreground hover:text-foreground',
+                          )}
+                        >
+                          {t('ws.autoOutbound.agent.tab', locale)}
+                        </button>
+                      )}
+                      {showPersonalAutoOutboundTab && (
+                        <button
+                          type="button"
+                          onClick={() => setCallSummaryTab('personal_auto_outbound')}
+                          className={cn(
+                            'rounded px-2 py-1 text-xs font-medium transition-colors',
+                            callSummaryTab === 'personal_auto_outbound'
+                              ? 'bg-white text-foreground shadow-sm'
+                              : 'text-muted-foreground hover:text-foreground',
+                          )}
+                        >
+                          {t('personalAuto.businessTab', locale)}
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}
-                {canCreateTicket && callSummaryTab === 'ticket' && callRecordForTicket ? (
+                {showPersonalAutoOutboundTab && callSummaryTab === 'personal_auto_outbound' ? (
+                  <PersonalAutoOutboundBusinessPanel
+                    incoming={screenPopIncoming}
+                    onSubmitted={completeWrapUp}
+                  />
+                ) : showAutoOutboundTab && callSummaryTab === 'auto_outbound' ? (
+                  <AutoOutboundBusinessPanel
+                    incoming={autoOutboundBusinessIncoming}
+                    phase={phase}
+                    callRecordId={currentRecord?.id ?? callSummaryRecordId}
+                    onSubmitted={() => {
+                      if (phase === 'wrap_up' && !selectedRecord) completeWrapUp()
+                    }}
+                  />
+                ) : canCreateTicket && callSummaryTab === 'ticket' && callRecordForTicket ? (
                   <CallTicketDraftPanel
                     key={callRecordForTicket.id}
                     callRecord={callRecordForTicket}
@@ -802,8 +1346,21 @@ export default function CallWorkspacePage() {
             </div>
           )}
           </div>
+          )}
+          </>
         )}
       </main>
+
+      <SendSmsDialog
+        open={smsDialog !== null}
+        onOpenChange={(open) => {
+          if (!open) setSmsDialog(null)
+        }}
+        defaultPhone={smsDialog?.phone ?? ''}
+        phoneReadonly={smsDialog?.phoneReadonly ?? false}
+        callId={smsDialog?.callId}
+        templates={workspaceSmsTemplates}
+      />
       </div>
     </div>
   )
@@ -865,19 +1422,20 @@ function CallWorkspaceEmptyState() {
   )
 }
 
-function HistoryDetail({ recordId }: { recordId: number }) {
+function HistoryDetail({ recordId }: { recordId: string }) {
   const { data: record, isLoading, refetch } = useCallRecord(recordId)
+  const playableRecording = selectDisplayRecording(record?.recordings)
 
   // Recording file may land a few seconds after hangup.
   useEffect(() => {
-    if (!record || record.recording_url || record.state !== 'completed') return
+    if (!record || playableRecording || record.lifecycle_status !== 'ended') return
     const endedAt = record.ended_at ? new Date(record.ended_at).getTime() : 0
     if (!endedAt || Date.now() - endedAt > 60_000) return
     const timer = window.setInterval(() => {
       void refetch()
     }, 3000)
     return () => window.clearInterval(timer)
-  }, [record, refetch])
+  }, [playableRecording, record, refetch])
 
   if (isLoading || !record) {
     return <p className="py-4 text-sm text-muted-foreground">加载中...</p>
@@ -891,11 +1449,11 @@ function HistoryDetail({ recordId }: { recordId: number }) {
     <div className="flex min-h-0 flex-1 flex-col gap-4">
       <section className="shrink-0">
         <h4 className="mb-2 text-xs font-semibold text-foreground/70">通话录音</h4>
-        {record.recording_url ? (
+        {playableRecording?.access_url ? (
           <div className="flex items-center gap-2">
-            <audio src={record.recording_url} controls className="min-w-0 flex-1" />
+            <audio src={playableRecording.access_url} controls className="min-w-0 flex-1" />
             <a
-              href={record.recording_url}
+              href={playableRecording.access_url}
               download
               className="shrink-0 rounded-md border border-border p-2 hover:bg-muted"
             >
@@ -913,17 +1471,19 @@ function HistoryDetail({ recordId }: { recordId: number }) {
         <Dt>通话类型</Dt><Dd>{record.direction === 'inbound' ? '呼入' : '呼出'}</Dd>
         <Dt>用户号码</Dt><Dd>{customerNumber || '—'}</Dd>
         <Dt>服务号码</Dt><Dd>{serviceNumber || '—'}</Dd>
-        <Dt>通话时长</Dt><Dd>{formatDuration(record.talk_duration_ms)}</Dd>
-        <Dt>响铃时长（含机器人/排队）</Dt>
-        <Dd>{formatDuration(record.ring_duration_ms)}</Dd>
+        <Dt>通话时长</Dt><Dd>{formatDuration(record.customer_agent_talk_duration_ms)}</Dd>
+        <Dt>客户响铃时长</Dt>
+        <Dd>{formatDuration(record.customer_ring_duration_ms)}</Dd>
         <Dt>来电时间</Dt><Dd>{started ? started.toLocaleString() : '—'}</Dd>
         <Dt>结束时间</Dt><Dd>{ended ? ended.toLocaleString() : '—'}</Dd>
-        <Dt>接听坐席</Dt><Dd>{record.agent_name || '—'}</Dd>
-        <Dt>状态</Dt><Dd>{formatCallRecordState(record.state)}</Dd>
+        <Dt>接听坐席</Dt><Dd>{record.last_serving_agent_name || '—'}</Dd>
+        <Dt>状态</Dt><Dd>{formatCallRecordState(record.lifecycle_status)}</Dd>
+        <Dt>挂断原因</Dt><Dd>{formatHangupReason(record.hangup_reason_code) || '—'}</Dd>
+        <Dt>机器人接待</Dt><Dd>{record.actual_reception_type === 'bot' || record.actual_reception_type === 'bot_agent' ? '是' : '—'}</Dd>
         <Dt>通话 ID</Dt>
         <Dd><code className="font-mono text-xs">{record.call_id}</code></Dd>
       </dl>
-      <CallTranscriptHistory recordId={record.id} />
+      <CallTranscriptHistory recordId={record.public_id} />
     </div>
   )
 }

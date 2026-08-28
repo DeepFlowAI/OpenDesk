@@ -39,6 +39,18 @@ MAX_SHARE_CODE_GENERATION_ATTEMPTS = 20
 
 
 class ConversationRepository:
+    @staticmethod
+    async def update_lingomaster_settings(
+        db: AsyncSession,
+        conversation: Conversation,
+        settings: dict,
+    ) -> Conversation:
+        """Replace the conversation's LingoMaster state."""
+        conversation.lingomaster_settings = settings
+        await db.commit()
+        await db.refresh(conversation)
+        return conversation
+
 
     @staticmethod
     async def get_by_id(db: AsyncSession, conversation_id: int) -> Conversation | None:

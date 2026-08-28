@@ -54,7 +54,16 @@ class SessionRoutingRuleService:
     def _rule_queue_sources(rule) -> list[dict]:
         sources = list(rule.target_queue_sources or [])
         if sources:
-            return sources
+            normalized: list[dict] = []
+            for source in sources:
+                if not isinstance(source, dict):
+                    continue
+                source_type = source.get("source_type") or "employee_group"
+                raw_ids = source.get("target_ids")
+                target_ids = [int(item) for item in raw_ids] if isinstance(raw_ids, list) else []
+                normalized.append({"source_type": source_type, "target_ids": target_ids})
+            if normalized:
+                return normalized
         if rule.target_group_id:
             return [{"source_type": "employee_group", "target_ids": [rule.target_group_id]}]
         return []

@@ -11,8 +11,8 @@ import type { SipRegistrationSecret } from '@/models/sip-extension'
 type SecretRow = { labelKey: string; value: string | null; phoneFieldKey?: string }
 
 /**
- * Shows the one-time full SIP registration info (including the plaintext
- * password) after creating an extension or resetting its password. Values
+ * Shows the full SIP registration info (including the plaintext password)
+ * after creating an extension or resetting its password. Values
  * that the deployment did not provide are rendered blank rather than filled
  * with a default.
  */

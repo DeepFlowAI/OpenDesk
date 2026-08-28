@@ -31,6 +31,7 @@ export type ConfirmDialogProps = {
   message?: string
   /** Optional emphasized item name (e.g. record being deleted). */
   itemName?: string
+  itemDescription?: string
   confirmLabel?: string
   cancelLabel?: string
   variant?: Variant
@@ -44,6 +45,7 @@ export function ConfirmDialog({
   title,
   message,
   itemName,
+  itemDescription,
   confirmLabel = '确定',
   cancelLabel = '取消',
   variant = 'default',
@@ -84,6 +86,9 @@ export function ConfirmDialog({
         {itemName && (
           <div className="mt-3 rounded-lg border border-border p-3">
             <p className="text-sm font-medium text-foreground">{itemName}</p>
+            {itemDescription && (
+              <p className="mt-1 text-sm text-muted-foreground">{itemDescription}</p>
+            )}
           </div>
         )}
         <div className="mt-6 flex justify-end gap-3">

@@ -25,6 +25,10 @@ from app.schemas.conversation import (
     StartConversationFromHistoryResponse,
     VisitorWebStatusResponse,
 )
+from app.schemas.conversation_translation import (
+    ConversationTranslationSettingsResponse,
+    ConversationTranslationSettingsUpdate,
+)
 from app.schemas.conversation_user_statistics import ConversationUserStatisticsResponse
 from app.schemas.conversation_file import ConversationFileUploadResponse
 from app.schemas.conversation_file import ConversationFileAccessResponse
@@ -49,6 +53,7 @@ from app.schemas.satisfaction_survey_record import (
 )
 from app.services.conversation_file_service import ConversationFileService
 from app.services.conversation_service import ConversationService
+from app.services.conversation_translation_service import ConversationTranslationService
 from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_user_stat_service import ConversationUserStatService
 from app.services.agent_status_service import AgentStatusService
@@ -482,31 +487,59 @@ async def recall_message(
 async def send_message(
     conversation_id: int,
     body: MessageCreate,
-    db: AsyncSession = Depends(get_db),
-    principal: EffectivePrincipal = Depends(get_current_principal),
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
 ):
     """Send a message in a conversation (agent sends via REST fallback)."""
-    msg = await ConversationService.send_message(
-        db,
+    msg = await ConversationTranslationService.send_agent_message_managed(
         conversation_id=conversation_id,
-        sender_type=MessageSenderType.AGENT.value,
-        sender_id=principal.user_id,
         content_type=body.content_type,
         content=body.content,
-        tenant_id=principal.tenant_id,
         principal=principal,
         quoted_message_id=body.quoted_message_id,
     )
-    from app.repositories.employee_repository import EmployeeRepository
-    employee = await EmployeeRepository.get_by_id(db, principal.user_id)
-    display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, principal.tenant_id)
-    return ConversationService._message_response_payload(
-        msg,
-        conversation_id=msg.conversation_id,
-        sender_name=ConversationService.agent_display_name(employee, display_mode) if employee else None,
-        sender_avatar=employee.avatar if employee else None,
-        viewer_agent_id=principal.user_id,
+    return await ConversationTranslationService.get_agent_message_payload_managed(
+        msg.id,
+        principal,
     )
+
+
+@router.get(
+    "/{conversation_id}/translation-settings",
+    response_model=ConversationTranslationSettingsResponse,
+)
+async def get_translation_settings(
+    conversation_id: int,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+) -> ConversationTranslationSettingsResponse:
+    """Read effective translation settings for a conversation."""
+    return await ConversationTranslationService.get_settings(db, conversation_id, principal)
+
+
+@router.patch(
+    "/{conversation_id}/translation-settings",
+    response_model=ConversationTranslationSettingsResponse,
+)
+async def update_translation_settings(
+    conversation_id: int,
+    body: ConversationTranslationSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
+    principal: EffectivePrincipal = Depends(get_current_principal),
+) -> ConversationTranslationSettingsResponse:
+    """Update translation preferences for a conversation."""
+    result = await ConversationTranslationService.update_settings(db, conversation_id, principal, body)
+    from app.libs.realtime import get_realtime_transport
+
+    try:
+        await get_realtime_transport().emit(
+            "translation_settings_updated",
+            {"conversation_id": conversation_id, "settings": result.model_dump(mode="json")},
+            room=f"conv:{conversation_id}",
+            namespace="/chat",
+        )
+    except RuntimeError:
+        pass
+    return result
 
 
 # -- Agent status endpoints (grouped under /conversations for convenience) --

@@ -7,15 +7,23 @@ from app.models.call_prompt_tone_settings import CallPromptToneSettings  # noqa:
 from app.models.open_agent_settings import OpenAgentSettings  # noqa: F401
 from app.models.service_hours import ServiceHours  # noqa: F401
 from app.models.api_key import ApiKey  # noqa: F401
+from app.models.event_subscription import EventSubscription, EventSubscriptionAudit  # noqa: F401
+from app.models.event_delivery import EventDelivery  # noqa: F401
 from app.models.employee_group import EmployeeGroup, EmployeeGroupMember  # noqa: F401
 from app.models.voice_flow import VoiceFlow  # noqa: F401
 from app.models.voice_flow_version import VoiceFlowVersion  # noqa: F401
+from app.models.satisfaction_flow import SatisfactionFlow, SatisfactionFlowVersion  # noqa: F401
 from app.models.ticket_workflow import TicketWorkflow  # noqa: F401
 from app.models.ticket_workflow_version import TicketWorkflowVersion  # noqa: F401
+from app.models.custom_dashboard import CustomDashboard, CustomDashboardVersion  # noqa: F401
 from app.models.audio_asset import AudioAsset  # noqa: F401
 from app.models.voice_flow_system_variable import VoiceFlowSystemVariable  # noqa: F401
 from app.models.agent_status import AgentStatus  # noqa: F401
 from app.models.call_record import CallRecord  # noqa: F401
+from app.models.call_record_access_scope import CallRecordAccessScope  # noqa: F401
+from app.models.call_recording import CallRecording  # noqa: F401
+from app.models.call_event import CallEvent  # noqa: F401
+from app.models.call_satisfaction import CallSatisfactionAnswer, CallSatisfactionExecution  # noqa: F401
 from app.models.call_transcript_segment import CallTranscriptSegment  # noqa: F401
 from app.models.agent_webrtc_session import AgentWebRTCSession  # noqa: F401
 from app.models.sip_extension import SipExtension  # noqa: F401
@@ -25,10 +33,26 @@ from app.models.inbound_routing_rule import InboundRoutingRule  # noqa: F401
 from app.models.sip_trunk import SipTrunk  # noqa: F401
 from app.models.phone_number import PhoneNumber  # noqa: F401
 from app.models.phone_number_tenant_meta import PhoneNumberTenantMeta  # noqa: F401
+from app.models.sms import SmsSendRecord, SmsSignature, SmsTemplate, SmsTemplateGrant  # noqa: F401
+from app.models.sms_bulk_task import SmsBulkTask, SmsBulkTarget  # noqa: F401
+from app.models.learning import (  # noqa: F401
+    LearningCourse,
+    LearningCourseAssignment,
+    LearningMaterial,
+    LearningMaterialRecord,
+    LearningSection,
+)
+from app.models.learning_exam import (  # noqa: F401
+    LearningExam,
+    LearningExamAssignment,
+    LearningExamAttempt,
+    LearningExamQuestion,
+)
 from app.models.verify_file import VerifyFile  # noqa: F401
 from app.models.session_routing_rule import SessionRoutingRule  # noqa: F401
 from app.models.welcome_message_rule import WelcomeMessageRule  # noqa: F401
 from app.models.conversation_announcement_rule import ConversationAnnouncementRule  # noqa: F401
+from app.models.embedded_page import EmbeddedPage  # noqa: F401
 from app.models.satisfaction_survey_config import SatisfactionSurveyConfig, SatisfactionSurveyConfigVersion  # noqa: F401
 from app.models.emoji_setting import EmojiSetting  # noqa: F401
 from app.models.conversation_read_status_setting import ConversationReadStatusSetting  # noqa: F401
@@ -37,6 +61,8 @@ from app.models.conversation_user_stat_setting import ConversationUserStatSettin
 from app.models.visitor_timeout_close import VisitorTimeoutCloseSetting, VisitorTimeoutCloseState  # noqa: F401
 from app.models.satisfaction_survey_record import SatisfactionSurveyRecord  # noqa: F401
 from app.models.channel import Channel  # noqa: F401
+from app.models.channel_form_config_version import ChannelFormConfigVersion  # noqa: F401
+from app.models.channel_form_submission import ChannelFormSubmission  # noqa: F401
 from app.models.conversation import Conversation  # noqa: F401
 from app.models.conversation_queue_summary import ConversationQueueSummary  # noqa: F401
 from app.models.conversation_reception_event import ConversationReceptionEvent  # noqa: F401
@@ -76,3 +102,17 @@ from app.models.queue import QueueTask, QueuePolicy, QueueRoundRobinState, Queue
 from app.models.queue_no_show_setting import QueueNoShowSetting  # noqa: F401
 from app.models.knowledge_input_suggestion_setting import KnowledgeInputSuggestionSetting  # noqa: F401
 from app.models.outbound_task import OutboundTaskTemplate, OutboundTask, OutboundTaskTarget, OutboundCallRecord  # noqa: F401
+from app.models.auto_outbound import AutoOutboundTask, AutoOutboundTarget, AutoOutboundCallRecord  # noqa: F401
+from app.models.auto_outbound_event_subscription import (  # noqa: F401
+    AutoOutboundEventSubscription,
+    AutoOutboundEventSubscriptionAudit,
+)
+from app.models.outbound_prescreen import OutboundPrescreenIntent, OutboundPrescreenIntentExample  # noqa: F401
+from app.models.personal_auto_outbound import PersonalAutoOutboundCall, PersonalAutoOutboundSession, PersonalOutboundRecording  # noqa: F401
+from app.models.embedded_call_integration import EmbeddedCallIntegration  # noqa: F401
+from app.models.scheduling import (  # noqa: F401
+    ScheduleAssignment,
+    SchedulePublishedSnapshot,
+    ScheduleShift,
+)
+from app.models.scheduling_rule import ScheduleRuleSet  # noqa: F401

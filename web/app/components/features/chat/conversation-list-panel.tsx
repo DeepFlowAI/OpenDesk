@@ -299,6 +299,7 @@ export function ConversationListPanel({
           <div className="relative shrink-0" ref={dropdownRef}>
             <button
               data-testid="agent-status-trigger"
+              data-agent-status={currentStatus}
               onClick={() => {
                 setMaxConcurrentOpen(false)
                 setStatusDropdownOpen(!statusDropdownOpen)
@@ -503,7 +504,7 @@ export function ConversationListPanel({
             </button>
             {isHistoryView && (
               <span className="ml-auto truncate pl-2 text-[11px] font-normal text-[#999999]">
-                {t('ws.chat.last24Hours', locale)}
+                {t('ws.chat.last30Days', locale)}
               </span>
             )}
           </div>

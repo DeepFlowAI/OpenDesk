@@ -88,6 +88,10 @@ async def test_end_conversation_closes_and_runs_lifecycle_side_effects(monkeypat
     message_data = create_message.await_args.args[1]
     assert message_data["conversation_id"] == 100
     assert message_data["content"] == "客服已结束会话"
+    assert message_data["metadata_"] == {
+        "event_type": "conversation_ended",
+        "ended_by": "agent",
+    }
     update_last_message.assert_awaited_once()
     assert update_last_message.await_args.args[2] == "客服已结束会话"
     send_survey_invitation.assert_awaited_once_with(db, ended)

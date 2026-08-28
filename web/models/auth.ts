@@ -3,8 +3,13 @@ export type WorkspaceChatPreferences = {
   composer_input_height?: number
 }
 
+export type WorkspaceCallPreferences = {
+  outbound_number_id?: string
+}
+
 export type UserPreferences = {
   workspace_chat?: WorkspaceChatPreferences
+  workspace_call?: WorkspaceCallPreferences
   [key: string]: unknown
 }
 
@@ -28,6 +33,7 @@ export type UserInfo = {
   is_super_admin: boolean
   group_ids: number[]
   preferences: UserPreferences
+  default_language: string
 }
 
 export type LoginResponse = {

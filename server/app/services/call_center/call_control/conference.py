@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from uuid import uuid4
 
 from app.core.exceptions import (
     NotFoundError,
@@ -12,6 +13,7 @@ from app.core.exceptions import (
 from app.libs.telephony.base import (
     BaseTelephonyClient,
     TelephonyMethodNotFoundError,
+    TelephonyRPCError,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,17 @@ class ConferenceMixin:
 
         _ccs.CallControlService._validate_target(target_type, target_id, number)
         call = await _ccs.CallControlService._resolve_current_call(tenant_id, employee_id)
+        operation_id = f"conference:{uuid4().hex}"
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="conference_invite_started",
+            employee_id=employee_id,
+            target_type=target_type,
+            target_id=target_id,
+            target_name=number,
+        )
 
         # A colleague on the Web phone (no SIP extension) is reached by ringing
         # their browser, then merged into the room on answer — the SIP-originate
@@ -61,6 +74,7 @@ class ConferenceMixin:
                 employee_id=employee_id,
                 target_employee_id=target_id,
                 call=call,
+                operation_id=operation_id,
             )
 
         originate_kwargs, desc_str = await _ccs.CallControlService._resolve_target_originate(
@@ -71,7 +85,19 @@ class ConferenceMixin:
         )
         legs = await _ccs._legs(tenant_id, employee_id)
         legs.conference_participant_call_id = target_call_id
+        legs.conference_operation_id = operation_id
         await _ccs._save_legs(tenant_id, employee_id, legs)
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="conference_target_ringing",
+            employee_id=employee_id,
+            target_type=target_type,
+            target_id=target_id,
+            target_name=desc_str,
+            participant_call_id=target_call_id,
+        )
 
         # Unbridge the customer immediately so they stop hearing the agent;
         # play the three-party waiting tone off the request path so invite
@@ -163,6 +189,7 @@ class ConferenceMixin:
         employee_id: int,
         target_employee_id: int,
         call: _ccs.CurrentCall,
+        operation_id: str | None = None,
     ) -> dict:
         """Add a Web-phone colleague to the conference: ring their browser, then
         merge their answered WebRTC leg into the room off the request path.
@@ -174,6 +201,19 @@ class ConferenceMixin:
         failed. The two-party call is never disturbed while it rings.
         """
 
+        operation_id = operation_id or f"conference:{uuid4().hex}"
+        legs = await _ccs._legs(tenant_id, employee_id)
+        legs.conference_operation_id = operation_id
+        await _ccs._save_legs(tenant_id, employee_id, legs)
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="conference_target_ringing",
+            employee_id=employee_id,
+            target_type="employee",
+            target_id=target_employee_id,
+        )
         if call.webrtc_call_id is None:
             raise ValidationError("坐席媒体腿不可用，无法添加参与人")
         display = await _ccs.CallControlService._resolve_initiator_display(
@@ -238,7 +278,19 @@ class ConferenceMixin:
             legs = await _ccs._legs(tenant_id, employee_id)
             legs.conference_participant_call_id = target_leg
             legs.conference_target_employee_id = target_employee_id
+            legs.conference_operation_id = operation_id
             await _ccs._save_legs(tenant_id, employee_id, legs)
+            await _ccs.CallControlService._record_conference_event(
+                tenant_id=tenant_id,
+                call_id=call.customer_call_id,
+                operation_id=operation_id,
+                event_type="conference_target_answered",
+                employee_id=employee_id,
+                target_type="employee",
+                target_id=target_employee_id,
+                participant_call_id=target_leg,
+                result="succeeded",
+            )
             try:
                 await _ccs.CallControlService._merge_participant_room(
                     telephony,
@@ -303,6 +355,30 @@ class ConferenceMixin:
         # customer — the room already carries the customer's audio, so we only
         # stop the tone here (no re-bridge).
         await _ccs.CallControlService._stop_tone(telephony, call.customer_call_id)
+        # The invite phase unbridged customer↔agent so the waiting tone could
+        # play in isolation. FlowKit only carries a leg's live transcript into
+        # a room when the bridge it leaves is still standing (roles are read
+        # before the room tears bridges down), so re-bridge with ASR first —
+        # otherwise the realtime transcript stops the moment a participant
+        # joins.
+        try:
+            from app.services.system_settings_service import SystemSettingsService
+
+            transcribe = await SystemSettingsService.is_bridge_asr_enabled_managed(
+                tenant_id
+            )
+            await telephony.call_bridge(
+                call.customer_call_id,
+                call.webrtc_call_id,
+                transcribe=transcribe,
+            )
+        except Exception:  # noqa: BLE001
+            # Merge can still proceed without the pre-bridge; the room works,
+            # only the live transcript would stop.
+            logger.warning(
+                "conference merge pre-bridge failed customer=%s agent_leg=%s",
+                call.customer_call_id, call.webrtc_call_id, exc_info=True,
+            )
         leg_ids = [call.customer_call_id, call.webrtc_call_id, participant_call_id]
         try:
             result = await telephony.room_create(leg_call_ids=leg_ids)
@@ -316,6 +392,30 @@ class ConferenceMixin:
         # conference when the participant later hangs up / drops.
         await _ccs._register_conference_participant(
             tenant_id, employee_id, participant_call_id
+        )
+        operation_id = legs.conference_operation_id or f"conference:{participant_call_id}"
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="conference_target_answered",
+            employee_id=employee_id,
+            target_type="employee" if legs.conference_target_employee_id else "external",
+            target_id=legs.conference_target_employee_id,
+            participant_call_id=participant_call_id,
+            result="succeeded",
+        )
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="conference_merged",
+            employee_id=employee_id,
+            target_type="employee" if legs.conference_target_employee_id else "external",
+            target_id=legs.conference_target_employee_id,
+            participant_call_id=participant_call_id,
+            room_id=room_id,
+            result="succeeded",
         )
         logger.info(
             "conference merged (auto): agent=%s room=%s legs=%s",
@@ -369,6 +469,29 @@ class ConferenceMixin:
             changed = True
         if changed:
             await _ccs._save_legs(tenant_id, host_employee_id, legs)
+            try:
+                current = await _ccs.CallControlService._resolve_current_call(
+                    tenant_id, host_employee_id
+                )
+                await _ccs.CallControlService._record_conference_event(
+                    tenant_id=tenant_id,
+                    call_id=current.customer_call_id,
+                    operation_id=legs.conference_operation_id or f"conference:{participant_leg}",
+                    event_type="conference_participant_left",
+                    employee_id=host_employee_id,
+                    target_type="employee" if colleague_id is not None else "external",
+                    target_id=colleague_id,
+                    participant_call_id=participant_leg,
+                    room_id=legs.room_id,
+                    result="succeeded",
+                    reason_code="participant_left",
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "conference participant-left trajectory failed leg=%s",
+                    participant_leg,
+                    exc_info=True,
+                )
 
         # A Web-phone colleague occupied their own resource for the conference;
         # free it so they are not stuck busy after hanging up.
@@ -426,6 +549,22 @@ class ConferenceMixin:
         )
         await _ccs.CallControlService._notify_conference_result(
             tenant_id, employee_id, ok=False, reason=reason
+        )
+        current = await _ccs.CallControlService._resolve_current_call(
+            tenant_id, employee_id
+        )
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=current.customer_call_id,
+            operation_id=legs.conference_operation_id or f"conference:{participant_call_id}",
+            event_type="conference_failed",
+            employee_id=employee_id,
+            target_type="employee" if legs.conference_target_employee_id else "external",
+            target_id=legs.conference_target_employee_id,
+            participant_call_id=participant_call_id,
+            result="failed",
+            reason_code="target_no_answer" if reason in {"timeout", "no_answer"} else "target_unavailable",
+            reason_detail=reason,
         )
 
     @staticmethod
@@ -500,6 +639,18 @@ class ConferenceMixin:
         await _ccs._register_conference_participant(
             tenant_id, employee_id, participant
         )
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=legs.conference_operation_id or f"conference:{participant}",
+            event_type="conference_merged",
+            employee_id=employee_id,
+            target_type="employee" if legs.conference_target_employee_id else "external",
+            target_id=legs.conference_target_employee_id,
+            participant_call_id=participant,
+            room_id=room_id,
+            result="succeeded",
+        )
         logger.info(
             "conference merge: agent=%s room=%s legs=%s",
             employee_id, room_id, leg_ids,
@@ -540,6 +691,19 @@ class ConferenceMixin:
             "conference remove: agent=%s room=%s participant=%s",
             employee_id, legs.room_id, participant,
         )
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=legs.conference_operation_id or f"conference:{participant}",
+            event_type="conference_participant_removed",
+            employee_id=employee_id,
+            target_type="employee" if colleague_id is not None else "external",
+            target_id=colleague_id,
+            participant_call_id=participant,
+            room_id=legs.room_id,
+            result="succeeded",
+            reason_code="canceled_by_actor",
+        )
         return {"ok": True, "call_id": call.customer_call_id}
 
     @staticmethod
@@ -576,7 +740,10 @@ class ConferenceMixin:
                     tenant_id
                 )
                 await telephony.call_bridge(
-                    call.customer_call_id, participant_leg, transcribe=transcribe,
+                    call.customer_call_id,
+                    participant_leg,
+                    transcribe=transcribe,
+                    keepalive_on_peer_hangup=colleague_id is not None,
                 )
             except Exception:  # noqa: BLE001
                 # Survivors stay up; ownership handover below still proceeds so
@@ -637,6 +804,30 @@ class ConferenceMixin:
             employee_id=employee_id,
             customer_call_id=call.customer_call_id,
         )
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=legs.conference_operation_id or f"conference:{room_id}",
+            event_type="conference_host_left",
+            employee_id=employee_id,
+            target_type="employee" if colleague_id is not None else "external",
+            target_id=colleague_id,
+            participant_call_id=participant_leg,
+            room_id=room_id,
+            result="succeeded",
+            reason_code="participant_left",
+        )
+        if colleague_id is not None and participant_leg:
+            from app.services.call_record_service import CallRecordService
+
+            await CallRecordService.mark_reception_transferred_managed(
+                tenant_id=tenant_id,
+                call_id=call.customer_call_id,
+                from_agent_id=employee_id,
+                to_agent_id=colleague_id,
+                operation_id=legs.conference_operation_id or f"conference:{room_id}",
+                target_leg_id=participant_leg,
+            )
 
         logger.info(
             "conference leave: agent=%s room=%s colleague=%s",
@@ -681,40 +872,46 @@ class ConferenceMixin:
             tenant_id, employee_id, customer_call_id, reason="left_conference",
         )
         from app.services.call_center.orchestrator import _get_redis_client
-        from app.services.cc_agent_status_service import CcAgentStatusService
 
         r = _get_redis_client()
-        if r is not None:
-            try:
-                await _ccs.CcAgentResourceService.mark_after_call_work(
-                    r,
-                    tenant_id,
-                    employee_id,
-                    call_id=customer_call_id,
-                    reason="left_conference",
+        try:
+            async with _ccs.AsyncSessionLocal() as db:
+                from app.services.call_wrapup_service import (
+                    apply_post_call_agent_status,
+                    resolve_effective_wrapup_seconds,
                 )
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "conference leave: mark_after_call_work failed agent=%s/%s",
-                    tenant_id, employee_id, exc_info=True,
+
+                wrapup_seconds = await resolve_effective_wrapup_seconds(
+                    db, tenant_id, customer_call_id
                 )
                 try:
-                    await _ccs.CcAgentResourceService.force_release(
-                        r, tenant_id, employee_id, reason="left_conference",
+                    await apply_post_call_agent_status(
+                        db,
+                        r,
+                        tenant_id,
+                        employee_id,
+                        call_id=customer_call_id,
+                        reason="left_conference",
+                        wrapup_seconds=wrapup_seconds,
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning(
-                        "conference leave: force_release failed agent=%s/%s",
+                        "conference leave: post-call status failed agent=%s/%s",
                         tenant_id, employee_id, exc_info=True,
                     )
-        try:
-            async with _ccs.AsyncSessionLocal() as db:
-                await CcAgentStatusService.sync_pg_status(
-                    db, tenant_id, employee_id, "after_call_work", None
-                )
+                    if r is not None:
+                        try:
+                            await _ccs.CcAgentResourceService.force_release(
+                                r, tenant_id, employee_id, reason="left_conference",
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "conference leave: force_release failed agent=%s/%s",
+                                tenant_id, employee_id, exc_info=True,
+                            )
         except Exception:  # noqa: BLE001
             logger.warning(
-                "conference leave: sync_pg after_call_work failed agent=%s/%s",
+                "conference leave: sync post-call status failed agent=%s/%s",
                 tenant_id, employee_id, exc_info=True,
             )
         await _ccs._clear_legs(tenant_id, employee_id)
@@ -793,11 +990,22 @@ class ConferenceMixin:
             except Exception:  # noqa: BLE001
                 logger.warning("room close failed room=%s", room_id, exc_info=True)
         # Hang up every leg the agent controls.
+        from app.services.call_center.orchestrator import get_orchestrator
+
         for leg in [call.customer_call_id, call.webrtc_call_id, participant_leg]:
             if not leg:
                 continue
             try:
                 await telephony.call_hangup(leg, reason="conference_ended")
+            except TelephonyRPCError as exc:
+                if exc.code != -32002:
+                    logger.warning(
+                        "conference leg hangup rejected leg=%s code=%s", leg, exc.code
+                    )
+                    continue
+                # The kernel no longer knows this leg, so it will never send a
+                # call.hangup for it. Drop our own state now.
+                await get_orchestrator().discard_call_state(leg)
             except Exception:  # noqa: BLE001
                 logger.warning("conference leg hangup failed leg=%s", leg, exc_info=True)
         await _ccs._clear_legs(tenant_id, employee_id)
@@ -818,7 +1026,92 @@ class ConferenceMixin:
                     reason="conference_ended",
                 )
         logger.info("conference end-all: agent=%s room=%s", employee_id, room_id)
+        await ConferenceMixin._close_cdr_after_end_all(
+            tenant_id=tenant_id, call_id=call.customer_call_id
+        )
+        await _ccs.CallControlService._record_conference_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=legs.conference_operation_id or f"conference:{room_id or participant_leg}",
+            event_type="conference_ended",
+            employee_id=employee_id,
+            target_type="employee" if webrtc_participant is not None else "external",
+            target_id=webrtc_participant,
+            participant_call_id=participant_leg,
+            room_id=room_id,
+            result="succeeded",
+            reason_code="canceled_by_actor",
+        )
         return {"ok": True, "call_id": call.customer_call_id}
+
+    @staticmethod
+    async def _close_cdr_after_end_all(*, tenant_id: int, call_id: str) -> None:
+        """Finalize the CDR after the agent ended the whole conference.
+
+        Closing the room drops its legs inside the kernel without emitting a
+        ``call.hangup`` notification, and the per-leg hangups that follow are
+        then rejected because those legs are already gone. So nothing reaches
+        the orchestrator's hangup handler and the record would sit in ``active``
+        until some unrelated hangup happens to sweep it up. Writing it here is
+        idempotent — a notification that does arrive updates the same row.
+        """
+
+        from app.services.call_record_service import CallRecordService
+
+        try:
+            async with _ccs.AsyncSessionLocal() as db:
+                await CallRecordService.mark_completed(
+                    db,
+                    tenant_id,
+                    call_id,
+                    hangup_reason="conference_ended",
+                    hangup_party="agent",
+                )
+        except Exception:  # noqa: BLE001 — teardown already succeeded
+            logger.warning(
+                "close CDR after conference end-all failed call=%s",
+                call_id, exc_info=True,
+            )
+
+    @staticmethod
+    async def _record_conference_event(
+        *,
+        tenant_id: int,
+        call_id: str,
+        operation_id: str,
+        event_type: str,
+        employee_id: int,
+        target_type: str,
+        target_id: int | None,
+        target_name: str | None = None,
+        participant_call_id: str | None = None,
+        room_id: str | None = None,
+        result: str | None = None,
+        reason_code: str | None = None,
+        reason_detail: str | None = None,
+    ) -> None:
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            event_id=f"opendesk:{event_type}:{operation_id}",
+            event_type=event_type,
+            event_category="conference",
+            actor_type="agent",
+            actor_id=str(employee_id),
+            source="opendesk",
+            operation_id=operation_id,
+            call_leg_id=participant_call_id,
+            participant_role="conference_participant" if participant_call_id else None,
+            target_type="external_number" if target_type == "external" else target_type,
+            target_id=str(target_id) if target_id is not None else None,
+            target_name_snapshot=target_name,
+            result=result,
+            reason_code=reason_code,
+            reason_detail=reason_detail,
+            details={"room_id": room_id} if room_id else {},
+        )
 
 # Imported after the mixin class so this module can be imported directly
 # without a circular-import error (call_control_service imports the mixins).

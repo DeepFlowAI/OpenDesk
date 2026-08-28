@@ -1,20 +1,13 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { DEFAULT_LOCALE, detectBrowserLocale, type Locale } from '@/lib/languages'
 
-export type Locale = 'zh' | 'en'
+export type { Locale } from '@/lib/languages'
 
 type LocaleState = {
   locale: Locale
   _hydrated: boolean
   setLocale: (locale: Locale) => void
-}
-
-const DEFAULT_LOCALE: Locale = 'zh'
-
-function detectBrowserLocale(): Locale {
-  if (typeof navigator === 'undefined') return DEFAULT_LOCALE
-  const lang = navigator.language.toLowerCase()
-  return lang.startsWith('zh') ? 'zh' : 'en'
 }
 
 export const useLocaleStore = create<LocaleState>()(
@@ -31,7 +24,7 @@ export const useLocaleStore = create<LocaleState>()(
           if (!state._hydrated) {
             const stored = localStorage.getItem('app-locale')
             if (!stored || !JSON.parse(stored)?.state?.locale) {
-              state.locale = detectBrowserLocale()
+              state.locale = detectBrowserLocale('en')
             }
           }
           state._hydrated = true

@@ -10,9 +10,10 @@ import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { getDefaultAccessiblePath } from '@/utils/permissions'
 import { loginSchema, TENANT_IDENTIFIER_REGEX } from '@/utils/validators'
-import { cn } from '@/lib/utils'
 import { LegalFooter } from '@/components/legal-footer'
-import { SESSION_REPLACED_REASON } from '@/utils/session-replacement'
+import { LanguageSwitcher } from '@/components/language-switcher'
+import { logAuthEvent } from '@/utils/auth-log'
+import { SESSION_EXPIRED_REASON, isForcedLoginReason } from '@/utils/session-replacement'
 
 const LAST_TENANT_KEY = 'opendesk_last_tenant'
 // Survive AuthSessionKeeper reloads that strip ?sso_token= from the address bar.
@@ -87,7 +88,7 @@ function LoginPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const { setAuth, token, user } = useAuthStore()
-  const { locale, setLocale } = useLocaleStore()
+  const { locale } = useLocaleStore()
   const loginMutation = useLogin()
   const ssoLoginMutation = useSsoLogin()
   const { data: systemInfo } = useSystemInfo()
@@ -98,7 +99,7 @@ function LoginPage() {
   const [formData, setFormData] = useState({ tenant: '', username: '', password: '' })
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
   const [apiError, setApiError] = useState('')
-  const [showSessionReplacedAlert, setShowSessionReplacedAlert] = useState(false)
+  const [loginNoticeReason, setLoginNoticeReason] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
   const [touched, setTouched] = useState<Record<string, boolean>>({})
   const [mounted, setMounted] = useState(false)
@@ -108,14 +109,22 @@ function LoginPage() {
   }, [])
 
   useEffect(() => {
-    setShowSessionReplacedAlert(searchParams.get('reason') === SESSION_REPLACED_REASON)
+    const reason = searchParams.get('reason')
+    const next = isForcedLoginReason(reason) ? reason : null
+    setLoginNoticeReason(next)
+    if (next) {
+      void logAuthEvent('login_notice_shown', {
+        reason: next,
+        redirect: searchParams.get('redirect') ?? undefined,
+      })
+    }
   }, [searchParams])
 
   // SSO finished but a cross-tab reload interrupted router.replace — resume entry.
   // Do not auto-bounce every logged-in visit to /login (password account switch).
   useEffect(() => {
     if (!mounted || !token || !user) return
-    if (searchParams.get('reason') === SESSION_REPLACED_REASON) return
+    if (isForcedLoginReason(searchParams.get('reason'))) return
     if (searchParams.get('sso_token') || readPendingSso().token) return
     const path = consumeSsoNavigation()
     if (!path) return
@@ -236,7 +245,7 @@ function LoginPage() {
   const handleChange = (field: string, value: string) => {
     setFormData((prev) => ({ ...prev, [field]: value }))
     setApiError('')
-    setShowSessionReplacedAlert(false)
+    setLoginNoticeReason(null)
     if (touched[field]) {
       validateField(field, value)
     }
@@ -311,41 +320,21 @@ function LoginPage() {
           <IconHeadset size={28} className="text-foreground" />
           <span className="font-sans text-xl font-semibold text-foreground">OpenDesk</span>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setLocale('zh')}
-            className={cn(
-              'rounded-md px-3 py-2 text-sm font-medium transition-colors',
-              locale === 'zh'
-                ? 'bg-border text-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            中文
-          </button>
-          <button
-            type="button"
-            onClick={() => setLocale('en')}
-            className={cn(
-              'rounded-md px-3 py-2 text-sm transition-colors',
-              locale === 'en'
-                ? 'bg-border font-medium text-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            English
-          </button>
-        </div>
+        <LanguageSwitcher />
       </div>
 
       {/* Main area */}
       <div className="flex flex-1 items-center justify-center">
         <div className="w-[400px] rounded-xl border border-border bg-white p-6">
-          {showSessionReplacedAlert && (
+          {loginNoticeReason && (
             <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 p-3">
               <p className="text-[13px] text-destructive/80">
-                {t('login.session_replaced', locale)}
+                {t(
+                  loginNoticeReason === SESSION_EXPIRED_REASON
+                    ? 'login.session_expired'
+                    : 'login.session_replaced',
+                  locale,
+                )}
               </p>
             </div>
           )}

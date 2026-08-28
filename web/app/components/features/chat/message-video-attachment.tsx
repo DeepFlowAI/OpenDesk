@@ -11,10 +11,22 @@ const GENERIC_FILE_MIME_TYPES = new Set([
   'binary/octet-stream',
   'unknown',
 ])
+const INLINE_VIDEO_MIME_TYPES = new Set([
+  'video/mp4',
+  'video/quicktime',
+  'video/x-m4v',
+])
+const INLINE_VIDEO_EXTENSIONS = ['.mp4', '.mov', '.m4v'] as const
 
 type Mp4Candidate = {
   name?: string | null
   mime_type?: string | null
+}
+
+type NavigatorLike = {
+  userAgent?: string
+  platform?: string
+  maxTouchPoints?: number
 }
 
 type MessageVideoAttachmentProps = {
@@ -26,15 +38,50 @@ type MessageVideoAttachmentProps = {
   className?: string
 }
 
+function normalizedMimeType(file: Mp4Candidate): string {
+  return (file.mime_type ?? '').split(';', 1)[0].trim().toLowerCase()
+}
+
+function fileNameLower(file: Mp4Candidate): string {
+  return (file.name ?? '').toLowerCase()
+}
+
 export function isMp4VideoCandidate(file: Mp4Candidate | null | undefined): boolean {
   if (!file) return false
-  const mimeType = (file.mime_type ?? '').split(';', 1)[0].trim().toLowerCase()
+  const mimeType = normalizedMimeType(file)
   if (mimeType === 'video/mp4') return true
-  return GENERIC_FILE_MIME_TYPES.has(mimeType) && Boolean(file.name?.toLowerCase().endsWith('.mp4'))
+  return GENERIC_FILE_MIME_TYPES.has(mimeType) && fileNameLower(file).endsWith('.mp4')
+}
+
+export function isInlineVideoCandidate(file: Mp4Candidate | null | undefined): boolean {
+  if (!file) return false
+  const mimeType = normalizedMimeType(file)
+  const name = fileNameLower(file)
+  if (INLINE_VIDEO_MIME_TYPES.has(mimeType)) return true
+  if (INLINE_VIDEO_EXTENSIONS.some((extension) => name.endsWith(extension))) {
+    return GENERIC_FILE_MIME_TYPES.has(mimeType) || mimeType.startsWith('video/')
+  }
+  return false
 }
 
 export function canPlayH264Mp4(video: Pick<HTMLVideoElement, 'canPlayType'>): boolean {
   return video.canPlayType(H264_MP4_CONTENT_TYPE) !== ''
+}
+
+export function isAppleMobileWebKit(nav: NavigatorLike = typeof navigator === 'undefined' ? {} : navigator): boolean {
+  const userAgent = nav.userAgent ?? ''
+  if (/iP(hone|ad|od)/i.test(userAgent)) return true
+  const isMac = /Macintosh/i.test(userAgent) || /Mac/i.test(nav.platform ?? '')
+  return isMac && (nav.maxTouchPoints ?? 0) > 1
+}
+
+export function shouldAttemptInlineVideo(
+  video: Pick<HTMLVideoElement, 'canPlayType'>,
+  options: { isAppleMobile: boolean; file: Mp4Candidate | null | undefined },
+): boolean {
+  if (!isInlineVideoCandidate(options.file)) return false
+  if (options.isAppleMobile) return true
+  return isMp4VideoCandidate(options.file) && canPlayH264Mp4(video)
 }
 
 export function MessageVideoAttachment({

@@ -12,6 +12,7 @@ export type Ticket = {
   conversation_public_id: string | null
   call_record_id: number | null
   call_record_call_id: string | null
+  call_record_public_id: string | null
   user_id: number | null
   agent_id: number | null
   assignee_group_id: number | null
@@ -22,8 +23,31 @@ export type Ticket = {
   created_by: AuditActorRef | null
   updated_by: AuditActorRef | null
   custom_fields: Record<string, CustomFieldValue>
+  form_submission?: TicketFormSubmission | null
   created_at: string
   updated_at: string
+}
+
+export type TicketFormSubmissionFieldSnapshot = {
+  field_key: string | null
+  field_id: number | null
+  name: string
+  field_type: string
+  required: boolean
+  sort_order: number
+  value: unknown
+  type_config: Record<string, unknown>
+  options: import('@/models/field-definition').FdFieldOption[]
+  tree_nodes: import('@/models/field-definition').FdTreeNode[]
+}
+
+export type TicketFormSubmission = {
+  channel_id: number
+  channel_name: string
+  source: string
+  submitted_at: string
+  conversation_public_id: string | null
+  field_snapshot: TicketFormSubmissionFieldSnapshot[]
 }
 
 export type RelatedTicket = {

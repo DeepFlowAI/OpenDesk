@@ -25,6 +25,7 @@ import {
   conferenceRemove,
   endConsult,
   holdCurrentCall,
+  sendCurrentCallDtmf,
   setCurrentCallMute,
   startConsult,
   transferCurrentCall,
@@ -63,7 +64,7 @@ type SetMuted = (muted: boolean) => boolean
  * reason; falls back to status-specific or generic text. Async because ky
  * exposes the error body only via `response.json()`.
  */
-async function controlErrorMessage(e: unknown, fallback: string): Promise<string> {
+export async function controlErrorMessage(e: unknown, fallback: string): Promise<string> {
   const response = (e as { response?: Response })?.response
   if (response) {
     try {
@@ -142,6 +143,22 @@ export function useCallControl(setMuted: SetMuted) {
       toast.error(await controlErrorMessage(e, next ? '静音失败' : '取消静音失败'))
     })
   }, [muted, setMuted])
+
+  /**
+   * Send one DTMF key into the live call.
+   *
+   * Digits go out one at a time as the agent presses them, because that is how
+   * the far end's IVR expects to hear them. A sent key cannot be taken back, so
+   * a failure is always surfaced.
+   */
+  const sendDtmf = useCallback(async (key: string) => {
+    try {
+      const res = await sendCurrentCallDtmf(key)
+      if (!res.ok) throw new Error('dtmf_failed')
+    } catch (e) {
+      toast.error(await controlErrorMessage(e, '发送按键失败'))
+    }
+  }, [])
 
   const toggleHold = useCallback(async () => {
     if (pending) return
@@ -243,11 +260,13 @@ export function useCallControl(setMuted: SetMuted) {
       resumed?: boolean
     }) => {
       const reason = (result.reason || '').trim()
-      // Target hung up (normal consult end) — leave consult UI for 1:1.
-      // Also treat legacy payloads that used ok:false for this success path.
+      // Target hung up / consult cancelled (normal consult end) — leave the
+      // consult UI for 1:1. `ended` always means a normal end, and legacy
+      // payloads used ok:false with a reason for the same paths (e.g.
+      // "求助已取消") — those are successes, not failures.
       const consultEndedNormally =
-        (result.ok && result.ended) ||
-        (!result.ok && /结束咨询|恢复与客户/.test(reason))
+        result.ended === true ||
+        (!result.ok && /结束咨询|恢复与客户|取消/.test(reason))
       if (consultEndedNormally) {
         setMode('single')
         setConsultTarget(null)
@@ -438,6 +457,7 @@ export function useCallControl(setMuted: SetMuted) {
     restoreConsult,
     toggleMute,
     toggleHold,
+    sendDtmf,
     submitTransfer,
     beginConsult,
     onConsultResult,

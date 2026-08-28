@@ -11,6 +11,7 @@ import { useEmployees, useDeleteEmployee, useUpdateEmployeeStatus } from '@/serv
 import { useRoleOptions } from '@/service/use-roles'
 import type { Employee } from '@/models/employee'
 import type { EmployeeListParams } from '@/service/use-employees'
+import type { Locale } from '@/lib/languages'
 
 function ConfirmModal({
   title,
@@ -112,7 +113,7 @@ function RoleMultiSelect({
   value: string[]
   options: { value: string; label: string }[]
   onChange: (v: string[]) => void
-  locale: 'zh' | 'en'
+  locale: Locale
 }) {
   const [open, setOpen] = useState(false)
 
@@ -166,7 +167,7 @@ function RoleBadge({ label, system }: { label: string; system?: boolean }) {
   return <span className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-medium ${bg}`}>{label}</span>
 }
 
-function RoleBadges({ employee, locale }: { employee: Employee; locale: 'zh' | 'en' }) {
+function RoleBadges({ employee, locale }: { employee: Employee; locale: Locale }) {
   const assignments = employee.role_assignments ?? []
   if (assignments.length > 0) {
     return (
@@ -193,7 +194,7 @@ function RoleBadges({ employee, locale }: { employee: Employee; locale: 'zh' | '
   )
 }
 
-function StatusBadge({ active, locale }: { active: boolean; locale: 'zh' | 'en' }) {
+function StatusBadge({ active, locale }: { active: boolean; locale: Locale }) {
   const label = active ? t('emp.status.active', locale) : t('emp.status.inactive', locale)
   const bg = active ? 'bg-success/10 text-success' : 'bg-destructive/10 text-destructive/80'
   return <span className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-medium ${bg}`}>{label}</span>

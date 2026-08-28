@@ -3,12 +3,13 @@ Data scope helpers for ticket, conversation, queue, and call record queries.
 """
 from __future__ import annotations
 
-from sqlalchemy import false, or_
+from sqlalchemy import false, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.exceptions import ForbiddenError
 from app.models.call_record import CallRecord
+from app.models.call_record_access_scope import CallRecordAccessScope
 from app.models.conversation import Conversation
 from app.models.offline_message import OfflineMessage
 from app.models.ticket import Ticket
@@ -101,18 +102,28 @@ class DataScopeService:
     @staticmethod
     def build_call_record_predicate(
         principal: EffectivePrincipal,
-        peer_employee_ids: list[int],
+        peer_employee_ids: list[int] | None = None,
     ) -> ColumnElement | None:
+        del peer_employee_ids
         scope = DataScopeService.get_scope(principal, RESOURCE_CALL_RECORD)
         if scope == SCOPE_ALL:
             return None
-        if scope == SCOPE_SELF:
-            return CallRecord.agent_id == principal.user_id
-        return DataScopeService._build_group_predicate(
-            principal,
-            peer_employee_ids,
-            group_column=CallRecord.employee_group_id,
-            agent_column=CallRecord.agent_id,
+        subject_type = "employee"
+        subject_ids = [principal.user_id]
+        if scope == SCOPE_GROUP:
+            subject_type = "employee_group"
+            subject_ids = principal.group_ids
+        if not subject_ids:
+            return false()
+        return (
+            select(CallRecordAccessScope.id)
+            .where(
+                CallRecordAccessScope.tenant_id == principal.tenant_id,
+                CallRecordAccessScope.call_record_id == CallRecord.id,
+                CallRecordAccessScope.subject_type == subject_type,
+                CallRecordAccessScope.subject_id.in_(subject_ids),
+            )
+            .exists()
         )
 
     @staticmethod
@@ -191,22 +202,54 @@ class DataScopeService:
         )
 
     @staticmethod
-    def call_record_in_scope(
+    async def call_record_in_scope(
+        db: AsyncSession,
         principal: EffectivePrincipal,
         row: CallRecord,
-        peer_employee_ids: list[int],
     ) -> bool:
         scope = DataScopeService.get_scope(principal, RESOURCE_CALL_RECORD)
         if scope == SCOPE_ALL:
             return True
-        if scope == SCOPE_SELF:
-            return row.agent_id == principal.user_id
-        return DataScopeService._row_in_group_scope(
-            principal,
-            peer_employee_ids,
-            group_id=row.employee_group_id,
-            agent_id=row.agent_id,
+        subject_type = "employee" if scope == SCOPE_SELF else "employee_group"
+        subject_ids = [principal.user_id] if scope == SCOPE_SELF else principal.group_ids
+        if not subject_ids:
+            return False
+        query = select(CallRecordAccessScope.id).where(
+            CallRecordAccessScope.tenant_id == principal.tenant_id,
+            CallRecordAccessScope.call_record_id == row.id,
+            CallRecordAccessScope.subject_type == subject_type,
+            CallRecordAccessScope.subject_id.in_(subject_ids),
         )
+        return (await db.execute(query.limit(1))).scalar_one_or_none() is not None
+
+    @staticmethod
+    async def call_record_ids_in_scope(
+        db: AsyncSession,
+        principal: EffectivePrincipal,
+        call_record_ids: list[int],
+    ) -> set[int]:
+        """Batch variant of call_record_in_scope: return the subset visible to the principal."""
+        ids = sorted({call_record_id for call_record_id in call_record_ids if call_record_id is not None})
+        if not ids:
+            return set()
+        scope = DataScopeService.get_scope(principal, RESOURCE_CALL_RECORD)
+        if scope == SCOPE_ALL:
+            return set(ids)
+        subject_type = "employee" if scope == SCOPE_SELF else "employee_group"
+        subject_ids = [principal.user_id] if scope == SCOPE_SELF else principal.group_ids
+        if not subject_ids:
+            return set()
+        result = await db.execute(
+            select(CallRecordAccessScope.call_record_id)
+            .where(
+                CallRecordAccessScope.tenant_id == principal.tenant_id,
+                CallRecordAccessScope.call_record_id.in_(ids),
+                CallRecordAccessScope.subject_type == subject_type,
+                CallRecordAccessScope.subject_id.in_(subject_ids),
+            )
+            .distinct()
+        )
+        return {row[0] for row in result}
 
     @staticmethod
     def offline_message_in_scope(
@@ -261,12 +304,12 @@ class DataScopeService:
             raise ForbiddenError("Permission denied")
 
     @staticmethod
-    def assert_call_record_in_scope(
+    async def assert_call_record_in_scope(
+        db: AsyncSession,
         principal: EffectivePrincipal,
         row: CallRecord,
-        peer_employee_ids: list[int],
     ) -> None:
-        if not DataScopeService.call_record_in_scope(principal, row, peer_employee_ids):
+        if not await DataScopeService.call_record_in_scope(db, principal, row):
             raise ForbiddenError("Permission denied")
 
     @staticmethod

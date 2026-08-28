@@ -5,9 +5,14 @@ Note: the orchestrator-facing "pick idle agent from group" call also lives
 here under /agent-status/group/{id}/online and is guarded by the call
 workspace permission.
 """
+import csv
 from datetime import datetime
+from io import StringIO
+from typing import Literal
+import logging
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,11 +22,13 @@ from app.db.deps import (
     get_current_principal,
     get_db,
     get_redis,
+    require_active_call_controller,
     require_permission,
     require_permission_short_session,
 )
 from app.db.session import AsyncSessionLocal
 from app.schemas.permission import EffectivePrincipal
+from app.schemas.call_trajectory import CallTrajectoryResponse
 from app.libs.telephony import get_telephony_client
 from app.schemas.call_control import (
     CallControlResult,
@@ -37,6 +44,7 @@ from app.schemas.call_center import (
     AgentStatusResponse,
     AgentStatusUpdate,
     CallRecordDetail,
+    CallRecordFilterOptionsResponse,
     CallRecordUserLinkRequest,
     CallTranscriptResponse,
     CallUserAssociationResponse,
@@ -63,6 +71,7 @@ from app.services.call_center.outbound_dial_service import OutboundDialService
 from app.services.call_center.outbound_webrtc_service import OutboundWebRTCService
 from app.repositories.call_record_repository import CallRecordRepository
 from app.services.call_record_service import CallRecordService
+from app.services.call_trajectory_service import CallTrajectoryService
 from app.services.call_transcript_service import CallTranscriptService
 from app.services.call_user_association_service import CallUserAssociationService
 from app.services.cc_agent_resource_service import CcAgentResourceService
@@ -73,8 +82,214 @@ from app.schemas.tenant_phone_number import (
     TenantPhoneNumberResponse,
     TenantPhoneNumberTagsUpdate,
 )
+from app.schemas.outbound_prescreen import (
+    OutboundPrescreenConfigDraft,
+    OutboundPrescreenConfigResponse,
+    OutboundPrescreenDecision,
+    OutboundPrescreenTestRequest,
+)
+from app.services.outbound_prescreen_service import OutboundPrescreenService
+from app.schemas.personal_auto_outbound import (
+    PersonalAutoOutboundConfigResponse,
+    PersonalAutoOutboundSessionEnvelope,
+    PersonalAutoOutboundSessionResponse,
+    PersonalAutoOutboundStartRequest,
+    PersonalOpeningScriptUpdate,
+    PersonalOutboundRecordingResponse,
+)
+from app.schemas.auto_outbound import (
+    AutoOutboundAgentContextResponse,
+    AutoOutboundWrapupRequest,
+)
+from app.services.personal_auto_outbound_service import PersonalAutoOutboundService
 
 router = APIRouter(prefix="/call-center", tags=["CallCenter"])
+logger = logging.getLogger(__name__)
+
+
+@router.get(
+    "/outbound-prescreen-intents",
+    response_model=OutboundPrescreenConfigResponse,
+)
+async def get_outbound_prescreen_intents(
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.admin.settings.manage")
+    ),
+):
+    return await OutboundPrescreenService.get_config_managed(principal.tenant_id)
+
+
+@router.put(
+    "/outbound-prescreen-intents",
+    response_model=OutboundPrescreenConfigResponse,
+)
+async def update_outbound_prescreen_intents(
+    body: OutboundPrescreenConfigDraft,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.admin.settings.manage")
+    ),
+):
+    return await OutboundPrescreenService.save_config_managed(principal.tenant_id, body)
+
+
+@router.post(
+    "/outbound-prescreen-intents/test",
+    response_model=OutboundPrescreenDecision,
+)
+async def test_outbound_prescreen_intents(
+    body: OutboundPrescreenTestRequest,
+    _principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.admin.settings.manage")
+    ),
+):
+    return await OutboundPrescreenService.test_draft(body)
+
+
+# ───── Personal auto outbound ─────
+
+
+@router.get(
+    "/personal-auto-outbound/config",
+    response_model=PersonalAutoOutboundConfigResponse,
+)
+async def get_personal_auto_outbound_config(
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.personal_auto_outbound.use")
+    ),
+    r: aioredis.Redis = Depends(get_redis),
+):
+    return await PersonalAutoOutboundService.get_config_managed(principal, r)
+
+
+@router.post(
+    "/personal-auto-outbound/recordings/{recording_type}",
+    response_model=PersonalOutboundRecordingResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_personal_auto_outbound_recording(
+    recording_type: str,
+    file: UploadFile = File(...),
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.personal_auto_outbound.use")
+    ),
+):
+    return await PersonalAutoOutboundService.upload_recording_managed(
+        principal,
+        recording_type,
+        filename=file.filename or "audio.bin",
+        content_type=file.content_type,
+        data=await file.read(),
+    )
+
+
+@router.patch(
+    "/personal-auto-outbound/recordings/opening/script",
+    response_model=PersonalOutboundRecordingResponse,
+)
+async def save_personal_auto_outbound_opening_script(
+    body: PersonalOpeningScriptUpdate,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.personal_auto_outbound.use")
+    ),
+):
+    return await PersonalAutoOutboundService.save_opening_script_managed(
+        principal, body.script_text
+    )
+
+
+@router.delete("/personal-auto-outbound/recordings/{recording_type}")
+async def remove_personal_auto_outbound_recording(
+    recording_type: str,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.personal_auto_outbound.use")
+    ),
+):
+    await PersonalAutoOutboundService.remove_recording_managed(principal, recording_type)
+    return {"removed": True}
+
+
+@router.get(
+    "/personal-auto-outbound/sessions/current",
+    response_model=PersonalAutoOutboundSessionEnvelope,
+)
+async def get_current_personal_auto_outbound_session(
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.personal_auto_outbound.use")
+    ),
+):
+    return await PersonalAutoOutboundService.get_current_session_managed(principal)
+
+
+@router.post(
+    "/personal-auto-outbound/sessions",
+    response_model=PersonalAutoOutboundSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def start_personal_auto_outbound_session(
+    body: PersonalAutoOutboundStartRequest,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.personal_auto_outbound.use")
+    ),
+    r: aioredis.Redis = Depends(get_redis),
+):
+    session = await PersonalAutoOutboundService.start_session_managed(principal, body, r)
+    from app.services.call_center.orchestrator import get_orchestrator
+
+    get_orchestrator().personal_auto_outbound.start_session(session.id)
+    return session
+
+
+@router.post(
+    "/personal-auto-outbound/sessions/{session_id}/{action}",
+    response_model=PersonalAutoOutboundSessionResponse,
+)
+async def control_personal_auto_outbound_session(
+    session_id: int,
+    action: str,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.personal_auto_outbound.use")
+    ),
+    r: aioredis.Redis = Depends(get_redis),
+):
+    session = await PersonalAutoOutboundService.control_session_managed(
+        principal, session_id, action, r
+    )
+    from app.services.call_center.orchestrator import get_orchestrator
+
+    runtime = get_orchestrator().personal_auto_outbound
+    if action == "pause":
+        await runtime.pause_session(session_id)
+    elif action == "resume":
+        await runtime.resume_session(session_id)
+    elif action == "stop":
+        await runtime.stop_session(session_id)
+    return session
+
+
+@router.get(
+    "/personal-auto-outbound/calls/{call_id}/business-context",
+    response_model=AutoOutboundAgentContextResponse,
+)
+async def get_personal_auto_outbound_business_context(
+    call_id: int,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.workspace.use")
+    ),
+):
+    return await PersonalAutoOutboundService.get_business_context_managed(principal, call_id)
+
+
+@router.post("/personal-auto-outbound/calls/{call_id}/wrapup")
+async def submit_personal_auto_outbound_wrapup(
+    call_id: int,
+    body: AutoOutboundWrapupRequest,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.workspace.use")
+    ),
+):
+    return await PersonalAutoOutboundService.submit_wrapup_managed(
+        principal, call_id, body
+    )
 
 
 # ─────────── Agent status ───────────
@@ -217,95 +432,320 @@ async def list_transfer_queues(
     dependencies=[Depends(require_permission("call.record.view"))],
 )
 async def list_call_records(
-    page: int = 1,
-    per_page: int = 20,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
     direction: str | None = None,
-    agent_id: int | None = None,
+    call_source: str | None = None,
+    lifecycle_status: str | None = None,
+    finalization_status: str | None = None,
+    actual_reception_type: str | None = None,
+    call_result: str | None = None,
+    hangup_party: str | None = None,
+    hangup_reason_code: str | None = None,
+    initiator_agent_id: int | None = None,
+    last_serving_agent_id: int | None = None,
     user_id: int | None = None,
-    keyword: str | None = None,
+    last_queue_type: str | None = None,
+    last_queue_id: int | None = None,
+    recording_status: str | None = None,
+    satisfaction_result: list[
+        Literal["not_surveyed", "completed", "partial", "unanswered", "failed"]
+    ] | None = Query(default=None),
+    satisfaction_trigger_source: list[
+        Literal["auto_transfer", "agent_invite"]
+    ] | None = Query(default=None),
+    keyword: str | None = Query(None, max_length=100),
     start_time: datetime | None = None,
     end_time: datetime | None = None,
+    min_total_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    max_total_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    min_customer_ring_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    max_customer_ring_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    min_agent_wait_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    max_agent_wait_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    min_customer_agent_talk_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    max_customer_agent_talk_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
     principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
     db: AsyncSession = Depends(get_db),
 ):
     return await CallRecordService.get_paginated(
         db,
         principal.tenant_id,
-        page,
-        per_page,
-        direction,
-        agent_id,
-        user_id,
-        keyword,
-        start_time,
-        end_time,
+        page=page,
+        per_page=per_page,
+        direction=direction,
+        call_source=call_source,
+        lifecycle_status=lifecycle_status,
+        finalization_status=finalization_status,
+        actual_reception_type=actual_reception_type,
+        call_result=call_result,
+        hangup_party=hangup_party,
+        hangup_reason_code=hangup_reason_code,
+        initiator_agent_id=initiator_agent_id,
+        last_serving_agent_id=last_serving_agent_id,
+        user_id=user_id,
+        last_queue_type=last_queue_type,
+        last_queue_id=last_queue_id,
+        recording_status=recording_status,
+        satisfaction_results=satisfaction_result,
+        satisfaction_trigger_sources=satisfaction_trigger_source,
+        keyword=keyword,
+        start_time=start_time,
+        end_time=end_time,
+        min_total_duration_ms=min_total_duration_ms,
+        max_total_duration_ms=max_total_duration_ms,
+        min_customer_ring_duration_ms=min_customer_ring_duration_ms,
+        max_customer_ring_duration_ms=max_customer_ring_duration_ms,
+        min_agent_wait_duration_ms=min_agent_wait_duration_ms,
+        max_agent_wait_duration_ms=max_agent_wait_duration_ms,
+        min_customer_agent_talk_duration_ms=min_customer_agent_talk_duration_ms,
+        max_customer_agent_talk_duration_ms=max_customer_agent_talk_duration_ms,
         principal=principal,
     )
 
 
 @router.get(
-    "/call-records/{record_id}",
+    "/call-records-export.csv",
+    dependencies=[Depends(require_permission("call.record.export"))],
+)
+async def export_call_records(
+    direction: str | None = None,
+    call_source: str | None = None,
+    lifecycle_status: str | None = None,
+    finalization_status: str | None = None,
+    actual_reception_type: str | None = None,
+    call_result: str | None = None,
+    hangup_party: str | None = None,
+    hangup_reason_code: str | None = None,
+    initiator_agent_id: int | None = None,
+    last_serving_agent_id: int | None = None,
+    user_id: int | None = None,
+    last_queue_type: str | None = None,
+    last_queue_id: int | None = None,
+    recording_status: str | None = None,
+    keyword: str | None = Query(None, max_length=100),
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    satisfaction_result: list[
+        Literal["not_surveyed", "completed", "partial", "unanswered", "failed"]
+    ] | None = Query(default=None),
+    satisfaction_trigger_source: list[
+        Literal["auto_transfer", "agent_invite"]
+    ] | None = Query(default=None),
+    min_total_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    max_total_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    min_customer_ring_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    max_customer_ring_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    min_agent_wait_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    max_agent_wait_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    min_customer_agent_talk_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    max_customer_agent_talk_duration_ms: int | None = Query(None, ge=0, le=86_400_000),
+    principal: EffectivePrincipal = Depends(require_permission("call.record.export")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Export scoped call records using only the final satisfaction projection."""
+    result = await CallRecordService.get_paginated(
+        db,
+        principal.tenant_id,
+        page=1,
+        per_page=10_000,
+        direction=direction,
+        call_source=call_source,
+        lifecycle_status=lifecycle_status,
+        finalization_status=finalization_status,
+        actual_reception_type=actual_reception_type,
+        call_result=call_result,
+        hangup_party=hangup_party,
+        hangup_reason_code=hangup_reason_code,
+        initiator_agent_id=initiator_agent_id,
+        last_serving_agent_id=last_serving_agent_id,
+        user_id=user_id,
+        last_queue_type=last_queue_type,
+        last_queue_id=last_queue_id,
+        recording_status=recording_status,
+        keyword=keyword,
+        start_time=start_time,
+        end_time=end_time,
+        satisfaction_results=satisfaction_result,
+        satisfaction_trigger_sources=satisfaction_trigger_source,
+        min_total_duration_ms=min_total_duration_ms,
+        max_total_duration_ms=max_total_duration_ms,
+        min_customer_ring_duration_ms=min_customer_ring_duration_ms,
+        max_customer_ring_duration_ms=max_customer_ring_duration_ms,
+        min_agent_wait_duration_ms=min_agent_wait_duration_ms,
+        max_agent_wait_duration_ms=max_agent_wait_duration_ms,
+        min_customer_agent_talk_duration_ms=min_customer_agent_talk_duration_ms,
+        max_customer_agent_talk_duration_ms=max_customer_agent_talk_duration_ms,
+        principal=principal,
+    )
+    output = StringIO()
+    output.write("\ufeff")
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "call_id",
+            "direction",
+            "customer_number",
+            "started_at",
+            "ended_at",
+            "human_service_ended_at",
+            "satisfaction_result",
+            "satisfaction_trigger_source",
+            "satisfaction_option",
+            "satisfaction_answer_count",
+            "satisfaction_duration_ms",
+        ]
+    )
+    for item in result["items"]:
+        writer.writerow(
+            [
+                item["call_id"],
+                item["direction"],
+                item["customer_number"] or "",
+                item["started_at"].isoformat(),
+                item["ended_at"].isoformat() if item["ended_at"] else "",
+                (
+                    item["human_service_ended_at"].isoformat()
+                    if item["human_service_ended_at"]
+                    else ""
+                ),
+                item["satisfaction_result"] or "",
+                item["satisfaction_trigger_source"] or "",
+                item["satisfaction_primary_option_label"] or "",
+                item["satisfaction_answer_count"]
+                if item["satisfaction_answer_count"] is not None
+                else "",
+                item["satisfaction_duration_ms"]
+                if item["satisfaction_duration_ms"] is not None
+                else "",
+            ]
+        )
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="call-records.csv"'
+        },
+    )
+
+
+@router.get(
+    "/call-records/filter-options",
+    response_model=CallRecordFilterOptionsResponse,
+    dependencies=[Depends(require_permission("call.record.view"))],
+)
+async def get_call_record_filter_options(
+    principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return call-record filter options allowed by the current data scope."""
+    return await CallRecordService.get_filter_options(
+        db,
+        principal.tenant_id,
+        principal,
+    )
+
+
+@router.get(
+    "/call-records/{public_id}",
     response_model=CallRecordDetail,
     dependencies=[Depends(require_permission("call.record.view"))],
 )
 async def get_call_record(
-    record_id: int,
+    public_id: UUID,
     principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
     db: AsyncSession = Depends(get_db),
 ):
-    return await CallRecordService.get_by_id(db, record_id, principal.tenant_id, principal)
+    return await CallRecordService.get_by_public_id(
+        db,
+        public_id,
+        principal.tenant_id,
+        principal,
+    )
 
 
 @router.get(
-    "/call-records/{record_id}/transcript",
+    "/call-records/{public_id}/trajectory",
+    response_model=CallTrajectoryResponse,
+    dependencies=[Depends(require_permission("call.record.view"))],
+)
+async def get_call_record_trajectory(
+    public_id: UUID,
+    principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the scoped, stably ordered trajectory for a call record."""
+    return await CallTrajectoryService.get_trajectory(
+        db,
+        public_id=public_id,
+        tenant_id=principal.tenant_id,
+        principal=principal,
+    )
+
+
+@router.get(
+    "/call-records/{public_id}/transcript",
     response_model=CallTranscriptResponse,
     dependencies=[Depends(require_permission("call.record.view"))],
 )
 async def get_call_record_transcript(
-    record_id: int,
+    public_id: UUID,
     principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
     db: AsyncSession = Depends(get_db),
 ):
     return await CallTranscriptService.get_for_record(
-        db, record_id, principal.tenant_id, principal
+        db, public_id, principal.tenant_id, principal
     )
 
 
 @router.post(
-    "/call-records/{record_id}/identify-user",
+    "/call-records/{public_id}/identify-user",
     response_model=CallUserAssociationResponse,
     dependencies=[Depends(require_permission("call.record.view"))],
 )
 async def identify_call_record_user(
-    record_id: int,
-    current_user: dict = Depends(get_current_user),
+    public_id: UUID,
+    principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
     db: AsyncSession = Depends(get_db),
 ):
-    return await CallUserAssociationService.identify_for_record_id(
+    return await CallUserAssociationService.identify_for_public_id(
         db,
-        current_user["tenant_id"],
-        record_id,
-        actor_id=current_user.get("user_id"),
+        public_id,
+        principal,
+        actor_id=principal.user_id,
     )
 
 
 @router.put(
-    "/call-records/{record_id}/associated-user",
+    "/call-records/{public_id}/associated-user",
     response_model=CallUserAssociationResponse,
     dependencies=[Depends(require_permission("call.record.view"))],
 )
 async def link_call_record_user(
-    record_id: int,
+    public_id: UUID,
     body: CallRecordUserLinkRequest,
-    current_user: dict = Depends(get_current_user),
+    principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
     db: AsyncSession = Depends(get_db),
 ):
     return await CallUserAssociationService.link_user(
         db,
-        current_user["tenant_id"],
-        record_id,
+        public_id,
+        principal,
         body.user_id,
     )
+
+
+@router.delete(
+    "/call-records/{public_id}/associated-user",
+    response_model=CallUserAssociationResponse,
+    dependencies=[Depends(require_permission("call.record.view"))],
+)
+async def unlink_call_record_user(
+    public_id: UUID,
+    principal: EffectivePrincipal = Depends(require_permission("call.record.view")),
+    db: AsyncSession = Depends(get_db),
+):
+    return await CallUserAssociationService.unlink_user(db, public_id, principal)
 
 
 # ─────────── Agent WebRTC session ───────────
@@ -333,7 +773,7 @@ async def get_my_webrtc_session(
 )
 async def open_my_webrtc_session(
     body: WebRTCSessionOpenRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
     db: AsyncSession = Depends(get_db),
 ):
     return await AgentWebRTCSessionService.open(
@@ -349,7 +789,7 @@ async def open_my_webrtc_session(
     dependencies=[Depends(require_permission("call.workspace.use"))],
 )
 async def close_my_webrtc_session(
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
     db: AsyncSession = Depends(get_db),
 ):
     try:
@@ -372,7 +812,7 @@ async def close_my_webrtc_session(
 )
 async def webrtc_offer(
     body: WebRTCOfferRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """
     Forward a browser SDP offer to the telephony kernel. The kernel responds
@@ -414,7 +854,7 @@ async def webrtc_offer(
 )
 async def webrtc_ice(
     body: WebRTCIceRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """
     Forward a browser-side ICE candidate to the kernel.
@@ -459,29 +899,94 @@ async def webrtc_ice(
 # ─────────── Current-call control (hangup / reject) ───────────
 
 
+@router.get(
+    "/agents/me/current-call/satisfaction",
+    dependencies=[Depends(require_permission_short_session("call.workspace.use"))],
+)
+async def get_current_call_satisfaction(
+    current_user: dict = Depends(get_current_user),
+):
+    """Return survey trigger availability for the agent's live call."""
+
+    from app.services.call_center.satisfaction_handoff_service import (
+        CallSatisfactionHandoffService,
+    )
+
+    return await CallSatisfactionHandoffService.get_availability(
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+    )
+
+
+@router.post(
+    "/agents/me/current-call/satisfaction/invite",
+    dependencies=[
+        Depends(
+            require_permission_short_session(
+                "call.operation.satisfaction_invite"
+            )
+        )
+    ],
+)
+async def invite_current_call_satisfaction(
+    current_user: dict = Depends(require_active_call_controller),
+):
+    """End human service and keep the customer leg for a requested survey."""
+
+    from app.services.call_center.satisfaction_handoff_service import (
+        CallSatisfactionHandoffService,
+    )
+
+    return await CallSatisfactionHandoffService.handoff(
+        tenant_id=current_user["tenant_id"],
+        employee_id=current_user["user_id"],
+        trigger_source="agent_invite",
+    )
+
+
 @router.post(
     "/agents/me/current-call/hangup",
     dependencies=[Depends(require_permission_short_session("call.workspace.use"))],
 )
 async def hangup_current_call(
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """
-    Hang up whatever call the current agent is on.
+    End the current agent's service.
 
-    Delegated to the orchestrator, which tears down the agent's OWN WebRTC leg
-    as well as the customer SIP leg and resets the agent's status. When the
-    customer leg is already gone the orchestrator finalizes locally (no
-    `call.hangup` event will arrive to drive cleanup), so the agent can always
-    hang up and never gets stuck on 忙碌.
+    An eligible call first hands the surviving customer leg to the active
+    satisfaction flow. Ineligible calls and preparation failures preserve the
+    original hangup behavior, including robust cleanup when a leg is gone.
     """
 
     from app.services.call_center.orchestrator import get_orchestrator
+    from app.services.call_center.satisfaction_handoff_service import (
+        CallSatisfactionHandoffService,
+    )
 
-    return await get_orchestrator().hangup_agent_current_call(
+    handoff_failed = False
+    try:
+        handoff = await CallSatisfactionHandoffService.handoff(
+            tenant_id=current_user["tenant_id"],
+            employee_id=current_user["user_id"],
+            trigger_source="auto_transfer",
+        )
+        if handoff.get("ok"):
+            return handoff
+        handoff_failed = not handoff.get("skipped", False)
+    except Exception:  # noqa: BLE001
+        handoff_failed = True
+        logger.exception(
+            "Automatic satisfaction handoff failed; falling back to hangup"
+        )
+
+    result = await get_orchestrator().hangup_agent_current_call(
         tenant_id=current_user["tenant_id"],
         employee_id=current_user["user_id"],
     )
+    if handoff_failed:
+        return {**result, "note": "satisfaction_fallback_hangup"}
+    return result
 
 
 # ─────────── In-call control (hold / dtmf / transfer / consult / conference) ───────────
@@ -492,7 +997,7 @@ async def hangup_current_call(
     response_model=CallControlResult,
     dependencies=[Depends(require_permission_short_session("call.workspace.use"))],
 )
-async def hold_current_call(current_user: dict = Depends(get_current_user)):
+async def hold_current_call(current_user: dict = Depends(require_active_call_controller)):
     """Put the current agent's customer on hold."""
 
     from app.services.call_center.call_control_service import CallControlService
@@ -509,7 +1014,7 @@ async def hold_current_call(current_user: dict = Depends(get_current_user)):
     response_model=CallControlResult,
     dependencies=[Depends(require_permission_short_session("call.workspace.use"))],
 )
-async def unhold_current_call(current_user: dict = Depends(get_current_user)):
+async def unhold_current_call(current_user: dict = Depends(require_active_call_controller)):
     """Resume the current agent's held customer."""
 
     from app.services.call_center.call_control_service import CallControlService
@@ -528,7 +1033,7 @@ async def unhold_current_call(current_user: dict = Depends(get_current_user)):
 )
 async def send_dtmf(
     body: DtmfRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """Send DTMF digits into the current agent's live call."""
 
@@ -549,7 +1054,7 @@ async def send_dtmf(
 )
 async def set_mute(
     body: MuteRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """Mute or unmute the agent's own leg of the current call.
 
@@ -575,7 +1080,7 @@ async def set_mute(
 )
 async def transfer_current_call(
     body: TransferRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """Blind-transfer the current call to an employee, queue or external number."""
 
@@ -598,7 +1103,7 @@ async def transfer_current_call(
 )
 async def start_consult(
     body: ConsultRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """Start a consultation: auto-hold the customer and call a third party."""
 
@@ -619,7 +1124,7 @@ async def start_consult(
     response_model=CallControlResult,
     dependencies=[Depends(require_permission_short_session("call.operation.consult"))],
 )
-async def end_consult(current_user: dict = Depends(get_current_user)):
+async def end_consult(current_user: dict = Depends(require_active_call_controller)):
     """End the consultation: drop the third party and resume the customer."""
 
     from app.services.call_center.call_control_service import CallControlService
@@ -638,7 +1143,7 @@ async def end_consult(current_user: dict = Depends(get_current_user)):
 )
 async def conference_add(
     body: ConferenceAddRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """Call a new participant to (later) merge into a 3-way call."""
 
@@ -659,7 +1164,7 @@ async def conference_add(
     response_model=CallControlResult,
     dependencies=[Depends(require_permission_short_session("call.operation.conference"))],
 )
-async def conference_merge(current_user: dict = Depends(get_current_user)):
+async def conference_merge(current_user: dict = Depends(require_active_call_controller)):
     """Merge the held customer, agent and participant into one 3-way call."""
 
     from app.services.call_center.call_control_service import CallControlService
@@ -676,7 +1181,7 @@ async def conference_merge(current_user: dict = Depends(get_current_user)):
     response_model=CallControlResult,
     dependencies=[Depends(require_permission_short_session("call.operation.conference"))],
 )
-async def conference_remove(current_user: dict = Depends(get_current_user)):
+async def conference_remove(current_user: dict = Depends(require_active_call_controller)):
     """Remove the added participant from the conference."""
 
     from app.services.call_center.call_control_service import CallControlService
@@ -693,7 +1198,7 @@ async def conference_remove(current_user: dict = Depends(get_current_user)):
     response_model=CallControlResult,
     dependencies=[Depends(require_permission_short_session("call.operation.conference"))],
 )
-async def conference_leave(current_user: dict = Depends(get_current_user)):
+async def conference_leave(current_user: dict = Depends(require_active_call_controller)):
     """Leave the conference; the customer and participant keep talking."""
 
     from app.services.call_center.call_control_service import CallControlService
@@ -710,7 +1215,7 @@ async def conference_leave(current_user: dict = Depends(get_current_user)):
     response_model=CallControlResult,
     dependencies=[Depends(require_permission_short_session("call.operation.conference"))],
 )
-async def conference_end_all(current_user: dict = Depends(get_current_user)):
+async def conference_end_all(current_user: dict = Depends(require_active_call_controller)):
     """End the call for everyone in the conference."""
 
     from app.services.call_center.call_control_service import CallControlService
@@ -729,7 +1234,7 @@ async def conference_end_all(current_user: dict = Depends(get_current_user)):
 )
 async def media_reconnect(
     body: MediaReconnectRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """Rebuild the agent's WebRTC media leg after refresh / media_eof.
 
@@ -754,7 +1259,7 @@ async def media_reconnect(
 )
 async def accept_offer(
     body: AcceptOfferRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
     r: aioredis.Redis = Depends(get_redis),
 ):
     """
@@ -810,6 +1315,16 @@ async def accept_offer(
         r, tenant_id, employee_id, offer_id=body.offer_id
     )
     if offer_snapshot is None:
+        current = await CcAgentResourceService.get_snapshot(r, tenant_id, employee_id)
+        log.info(
+            "accept_offer: offer not acceptable offer_id=%s agent=%s/%s "
+            "current_state=%s current_offer=%s",
+            body.offer_id,
+            tenant_id,
+            employee_id,
+            (current or {}).get("resource_state") or "-",
+            (current or {}).get("offer_id") or "-",
+        )
         return AcceptOfferResponse(ok=False, error="offer_expired")
 
     accept_lock_token = await CcAgentResourceService.acquire_offer_accept_lock(
@@ -917,7 +1432,7 @@ async def accept_offer(
 )
 async def reject_offer(
     body: RejectOfferRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
     r: aioredis.Redis = Depends(get_redis),
 ):
     """Reject a pending offer; the workflow exits via the timeout outlet."""
@@ -945,6 +1460,14 @@ async def reject_offer(
     ):
         return {"ok": False, "error": "offer_expired"}
 
+    # Rejecting takes the agent out of the ready pool: they go busy and have to
+    # come back to ready themselves. Without this the queue can hand the very
+    # same call straight back, so a reject turns into "rejected and here it is
+    # again". Applied before the workflow is told, so the retry that follows
+    # cannot pick this agent.
+    async with AsyncSessionLocal() as db:
+        await CcAgentStatusService.set_status(db, tenant_id, employee_id, "busy", None, r)
+
     orchestrator = get_orchestrator()
     await orchestrator.deliver_offer_decision(
         body.offer_id, {"accept": False, "reason": "rejected"}
@@ -955,11 +1478,11 @@ async def reject_offer(
 @router.post(
     "/agents/me/dial",
     response_model=DialOutboundResponse,
-    dependencies=[Depends(require_permission_short_session("call.workspace.use"))],
+    dependencies=[Depends(require_permission_short_session("call.dial.outbound"))],
 )
 async def dial_outbound(
     body: DialOutboundRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
     r: aioredis.Redis = Depends(get_redis),
 ):
     """Agent-initiated outbound call. Forwards to FlowKit `call.originate`
@@ -979,13 +1502,35 @@ async def dial_outbound(
     )
 
 
+@router.get(
+    "/agents/me/outbound-numbers",
+    response_model=TenantPhoneNumberListResponse,
+    dependencies=[Depends(require_permission("call.dial.outbound"))],
+)
+async def list_my_outbound_numbers(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await TenantPhoneNumberService.list_for_tenant(
+        db, current_user["tenant_id"], page=1, per_page=1000
+    )
+    items = [item for item in result.items if "outbound" in item.call_types]
+    return TenantPhoneNumberListResponse(
+        items=items,
+        total=len(items),
+        page=1,
+        per_page=1000,
+        pages=1 if items else 0,
+    )
+
+
 @router.post(
     "/agents/me/dial/cancel",
     dependencies=[Depends(require_permission_short_session("call.workspace.use"))],
 )
 async def cancel_outbound(
     body: CancelOutboundRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
     r: aioredis.Redis = Depends(get_redis),
 ):
     """Cancel an in-flight outbound call started by this agent.
@@ -1029,11 +1574,11 @@ async def cancel_outbound(
 @router.post(
     "/agents/me/dial-webrtc/offer",
     response_model=DialWebRTCOfferResponse,
-    dependencies=[Depends(require_permission_short_session("call.workspace.use"))],
+    dependencies=[Depends(require_permission_short_session("call.dial.outbound"))],
 )
 async def dial_webrtc_offer(
     body: DialWebRTCOfferRequest,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_active_call_controller),
 ):
     """Attach the agent's browser WebRTC leg to an in-flight outbound SIP
     call. Backend forwards the offer SDP to FlowKit, records the pairing,

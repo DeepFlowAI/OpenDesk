@@ -80,6 +80,21 @@
       : 'bottom-right'
   }
 
+  // Keep in sync with SUPPORTED_LOCALES in web/lib/languages.ts.
+  var SUPPORTED_LOCALES = ['zh', 'en', 'fr-FR', 'es-ES', 'es-419', 'pt-BR', 'pt-PT', 'it-IT', 'nl-NL', 'pl-PL', 'ru-RU', 'tr-TR', 'th-TH', 'vi-VN', 'id-ID']
+
+  function normalizeLocale(value) {
+    if (typeof value !== 'string') return null
+    var trimmed = value.trim()
+    if (!trimmed) return null
+    var lower = trimmed.replace('_', '-').toLowerCase()
+    if (lower === 'auto') return 'auto'
+    for (var i = 0; i < SUPPORTED_LOCALES.length; i++) {
+      if (SUPPORTED_LOCALES[i].toLowerCase() === lower) return SUPPORTED_LOCALES[i]
+    }
+    return null
+  }
+
   function createSdkError(code, message, detail) {
     return { code: code, message: message, detail: detail }
   }
@@ -192,12 +207,14 @@
     var launcher = options.launcher || {}
     var windowOptions = options.window || {}
     var appBaseUrl = normalizeAppBaseUrl(options.appBaseUrl || options.baseUrl)
+    var normalizedLocale = normalizeLocale(options.locale)
     return {
       channelKey: String(options.channelKey || '').trim(),
       baseUrl: appBaseUrl,
       appBaseUrl: appBaseUrl,
       apiBaseUrl: normalizeApiBaseUrl(options.apiBaseUrl, appBaseUrl),
-      locale: options.locale || 'auto',
+      locale: normalizedLocale,
+      localeProvided: Object.prototype.hasOwnProperty.call(options, 'locale') && normalizedLocale !== null,
       visitor: normalizeVisitor(options.visitor),
       contextToken: normalizeContextToken(options.contextToken),
       sessionSummary: normalizeContextObject(options.sessionSummary),
@@ -338,6 +355,43 @@
     if (defaultChannelKey === this.channelKey) defaultChannelKey = null
   }
 
+  function fetchChannelConfig(apiBaseUrl, channelKey) {
+    return fetch(apiBaseUrl + '/v1/public/channels/' + encodeURIComponent(channelKey), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      credentials: 'omit',
+    }).then(function (response) {
+      if (response.status === 404) {
+        throw createSdkError('CHANNEL_NOT_FOUND', 'OpenDesk channel was not found.')
+      }
+      if (!response.ok) {
+        throw createSdkError('CONFIG_LOAD_FAILED', 'Failed to load OpenDesk channel config.', {
+          status: response.status,
+        })
+      }
+      return response.json()
+    })
+  }
+
+  function configFailureProps(error) {
+    var props = {
+      code: error && error.code ? error.code : 'CONFIG_LOAD_FAILED',
+    }
+    if (error && error.name) props.name = String(error.name)
+    if (error && error.message) props.message = String(error.message).slice(0, 256)
+    var status = error && error.detail && error.detail.status
+    if (status) props.status = status
+    return props
+  }
+
+  function isTransientConfigError(error) {
+    if (!error) return true
+    if (error.name === 'AbortError') return false
+    if (error.code === 'CHANNEL_NOT_FOUND') return false
+    if (error.code === 'CONFIG_LOAD_FAILED' && error.detail && error.detail.status) return false
+    return !error.code
+  }
+
   OpenDeskInstance.prototype.load = function () {
     var self = this
     if (!this.channelKey) {
@@ -345,22 +399,19 @@
       return
     }
 
-    fetch(this.apiBaseUrl + '/v1/public/channels/' + encodeURIComponent(this.channelKey), {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      credentials: 'omit',
-    })
-      .then(function (response) {
-        if (response.status === 404) {
-          throw createSdkError('CHANNEL_NOT_FOUND', 'OpenDesk channel was not found.')
+    var attempt = 0
+    var request = function () {
+      return fetchChannelConfig(self.apiBaseUrl, self.channelKey).catch(function (error) {
+        if (self.destroyed) throw error
+        if (attempt < 1 && isTransientConfigError(error)) {
+          attempt += 1
+          return new Promise(function (resolve) { setTimeout(resolve, 400) }).then(request)
         }
-        if (!response.ok) {
-          throw createSdkError('CONFIG_LOAD_FAILED', 'Failed to load OpenDesk channel config.', {
-            status: response.status,
-          })
-        }
-        return response.json()
+        throw error
       })
+    }
+
+    request()
       .then(function (channel) {
         if (self.destroyed) return
         self.channel = channel
@@ -377,9 +428,10 @@
       })
       .catch(function (error) {
         if (self.destroyed) return
-        self.track('sdk_config_failed', {
-          code: error && error.code ? error.code : 'CONFIG_LOAD_FAILED',
-        }, 'error')
+        if (error && error.name === 'AbortError') return
+        var props = configFailureProps(error)
+        var level = isTransientConfigError(error) ? 'warn' : 'error'
+        self.track('sdk_config_failed', props, level)
         if (error && error.code) {
           self.fail(error)
           return
@@ -538,11 +590,11 @@
       if (this.options.testMode) {
         url.searchParams.set('opendesk_test', '1')
       }
-      if (this.options.locale && this.options.locale !== 'auto') {
-        url.searchParams.set('locale', this.options.locale)
-      }
     } else if (this.options.contextToken) {
       url.searchParams.set('contextToken', this.options.contextToken)
+    }
+    if (this.options.localeProvided && this.options.locale) {
+      url.searchParams.set('locale', this.options.locale)
     }
     return url.toString()
   }
@@ -596,21 +648,47 @@
       this.emitError(createSdkError('INVALID_CONTEXT', 'updateContext requires a context object.'))
       return this
     }
+    // Only an explicit contextToken:null from the caller means "signed out".
+    // A plain sessionSummary/visitor update must never look like a logout, even
+    // though every frame message carries the current (possibly null) token.
+    var contextTokenCleared = false
     if (Object.prototype.hasOwnProperty.call(context, 'contextToken')) {
       this.options.contextToken = normalizeContextToken(context.contextToken)
+      contextTokenCleared = !this.options.contextToken
     }
     if (Object.prototype.hasOwnProperty.call(context, 'sessionSummary')) {
       this.options.sessionSummary = normalizeContextObject(context.sessionSummary)
     }
-    if (context.visitor && typeof context.visitor === 'object') {
+    if (Object.prototype.hasOwnProperty.call(context, 'visitor') && context.visitor === null) {
+      this.options.visitor = null
+    } else if (context.visitor && typeof context.visitor === 'object') {
       this.options.visitor = normalizeVisitor(context.visitor)
     }
-    this.postFrameMessage('update_context', { active: this.state.open })
+    this.postFrameMessage('update_context', {
+      active: this.state.open,
+      contextTokenCleared: contextTokenCleared,
+    })
     this.track('sdk_context_updated', {
       has_context_token: Boolean(this.options.contextToken),
       has_session_summary: Boolean(this.options.sessionSummary),
       has_visitor: Boolean(this.options.visitor),
+      context_token_cleared: contextTokenCleared,
     })
+    return this
+  }
+
+  /**
+   * Clear the signed-in Web SDK identity. Host sites should call this on logout
+   * so the next visitor session does not reuse the previous account.
+   */
+  OpenDeskInstance.prototype.logout = function () {
+    this.options.contextToken = null
+    this.options.visitor = null
+    this.postFrameMessage('update_context', {
+      active: this.state.open,
+      contextTokenCleared: true,
+    })
+    this.track('sdk_logout')
     return this
   }
 

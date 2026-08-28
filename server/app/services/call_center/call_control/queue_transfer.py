@@ -48,6 +48,22 @@ class QueueTransferMixin:
         call = await _ccs.CallControlService._resolve_current_call(
             tenant_id, employee_id
         )
+        operation_id = f"queue-transfer:{uuid.uuid4().hex}"
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            event_id=f"opendesk:transfer-started:{operation_id}",
+            event_type="transfer_started",
+            event_category="transfer",
+            actor_type="agent",
+            actor_id=str(employee_id),
+            source="opendesk",
+            operation_id=operation_id,
+            target_type="queue",
+            target_id=str(queue_id),
+        )
         await _ccs.CallControlService._validate_queue_transfer_target(
             tenant_id, queue_id
         )
@@ -83,6 +99,8 @@ class QueueTransferMixin:
                 tenant_id=tenant_id,
                 queue_id=queue_id,
                 customer_call_id=call.customer_call_id,
+                operation_id=operation_id,
+                from_employee_id=employee_id,
             ),
             name=f"queue-transfer:{call.customer_call_id}",
         )
@@ -176,6 +194,8 @@ class QueueTransferMixin:
         tenant_id: int,
         queue_id: int,
         customer_call_id: str,
+        operation_id: str | None = None,
+        from_employee_id: int | None = None,
     ) -> None:
         """Background loop: pick → ring → bridge, until budget ends."""
 
@@ -184,6 +204,7 @@ class QueueTransferMixin:
             get_orchestrator,
         )
 
+        operation_id = operation_id or f"queue-transfer:{uuid.uuid4().hex}"
         reserved_employee_id: int | None = None
         reserved_offer_id: str | None = None
         agent_leg_call_id: str | None = None
@@ -271,19 +292,22 @@ class QueueTransferMixin:
 
                     t0 = time.monotonic()
                     try:
-                        answered, agent_leg_call_id, incoming_pushed = (
-                            await _ccs.CallControlService._queue_transfer_ring_agent(
-                                telephony,
-                                tenant_id=tenant_id,
-                                queue_id=queue_id,
-                                customer_call_id=customer_call_id,
-                                employee_id=employee_id,
-                                offer_id=offer_id,
-                                redis=r,
-                                caller_number=caller_number,
-                                called_number=called_number,
-                                incoming_pushed_out=pushed_out,
-                            )
+                        (
+                            answered,
+                            agent_leg_call_id,
+                            incoming_pushed,
+                            agent_leg_is_webrtc,
+                        ) = await _ccs.CallControlService._queue_transfer_ring_agent(
+                            telephony,
+                            tenant_id=tenant_id,
+                            queue_id=queue_id,
+                            customer_call_id=customer_call_id,
+                            employee_id=employee_id,
+                            offer_id=offer_id,
+                            redis=r,
+                            caller_number=caller_number,
+                            called_number=called_number,
+                            incoming_pushed_out=pushed_out,
                         )
                     except asyncio.CancelledError:
                         incoming_pushed = pushed_out[0]
@@ -331,11 +355,44 @@ class QueueTransferMixin:
                             customer_call_id=customer_call_id,
                             employee_id=employee_id,
                             agent_leg_call_id=agent_leg_call_id or "",
+                            agent_leg_is_webrtc=agent_leg_is_webrtc,
                             offer_id=offer_id,
                             redis=r,
                         )
                     )
                     if handed_over:
+                        from app.services.call_trajectory_service import CallTrajectoryService
+
+                        await CallTrajectoryService.append_for_call_id_best_effort(
+                            tenant_id=tenant_id,
+                            call_id=customer_call_id,
+                            event_id=f"opendesk:transfer-completed:{operation_id}",
+                            event_type="transfer_completed",
+                            event_category="transfer",
+                            actor_type="agent" if from_employee_id is not None else "system",
+                            actor_id=str(from_employee_id) if from_employee_id is not None else None,
+                            source="opendesk",
+                            operation_id=operation_id,
+                            call_leg_id=agent_leg_call_id,
+                            participant_role="transfer_target",
+                            target_type="employee",
+                            target_id=str(employee_id),
+                            queue_type=_QUEUE_TYPE,
+                            queue_id=queue_id,
+                            result="succeeded",
+                            reason_code="transfer_completed",
+                        )
+                        if from_employee_id is not None:
+                            from app.services.call_record_service import CallRecordService
+
+                            await CallRecordService.mark_reception_transferred_managed(
+                                tenant_id=tenant_id,
+                                call_id=customer_call_id,
+                                from_agent_id=from_employee_id,
+                                to_agent_id=employee_id,
+                                operation_id=operation_id,
+                                target_leg_id=agent_leg_call_id,
+                            )
                         reserved_employee_id = None
                         reserved_offer_id = None
                         incoming_pushed = False
@@ -408,6 +465,24 @@ class QueueTransferMixin:
                 customer_call_id=customer_call_id,
                 queue_id=queue_id,
             )
+            from app.services.call_trajectory_service import CallTrajectoryService
+
+            await CallTrajectoryService.append_for_call_id_best_effort(
+                tenant_id=tenant_id,
+                call_id=customer_call_id,
+                event_id=f"opendesk:transfer-failed:{operation_id}",
+                event_type="transfer_failed",
+                event_category="transfer",
+                actor_type="system",
+                source="opendesk",
+                operation_id=operation_id,
+                target_type="queue",
+                target_id=str(queue_id),
+                queue_type=_QUEUE_TYPE,
+                queue_id=queue_id,
+                result="timeout",
+                reason_code="queue_timeout",
+            )
         except asyncio.CancelledError:
             logger.info(
                 "queue transfer: cancelled tenant=%s call=%s queue=%s",
@@ -469,13 +544,12 @@ class QueueTransferMixin:
 
         from sqlalchemy import select
 
-        from app.constants.call_center import ACTIVE_CALL_RECORD_STATES
         from app.models.call_record import CallRecord
 
         async with _ccs.AsyncSessionLocal() as db:
             row = (
                 await db.execute(
-                    select(CallRecord.state).where(
+                    select(CallRecord.lifecycle_status).where(
                         CallRecord.tenant_id == tenant_id,
                         CallRecord.call_id == customer_call_id,
                     )
@@ -484,7 +558,7 @@ class QueueTransferMixin:
             if row is None:
                 row = (
                     await db.execute(
-                        select(CallRecord.state).where(
+                        select(CallRecord.lifecycle_status).where(
                             CallRecord.tenant_id == tenant_id,
                             CallRecord.root_call_id == customer_call_id,
                         )
@@ -492,7 +566,7 @@ class QueueTransferMixin:
                 ).scalar_one_or_none()
         if row is None:
             return False
-        return row in ACTIVE_CALL_RECORD_STATES
+        return row == "active"
 
     @staticmethod
     async def _queue_transfer_customer_numbers(
@@ -508,30 +582,16 @@ class QueueTransferMixin:
             )
             if row is None:
                 return "", ""
-            return (row.from_number or "", row.to_number or "")
+            if row.direction == "inbound":
+                return (row.customer_number or "", row.service_number or "")
+            return (row.service_number or "", row.customer_number or "")
 
     @staticmethod
     async def _queue_transfer_restore_in_progress(
         tenant_id: int, customer_call_id: str
     ) -> None:
-        """Set call record state back to in_progress after a successful bridge.
-
-        Only patches ``state`` — answered_at / ring_duration were set when the
-        original agent answered and must not be rewritten.
-        """
-
-        from app.constants.call_center import CallRecordState
-        from app.repositories.call_record_repository import CallRecordRepository
-
-        async with _ccs.AsyncSessionLocal() as db:
-            row = await CallRecordRepository.get_by_call_id(
-                db, customer_call_id, tenant_id
-            )
-            if row is None:
-                return
-            await CallRecordRepository.update(
-                db, row, {"state": CallRecordState.IN_PROGRESS.value}
-            )
+        """The target CDR remains active across queue transfers."""
+        del tenant_id, customer_call_id
 
     @staticmethod
     async def _queue_transfer_pick_agent(
@@ -571,10 +631,10 @@ class QueueTransferMixin:
         caller_number: str = "",
         called_number: str = "",
         incoming_pushed_out: list[bool] | None = None,
-    ) -> tuple[bool, str | None, bool]:
+    ) -> tuple[bool, str | None, bool, bool]:
         """Ring one reserved agent.
 
-        Returns ``(answered, agent_leg_call_id, incoming_pushed)``.
+        Returns ``(answered, agent_leg_call_id, incoming_pushed, leg_is_webrtc)``.
         ``incoming_pushed_out`` is updated as soon as an incoming is pushed so
         a cancel during the ring wait still sees the correct flag.
         """
@@ -626,7 +686,7 @@ class QueueTransferMixin:
         caller_number: str = "",
         called_number: str = "",
         incoming_pushed_out: list[bool] | None = None,
-    ) -> tuple[bool, str | None, bool]:
+    ) -> tuple[bool, str | None, bool, bool]:
         from app.repositories.sip_extension_repository import SipExtensionRepository
         from app.services.agent_call_device_service import DEVICE_SIP_PHONE
         from app.services.call_center.orchestrator import get_orchestrator
@@ -657,7 +717,7 @@ class QueueTransferMixin:
                 "queue transfer: SIP extension unavailable agent=%s/%s call=%s",
                 tenant_id, employee_id, customer_call_id,
             )
-            return False, None, False
+            return False, None, False, False
 
         try:
             await CcAgentResourceService.mark_ringing(
@@ -673,7 +733,7 @@ class QueueTransferMixin:
                 "queue transfer: SIP mark_ringing failed agent=%s/%s call=%s",
                 tenant_id, employee_id, customer_call_id,
             )
-            return False, None, False
+            return False, None, False, False
 
         try:
             result = await telephony.call_originate(extension=sip_user_id)
@@ -683,11 +743,11 @@ class QueueTransferMixin:
                 tenant_id, employee_id, customer_call_id,
                 exc_info=True,
             )
-            return False, None, False
+            return False, None, False, False
 
         agent_leg = (result or {}).get("call_id")
         if not agent_leg:
-            return False, None, False
+            return False, None, False, False
 
         waiter = orchestrator.register_leg_wait(agent_leg)
         orchestrator.set_pending_sip_originate(customer_call_id, agent_leg)
@@ -734,7 +794,7 @@ class QueueTransferMixin:
                 "queue transfer: SIP no answer agent=%s/%s call=%s",
                 tenant_id, employee_id, customer_call_id,
             )
-            return False, agent_leg, incoming_pushed
+            return False, agent_leg, incoming_pushed, False
 
         try:
             await orchestrator.notify_agent_call_answered(
@@ -747,7 +807,7 @@ class QueueTransferMixin:
                 "queue transfer: SIP answered notify failed agent=%s/%s call=%s",
                 tenant_id, employee_id, customer_call_id,
             )
-        return True, agent_leg, incoming_pushed
+        return True, agent_leg, incoming_pushed, False
 
     @staticmethod
     async def _queue_transfer_ring_webrtc(
@@ -761,7 +821,7 @@ class QueueTransferMixin:
         caller_number: str = "",
         called_number: str = "",
         incoming_pushed_out: list[bool] | None = None,
-    ) -> tuple[bool, str | None, bool]:
+    ) -> tuple[bool, str | None, bool, bool]:
         from app.services.agent_status_service import AgentStatusService
         from app.services.call_center.orchestrator import get_orchestrator
         from app.services.cc_agent_resource_service import CcAgentResourceService
@@ -772,7 +832,7 @@ class QueueTransferMixin:
                 "agent=%s/%s call=%s",
                 tenant_id, employee_id, customer_call_id,
             )
-            return False, None, False
+            return False, None, False, True
 
         orchestrator = get_orchestrator()
         future = orchestrator.register_offer(offer_id)
@@ -799,7 +859,7 @@ class QueueTransferMixin:
 
         if not pushed:
             orchestrator.cancel_offer(offer_id)
-            return False, None, False
+            return False, None, False, True
 
         if incoming_pushed_out is not None:
             incoming_pushed_out[0] = True
@@ -819,7 +879,7 @@ class QueueTransferMixin:
                 tenant_id, employee_id, customer_call_id,
             )
             orchestrator.cancel_offer(offer_id)
-            return False, None, True
+            return False, None, True, True
 
         try:
             decision = await asyncio.wait_for(future, timeout=_RING_TIMEOUT_S)
@@ -835,12 +895,12 @@ class QueueTransferMixin:
                 "queue transfer: WebRTC no accept agent=%s/%s call=%s decision=%s",
                 tenant_id, employee_id, customer_call_id, decision,
             )
-            return False, None, True
+            return False, None, True, True
 
         webrtc_call_id = decision.get("webrtc_call_id")
         if not webrtc_call_id:
-            return False, None, True
-        return True, str(webrtc_call_id), True
+            return False, None, True, True
+        return True, str(webrtc_call_id), True, True
 
     @staticmethod
     async def _queue_transfer_handover(
@@ -853,6 +913,7 @@ class QueueTransferMixin:
         agent_leg_call_id: str,
         offer_id: str,
         redis,
+        agent_leg_is_webrtc: bool = False,
     ) -> bool:
         """Bridge customer to the answering agent and persist ownership.
 
@@ -873,7 +934,10 @@ class QueueTransferMixin:
         )
         try:
             await telephony.call_bridge(
-                customer_call_id, agent_leg_call_id, transcribe=transcribe
+                customer_call_id,
+                agent_leg_call_id,
+                transcribe=transcribe,
+                keepalive_on_peer_hangup=agent_leg_is_webrtc,
             )
         except Exception:  # noqa: BLE001
             logger.exception(

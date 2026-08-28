@@ -4,13 +4,13 @@ from __future__ import annotations
 import json
 import logging
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 
 from app.constants.call_center import (
     INCALL_LEGS_KEY_PREFIX,
     ConsultState,
 )
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import ConflictError, NotFoundError, ValidationError
 from app.libs.telephony.base import BaseTelephonyClient
 from app.models.call_record import CallRecord
 from app.services.call_center import consult_session
@@ -20,6 +20,23 @@ logger = logging.getLogger(__name__)
 
 class ResolutionMixin:
     # ───────────────────────── resolution ─────────────────────────
+
+    @staticmethod
+    async def _customer_leg_alive_in_kernel(
+        telephony: BaseTelephonyClient,
+        customer_call_id: str,
+    ) -> bool | None:
+        """Delegate to telephony ``call_alive`` (three-state; ``None`` = fail open)."""
+
+        try:
+            return await telephony.call_alive(customer_call_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "customer leg alive check failed call_id=%s",
+                customer_call_id,
+                exc_info=True,
+            )
+            return None
 
     @staticmethod
     async def _customer_context_for_call(call: _ccs.CurrentCall) -> dict:
@@ -42,8 +59,12 @@ class ResolutionMixin:
                 )
             if row is None:
                 return ctx
-            ctx["customer_from"] = getattr(row, "from_number", None) or ""
-            ctx["customer_to"] = getattr(row, "to_number", None) or ""
+            if row.direction == "inbound":
+                ctx["customer_from"] = row.customer_number or ""
+                ctx["customer_to"] = row.service_number or ""
+            else:
+                ctx["customer_from"] = row.service_number or ""
+                ctx["customer_to"] = row.customer_number or ""
             user_id = getattr(row, "user_id", None)
             if user_id is not None:
                 ctx["user_id"] = user_id
@@ -71,8 +92,11 @@ class ResolutionMixin:
                     select(CallRecord)
                     .where(
                         CallRecord.tenant_id == tenant_id,
-                        CallRecord.agent_id == employee_id,
-                        CallRecord.state.in_(_ccs._ACTIVE_STATES),
+                        or_(
+                            CallRecord.last_serving_agent_id == employee_id,
+                            CallRecord.initiator_agent_id == employee_id,
+                        ),
+                        CallRecord.lifecycle_status == "active",
                     )
                     .order_by(desc(CallRecord.started_at))
                     .limit(1)
@@ -80,6 +104,7 @@ class ResolutionMixin:
             ).scalar_one_or_none()
             if row is None:
                 raise NotFoundError("当前没有进行中的通话")
+            record_call_id = row.call_id
             customer_call_id = row.root_call_id or row.call_id
             record_id = row.id
             session = await _ccs.AgentWebRTCSessionService.get_active(
@@ -88,6 +113,31 @@ class ResolutionMixin:
             session_leg = session["webrtc_call_id"] if session else None
 
         legs = await _ccs._legs(tenant_id, employee_id)
+
+        # A new queue offer may already own the agent resource while an old
+        # outbound CDR was left active by an early carrier rejection. Never
+        # reconnect media to a different call than the resource currently
+        # reserves/rings/serves.
+        from app.services.call_center.orchestrator import _get_redis_client
+
+        redis = _get_redis_client()
+        if redis is not None:
+            try:
+                snapshot = await _ccs.CcAgentResourceService.get_snapshot(
+                    redis, tenant_id, employee_id
+                )
+            except Exception:  # noqa: BLE001 — DB resolution remains available
+                logger.warning(
+                    "current call resource unreadable agent=%s/%s",
+                    tenant_id,
+                    employee_id,
+                    exc_info=True,
+                )
+                snapshot = None
+            resource_call_id = snapshot.get("current_call_id") if snapshot else None
+            if resource_call_id and resource_call_id != record_call_id:
+                raise NotFoundError("当前通话状态已变化，请重新接听")
+
         webrtc_call_id = legs.agent_media_call_id or session_leg
 
         return _ccs.CurrentCall(
@@ -104,17 +154,20 @@ class ResolutionMixin:
         agent_media_call_id: str,
         *,
         preserve_consult: bool = False,
+        preserve_room: bool = False,
     ) -> None:
         """Record the live agent media leg after customer↔agent bridge.
 
         When the media leg changes for a new customer bridge, drop leftover
         consult/conference pointers from a prior call. Pass
-        ``preserve_consult=True`` for mid-consult host media reconnect.
+        ``preserve_consult=True`` for mid-consult host media reconnect and
+        ``preserve_room=True`` when replacing a leg inside an active room.
         """
 
         legs = await _ccs._legs(tenant_id, employee_id)
         if (
             not preserve_consult
+            and not preserve_room
             and legs.agent_media_call_id != agent_media_call_id
             and (
                 legs.consult_call_id
@@ -142,6 +195,7 @@ class ResolutionMixin:
             legs.room_id = None
             legs.room_legs = []
         legs.agent_media_call_id = agent_media_call_id
+        legs.customer_held = False
         await _ccs._save_legs(tenant_id, employee_id, legs)
 
     @staticmethod
@@ -179,9 +233,41 @@ class ResolutionMixin:
 
         call = await _ccs.CallControlService._resolve_current_call(tenant_id, employee_id)
         customer_call_id = call.customer_call_id
+        # Agent already left for after-call work; the customer is on a survey.
+        # Re-bridging here would steal the IVR audio path mid-prompt.
+        async with _ccs.AsyncSessionLocal() as db:
+            from app.repositories.call_satisfaction_execution_repository import (
+                CallSatisfactionExecutionRepository,
+            )
+
+            survey = await CallSatisfactionExecutionRepository.get_by_call_record_id(
+                db, call.record_id
+            )
+            if survey is not None and survey.status in {"preparing", "in_progress"}:
+                raise ConflictError("客户正在满意度调查中，无法恢复坐席媒体")
         legs = await _ccs._legs(tenant_id, employee_id)
         consult_call_id = legs.consult_call_id
         consult_target_employee_id = legs.consult_target_employee_id
+
+        customer_alive = await _ccs.CallControlService._customer_leg_alive_in_kernel(
+            telephony, customer_call_id
+        )
+        if customer_alive is False:
+            logger.info(
+                "media reconnect: customer leg gone in kernel agent=%s customer=%s",
+                employee_id, customer_call_id,
+            )
+            from app.services.call_center.orchestrator import get_orchestrator
+
+            await get_orchestrator().finalize_agent_call(
+                tenant_id=tenant_id,
+                employee_id=employee_id,
+                call_id=customer_call_id,
+                reason="media_timeout",
+                mark_cdr_completed=True,
+            )
+            await _ccs._clear_legs(tenant_id, employee_id)
+            raise NotFoundError("客户通话已结束，无法恢复坐席媒体")
 
         result = await telephony.webrtc_offer(sdp, call_id=customer_call_id)
         new_leg = result.get("call_id") or ""
@@ -195,15 +281,45 @@ class ResolutionMixin:
             # Kernels that auto-answer reject a duplicate answer — safe to ignore.
             pass
 
-        # Drop any stale agent media leg mapping before bridging the new one.
+        # Replace the browser leg inside an existing room (supervisor
+        # whisper/barge or a regular conference). A plain call.bridge would try
+        # to transition the already-roomed customer from bridged -> bridged.
         stale = call.webrtc_call_id
+        room_active = bool(legs.room_id)
+        if room_active:
+            replaced = False
+            if stale and stale != new_leg:
+                try:
+                    await telephony.room_replace_leg(legs.room_id, stale, new_leg)
+                    replaced = True
+                except Exception:  # noqa: BLE001
+                    # The old browser leg commonly reaches media_eof before the
+                    # reconnect request, so the room may already have detached
+                    # it. Adding the new leg is the correct recovery in that case.
+                    logger.info(
+                        "media reconnect: old room leg already detached; adding "
+                        "new leg room=%s old=%s new=%s",
+                        legs.room_id, stale, new_leg,
+                    )
+            if not replaced:
+                await telephony.room_add_leg(legs.room_id, new_leg)
+            legs.room_legs = [
+                new_leg if leg == stale else leg
+                for leg in legs.room_legs
+                if leg != new_leg
+            ]
+            if new_leg not in legs.room_legs:
+                legs.room_legs.append(new_leg)
+
         if stale and stale != new_leg:
             try:
                 await telephony.call_hangup(stale, reason=_ccs._CONSULT_TARGET_REPLACED_REASON)
             except Exception:  # noqa: BLE001
                 pass
 
-        if consult_call_id:
+        if room_active:
+            pass
+        elif consult_call_id:
             # Keep the customer held with the consult tone; only rebuild A↔B.
             try:
                 await telephony.call_bridge(
@@ -225,18 +341,27 @@ class ResolutionMixin:
                     agent_media_call_id=None,
                 )
                 await _ccs.CallControlService._stop_tone(telephony, customer_call_id)
-                await telephony.call_bridge(customer_call_id, new_leg)
+                await telephony.call_bridge(
+                    customer_call_id,
+                    new_leg,
+                    keepalive_on_peer_hangup=True,
+                )
                 consult_call_id = None
                 consult_target_employee_id = None
         else:
             await _ccs.CallControlService._stop_tone(telephony, customer_call_id)
-            await telephony.call_bridge(customer_call_id, new_leg)
+            await telephony.call_bridge(
+                customer_call_id,
+                new_leg,
+                keepalive_on_peer_hangup=True,
+            )
 
         await _ccs.CallControlService.bind_agent_media_leg(
             tenant_id,
             employee_id,
             new_leg,
             preserve_consult=bool(consult_call_id),
+            preserve_room=room_active,
         )
 
         async with _ccs.AsyncSessionLocal() as db:

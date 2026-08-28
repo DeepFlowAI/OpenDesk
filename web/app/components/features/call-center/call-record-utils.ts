@@ -1,13 +1,13 @@
-import type { CallRecordListItem } from '@/models/call-center'
+import type { CallRecordListItem, CallRecordingItem } from '@/models/call-center'
 
-type CallRecordNumberFields = Pick<CallRecordListItem, 'direction' | 'from_number' | 'to_number'>
+type CallRecordNumberFields = Pick<CallRecordListItem, 'customer_number' | 'service_number'>
 
 export function callRecordCustomerNumber(record: CallRecordNumberFields): string | null {
-  return record.direction === 'outbound' ? record.to_number : record.from_number
+  return record.customer_number
 }
 
 export function callRecordServiceNumber(record: CallRecordNumberFields): string | null {
-  return record.direction === 'outbound' ? record.from_number : record.to_number
+  return record.service_number
 }
 
 export function formatCallRecordDuration(ms: number | null): string {
@@ -31,6 +31,40 @@ export function formatQueueDurationSeconds(seconds: number | null): string {
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`
   }
   return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`
+}
+
+const RECORDING_STATUS_RANK: Record<string, number> = {
+  completed: 4,
+  partial: 3,
+  recording: 2,
+  failed: 1,
+}
+
+function recordingPhaseRank(phase: string | null): number {
+  if (phase === 'ai') return 2
+  if (phase === 'bridged') return 1
+  return 0
+}
+
+function compareDisplayRecordings(left: CallRecordingItem, right: CallRecordingItem): number {
+  const playable = Number(Boolean(left.access_url)) - Number(Boolean(right.access_url))
+  if (playable) return playable
+  const status = (RECORDING_STATUS_RANK[left.status] ?? 0) - (RECORDING_STATUS_RANK[right.status] ?? 0)
+  if (status) return status
+  const duration = (left.duration_ms ?? -1) - (right.duration_ms ?? -1)
+  if (duration) return duration
+  const phase = recordingPhaseRank(left.phase) - recordingPhaseRank(right.phase)
+  if (phase) return phase
+  return (left.started_at ?? '').localeCompare(right.started_at ?? '')
+}
+
+export function selectDisplayRecording(
+  recordings: CallRecordingItem[] | null | undefined,
+): CallRecordingItem | null {
+  if (!recordings?.length) return null
+  return recordings.reduce((best, current) => (
+    compareDisplayRecordings(current, best) > 0 ? current : best
+  ))
 }
 
 export function formatCallRecordDate(value: string | null, isZh = true): string {

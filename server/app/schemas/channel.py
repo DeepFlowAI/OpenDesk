@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.schemas.open_agent_settings import OpenAgentAIDisclaimer, OpenAgentWelcomeMessage
 from app.schemas.conversation_announcement_rule import ConversationAnnouncementPublic
 from app.schemas.conversation_read_status import ConversationReadStatusPublicResponse
+from app.schemas.system_settings import SUPPORTED_LANGUAGES
 from app.schemas.welcome_message_rule import WelcomeMessagePublic
 
 
@@ -17,6 +18,11 @@ DEFAULT_OFFLINE_TITLE = "当前客服不在线"
 DEFAULT_OFFLINE_MESSAGE = "您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。"
 DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY = "offline_message"
 DEFAULT_LEAVE_MESSAGE_PROMPT = "请留下您的问题和联系方式，我们上线后会尽快联系您。"
+DEFAULT_FORM_MESSAGE_TITLE = "请留下您的信息"
+DEFAULT_FORM_MESSAGE_DESCRIPTION = "请填写以下信息，我们会尽快与您联系。"
+DEFAULT_FORM_MESSAGE_SUBMIT_LABEL = "提交"
+DEFAULT_FORM_MESSAGE_SUCCESS_TITLE = "提交成功"
+DEFAULT_FORM_MESSAGE_SUCCESS_DESCRIPTION = "我们已收到您的信息，会尽快与您联系。"
 DEFAULT_RESTRICTED_SERVICE_TITLE = "当前暂时无法提供在线咨询"
 DEFAULT_RESTRICTED_SERVICE_MESSAGE = "抱歉，当前暂时无法为您提供在线咨询服务。如需帮助，请通过其他公开渠道联系服务方。"
 DEFAULT_QUEUE_MESSAGE = (
@@ -103,6 +109,76 @@ class ChannelCustomButton(BaseModel):
         return self
 
 
+class ChannelFormFieldConfig(BaseModel):
+    field_key: str | None = Field(default=None, min_length=1, max_length=64)
+    field_id: int | None = Field(default=None, gt=0)
+    required: bool = False
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> "ChannelFormFieldConfig":
+        if (self.field_key is None) == (self.field_id is None):
+            raise ValueError("Exactly one of field_key or field_id is required")
+        return self
+
+
+class ChannelFormMessageConfig(BaseModel):
+    title: str = DEFAULT_FORM_MESSAGE_TITLE
+    description: str = DEFAULT_FORM_MESSAGE_DESCRIPTION
+    submit_label: str = DEFAULT_FORM_MESSAGE_SUBMIT_LABEL
+    success_title: str = DEFAULT_FORM_MESSAGE_SUCCESS_TITLE
+    success_description: str = DEFAULT_FORM_MESSAGE_SUCCESS_DESCRIPTION
+    show_ticket_number: bool = True
+    fields: list[ChannelFormFieldConfig] = Field(default_factory=list)
+
+    @field_validator("title", "submit_label", "success_title", "success_description", mode="before")
+    @classmethod
+    def normalize_required_text(cls, value: str | None) -> str:
+        return (value or "").strip()
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def normalize_description(cls, value: str | None) -> str:
+        return (value or "").strip()
+
+    @field_validator("title", "success_title")
+    @classmethod
+    def validate_short_title(cls, value: str) -> str:
+        if not value or len(value) > 64:
+            raise ValueError("Form title must contain 1 to 64 characters")
+        return value
+
+    @field_validator("submit_label")
+    @classmethod
+    def validate_submit_label(cls, value: str) -> str:
+        if not value or len(value) > 16:
+            raise ValueError("Submit label must contain 1 to 16 characters")
+        return value
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        if len(value) > 1000:
+            raise ValueError("Form description must be at most 1000 characters")
+        return value
+
+    @field_validator("success_description")
+    @classmethod
+    def validate_success_description(cls, value: str) -> str:
+        if not value or len(value) > 1000:
+            raise ValueError("Success description must contain 1 to 1000 characters")
+        return value
+
+    @model_validator(mode="after")
+    def validate_unique_fields(self) -> "ChannelFormMessageConfig":
+        refs = [
+            f"key:{item.field_key}" if item.field_key is not None else f"id:{item.field_id}"
+            for item in self.fields
+        ]
+        if len(refs) != len(set(refs)):
+            raise ValueError("A form field can only be configured once")
+        return self
+
+
 class ChannelConfig(BaseModel):
     title: str | None = None
     document_title: str | None = None
@@ -125,12 +201,17 @@ class ChannelConfig(BaseModel):
     embed_button_icon_color: str | None = None
     send_button_bg_color: str | None = None
     input_placeholder: str | None = None
+    language_strategy: Literal["browser", "fixed"] = "browser"
+    default_language: str = "en"
     service_hours_enabled: bool = False
     service_hours_id: int | None = None
     outside_service_hours_strategy: str = DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY
     offline_title: str = DEFAULT_OFFLINE_TITLE
     offline_message: str = DEFAULT_OFFLINE_MESSAGE
     leave_message_prompt: str = DEFAULT_LEAVE_MESSAGE_PROMPT
+    leave_message_mode: Literal["conversation", "form"] = "conversation"
+    form_message_config: ChannelFormMessageConfig = Field(default_factory=ChannelFormMessageConfig)
+    form_message_config_version: int | None = Field(default=None, ge=1)
     restricted_service_message: str = DEFAULT_RESTRICTED_SERVICE_MESSAGE
     queue_message: str = DEFAULT_QUEUE_MESSAGE
     queue_full_message: str = DEFAULT_QUEUE_FULL_MESSAGE
@@ -174,6 +255,13 @@ class ChannelConfig(BaseModel):
     def validate_placeholder(cls, v: str | None) -> str | None:
         if v and len(v) > 50:
             raise ValueError("Input placeholder must be at most 50 characters")
+        return v
+
+    @field_validator("default_language")
+    @classmethod
+    def validate_default_language(cls, v: str) -> str:
+        if v not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"Language must be one of: {', '.join(sorted(SUPPORTED_LANGUAGES))}")
         return v
 
     @field_validator("outside_service_hours_strategy")
@@ -300,6 +388,16 @@ class ChannelConfig(BaseModel):
         if self.assist_panel_enabled and not self.assist_panel_react_code:
             raise ValueError("Assist panel React code is required when enabled")
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_form_message_mode(self) -> "ChannelConfig":
+        if self.leave_message_mode != "form":
+            return self
+        if not self.form_message_config.fields:
+            raise ValueError("Form message mode requires at least one ticket field")
+        if not any(field.required for field in self.form_message_config.fields):
+            raise ValueError("Form message mode requires at least one required ticket field")
         return self
 
     @field_validator("title")

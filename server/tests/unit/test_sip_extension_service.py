@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.core.exceptions import ConflictError, ValidationError
+from app.core.secret_store import decrypt_secret, encrypt_secret
 from app.repositories.agent_call_device_repository import AgentCallDeviceRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.sip_extension_repository import SipExtensionRepository
@@ -38,6 +39,7 @@ def _extension(**overrides):
         auth_account="acme-1001",
         auth_password_hash="hash",
         auth_password_masked="abcd********",
+        auth_password_ciphertext=encrypt_secret("plain-secret"),
         registration_status="registered",
         last_registered_at=None,
         is_active=True,
@@ -179,6 +181,7 @@ async def test_create_returns_one_time_registration_info(monkeypatch):
     assert info.auth_password is not None
     assert created["auth_password_hash"] != info.auth_password
     assert created["auth_password_masked"].endswith("********")
+    assert decrypt_secret(created["auth_password_ciphertext"]) == info.auth_password
 
 
 @pytest.mark.asyncio
@@ -278,6 +281,37 @@ async def test_reset_password_masks_and_resets_registration(monkeypatch):
     assert saved["registration_status"] == "unregistered"
     assert saved["last_registered_at"] is None
     assert saved["auth_password_masked"].endswith("********")
+    assert decrypt_secret(saved["auth_password_ciphertext"]) == result["registration_info"].auth_password
+
+
+@pytest.mark.asyncio
+async def test_registration_info_returns_saved_plaintext_password(monkeypatch):
+    item = _extension(auth_password_ciphertext=encrypt_secret("phone-secret"))
+    monkeypatch.setattr(SipExtensionService, "get_scoped", AsyncMock(return_value=item))
+    monkeypatch.setattr(
+        SipExtensionService,
+        "_resolve_registrar_endpoint",
+        AsyncMock(return_value=("sip.example.com", 5070, "UDP")),
+    )
+
+    info = await SipExtensionService.get_registration_info(
+        object(), _principal(), item.id
+    )
+
+    assert info.registration_server == "sip.example.com"
+    assert info.registration_port == 5070
+    assert info.auth_password == "phone-secret"
+
+
+@pytest.mark.asyncio
+async def test_registration_info_requires_reset_for_legacy_record(monkeypatch):
+    item = _extension(auth_password_ciphertext=None)
+    monkeypatch.setattr(SipExtensionService, "get_scoped", AsyncMock(return_value=item))
+
+    with pytest.raises(ValidationError, match="请先重置密码"):
+        await SipExtensionService.get_registration_info(
+            object(), _principal(), item.id
+        )
 
 
 @pytest.mark.asyncio

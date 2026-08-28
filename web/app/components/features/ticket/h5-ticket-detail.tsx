@@ -7,6 +7,7 @@ import { HTTPError } from 'ky'
 import { H5TicketActivity } from '@/app/components/features/ticket/h5-ticket-activity'
 import { H5TicketDetailForm } from '@/app/components/features/ticket/h5-ticket-detail-form'
 import { H5TicketShell } from '@/app/components/features/ticket/h5-ticket-shell'
+import { FormMessageSubmissionCard } from '@/app/components/features/ticket/form-message-submission-card'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
@@ -123,6 +124,11 @@ export function H5TicketDetail() {
                 onSavingChange={setSaving}
                 onEditableChange={setHasEditable}
               />}
+              {ticket.form_submission && (
+                <div className="px-4 pb-4">
+                  <FormMessageSubmissionCard submission={ticket.form_submission} isZh={isZh} />
+                </div>
+              )}
             </div>
             <div className={cn('h-full min-h-0', primaryTab !== 'activity' && 'hidden')}>
               <H5TicketActivity ticketId={ticketId} canComment={canComment} isZh={isZh} />

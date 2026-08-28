@@ -4,10 +4,16 @@ Per-DID tenant routing for inbound calls.
 An inbound call must be bound to the tenant that owns the dialed number (DID),
 not to a single fixed default tenant. `_resolve_tenant_id_for_did` looks the
 `to` number up in the phone-number catalog and resolves its owning tenant;
-unknown/unassigned numbers return None so the caller falls back to the default.
+unknown/unassigned numbers return None. Shared-FlowKit deployments skip those
+calls; OSS still falls back to the default tenant.
 """
+from unittest.mock import AsyncMock
+
+import fakeredis.aioredis
 import pytest
 
+from app.configs.settings import settings
+from app.libs.telephony.base import CallEvent
 from app.libs.telephony.providers.mock.client import MockTelephonyClient
 from app.repositories.phone_number_repository import PhoneNumberRepository
 from app.services.call_center import orchestrator as orch_module
@@ -87,3 +93,64 @@ async def test_unassigned_number_returns_none(monkeypatch):
 
     orch = CallCenterOrchestrator(telephony=MockTelephonyClient())
     assert await orch._resolve_tenant_id_for_did("4001681715") is None
+
+
+def _incoming(call_id: str, to_number: str = "4001681715") -> CallEvent:
+    return CallEvent(
+        method="call.incoming",
+        data={
+            "call_id": call_id,
+            "transport": "sip",
+            "from": "13800138000",
+            "to": to_number,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_unowned_did_is_skipped_when_flag_enabled(monkeypatch):
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake)
+    monkeypatch.setattr(settings, "CALL_CENTER_SKIP_UNOWNED_DID", True)
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+    orch = CallCenterOrchestrator(telephony=tel)
+    orch._node_id = "node-skip"
+    orch._started = True
+    fallback = AsyncMock(return_value=1)
+    hangup = AsyncMock()
+    monkeypatch.setattr(orch, "_resolve_tenant_id_for_did", AsyncMock(return_value=None))
+    monkeypatch.setattr(orch, "_resolve_tenant_id", fallback)
+    monkeypatch.setattr(tel, "call_hangup", hangup)
+
+    await orch._on_incoming(_incoming("c-skip-unowned"))
+
+    fallback.assert_not_awaited()
+    hangup.assert_not_awaited()
+    assert await fake.exists(orch._call_owner_key("c-skip-unowned")) == 0
+    assert "c-skip-unowned" not in orch._workflows
+
+
+@pytest.mark.asyncio
+async def test_unowned_did_falls_back_when_flag_disabled(monkeypatch):
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake)
+    monkeypatch.setattr(settings, "CALL_CENTER_SKIP_UNOWNED_DID", False)
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+    orch = CallCenterOrchestrator(telephony=tel)
+    orch._node_id = "node-fallback"
+    orch._started = True
+    fallback = AsyncMock(return_value=7)
+    match = AsyncMock(return_value=None)
+    monkeypatch.setattr(orch, "_resolve_tenant_id_for_did", AsyncMock(return_value=None))
+    monkeypatch.setattr(orch, "_resolve_tenant_id", fallback)
+    monkeypatch.setattr(orch_module, "match_routing_rule", match)
+
+    await orch._on_incoming(_incoming("c-fallback-unowned"))
+
+    fallback.assert_awaited()
+    match.assert_awaited()
+    assert any(name == "call.hangup" for name, _ in tel.recorded)

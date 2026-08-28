@@ -42,6 +42,7 @@ import type {
   CreateFdFormLayoutFieldPayload,
   FieldSource,
 } from '@/models/form-layout'
+import type { Locale } from '@/lib/languages'
 
 // ── Drag data types ──
 
@@ -152,7 +153,7 @@ function customDefinitionToUnifiedField(field: FdFieldDefinition): UnifiedField 
   }
 }
 
-function metadataToUnifiedField(field: MetadataFieldDef, locale: 'zh' | 'en'): UnifiedField {
+function metadataToUnifiedField(field: MetadataFieldDef, locale: Locale): UnifiedField {
   return {
     key: field.key,
     id: null,
@@ -389,7 +390,7 @@ function applyDropTarget(
 function buildTabPayloads(
   tabs: LocalTab[],
   items: CanvasItem[],
-  locale: 'zh' | 'en',
+  locale: Locale,
 ): CreateFdFormLayoutTabPayload[] {
   return tabs.map((tb, ti) => {
     const tabItems = items.filter((i) => i._tabUid === tb._uid)
@@ -1016,7 +1017,7 @@ function LeftPanel({
   onAddSection,
   onAddTab,
 }: {
-  locale: 'zh' | 'en'
+  locale: Locale
   scene: string
   systemFields: UnifiedField[]
   customFields: CustomPaletteField[]
@@ -1274,7 +1275,7 @@ function CanvasArea({
   onRemoveTab,
   getFieldDisplayInfo,
 }: {
-  locale: 'zh' | 'en'
+  locale: Locale
   tabs: LocalTab[]
   itemsByTab: Map<string, CanvasItem[]>
   selection: Selection
@@ -1360,7 +1361,7 @@ function TabCard({
   selection: Selection
   columnsPerRow: number
   labelPosition: string
-  locale: 'zh' | 'en'
+  locale: Locale
   dropTarget: DropTarget | null
   isDragging: boolean
   onSelectTab: () => void
@@ -1534,7 +1535,7 @@ function InterRowDropZone({
   dropTarget: DropTarget | null
   isDragging: boolean
   isEmpty?: boolean
-  locale: 'zh' | 'en'
+  locale: Locale
 }) {
   const id = `inter-row-${tabUid}-${afterRowIdx}`
   const { setNodeRef } = useDroppable({ id })
@@ -1650,7 +1651,7 @@ function SectionDividerRow({
   item: SectionItem
   fieldCount: number
   isSelected: boolean
-  locale: 'zh' | 'en'
+  locale: Locale
   dropTarget: DropTarget | null
   onSelect: () => void
   onRemove: () => void
@@ -1847,7 +1848,7 @@ function RightPanel({
   onRemoveTab,
   getFieldDisplayInfo,
 }: {
-  locale: 'zh' | 'en'
+  locale: Locale
   scene: string
   selection: Selection
   columnsPerRow: number
@@ -1926,7 +1927,7 @@ function RightPanel({
 // ── Sub-panels ──
 
 function FormProperties({ locale, columnsPerRow, labelPosition, onColumnsChange, onLabelPositionChange }: {
-  locale: 'zh' | 'en'; columnsPerRow: number; labelPosition: string; onColumnsChange: (v: number) => void; onLabelPositionChange: (v: string) => void
+  locale: Locale; columnsPerRow: number; labelPosition: string; onColumnsChange: (v: number) => void; onLabelPositionChange: (v: string) => void
 }) {
   return (
     <div className="flex flex-col gap-5">
@@ -1953,7 +1954,7 @@ function FormProperties({ locale, columnsPerRow, labelPosition, onColumnsChange,
 }
 
 function FieldProperties({ locale, field, columnsPerRow, onStateChange, onSpanChange, getFieldDisplayInfo }: {
-  locale: 'zh' | 'en'; field: FieldItem; columnsPerRow: number; onStateChange: (s: string) => void; onSpanChange: (s: number) => void; getFieldDisplayInfo: (f: FieldItem) => { name: string; type: string }
+  locale: Locale; field: FieldItem; columnsPerRow: number; onStateChange: (s: string) => void; onSpanChange: (s: number) => void; getFieldDisplayInfo: (f: FieldItem) => { name: string; type: string }
 }) {
   const info = getFieldDisplayInfo(field)
   const isRefField = field.field_source === 'user' || field.field_source === 'organization' || field.field_source === 'ticket_metadata'
@@ -2015,7 +2016,7 @@ function FieldProperties({ locale, field, columnsPerRow, onStateChange, onSpanCh
 }
 
 function SectionProperties({ locale, name, onNameChange }: {
-  locale: 'zh' | 'en'; name: string; onNameChange: (name: string) => void
+  locale: Locale; name: string; onNameChange: (name: string) => void
 }) {
   return (
     <div className="flex flex-col gap-5">
@@ -2029,7 +2030,7 @@ function SectionProperties({ locale, name, onNameChange }: {
 }
 
 function SingleTabProperties({ locale, tab, canDelete, onTabNameChange, onRemoveTab }: {
-  locale: 'zh' | 'en'; tab: LocalTab; canDelete: boolean; onTabNameChange: (name: string) => void; onRemoveTab: () => void
+  locale: Locale; tab: LocalTab; canDelete: boolean; onTabNameChange: (name: string) => void; onRemoveTab: () => void
 }) {
   return (
     <div className="flex flex-col gap-5">

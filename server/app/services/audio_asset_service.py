@@ -1,6 +1,7 @@
 """
 Audio asset service — upload mp3/wav prompts and issue temporary preview URLs.
 """
+import logging
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,7 +11,10 @@ from app.core.exceptions import NotFoundError, ValidationError
 from app.db.session import AsyncSessionLocal
 from app.libs.storage import create_storage_client
 from app.repositories.audio_asset_repository import AudioAssetRepository
+from app.services import audio_loudness
 from app.services.audit_actor_service import AuditActorService
+
+logger = logging.getLogger(__name__)
 
 
 ALLOWED_AUDIO_MIME = {
@@ -134,6 +138,23 @@ class AudioAssetService:
         if kind is None:
             raise ValidationError(_describe_unsupported_audio(data))
 
+        # Level unhealthy prompts (too quiet/loud/clipped/uneven) to the same
+        # target loudness the playback side falls back to, so preview matches
+        # what callers hear. Healthy audio keeps its original bytes. Leveling
+        # must never fail an upload — store the original on any error.
+        duration_ms = None
+        try:
+            normalized = audio_loudness.normalize_for_upload(data, kind)
+        except Exception:
+            logger.warning(
+                "Audio loudness leveling failed; storing original file",
+                exc_info=True,
+            )
+            normalized = None
+        if normalized is not None:
+            data, duration_ms = normalized
+            kind = "wav"
+
         resolved_mime = _MIME_BY_KIND[kind]
         storage_key = f"voice-flow/audio/{tenant_id}/{uuid.uuid4().hex}.{kind}"
         storage = create_storage_client()
@@ -152,7 +173,7 @@ class AudioAssetService:
                     "storage_key": storage_key,
                     "mime_type": resolved_mime,
                     "size_bytes": len(data),
-                    "duration_ms": None,
+                    "duration_ms": duration_ms,
                     "created_by_actor_type": actor.get("actor_type"),
                     "created_by_actor_id": actor.get("actor_id"),
                     "created_by_actor_name": actor.get("actor_name"),

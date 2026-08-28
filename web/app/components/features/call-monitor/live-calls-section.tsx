@@ -11,7 +11,7 @@
  * permission and by the phase capability matrix; unavailable items are disabled
  * with a reason, missing-permission items are hidden.
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   IconDotsVertical,
   IconHeadphones,
@@ -139,6 +139,13 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
   const [monitorStart, setMonitorStart] = useState<number | null>(null)
   const [nowTick, setNowTick] = useState(() => Date.now())
 
+  // Bumped by every session teardown (manual exit, takeover end, auto-exit on
+  // dead target). Async mode flows (listen/whisper/barge/takeover negotiation)
+  // capture it on entry; if it changed by the time the request resolves the
+  // user already left — bail instead of resurrecting a bar over a released
+  // media leg.
+  const sessionGenRef = useRef(0)
+
   const listen = useListenCall()
   const whisper = useWhisperCall()
   const barge = useBargeCall()
@@ -177,12 +184,36 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
   // poll or fetch error can't kill an active session.
   useEffect(() => {
     if (!session || isFetching || isError || !data) return
+    // Takeover intentionally reassigns the call away from the original agent,
+    // so it disappears from the monitored-agent list while the supervisor is
+    // still the active media party. Keep B's leg until the customer hangs up
+    // or B explicitly ends the taken-over call.
+    if (session.mode === 'takeover') return
     if (rows.some((r) => r.call_id === session.callId)) return
+    sessionGenRef.current += 1
     supervisorLeg.release()
     setSession(null)
     setPendingMode(null)
     toast(t('ws.records.callMonitor.targetEnded', locale))
   }, [session, rows, isFetching, isError, data, supervisorLeg, t, locale])
+
+  // Restore a listen-only monitoring session after a page refresh. The backend
+  // monitor lock is the source of truth; when it names me as holder in listen
+  // mode, rebuild the bar (a plain listen holds no browser media leg, so this
+  // is safe). Speaking modes (whisper/barge/takeover) lost their media leg
+  // with the page and are not auto-restored — the row menu stays actionable
+  // for sessions held by me (see RowMenu) so I can re-enter via listen.
+  const myEmployeeId = user?.id
+  useEffect(() => {
+    if (session || isFetching || isError || !data || myEmployeeId == null) return
+    const mine = rows.find(
+      (r) =>
+        r.current_supervisor?.employee_id === myEmployeeId &&
+        r.current_supervisor?.mode === 'listen',
+    )
+    if (mine) beginSession(mine, 'listen')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, isFetching, isError, data, myEmployeeId])
 
   // Confirmation dialog state.
   const [confirmBarge, setConfirmBarge] = useState<LiveCallRow | null>(null)
@@ -216,6 +247,15 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
     }
   }
 
+  // True when the session was torn down while an async flow (captured `gen`)
+  // was still negotiating — the caller must bail. A leg re-negotiated after
+  // the teardown's release is released again so nothing leaks.
+  const superseded = (gen: number): boolean => {
+    if (sessionGenRef.current === gen) return false
+    supervisorLeg.release()
+    return true
+  }
+
   // Whisper / barge / takeover need the supervisor's own audio leg. Negotiate
   // it once (idempotent) before the speaking-mode request. Returns false when
   // the mic/handshake fails so the caller can abort cleanly.
@@ -229,6 +269,7 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
   }
 
   const runMode = async (row: LiveCallRow, mode: 'listen' | 'whisper' | 'barge') => {
+    const gen = sessionGenRef.current
     setPendingMode(mode)
     try {
       if (mode === 'listen') {
@@ -238,6 +279,7 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
         if (mode === 'whisper') await whisper.mutateAsync(row.call_id)
         else await barge.mutateAsync(row.call_id)
       }
+      if (superseded(gen)) return
       beginSession(row, mode)
     } catch (err) {
       failBanner(err)
@@ -255,6 +297,7 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
       return
     }
     setPendingMode(mode)
+    const gen = sessionGenRef.current
     try {
       if (mode === 'listen') {
         await listen.mutateAsync(session.callId)
@@ -262,6 +305,7 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
         if (!(await ensureAudioLeg(session.callId))) return
         await whisper.mutateAsync(session.callId)
       }
+      if (superseded(gen)) return
       setSession({ ...session, mode })
     } catch (err) {
       failBanner(err)
@@ -277,6 +321,7 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
     } catch {
       // best-effort; still clear the local session
     }
+    sessionGenRef.current += 1
     supervisorLeg.release()
     setSession(null)
     setMonitorStart(null)
@@ -293,6 +338,7 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
     } catch {
       // best-effort; still tear down locally
     }
+    sessionGenRef.current += 1
     supervisorLeg.release()
     setSession(null)
     setMonitorStart(null)
@@ -415,9 +461,11 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
           setConfirmBarge(null)
           if (!row) return
           setPendingMode('barge')
+          const gen = sessionGenRef.current
           try {
             if (!(await ensureAudioLeg(row.call_id))) return
             await barge.mutateAsync(row.call_id)
+            if (superseded(gen)) return
             beginSession(row, 'barge')
           } catch (err) {
             failBanner(err)
@@ -454,9 +502,11 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
           const row = confirmTakeover
           if (!row) return
           setPendingMode('takeover')
+          const gen = sessionGenRef.current
           try {
             if (!(await ensureAudioLeg(row.call_id))) return
             await takeover.mutateAsync({ callId: row.call_id, payload: { reason, note: note || undefined } })
+            if (superseded(gen)) return
             toast.success(t('ws.records.callMonitor.takeoverSuccess', locale, {
               agent: row.agent.display_name ?? row.agent.name,
             }))
@@ -498,6 +548,7 @@ export function LiveCallsSection({ reportsEnabled }: Props) {
             await forceHangup.mutateAsync({ callId: row.call_id, payload: { reason, note: note || undefined } })
             toast.success(t('ws.records.callMonitor.forceHangupSuccess', locale))
             setConfirmForceHangup(null)
+            sessionGenRef.current += 1
             supervisorLeg.release()
             if (session?.callId === row.call_id) setSession(null)
           } catch (err) {

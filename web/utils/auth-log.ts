@@ -12,6 +12,12 @@ const AUTH_TELEMETRY_EVENTS: Record<string, { name: string; level: TelemetryLeve
   api_unauthorized: { name: 'auth_api_unauthorized', level: 'warn' },
   socket_auth_failed: { name: 'auth_socket_auth_failed', level: 'warn' },
   token_adopted_from_storage: { name: 'auth_token_adopted_from_storage', level: 'info' },
+  /** Login page rendered a forced-logout banner from ?reason=. */
+  login_notice_shown: { name: 'auth_login_notice_shown', level: 'info' },
+  /** Another tab signed in a different account; this tab reloaded onto it. */
+  account_switched: { name: 'auth_account_switched', level: 'warn' },
+  /** Kept a signing-in tab alive instead of reloading it onto another account. */
+  account_switch_reload_skipped: { name: 'auth_account_switch_reload_skipped', level: 'info' },
 }
 
 /** Stable per-tab id so concurrent tabs for the same device can be told apart. */
@@ -68,10 +74,18 @@ export async function logAuthEvent(
   options?: { immediate?: boolean; level?: TelemetryLevel },
 ): Promise<void> {
   const identity = readIdentityProps()
+  const page =
+    typeof window !== 'undefined'
+      ? {
+          pathname: window.location.pathname,
+          search: window.location.search || undefined,
+        }
+      : {}
   const enriched: AuthLogDetail = {
     ...detail,
     ...identity,
     tab_id: TAB_ID,
+    ...page,
     ...(typeof document !== 'undefined' ? { visibility: document.visibilityState } : {}),
   }
 

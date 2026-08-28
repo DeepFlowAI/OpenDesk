@@ -2,6 +2,7 @@
 Unit tests for ticket service.
 """
 from types import SimpleNamespace
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -12,6 +13,50 @@ from app.services.ticket_service import TicketService
 
 
 class TestTicketService:
+
+    @pytest.mark.asyncio
+    async def test_get_by_id_includes_form_submission_after_scope_check(self):
+        mock_db = AsyncMock()
+        ticket = SimpleNamespace(id=1, tenant_id=10, conversation_id=None, call_record_id=None)
+        submitted_at = datetime.now(timezone.utc)
+        submission = SimpleNamespace(
+            channel_id=5,
+            source="queue_waiting",
+            created_at=submitted_at,
+            field_snapshot=[
+                {"name": "Second", "field_type": "single_line_text", "sort_order": 2},
+                {"name": "First", "field_type": "single_line_text", "sort_order": 1},
+            ],
+        )
+        principal = SimpleNamespace()
+
+        with (
+            patch("app.services.ticket_service.TicketRepository") as ticket_repo,
+            patch(
+                "app.services.ticket_service.ChannelFormSubmissionRepository"
+            ) as submission_repo,
+            patch.object(TicketService, "_assert_ticket_scope", AsyncMock()) as assert_scope,
+            patch.object(TicketService, "_get_field_key_slot_map", AsyncMock(return_value={})),
+            patch.object(TicketService, "_get_conversation_public_id_map", AsyncMock(return_value={})),
+            patch.object(TicketService, "_get_call_record_call_id_map", AsyncMock(return_value={})),
+            patch.object(TicketService, "_enrich_response", return_value={"id": 1}),
+        ):
+            ticket_repo.get_by_id = AsyncMock(return_value=ticket)
+            submission_repo.get_detail_by_ticket_id = AsyncMock(
+                return_value=(submission, "Website", "conv-public")
+            )
+
+            result = await TicketService.get_by_id(mock_db, 10, 1, principal)
+
+        assert_scope.assert_awaited_once_with(mock_db, principal, ticket)
+        submission_repo.get_detail_by_ticket_id.assert_awaited_once_with(mock_db, 10, 1)
+        assert result["form_submission"]["channel_name"] == "Website"
+        assert result["form_submission"]["conversation_public_id"] == "conv-public"
+        assert [field["name"] for field in result["form_submission"]["field_snapshot"]] == [
+            "First",
+            "Second",
+        ]
+
 
     @pytest.mark.asyncio
     async def test_create_ticket_with_conversation_id_persists_link(self):

@@ -380,7 +380,14 @@ function AgentRow({
           <IconUser size={16} className="text-muted-foreground" />
         )}
       </span>
-      <span className="min-w-0 flex-1 truncate text-sm text-foreground">{displayName}</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm text-foreground">{displayName}</span>
+        {agent.group_names && agent.group_names.length > 0 && (
+          <span className="block truncate text-xs text-muted-foreground">
+            {agent.group_names.join(' · ')}
+          </span>
+        )}
+      </span>
       <span className={cn('flex shrink-0 items-center gap-1.5 text-xs', style.text)}>
         <span className={cn('inline-block h-2 w-2 rounded-full', style.dot)} />
         {t(STATUS_LABEL_KEY[agent.status] ?? STATUS_LABEL_KEY.offline, locale)}

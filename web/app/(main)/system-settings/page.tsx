@@ -4,12 +4,8 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { IconChevronDown, IconCheck, IconSearch } from '@tabler/icons-react'
 import { useSystemSettings, useUpdateSystemSettings } from '@/service/use-system-settings'
 import { useLocaleStore } from '@/context/locale-store'
+import { LANGUAGE_OPTIONS } from '@/lib/languages'
 import { t } from '@/utils/i18n'
-
-const LANGUAGE_OPTIONS = [
-  { value: 'zh', label: 'zh 中文' },
-  { value: 'en', label: 'en English' },
-]
 
 const TIMEZONE_OPTIONS = [
   { value: 'Asia/Shanghai', label: 'Asia/Shanghai (UTC+8)' },
@@ -32,7 +28,7 @@ const TIMEZONE_OPTIONS = [
   { value: 'UTC', label: 'UTC (UTC+0)' },
 ]
 
-type SelectOption = { value: string; label: string }
+type SelectOption = { value: string; label: string; keywords?: string }
 
 function SimpleSelect({
   options,
@@ -55,7 +51,9 @@ function SimpleSelect({
   const selected = options.find((o) => o.value === value)
 
   const filtered = searchable && search
-    ? options.filter((o) => o.label.toLowerCase().includes(search.toLowerCase()))
+    ? options.filter((o) =>
+        `${o.label} ${o.keywords ?? ''}`.toLowerCase().includes(search.toLowerCase())
+      )
     : options
 
   const handleClickOutside = useCallback((e: MouseEvent) => {
@@ -195,6 +193,8 @@ export default function SystemSettingsPage() {
             options={LANGUAGE_OPTIONS}
             value={language}
             onChange={setLanguage}
+            searchable
+            searchPlaceholder={t('settings.lang.search', locale)}
           />
         </div>
 

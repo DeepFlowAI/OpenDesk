@@ -98,6 +98,11 @@ async def test_connect_auto_assign_uses_queue_service(monkeypatch):
         "get_status",
         AsyncMock(return_value={"status": "online", "current_count": 0, "max_concurrent": 10}),
     )
+    monkeypatch.setattr(
+        chat_handlers.PermissionService,
+        "get_current_principal",
+        AsyncMock(return_value=_principal({"chat.workspace.use"})),
+    )
 
     from app.repositories.conversation_repository import ConversationRepository
     from app.repositories.employee_repository import EmployeeRepository
@@ -161,6 +166,45 @@ async def test_auto_assign_skips_when_agent_is_at_capacity(monkeypatch):
         EmployeeRepository,
         "get_by_id",
         AsyncMock(return_value=SimpleNamespace(id=20, max_concurrent=1)),
+    )
+    monkeypatch.setattr(ConversationRepository, "get_queued_by_tenant", get_queued)
+    monkeypatch.setattr(QueueTaskService, "pull_next", pull_next)
+
+    await chat_handlers._assign_queued_conversations(rt, r, tenant_id=1, agent_id=20)
+
+    get_queued.assert_not_awaited()
+    pull_next.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_assign_skips_agent_without_chat_workspace(monkeypatch):
+    """Call-only agents share the socket but must not be handed conversations."""
+    db = SimpleNamespace()
+    rt = SimpleNamespace(emit=AsyncMock())
+    r = SimpleNamespace()
+    get_queued = AsyncMock(return_value=[_conversation()])
+    pull_next = AsyncMock()
+
+    monkeypatch.setattr(chat_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(
+        chat_handlers.AgentStatusService,
+        "get_status",
+        AsyncMock(return_value={"status": "online", "current_count": 0, "max_concurrent": 10}),
+    )
+    monkeypatch.setattr(
+        chat_handlers.PermissionService,
+        "get_current_principal",
+        AsyncMock(return_value=_principal({"call.workspace.use"})),
+    )
+
+    from app.repositories.conversation_repository import ConversationRepository
+    from app.repositories.employee_repository import EmployeeRepository
+    from app.services.queue_service import QueueTaskService
+
+    monkeypatch.setattr(
+        EmployeeRepository,
+        "get_by_id",
+        AsyncMock(return_value=SimpleNamespace(id=20, max_concurrent=10)),
     )
     monkeypatch.setattr(ConversationRepository, "get_queued_by_tenant", get_queued)
     monkeypatch.setattr(QueueTaskService, "pull_next", pull_next)
@@ -388,8 +432,8 @@ async def test_send_message_broadcasts_normalized_payload_to_agent_message_strea
         AsyncMock(return_value=principal),
     )
     monkeypatch.setattr(
-        chat_handlers.ConversationService,
-        "send_message",
+        chat_handlers.ConversationTranslationService,
+        "send_agent_message_managed",
         AsyncMock(return_value=message),
     )
     monkeypatch.setattr(
@@ -432,17 +476,13 @@ async def test_send_message_broadcasts_normalized_payload_to_agent_message_strea
     assert response["ok"] is True
     assert response["message"]["conversation_id"] == 100
     assert response["message"]["sender_id"] == 10
-    chat_handlers.ConversationService.send_message.assert_awaited_once_with(
-        db,
+    chat_handlers.ConversationTranslationService.send_agent_message_managed.assert_awaited_once_with(
         conversation_id=100,
-        sender_type="agent",
-        sender_id=10,
         content_type="text",
         content="hello",
-        tenant_id=1,
         principal=principal,
         quoted_message_id=None,
-        metadata={"client_message_id": "client-501"},
+        client_message_id="client-501",
     )
     chat_handlers.ConversationRealtimeService.emit_conversation_list_updated.assert_awaited_once_with(
         1,

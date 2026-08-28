@@ -68,6 +68,7 @@ import type {
   ConversationAnnouncementListItem,
 } from '@/models/conversation-announcement'
 import { RobotQaSettingSection } from '@/app/components/features/conversation-settings/robot-qa-setting-section'
+import { EmbeddedPagesSection } from '@/app/components/features/conversation-settings/embedded-pages-section'
 
 function formatDate(iso: string | null, locale: Locale): string {
   if (!iso) return '—'
@@ -1366,6 +1367,11 @@ export default function ConversationSettingsPage() {
           </div>
         ) : null}
       </section>
+
+      <EmbeddedPagesSection
+        location="chat_auxiliary"
+        basePath="/online-service/conversation-settings/embedded-pages"
+      />
 
       {deleteTarget && (
         <DeleteModal

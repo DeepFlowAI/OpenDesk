@@ -144,7 +144,11 @@ class HelpersMixin:
         await _ccs.CallControlService._stop_tone(telephony, call.customer_call_id)
         try:
             if call.webrtc_call_id:
-                await telephony.call_bridge(call.customer_call_id, call.webrtc_call_id)
+                await telephony.call_bridge(
+                    call.customer_call_id,
+                    call.webrtc_call_id,
+                    keepalive_on_peer_hangup=True,
+                )
         except Exception:  # noqa: BLE001
             logger.warning("consult abort re-bridge failed", exc_info=True)
         await consult_session.clear(
@@ -356,7 +360,9 @@ class HelpersMixin:
             for attempt in range(2):
                 try:
                     await telephony.call_bridge(
-                        call.customer_call_id, host_media
+                        call.customer_call_id,
+                        host_media,
+                        keepalive_on_peer_hangup=True,
                     )
                     resumed = True
                     break
@@ -623,12 +629,11 @@ class HelpersMixin:
             )
             return
         try:
-            await _ccs.CcAgentResourceService.mark_in_call(
+            await _ccs.CcAgentResourceService.rekey_current_call(
                 r,
                 tenant_id,
                 target_employee_id,
                 call_id=customer_call_id,
-                direction="inbound",
             )
         except Exception:  # noqa: BLE001
             logger.warning(
@@ -785,43 +790,49 @@ class HelpersMixin:
         )
         from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
         from app.services.call_center.orchestrator import _get_redis_client
-        from app.services.cc_agent_status_service import CcAgentStatusService
 
         r = _get_redis_client()
-        if r is not None:
-            try:
-                await _ccs.CcAgentResourceService.mark_after_call_work(
-                    r,
-                    tenant_id,
-                    employee_id,
-                    call_id=call.customer_call_id,
-                    reason="transferred",
+        try:
+            async with _ccs.AsyncSessionLocal() as db:
+                from app.services.call_wrapup_service import (
+                    apply_post_call_agent_status,
+                    resolve_effective_wrapup_seconds,
                 )
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "transfer: mark_after_call_work failed agent=%s/%s",
-                    tenant_id, employee_id, exc_info=True,
+
+                wrapup_seconds = await resolve_effective_wrapup_seconds(
+                    db, tenant_id, call.customer_call_id
                 )
                 try:
-                    await _ccs.CcAgentResourceService.force_release(
-                        r, tenant_id, employee_id, reason="transferred",
+                    await apply_post_call_agent_status(
+                        db,
+                        r,
+                        tenant_id,
+                        employee_id,
+                        call_id=call.customer_call_id,
+                        reason="transferred",
+                        wrapup_seconds=wrapup_seconds,
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning(
-                        "transfer: force_release failed agent=%s/%s",
+                        "transfer: post-call status failed agent=%s/%s",
                         tenant_id, employee_id, exc_info=True,
                     )
-        try:
-            async with _ccs.AsyncSessionLocal() as db:
-                await CcAgentStatusService.sync_pg_status(
-                    db, tenant_id, employee_id, "after_call_work", None
-                )
+                    if r is not None:
+                        try:
+                            await _ccs.CcAgentResourceService.force_release(
+                                r, tenant_id, employee_id, reason="transferred",
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "transfer: force_release failed agent=%s/%s",
+                                tenant_id, employee_id, exc_info=True,
+                            )
                 await AgentWebRTCSessionService.set_busy(
                     db, tenant_id, employee_id, busy=False
                 )
         except Exception:  # noqa: BLE001
             logger.warning(
-                "transfer: sync_pg after_call_work failed agent=%s/%s",
+                "transfer: sync post-call status failed agent=%s/%s",
                 tenant_id, employee_id, exc_info=True,
             )
         # Initiator has left the call; drop stale room/consult legs so they
@@ -870,8 +881,8 @@ class HelpersMixin:
                             )
                         )
                     ).scalar_one_or_none()
-                if row is not None and row.agent_id != new_agent_id:
-                    row.agent_id = new_agent_id
+                if row is not None and row.last_serving_agent_id != new_agent_id:
+                    row.last_serving_agent_id = new_agent_id
                     await db.commit()
                     logger.info(
                         "transfer: call %s reassigned to agent %s",

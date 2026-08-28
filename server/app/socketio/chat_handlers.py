@@ -25,6 +25,7 @@ from fastapi.encoders import jsonable_encoder
 from socketio.exceptions import ConnectionRefusedError
 
 from app.configs.settings import settings
+from app.constants.call_center import embedded_call_socket_room
 from app.core.exceptions import BusinessError
 from app.core.security import decode_access_token
 from app.db.session import AsyncSessionLocal
@@ -32,11 +33,13 @@ from app.db.redis import redis_client
 from app.enums import MessageContentType, MessageSenderType, AgentOnlineStatus
 from app.libs.realtime.base import BaseRealtimeTransport
 from app.services.conversation_service import ConversationService
+from app.services.conversation_translation_service import ConversationTranslationService
 from app.services.conversation_agent_display_setting_service import ConversationAgentDisplaySettingService
 from app.services.conversation_realtime_service import ConversationRealtimeService
 from app.services.agent_status_service import AgentStatusService
 from app.services.data_scope_service import DataScopeService, RESOURCE_PEER_CONVERSATION
 from app.services.employee_session_service import EmployeeSessionService
+from app.services.embedded_call_integration_service import EmbeddedCallIntegrationService
 from app.services.offline_message_realtime_service import OfflineMessageRealtimeService
 from app.services.permission_service import PermissionService
 from app.services.queue_realtime_service import QueueRealtimeService
@@ -127,6 +130,16 @@ def _normalize_subscription_items(data: dict | None, key: str, allowed: list[str
     return [item for item in allowed if item in requested]
 
 
+def _embedded_socket_event_rejection(session: dict) -> dict | None:
+    if session.get("typ") != "embedded_call_session":
+        return None
+    return {
+        "ok": False,
+        "error": "EMBED_SOCKET_RECEIVE_ONLY",
+        "message": "Embedded call sockets are receive-only",
+    }
+
+
 async def _get_socket_principal(rt: BaseRealtimeTransport, sid: str):
     session = await _get_valid_socket_session(rt, sid)
     user_id = session.get("user_id")
@@ -151,14 +164,24 @@ async def _get_valid_socket_session(rt: BaseRealtimeTransport, sid: str) -> dict
         )
 
     async with AsyncSessionLocal() as db:
-        await EmployeeSessionService.validate_payload(
-            db,
-            {
-                "user_id": int(user_id),
-                "tenant_id": int(tenant_id),
-                "session_id": session.get("session_id"),
-            },
-        )
+        if session.get("typ") == "embedded_call_session":
+            await EmbeddedCallIntegrationService.validate_session_payload(
+                db, redis_client.client, session
+            )
+            raise BusinessError(
+                "Embedded call sockets are receive-only",
+                status_code=403,
+                code="EMBED_SOCKET_RECEIVE_ONLY",
+            )
+        else:
+            await EmployeeSessionService.validate_payload(
+                db,
+                {
+                    "user_id": int(user_id),
+                    "tenant_id": int(tenant_id),
+                    "session_id": session.get("session_id"),
+                },
+            )
     return session
 
 
@@ -269,6 +292,15 @@ async def _assign_queued_conversations(
         if available_slots <= 0:
             return
 
+        # Phone-only agents share this socket for call pushes but have no
+        # chat workspace to answer in, so they must not receive queued
+        # conversations.
+        principal = await PermissionService.get_current_principal(
+            db, {"user_id": agent_id, "tenant_id": tenant_id}
+        )
+        if not principal.has_permission("chat.workspace.use"):
+            return
+
         queued = await ConversationRepository.get_queued_by_tenant(
             db, tenant_id, limit=available_slots
         )
@@ -336,42 +368,65 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
         try:
             async with AsyncSessionLocal() as db:
-                await EmployeeSessionService.validate_payload(
-                    db,
-                    {
-                        "user_id": user_id,
-                        "tenant_id": tenant_id,
-                        "session_id": payload.get("session_id"),
-                    },
-                )
+                if payload.get("typ") == "embedded_call_session":
+                    await EmbeddedCallIntegrationService.validate_session_payload(
+                        db, redis_client.client, payload
+                    )
+                else:
+                    await EmployeeSessionService.validate_payload(
+                        db,
+                        {
+                            "user_id": user_id,
+                            "tenant_id": tenant_id,
+                            "session_id": payload.get("session_id"),
+                        },
+                    )
         except BusinessError as exc:
             _log_rejected_connect(
                 environ, sid, exc.code, tenant_id=tenant_id, user_id=user_id,
             )
             raise ConnectionRefusedError(exc.code) from exc
 
-        await rt.save_session(sid, {
-            "user_id": user_id,
-            "tenant_id": tenant_id,
-            "session_id": payload.get("session_id"),
-        }, namespace=NAMESPACE)
+        is_embedded_call = payload.get("typ") == "embedded_call_session"
+        await rt.save_session(
+            sid,
+            {
+                "user_id": user_id,
+                "tenant_id": tenant_id,
+                "session_id": payload.get("session_id"),
+                "typ": payload.get("typ"),
+                "integration_id": payload.get("integration_id"),
+                "integration_key": payload.get("integration_key"),
+                "origin": payload.get("origin"),
+                "instance_id": payload.get("instance_id"),
+            },
+            namespace=NAMESPACE,
+        )
 
-        # Join personal agent room for targeted events
-        agent_room = f"agent:{tenant_id}:{user_id}"
-        await rt.join_room(sid, agent_room, namespace=NAMESPACE)
-        await rt.join_room(sid, f"tenant:{tenant_id}:agents", namespace=NAMESPACE)
+        if is_embedded_call:
+            await rt.join_room(
+                sid,
+                embedded_call_socket_room(tenant_id, user_id),
+                namespace=NAMESPACE,
+            )
+            logger.info("Embedded call connected: user_id=%s sid=%s", user_id, sid)
+        else:
+            # Only the workspace connection owns online-service presence and rooms.
+            agent_room = f"agent:{tenant_id}:{user_id}"
+            await rt.join_room(sid, agent_room, namespace=NAMESPACE)
+            await rt.join_room(sid, f"tenant:{tenant_id}:agents", namespace=NAMESPACE)
 
-        # Track the active Socket.IO sid to avoid stale disconnects overwriting a newer connection.
-        r = redis_client.client
-        await AgentStatusService.mark_connected(r, tenant_id, user_id, sid)
+            # Track the active Socket.IO sid to avoid stale disconnects overwriting a newer connection.
+            r = redis_client.client
+            await AgentStatusService.mark_connected(r, tenant_id, user_id, sid)
 
-        # Sync current_count from DB so the counter survives reconnects
-        from app.repositories.conversation_repository import ConversationRepository
-        async with AsyncSessionLocal() as db:
-            active_count = await ConversationRepository.count_active_by_agent(db, tenant_id, user_id)
-        await AgentStatusService.set_count(r, tenant_id, user_id, active_count)
+            # Sync current_count from DB so the counter survives reconnects
+            from app.repositories.conversation_repository import ConversationRepository
+            async with AsyncSessionLocal() as db:
+                active_count = await ConversationRepository.count_active_by_agent(db, tenant_id, user_id)
+            await AgentStatusService.set_count(r, tenant_id, user_id, active_count)
 
-        logger.info("Agent connected: user_id=%s sid=%s active_count=%d", user_id, sid, active_count)
+            logger.info("Agent connected: user_id=%s sid=%s active_count=%d", user_id, sid, active_count)
 
         # Re-push ringing / in-call UI so a page refresh does not lose the
         # incoming banner while the caller is still waiting / bridged.
@@ -386,6 +441,9 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                 "Error republishing call UI for agent %s/%s", tenant_id, user_id,
             )
 
+        if is_embedded_call:
+            return
+
         # Try queued conversations after connect; the status check keeps
         # offline or busy agents from receiving work implicitly.
         try:
@@ -399,6 +457,8 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         user_id = session.get("user_id")
         tenant_id = session.get("tenant_id")
         if not (user_id and tenant_id):
+            return
+        if session.get("typ") == "embedded_call_session":
             return
 
         r = redis_client.client
@@ -498,6 +558,9 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
     @rt.on("unsubscribe_workspace_counters", namespace=NAMESPACE)  # type: ignore
     async def on_unsubscribe_workspace_counters(sid: str, data: dict | None = None):
         session = await rt.get_session(sid, namespace=NAMESPACE)
+        rejection = _embedded_socket_event_rejection(session)
+        if rejection:
+            return rejection
         tenant_id = session.get("tenant_id")
         user_id = session.get("user_id")
         if not tenant_id:
@@ -568,6 +631,9 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
             return {"ok": True}
 
         session = await rt.get_session(sid, namespace=NAMESPACE)
+        rejection = _embedded_socket_event_rejection(session)
+        if rejection:
+            return rejection
         tenant_id = session.get("tenant_id")
         user_id = session.get("user_id")
         if not tenant_id:
@@ -624,6 +690,10 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
 
     @rt.on("leave_conversation", namespace=NAMESPACE)  # type: ignore
     async def on_leave_conversation(sid: str, data: dict):
+        session = await rt.get_session(sid, namespace=NAMESPACE)
+        rejection = _embedded_socket_event_rejection(session)
+        if rejection:
+            return rejection
         conversation_id = data.get("conversation_id")
         if not conversation_id:
             return {"ok": True}
@@ -693,32 +763,15 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                     db,
                     {"user_id": user_id, "tenant_id": tenant_id},
                 )
-                existing_message = None
-                if client_message_id:
-                    from app.repositories.message_repository import MessageRepository
-
-                    existing_message = await MessageRepository.get_by_client_message_id(
-                        db,
-                        tenant_id,
-                        conversation_id,
-                        client_message_id,
-                        sender_type=MessageSenderType.AGENT.value,
-                        sender_id=user_id,
-                    )
-                msg = existing_message or await ConversationService.send_message(
-                    db,
-                    conversation_id=conversation_id,
-                    sender_type=MessageSenderType.AGENT.value,
-                    sender_id=user_id,
-                    content_type=content_type,
-                    content=content,
-                    tenant_id=tenant_id,
-                    principal=principal,
-                    quoted_message_id=quoted_message_id,
-                    **({"metadata": {"client_message_id": client_message_id}} if client_message_id else {}),
-                )
-
-                # Fetch agent info for the message payload
+            msg = await ConversationTranslationService.send_agent_message_managed(
+                conversation_id=conversation_id,
+                content_type=content_type,
+                content=content,
+                principal=principal,
+                quoted_message_id=quoted_message_id,
+                client_message_id=client_message_id,
+            )
+            async with AsyncSessionLocal() as db:
                 from app.repositories.conversation_collaboration_repository import ConversationCollaborationRepository
                 from app.repositories.employee_repository import EmployeeRepository
                 from app.repositories.conversation_repository import ConversationRepository
@@ -729,7 +782,6 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
                     tenant_id=tenant_id,
                     conversation_id=conversation_id,
                 )
-                display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
                 display_mode = await ConversationAgentDisplaySettingService.get_display_mode(db, tenant_id)
         except BusinessError as exc:
             logger.warning(
@@ -844,16 +896,17 @@ def register_chat_handlers(rt: BaseRealtimeTransport) -> None:
         )
 
         if not is_internal_note:
-            visitor_msg_payload = {
-                **msg_payload,
-                "sender_name": ConversationService.agent_display_name(user, display_mode) if user else "Agent",
-            }
-            # The Web SDK keys messages by conversation_public_id and only marks
-            # agent messages read when this id matches the open conversation, so
-            # the realtime payload must carry it (the numeric id alone is not
-            # enough for the visitor side to send a read receipt).
             if conv:
-                visitor_msg_payload["conversation_public_id"] = conv.public_id
+                visitor_msg_payload = ConversationService._message_response_payload(
+                    msg,
+                    conversation_public_id=conv.public_id,
+                    sender_name=ConversationService.agent_display_name(user, display_mode) if user else "Agent",
+                    sender_avatar=user.avatar if user else None,
+                    visitor_facing=True,
+                )
+                visitor_msg_payload["created_at"] = msg_payload["created_at"]
+            else:
+                visitor_msg_payload = msg_payload
             await _emit_workspace_message_event(
                 rt,
                 "new_message",

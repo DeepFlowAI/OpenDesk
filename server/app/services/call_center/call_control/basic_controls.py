@@ -154,7 +154,9 @@ class BasicControlsMixin:
         if call.webrtc_call_id:
             try:
                 await telephony.call_bridge(
-                    call.customer_call_id, call.webrtc_call_id
+                    call.customer_call_id,
+                    call.webrtc_call_id,
+                    keepalive_on_peer_hangup=True,
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(
@@ -186,6 +188,22 @@ class BasicControlsMixin:
             customer_call_id=call.customer_call_id,
             scene="hold",
         )
+        legs = await _ccs._legs(tenant_id, employee_id)
+        legs.customer_held = True
+        await _ccs._save_legs(tenant_id, employee_id, legs)
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            event_type="hold_started",
+            event_category="control",
+            actor_type="agent",
+            actor_id=str(employee_id),
+            source="opendesk",
+            call_leg_id=call.customer_call_id,
+            participant_role="customer",
+        )
         logger.info("hold: agent=%s call=%s", employee_id, call.customer_call_id)
         return {"ok": True, "call_id": call.customer_call_id}
 
@@ -198,7 +216,29 @@ class BasicControlsMixin:
         call = await _ccs.CallControlService._resolve_current_call(tenant_id, employee_id)
         await _ccs.CallControlService._stop_tone(telephony, call.customer_call_id)
         if call.webrtc_call_id:
-            await telephony.call_bridge(call.customer_call_id, call.webrtc_call_id)
+            await telephony.call_bridge(
+                call.customer_call_id,
+                call.webrtc_call_id,
+                keepalive_on_peer_hangup=True,
+            )
+        legs = await _ccs._legs(tenant_id, employee_id)
+        legs.customer_held = False
+        await _ccs._save_legs(tenant_id, employee_id, legs)
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            event_type="hold_ended",
+            event_category="control",
+            actor_type="agent",
+            actor_id=str(employee_id),
+            source="opendesk",
+            call_leg_id=call.customer_call_id,
+            participant_role="customer",
+            result="succeeded",
+            reason_code="normal",
+        )
         logger.info("unhold: agent=%s call=%s", employee_id, call.customer_call_id)
         return {"ok": True, "call_id": call.customer_call_id}
 
@@ -219,6 +259,20 @@ class BasicControlsMixin:
 
         call = await _ccs.CallControlService._resolve_current_call(tenant_id, employee_id)
         await telephony.call_dtmf(call.customer_call_id, digits)
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            event_type="dtmf_sent",
+            event_category="control",
+            actor_type="agent",
+            actor_id=str(employee_id),
+            source="opendesk",
+            call_leg_id=call.customer_call_id,
+            result="succeeded",
+            details={"digit_count": len(digits)},
+        )
         logger.info(
             "dtmf: agent=%s call=%s count=%d",
             employee_id, call.customer_call_id, len(digits),
@@ -252,6 +306,21 @@ class BasicControlsMixin:
             await telephony.call_mute(call.webrtc_call_id)
         else:
             await telephony.call_unmute(call.webrtc_call_id)
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            event_type="mute_started" if muted else "mute_ended",
+            event_category="control",
+            actor_type="agent",
+            actor_id=str(employee_id),
+            source="opendesk",
+            call_leg_id=call.webrtc_call_id,
+            participant_role="serving_agent",
+            result="succeeded" if not muted else None,
+            reason_code="normal" if not muted else None,
+        )
         logger.info(
             "mute: agent=%s call=%s agent_leg=%s muted=%s",
             employee_id, call.customer_call_id, call.webrtc_call_id, muted,

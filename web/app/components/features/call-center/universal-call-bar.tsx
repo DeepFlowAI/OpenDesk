@@ -43,6 +43,11 @@ export type UniversalCallBarProps = {
   onToggleExpand: () => void
   /** When true the collapse control is hidden and the bar stays expanded. */
   expandLocked?: boolean
+  /**
+   * Toggle button chrome: 'label' renders text + chevron (default, used by the
+   * supervisor monitor bar); 'icon' renders a 32×32 chevron-only button.
+   */
+  expandToggleVariant?: 'label' | 'icon'
   /** Optional trailing slot in the main row (e.g. "back to workspace" link). */
   trailing?: ReactNode
   className?: string
@@ -56,6 +61,7 @@ export function UniversalCallBar({
   expanded,
   onToggleExpand,
   expandLocked = false,
+  expandToggleVariant = 'label',
   trailing,
   className,
 }: UniversalCallBarProps) {
@@ -68,7 +74,19 @@ export function UniversalCallBar({
       <div className="flex min-h-11 flex-wrap items-center gap-3 px-3 py-2">
         <div className="flex min-w-0 flex-1 items-center gap-3">{status}</div>
         <div className="flex shrink-0 items-center gap-2">{mainActions}</div>
-        {extension && (
+        {extension && expandToggleVariant === 'icon' ? (
+          <button
+            type="button"
+            onClick={onToggleExpand}
+            disabled={expandLocked && expanded}
+            aria-expanded={expanded}
+            title={expanded ? t('ws.callbar.collapse', locale) : t('ws.callbar.expand', locale)}
+            aria-label={expanded ? t('ws.callbar.collapse', locale) : t('ws.callbar.expand', locale)}
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-border/60 bg-background/60 text-foreground/80 transition-colors hover:bg-background disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {expanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
+          </button>
+        ) : extension ? (
           <button
             type="button"
             onClick={onToggleExpand}
@@ -82,7 +100,7 @@ export function UniversalCallBar({
             <span>{expanded ? t('ws.callbar.collapse', locale) : t('ws.callbar.expand', locale)}</span>
             {expanded ? <IconChevronUp size={14} /> : <IconChevronDown size={14} />}
           </button>
-        )}
+        ) : null}
         {trailing && <div className="flex shrink-0 items-center">{trailing}</div>}
       </div>
 

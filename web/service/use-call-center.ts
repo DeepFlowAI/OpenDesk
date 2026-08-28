@@ -1,12 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { del, get, post, put } from './base'
+import { del, filenameFromContentDisposition, get, getBlob, post, put } from './base'
 import type {
   AgentStatusResponse,
   AgentStatusUpdate,
   ConsultableAgent,
   TransferQueue,
   CallRecordDetail,
+  CallRecordFilterOptionsResponse,
   CallRecordListResponse,
+  CallTrajectoryResponse,
   CallTranscriptResponse,
   CallUserAssociationResponse,
   WebRTCSession,
@@ -21,9 +23,16 @@ const keys = {
   transferQueues: (keyword: string) => [NS, 'transfer-queues', keyword] as const,
   recordsRoot: () => [NS, 'records'] as const,
   records: (params: Record<string, unknown>) => [NS, 'records', params] as const,
-  record: (id: number | null | undefined) => [NS, 'records', id ?? null] as const,
-  transcript: (id: number | null | undefined) => [NS, 'records', id ?? null, 'transcript'] as const,
+  recordFilterOptions: () => [NS, 'records', 'filter-options'] as const,
+  record: (publicId: string | null | undefined) => [NS, 'records', publicId ?? null] as const,
+  transcript: (publicId: string | null | undefined) => [NS, 'records', publicId ?? null, 'transcript'] as const,
+  trajectory: (publicId: string | null | undefined) => [NS, 'records', publicId ?? null, 'trajectory'] as const,
+  satisfaction: () => [NS, 'current-call', 'satisfaction'] as const,
 }
+
+// Exported so socket handlers can invalidate every records query (list pages
+// and the workspace sidebar) when a call ends, not just the sidebar's page.
+export const callCenterQueryKeys = keys
 
 /**
  * Workspace agents that can be a consult / transfer / conference target,
@@ -134,7 +143,28 @@ export const postWebRTCIce = (
 
 // ─────────── Current-call control ───────────
 
-export type CurrentCallActionResponse = { ok: boolean; call_id?: string; error?: string }
+export type CurrentCallActionResponse = {
+  ok: boolean
+  call_id?: string
+  error?: string
+  note?: string
+  execution_id?: number
+  flow_name?: string
+  flow_version_no?: number
+}
+
+export type SatisfactionTriggerAvailability = {
+  available: boolean
+  reason: string | null
+  message: string | null
+}
+
+export type CurrentCallSatisfactionAvailability = {
+  call_id: string | null
+  agent_invite: SatisfactionTriggerAvailability
+  auto_transfer: SatisfactionTriggerAvailability
+  flow: { id: number; name: string; version_no: number } | null
+}
 
 export type AcceptOfferResponse = {
   ok: boolean
@@ -155,6 +185,23 @@ export const rejectCurrentCall = (offerId: string) =>
 
 export const hangupCurrentCall = () =>
   post<CurrentCallActionResponse>('v1/call-center/agents/me/current-call/hangup')
+
+export const useCurrentCallSatisfaction = (enabled: boolean) =>
+  useQuery({
+    queryKey: keys.satisfaction(),
+    queryFn: () =>
+      get<CurrentCallSatisfactionAvailability>(
+        'v1/call-center/agents/me/current-call/satisfaction',
+      ),
+    enabled,
+    staleTime: 5_000,
+    refetchInterval: enabled ? 15_000 : false,
+  })
+
+export const inviteCurrentCallSatisfaction = () =>
+  post<CurrentCallActionResponse>(
+    'v1/call-center/agents/me/current-call/satisfaction/invite',
+  )
 
 export type MediaReconnectResponse = {
   call_id: string
@@ -265,19 +312,54 @@ export const cancelOutboundCall = (callId: string) =>
     json: { call_id: callId },
   })
 
-type CallRecordsParams = {
+export type CallRecordsParams = {
   page?: number
   per_page?: number
   direction?: string
-  agent_id?: number
+  call_source?: string
+  lifecycle_status?: string
+  finalization_status?: string
+  actual_reception_type?: string
+  call_result?: string
+  hangup_party?: string
+  hangup_reason_code?: string
+  initiator_agent_id?: number
+  last_serving_agent_id?: number
   user_id?: number
+  last_queue_type?: string
+  last_queue_id?: number
+  recording_status?: string
+  satisfaction_result?: string[]
+  satisfaction_trigger_source?: string[]
   keyword?: string
   start_time?: string
   end_time?: string
+  min_total_duration_ms?: number
+  max_total_duration_ms?: number
+  min_customer_ring_duration_ms?: number
+  max_customer_ring_duration_ms?: number
+  min_agent_wait_duration_ms?: number
+  max_agent_wait_duration_ms?: number
+  min_customer_agent_talk_duration_ms?: number
+  max_customer_agent_talk_duration_ms?: number
+}
+
+function callRecordsSearchParams(params: CallRecordsParams): URLSearchParams {
+  const searchParams = new URLSearchParams()
+  for (const [key, rawValue] of Object.entries(params)) {
+    if (rawValue === undefined) continue
+    if (Array.isArray(rawValue)) {
+      rawValue.forEach((value) => searchParams.append(key, value))
+    } else {
+      searchParams.set(key, String(rawValue))
+    }
+  }
+  return searchParams
 }
 
 type CallRecordsQueryOptions = {
   enabled?: boolean
+  refetchInterval?: number
 }
 
 export const useCallRecords = (
@@ -289,33 +371,71 @@ export const useCallRecords = (
     queryFn: () =>
       get<CallRecordListResponse>(
         'v1/call-center/call-records',
-        params ? { searchParams: params as Record<string, string | number> } : undefined,
+        params ? { searchParams: callRecordsSearchParams(params) } : undefined,
       ),
     enabled: options?.enabled ?? true,
+    refetchInterval: options?.refetchInterval,
   })
 
-export const useCallRecord = (id: number | null | undefined) =>
+export const useCallRecordFilterOptions = (enabled = true) =>
   useQuery({
-    queryKey: keys.record(id),
-    queryFn: () => get<CallRecordDetail>(`v1/call-center/call-records/${id}`),
-    enabled: typeof id === 'number',
-  })
-
-export const useCallTranscript = (id: number | null | undefined) =>
-  useQuery({
-    queryKey: keys.transcript(id),
+    queryKey: keys.recordFilterOptions(),
     queryFn: () =>
-      get<CallTranscriptResponse>(`v1/call-center/call-records/${id}/transcript`),
-    enabled: typeof id === 'number',
+      get<CallRecordFilterOptionsResponse>('v1/call-center/call-records/filter-options'),
+    enabled,
+    staleTime: 60_000,
+  })
+
+export const downloadCallRecordsExport = async (params: CallRecordsParams) => {
+  const exportParams = { ...params }
+  delete exportParams.page
+  delete exportParams.per_page
+  const { blob, headers } = await getBlob('v1/call-center/call-records-export.csv', {
+    searchParams: callRecordsSearchParams(exportParams),
+  })
+  return {
+    blob,
+    filename: filenameFromContentDisposition(
+      headers.get('content-disposition'),
+      'call-records.csv',
+    ),
+  }
+}
+
+export const useCallRecord = (publicId: string | null | undefined) =>
+  useQuery({
+    queryKey: keys.record(publicId),
+    queryFn: () => get<CallRecordDetail>(`v1/call-center/call-records/${publicId}`),
+    enabled: Boolean(publicId),
+  })
+
+export const useCallTrajectory = (
+  publicId: string | null | undefined,
+  enabled = true,
+) =>
+  useQuery({
+    queryKey: keys.trajectory(publicId),
+    queryFn: () => get<CallTrajectoryResponse>(`v1/call-center/call-records/${publicId}/trajectory`),
+    enabled: enabled && Boolean(publicId),
+    staleTime: 0,
+    refetchInterval: (query) => query.state.data?.is_live ? 5_000 : false,
+  })
+
+export const useCallTranscript = (publicId: string | null | undefined) =>
+  useQuery({
+    queryKey: keys.transcript(publicId),
+    queryFn: () =>
+      get<CallTranscriptResponse>(`v1/call-center/call-records/${publicId}/transcript`),
+    enabled: Boolean(publicId),
   })
 
 export const useIdentifyCallRecordUser = () => {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (recordId: number) =>
-      post<CallUserAssociationResponse>(`v1/call-center/call-records/${recordId}/identify-user`),
-    onSuccess: (_, recordId) => {
-      qc.invalidateQueries({ queryKey: keys.record(recordId) })
+    mutationFn: (publicId: string) =>
+      post<CallUserAssociationResponse>(`v1/call-center/call-records/${publicId}/identify-user`),
+    onSuccess: (_, publicId) => {
+      qc.invalidateQueries({ queryKey: keys.record(publicId) })
       qc.invalidateQueries({ queryKey: keys.recordsRoot() })
     },
   })
@@ -324,12 +444,12 @@ export const useIdentifyCallRecordUser = () => {
 export const useLinkCallRecordUser = () => {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: ({ recordId, userId }: { recordId: number; userId: number }) =>
-      put<CallUserAssociationResponse>(`v1/call-center/call-records/${recordId}/associated-user`, {
+    mutationFn: ({ publicId, userId }: { publicId: string; userId: number }) =>
+      put<CallUserAssociationResponse>(`v1/call-center/call-records/${publicId}/associated-user`, {
         json: { user_id: userId },
       }),
     onSuccess: (_, v) => {
-      qc.invalidateQueries({ queryKey: keys.record(v.recordId) })
+      qc.invalidateQueries({ queryKey: keys.record(v.publicId) })
       qc.invalidateQueries({ queryKey: keys.recordsRoot() })
     },
   })

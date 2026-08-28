@@ -22,6 +22,21 @@ passlib[bcrypt]==1.7.4
 # Storage
 oss2==2.19.1
 
+# Audio decode for upload-time loudness leveling (pure wheel, no ffmpeg)
+miniaudio==1.70
+
+# SMS channel (Aliyun SendSms)
+alibabacloud_dysmsapi20170525>=3.1.0,<4.0.0
+
+# VOD channel (Aliyun video-on-demand, learning center)
+alibabacloud_vod20170321>=3.6.0,<4.0.0
+
+# LLM routing and local language detection
+litellm
+fasttext-wheel
+# fasttext-wheel 0.9.2 uses a NumPy 1.x-only copy=False call in predict().
+numpy<2
+
 # Observability — OpenTelemetry SDK + OTLP/HTTP exporter
 # (Vendor-neutral: works with SigNoz, Honeycomb, Tempo, GreptimeDB, etc.)
 # Only imported when OBSERVABILITY_BACKEND=otel; noop deployments don't need them.

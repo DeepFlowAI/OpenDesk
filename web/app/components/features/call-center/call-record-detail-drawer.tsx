@@ -5,16 +5,19 @@ import Link from 'next/link'
 import { IconDownload, IconLoader2, IconMicrophoneOff, IconX } from '@tabler/icons-react'
 
 import { useLocaleStore } from '@/context/locale-store'
+import type { Locale } from '@/lib/languages'
+import { formatHangupReason } from '@/lib/call-record-labels'
 import { useCallRecord } from '@/service/use-call-center'
-import type { CallRecordDetail, CallRecordListItem } from '@/models/call-center'
+import type { CallRecordDetail, CallRecordListItem, CallRecordingItem } from '@/models/call-center'
 import { t } from '@/utils/i18n'
 import { CallSummaryFields } from '@/app/components/features/call-summary/call-summary-fields'
+import { CallTrajectoryPanel } from '@/app/components/features/call-center/call-trajectory-panel'
 import {
   callRecordCustomerNumber,
   callRecordServiceNumber,
   formatCallRecordDate,
   formatCallRecordDuration,
-  formatQueueDurationSeconds,
+  selectDisplayRecording,
 } from '@/app/components/features/call-center/call-record-utils'
 
 export {
@@ -22,11 +25,10 @@ export {
   callRecordServiceNumber,
   formatCallRecordDate,
   formatCallRecordDuration,
-  formatQueueDurationSeconds,
 }
 
 type CallRecordDetailDrawerProps = {
-  recordId: number
+  recordId: string
   onClose: () => void
 }
 
@@ -34,8 +36,10 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
   const { locale } = useLocaleStore()
   const isZh = locale === 'zh'
   const { data, isLoading } = useCallRecord(recordId)
+  const displayRecording = selectDisplayRecording(data?.recordings)
   const [summaryDirty, setSummaryDirty] = useState(false)
-  const [recordingDownloading, setRecordingDownloading] = useState(false)
+  const [activeTab, setActiveTab] = useState<'overview' | 'trajectory'>('overview')
+  const [recordingDownloading, setRecordingDownloading] = useState<string | null>(null)
   const [recordingDownloadError, setRecordingDownloadError] = useState(false)
 
   const requestClose = useCallback(() => {
@@ -48,24 +52,25 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
 
   useEffect(() => {
     setSummaryDirty(false)
-    setRecordingDownloading(false)
+    setActiveTab('overview')
+    setRecordingDownloading(null)
     setRecordingDownloadError(false)
   }, [recordId])
 
-  const handleDownloadRecording = useCallback(async () => {
-    if (!data?.recording_url || recordingDownloading) return
+  const handleDownloadRecording = useCallback(async (recording: CallRecordingItem) => {
+    if (!data || !recording.access_url || recordingDownloading) return
 
     setRecordingDownloadError(false)
-    setRecordingDownloading(true)
+    setRecordingDownloading(recording.recording_id)
     try {
-      const response = await fetch(data.recording_url, { credentials: 'omit' })
+      const response = await fetch(recording.access_url, { credentials: 'omit' })
       if (!response.ok) throw new Error('Failed to fetch recording')
       const blob = await response.blob()
-      triggerRecordingDownload(blob, recordingFileName(data))
+      triggerRecordingDownload(blob, recordingFileName(data, recording))
     } catch {
       setRecordingDownloadError(true)
     } finally {
-      setRecordingDownloading(false)
+      setRecordingDownloading(null)
     }
   }, [data, recordingDownloading])
 
@@ -87,7 +92,7 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
       <div className="absolute inset-0 bg-black/40" onClick={requestClose} />
-      <div className="relative z-10 flex h-full w-full max-w-[1120px] flex-col bg-white shadow-2xl sm:w-[80%]">
+      <div className="relative z-10 flex h-full w-full max-w-[1120px] flex-col bg-background shadow-2xl sm:w-[80%]">
         <div className="flex items-center justify-between border-b border-border px-6 py-4">
           <h2 className="text-base font-semibold">
             {isZh ? '通话详情' : 'Call Details'}
@@ -101,6 +106,23 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
           </button>
         </div>
 
+        <div className="flex h-12 shrink-0 items-end gap-7 border-b border-border px-6 text-sm" role="tablist">
+          {(['overview', 'trajectory'] as const).map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab}
+              onClick={() => setActiveTab(tab)}
+              className={`flex h-full items-center border-b-2 px-0.5 ${activeTab === tab ? 'border-foreground font-semibold text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+            >
+              {tab === 'overview'
+                ? t('ws.records.calls.trajectory.overview', locale)
+                : t('ws.records.calls.trajectory.tab', locale)}
+            </button>
+          ))}
+        </div>
+
         <div className="flex-1 space-y-4 overflow-y-auto p-6">
           {isLoading || !data ? (
             <div className="flex min-h-[180px] items-center justify-center">
@@ -108,29 +130,43 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
             </div>
           ) : (
             <>
+              <div className={activeTab === 'overview' ? 'space-y-4' : 'hidden'}>
               <section className="rounded-xl border border-border p-4">
                 <h3 className="mb-3 text-sm font-semibold">
                   {isZh ? '通话录音' : 'Recording'}
                 </h3>
-                {data.recording_url ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-3">
-                      <audio src={data.recording_url} controls className="flex-1" />
-                      <button
-                        type="button"
-                        onClick={handleDownloadRecording}
-                        disabled={recordingDownloading}
-                        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                        aria-label={isZh ? '下载录音' : 'Download recording'}
-                        title={isZh ? '下载录音' : 'Download recording'}
-                      >
-                        {recordingDownloading ? (
-                          <IconLoader2 size={16} className="animate-spin" />
+                {displayRecording ? (
+                  <div className="space-y-3">
+                    <div className="space-y-2 rounded-lg border border-border p-3">
+                        {displayRecording.access_url ? (
+                          <div className="flex items-center gap-3">
+                            <audio src={displayRecording.access_url} controls className="min-w-0 flex-1" />
+                            <button
+                              type="button"
+                              onClick={() => handleDownloadRecording(displayRecording)}
+                              disabled={recordingDownloading !== null}
+                              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                              aria-label={isZh ? '下载录音' : 'Download recording'}
+                              title={isZh ? '下载录音' : 'Download recording'}
+                            >
+                              {recordingDownloading === displayRecording.recording_id ? (
+                                <IconLoader2 size={16} className="animate-spin" />
+                              ) : (
+                                <IconDownload size={16} />
+                              )}
+                            </button>
+                          </div>
                         ) : (
-                          <IconDownload size={16} />
+                          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                            <IconMicrophoneOff size={16} />
+                            {recordingArtifactStatus(displayRecording.status, isZh)}
+                          </div>
                         )}
-                      </button>
-                    </div>
+                        <p className="text-xs text-muted-foreground">
+                          {recordingArtifactStatus(displayRecording.status, isZh)}
+                          {displayRecording.duration_ms != null ? ` · ${formatCallRecordDuration(displayRecording.duration_ms)}` : ''}
+                        </p>
+                      </div>
                     {recordingDownloadError && (
                       <p className="text-xs text-destructive">
                         {isZh ? '录音下载失败，请重试' : 'Failed to download recording. Please try again.'}
@@ -147,50 +183,120 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
                 )}
               </section>
 
+              {data.custom_business_info ? (
+                <section className="rounded-xl border border-border p-4">
+                  <h3 className="mb-3 text-sm font-semibold">
+                    {isZh ? '自定义业务信息' : 'Custom Business Information'}
+                  </h3>
+                  <p className="whitespace-pre-wrap break-words text-sm text-foreground">
+                    {data.custom_business_info}
+                  </p>
+                </section>
+              ) : null}
+
               <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(300px,380px)]">
                 <section className="rounded-xl border border-border p-4">
                   <h3 className="mb-3 text-sm font-semibold">
                     {isZh ? '通话信息' : 'Call Info'}
                   </h3>
-                  <dl className="grid grid-cols-[120px_1fr] gap-y-2 text-sm">
-                    <Dt>{isZh ? '通话 ID' : 'Call ID'}</Dt>
+                  <dl className="grid grid-cols-[140px_1fr] gap-y-2 text-sm">
+                    <Dt>{t('ws.records.calls.col.callId', locale)}</Dt>
                     <Dd mono>{data.call_id}</Dd>
-                    <Dt>{isZh ? '通话类型' : 'Direction'}</Dt>
+                    <Dt>{t('ws.records.calls.col.direction', locale)}</Dt>
+                    <Dd>{optionLabel('direction', data.direction, locale)}</Dd>
+                    <Dt>{t('ws.records.calls.col.callSource', locale)}</Dt>
+                    <Dd>{optionLabel('callSource', data.call_source, locale)}</Dd>
+                    <Dt>{t('ws.records.calls.col.customerNumber', locale)}</Dt>
                     <Dd>
-                      {data.direction === 'inbound'
-                        ? (isZh ? '呼入' : 'Inbound')
-                        : (isZh ? '呼出' : 'Outbound')}
+                      {callRecordCustomerNumber(data)
+                        || t('ws.records.calls.unknownNumber', locale)}
                     </Dd>
-                    <Dt>{isZh ? '用户号码' : 'User Number'}</Dt>
-                    <Dd>{callRecordCustomerNumber(data) || (isZh ? '未知号码' : 'Unknown')}</Dd>
-                    <Dt>{isZh ? '服务号码' : 'Service Number'}</Dt>
+                    <Dt>{t('ws.records.calls.col.serviceNumber', locale)}</Dt>
                     <Dd>{callRecordServiceNumber(data) || '-'}</Dd>
-                    <Dt>{t('ws.records.calls.detail.lastAssignedQueue', locale)}</Dt>
-                    <Dd>
-                      <CallQueueName queue={data.last_assigned_queue} locale={locale} />
-                    </Dd>
-                    <Dt>{t('ws.records.calls.detail.queueDuration', locale)}</Dt>
-                    <Dd>{formatQueueDurationSeconds(data.queue_duration_seconds)}</Dd>
-                    <Dt>{isZh ? '关联用户' : 'Linked User'}</Dt>
+                    <Dt>{t('ws.records.calls.col.user', locale)}</Dt>
                     <Dd>
                       <AssociatedUserDetail record={data} isZh={isZh} />
                     </Dd>
+                    <Dt>{t('ws.records.calls.col.userAssociationStatus', locale)}</Dt>
+                    <Dd>{optionLabel('association', data.user_association_status, locale)}</Dd>
                     <Dt>{isZh ? '相关工单' : 'Related Tickets'}</Dt>
                     <Dd>
                       <RelatedTicketsDetail record={data} />
                     </Dd>
-                    <Dt>{isZh ? '接待客服' : 'Agent'}</Dt>
-                    <Dd>{data.agent_name || '-'}</Dd>
-                    <Dt>{isZh ? '开始时间' : 'Started At'}</Dt>
+                    <Dt>{t('ws.records.calls.col.initiatorAgent', locale)}</Dt>
+                    <Dd>{data.initiator_agent_name || '-'}</Dd>
+                    <Dt>{t('ws.records.calls.col.lastQueue', locale)}</Dt>
+                    <Dd>
+                      <CallQueueName queue={data.last_queue} locale={locale} />
+                    </Dd>
+                    <Dt>{t('ws.records.calls.col.lastServingAgent', locale)}</Dt>
+                    <Dd>{data.last_serving_agent_name || '-'}</Dd>
+                    <Dt>{t('ws.records.calls.col.lifecycleStatus', locale)}</Dt>
+                    <Dd>{optionLabel('lifecycleStatus', data.lifecycle_status, locale)}</Dd>
+                    <Dt>{t('ws.records.calls.col.finalizationStatus', locale)}</Dt>
+                    <Dd>{optionLabel('finalizationStatus', data.finalization_status, locale)}</Dd>
+                    <Dt>{t('ws.records.calls.col.receptionType', locale)}</Dt>
+                    <Dd>{optionLabel('receptionType', data.actual_reception_type, locale)}</Dd>
+                    <Dt>{t('ws.records.calls.col.callResult', locale)}</Dt>
+                    <Dd>
+                      {optionLabel(
+                        'callResult',
+                        data.call_result || data.lifecycle_status,
+                        locale,
+                      )}
+                    </Dd>
+                    <Dt>{t('ws.records.calls.col.hangupParty', locale)}</Dt>
+                    <Dd>{optionLabel('hangupParty', data.hangup_party, locale)}</Dd>
+                    <Dt>{t('ws.records.calls.col.hangupReason', locale)}</Dt>
+                    <Dd>
+                      {optionLabel('hangupReason', data.hangup_reason_code, locale)
+                        || formatHangupReason(data.hangup_reason_code, isZh)
+                        || '-'}
+                    </Dd>
+                    <Dt>{t('ws.records.calls.col.startedAt', locale)}</Dt>
                     <Dd>{formatCallRecordDate(data.started_at, isZh)}</Dd>
-                    <Dt>{isZh ? '结束时间' : 'Ended At'}</Dt>
+                    <Dt>{t('ws.records.calls.col.customerConnectedAt', locale)}</Dt>
+                    <Dd>{formatCallRecordDate(data.customer_connected_at, isZh)}</Dd>
+                    <Dt>{t('ws.records.calls.col.firstAgentConnectedAt', locale)}</Dt>
+                    <Dd>{formatCallRecordDate(data.first_agent_connected_at, isZh)}</Dd>
+                    <Dt>{t('ws.records.calls.col.humanServiceEndedAt', locale)}</Dt>
+                    <Dd>{formatCallRecordDate(data.human_service_ended_at, isZh)}</Dd>
+                    <Dt>{t('ws.records.calls.col.endedAt', locale)}</Dt>
                     <Dd>{formatCallRecordDate(data.ended_at, isZh)}</Dd>
-                    <Dt>{isZh ? '通话时长' : 'Talk Time'}</Dt>
-                    <Dd>{formatCallRecordDuration(data.talk_duration_ms)}</Dd>
-                    <Dt>{isZh ? '响铃时长（含机器人/排队）' : 'Ring Time (incl. bot/queue)'}</Dt>
-                    <Dd>{formatCallRecordDuration(data.ring_duration_ms)}</Dd>
-                    <Dt>{isZh ? '挂断原因' : 'Hangup Reason'}</Dt>
-                    <Dd>{data.hangup_reason || '-'}</Dd>
+                    <Dt>{t('ws.records.calls.col.totalDuration', locale)}</Dt>
+                    <Dd>{formatCallRecordDuration(data.total_duration_ms)}</Dd>
+                    <Dt>{t('ws.records.calls.col.customerRingDuration', locale)}</Dt>
+                    <Dd>{formatCallRecordDuration(data.customer_ring_duration_ms)}</Dd>
+                    <Dt>{t('ws.records.calls.col.agentWaitDuration', locale)}</Dt>
+                    <Dd>{formatCallRecordDuration(data.agent_wait_duration_ms)}</Dd>
+                    <Dt>{t('ws.records.calls.col.talkDuration', locale)}</Dt>
+                    <Dd>{formatCallRecordDuration(data.customer_agent_talk_duration_ms)}</Dd>
+                    <Dt>{t('ws.records.calls.col.recordingStatus', locale)}</Dt>
+                    <Dd>
+                      {optionLabel('recordingStatus', data.recording_status, locale)}
+                    </Dd>
+                    <Dt>{t('ws.records.calls.col.satisfactionResult', locale)}</Dt>
+                    <Dd>
+                      <SatisfactionResultSummary record={data} locale={locale} />
+                    </Dd>
+                    <Dt>{t('ws.records.calls.col.satisfactionSource', locale)}</Dt>
+                    <Dd>
+                      {optionLabel(
+                        'satisfactionSource',
+                        data.satisfaction_trigger_source,
+                        locale,
+                      )}
+                    </Dd>
+                    <Dt>{t('ws.records.calls.col.satisfactionPrimaryOption', locale)}</Dt>
+                    <Dd>{data.satisfaction_primary_option_label || '-'}</Dd>
+                    <Dt>{t('ws.records.calls.col.satisfactionAnswerCount', locale)}</Dt>
+                    <Dd>
+                      {data.satisfaction_answer_count == null
+                        ? '-'
+                        : String(data.satisfaction_answer_count)}
+                    </Dd>
+                    <Dt>{t('ws.records.calls.col.satisfactionDuration', locale)}</Dt>
+                    <Dd>{formatCallRecordDuration(data.satisfaction_duration_ms)}</Dd>
                   </dl>
                 </section>
 
@@ -203,11 +309,162 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
                   <CallSummaryFields callRecordId={data.id} onDirtyChange={setSummaryDirty} />
                 </section>
               </div>
+              <SatisfactionResultSection record={data} isZh={isZh} />
+              </div>
+              <div className={activeTab === 'trajectory' ? 'block' : 'hidden'}>
+                <CallTrajectoryPanel recordId={data.public_id} enabled={activeTab === 'trajectory'} />
+              </div>
             </>
           )}
         </div>
       </div>
     </div>
+  )
+}
+
+function SatisfactionResultSection({ record, isZh }: { record: CallRecordDetail; isZh: boolean }) {
+  const satisfaction = record.satisfaction
+  return (
+    <section className="rounded-xl border border-border p-4">
+      <h3 className="mb-3 text-sm font-semibold">
+        {isZh ? '满意度结果' : 'Satisfaction Result'}
+      </h3>
+      {record.satisfaction_result == null ? (
+        <p className="text-sm text-muted-foreground">—</p>
+      ) : !satisfaction ? (
+        <p className="text-sm text-muted-foreground">
+          {isZh ? '本次通话未触发满意度调查' : 'No satisfaction survey was triggered for this call.'}
+        </p>
+      ) : (
+        <div className="space-y-4">
+          <dl className="grid grid-cols-[120px_1fr] gap-y-2 text-sm sm:grid-cols-[120px_1fr_120px_1fr]">
+            <Dt>{isZh ? '状态' : 'Status'}</Dt>
+            <Dd>{satisfactionStatusLabel(satisfaction.status, isZh)}</Dd>
+            <Dt>{isZh ? '触发来源' : 'Trigger'}</Dt>
+            <Dd>{satisfaction.trigger_source === 'auto_transfer' ? (isZh ? '自动转入' : 'Automatic') : (isZh ? '客服主动邀请' : 'Agent invite')}</Dd>
+            <Dt>{isZh ? '调查流程' : 'Flow'}</Dt>
+            <Dd>{satisfaction.flow_name} · V{satisfaction.flow_version_no}</Dd>
+            <Dt>{isZh ? '满意度耗时' : 'Duration'}</Dt>
+            <Dd>{formatCallRecordDuration(satisfaction.duration_ms)}</Dd>
+            <Dt>{isZh ? '开始时间' : 'Started At'}</Dt>
+            <Dd>{formatCallRecordDate(satisfaction.started_at, isZh)}</Dd>
+            <Dt>{isZh ? '结束时间' : 'Ended At'}</Dt>
+            <Dd>{formatCallRecordDate(satisfaction.ended_at, isZh)}</Dd>
+            <Dt>{isZh ? '归属客服' : 'Assigned Agent'}</Dt>
+            <Dd>{satisfaction.agent_name || '-'}</Dd>
+            <Dt>{isZh ? '归属队列' : 'Assigned Queue'}</Dt>
+            <Dd>{satisfaction.queue_name || '-'}</Dd>
+            {satisfaction.termination_reason && satisfaction.status !== 'completed' && (
+              <>
+                <Dt>{isZh ? '未完成说明' : 'Incomplete Reason'}</Dt>
+                <Dd>{satisfactionReasonLabel(satisfaction.termination_reason, isZh)}</Dd>
+              </>
+            )}
+          </dl>
+          <div className="space-y-2">
+            <h4 className="text-xs font-semibold text-muted-foreground">
+              {isZh ? '问题结果' : 'Question Results'}
+            </h4>
+            {satisfaction.answers.map((answer, index) => (
+              <div key={answer.question_node_id} className="flex items-start justify-between gap-4 rounded-lg bg-muted/40 px-3 py-2 text-sm">
+                <div>
+                  <p className="font-medium">{index + 1}. {answer.question_name}</p>
+                  <p className={answer.option_label ? 'mt-0.5' : 'mt-0.5 text-muted-foreground'}>
+                    {answer.option_label || (isZh ? '未回答' : 'Not answered')}
+                  </p>
+                </div>
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {answer.answered_at ? formatCallRecordDate(answer.answered_at, isZh) : '—'}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function satisfactionStatusLabel(status: string, isZh: boolean): string {
+  const labels: Record<string, [string, string]> = {
+    preparing: ['准备中', 'Preparing'],
+    in_progress: ['进行中', 'In progress'],
+    completed: ['已完成', 'Completed'],
+    partial: ['部分完成', 'Partially completed'],
+    unanswered: ['未作答', 'Unanswered'],
+    failed: ['启动失败', 'Failed to start'],
+  }
+  return labels[status]?.[isZh ? 0 : 1] ?? status
+}
+
+function satisfactionReasonLabel(reason: string, isZh: boolean): string {
+  const labels: Record<string, [string, string]> = {
+    customer_hangup: ['客户挂断', 'Customer hung up'],
+    // Older executions stored the kernel SIP reason before it was normalized.
+    remote_bye: ['客户挂断', 'Customer hung up'],
+    bye: ['客户挂断', 'Customer hung up'],
+    caller_hangup: ['客户挂断', 'Customer hung up'],
+    no_input_exhausted: ['无输入重试耗尽', 'No-input retries exhausted'],
+    no_match_exhausted: ['无匹配重试耗尽', 'Invalid-input retries exhausted'],
+    workflow_error: ['流程执行异常', 'Workflow error'],
+    handoff_failed: ['满意度调查启动失败', 'Survey handoff failed'],
+  }
+  return labels[reason]?.[isZh ? 0 : 1] ?? reason.replaceAll('_', ' ')
+}
+
+function recordingArtifactStatus(status: CallRecordingItem['status'], isZh: boolean): string {
+  switch (status) {
+    case 'recording':
+      return isZh ? '录音中' : 'Recording'
+    case 'completed':
+      return isZh ? '已完成' : 'Completed'
+    case 'partial':
+      return isZh ? '录音分段' : 'Segmented'
+    case 'failed':
+      return isZh ? '录音失败' : 'Failed'
+    default:
+      return status
+  }
+}
+
+function optionLabel(group: string, value: string | null | undefined, locale: Locale): string {
+  if (!value) return '-'
+  const key = `ws.records.calls.option.${group}.${value}`
+  const translated = t(key, locale)
+  return translated === key ? value : translated
+}
+
+function SatisfactionResultSummary({
+  record,
+  locale,
+}: {
+  record: Pick<
+    CallRecordListItem,
+    | 'satisfaction_result'
+    | 'satisfaction_primary_option_label'
+    | 'satisfaction_answer_count'
+  >
+  locale: Locale
+}) {
+  if (!record.satisfaction_result) return <span>-</span>
+  const result = optionLabel('satisfactionResult', record.satisfaction_result, locale)
+  if (!record.satisfaction_primary_option_label) {
+    return <span>{result}</span>
+  }
+  return (
+    <span className="inline-flex max-w-full flex-wrap items-center gap-1.5">
+      <span>{record.satisfaction_primary_option_label}</span>
+      {(record.satisfaction_answer_count ?? 0) > 1 && (
+        <span className="text-xs text-muted-foreground">
+          {t('ws.records.calls.satisfaction.answerCount', locale, {
+            count: record.satisfaction_answer_count ?? 0,
+          })}
+        </span>
+      )}
+      {record.satisfaction_result === 'partial' && (
+        <span className="text-xs text-warning">{result}</span>
+      )}
+    </span>
   )
 }
 
@@ -288,18 +545,19 @@ function CallQueueName({
   queue,
   locale,
 }: {
-  queue: CallRecordDetail['last_assigned_queue']
-  locale: 'zh' | 'en'
+  queue: CallRecordDetail['last_queue']
+  locale: Locale
 }) {
-  if (!queue?.name) return <span />
+  if (!queue?.name) return <span>-</span>
   return (
     <span className="inline-flex min-w-0 items-center gap-1.5">
       <span className="min-w-0 break-words">{queue.name}</span>
-      {queue.queue_type === 'employee' && (
-        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] leading-4 text-muted-foreground">
-          {t('ws.records.queue.personalQueue', locale)}
-        </span>
-      )}
+      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] leading-4 text-muted-foreground">
+        {t(
+          `ws.records.calls.filter.${queue.queue_type === 'employee' ? 'personalQueue' : 'groupQueue'}`,
+          locale,
+        )}
+      </span>
     </span>
   )
 }
@@ -337,17 +595,17 @@ function triggerRecordingDownload(blob: Blob, filename: string) {
   window.URL.revokeObjectURL(url)
 }
 
-function recordingFileName(record: CallRecordDetail): string {
+function recordingFileName(record: CallRecordDetail, recording: CallRecordingItem): string {
   const safeCallId = record.call_id.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '')
   let suffix = '.wav'
   try {
-    const pathname = new URL(record.recording_url || '', window.location.href).pathname
+    const pathname = new URL(recording.access_url || '', window.location.href).pathname
     const matched = pathname.match(/\.(wav|mp3|m4a|aac|ogg|webm|flac)$/i)
     if (matched) suffix = `.${matched[1].toLowerCase()}`
   } catch {
     // Keep the default extension for malformed legacy URLs.
   }
-  return `call-recording-${safeCallId || record.id}${suffix}`
+  return `call-recording-${safeCallId || record.id}-${recording.recording_id}${suffix}`
 }
 
 function Dt({ children }: { children: React.ReactNode }) {

@@ -3,6 +3,7 @@ Call-center schemas — agent_status, call_record, agent_webrtc_session.
 """
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -50,6 +51,14 @@ class AgentStatusResponse(BaseModel):
     # When the agent entered in_call (Redis). Used to restore the live timer for
     # consult targets that have no CallRecord of their own.
     in_call_since: datetime | None = None
+    # After-call work deadline (Redis epoch, fixed at hangup). Drives the
+    # wrap-up countdown; null when not in wrap-up or no deadline applies.
+    wrap_up_until: datetime | None = None
+    wrap_up_call_id: str | None = None
+    # Server-owned call-screen context restored after refresh/reconnect.
+    source: str | None = None
+    task_id: int | None = None
+    record_id: int | None = None
 
 
 class AgentStatusUpdate(BaseModel):
@@ -77,6 +86,9 @@ class ConsultableAgent(BaseModel):
     name: str | None = None
     avatar: str | None = None
     status: AgentStatusValue
+    # Employee groups (queues) this agent belongs to — shown in the target
+    # picker so an operator can spot colleagues from their own queue.
+    group_names: list[str] = []
 
 
 class TransferQueue(BaseModel):
@@ -109,52 +121,137 @@ class CallRecordUserBrief(BaseModel):
     email: str | None = None
 
 
+class CallRecordingItem(BaseModel):
+    recording_id: str
+    call_leg_id: str | None = None
+    phase: str | None = None
+    status: str
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    access_url: str | None = None
+
+
+class CallSatisfactionAnswerDetail(BaseModel):
+    question_node_id: str
+    question_name: str
+    option_id: str | None = None
+    option_label: str | None = None
+    answered_at: datetime | None = None
+
+
+class CallSatisfactionDetail(BaseModel):
+    status: str
+    trigger_source: str
+    flow_name: str
+    flow_version_no: int
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration_ms: int | None = None
+    agent_id: int | None = None
+    agent_name: str | None = None
+    queue_type: str | None = None
+    queue_id: int | None = None
+    queue_name: str | None = None
+    termination_reason: str | None = None
+    answers: list[CallSatisfactionAnswerDetail] = Field(default_factory=list)
+
+
 class CallRecordListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    public_id: UUID
     call_id: str
     direction: str
-    state: str
-    from_number: str | None = None
-    to_number: str | None = None
-    employee_group_id: int | None = None
-    agent_id: int | None = None
-    agent_name: str | None = None
+    call_source: str
+    source: str | None = None
+    task_id: int | None = None
+    record_id: int | None = None
+    customer_number: str | None = None
+    service_number: str | None = None
+    lifecycle_status: str
+    finalization_status: str | None = None
+    actual_reception_type: str | None = None
+    call_result: str | None = None
+    hangup_party: str | None = None
+    hangup_reason_code: str | None = None
+    initiator_agent_id: int | None = None
+    initiator_agent_name: str | None = None
+    last_serving_agent_id: int | None = None
+    last_serving_agent_name: str | None = None
     user_id: int | None = None
     user_public_id: str | None = None
     user_name: str | None = None
     user_phone: str | None = None
     user_association_status: CallUserAssociationStatus = "unlinked"
     started_at: datetime
-    answered_at: datetime | None = None
+    customer_connected_at: datetime | None = None
+    first_agent_connected_at: datetime | None = None
     ended_at: datetime | None = None
-    ring_duration_ms: int | None = None
-    talk_duration_ms: int | None = None
-    last_assigned_queue: QueueRecordBrief | None = None
-    queue_duration_seconds: int | None = None
+    human_service_ended_at: datetime | None = None
+    total_duration_ms: int | None = None
+    customer_ring_duration_ms: int | None = None
+    agent_wait_duration_ms: int | None = None
+    customer_agent_talk_duration_ms: int | None = None
+    satisfaction_result: str | None = None
+    satisfaction_trigger_source: str | None = None
+    satisfaction_primary_option_id: str | None = None
+    satisfaction_primary_option_label: str | None = None
+    satisfaction_answer_count: int | None = None
+    satisfaction_duration_ms: int | None = None
+    recording_status: str
+    last_queue: QueueRecordBrief | None = None
 
 
 class CallRecordListResponse(PaginatedResponse):
     items: list[CallRecordListItem]
 
 
+class CallRecordAgentFilterOption(BaseModel):
+    id: int
+    name: str
+
+
+class CallRecordQueueFilterOption(BaseModel):
+    queue_type: Literal["employee_group", "employee"]
+    queue_id: int
+    name: str
+
+
+class CallRecordFilterOptionsResponse(BaseModel):
+    agents: list[CallRecordAgentFilterOption] = Field(default_factory=list)
+    queues: list[CallRecordQueueFilterOption] = Field(default_factory=list)
+
+
 class CallRecordDetail(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    public_id: UUID
     call_id: str
     conversation_id: str | None = None
     root_call_id: str | None = None
     direction: str
-    state: str
-    from_number: str | None = None
-    to_number: str | None = None
+    call_source: str
+    custom_business_info: str | None = None
+    external_context: dict | None = None
+    customer_number: str | None = None
+    service_number: str | None = None
     voice_flow_id: int | None = None
     voice_flow_version_id: int | None = None
-    employee_group_id: int | None = None
-    agent_id: int | None = None
-    agent_name: str | None = None
+    initiator_agent_id: int | None = None
+    initiator_agent_name: str | None = None
+    last_serving_agent_id: int | None = None
+    last_serving_agent_name: str | None = None
+    lifecycle_status: str
+    finalization_status: str | None = None
+    result_rule_version: int | None = None
+    finalized_at: datetime | None = None
+    actual_reception_type: str | None = None
+    call_result: str | None = None
+    hangup_party: str | None = None
+    hangup_reason_code: str | None = None
     user_id: int | None = None
     user_public_id: str | None = None
     user_name: str | None = None
@@ -162,17 +259,25 @@ class CallRecordDetail(BaseModel):
     user_association_status: CallUserAssociationStatus = "unlinked"
     associated_user_candidates: list[CallRecordUserBrief] = Field(default_factory=list)
     started_at: datetime
-    answered_at: datetime | None = None
+    customer_connected_at: datetime | None = None
+    first_agent_connected_at: datetime | None = None
     ended_at: datetime | None = None
-    ring_duration_ms: int | None = None
-    talk_duration_ms: int | None = None
-    hangup_reason: str | None = None
-    recording_url: str | None = None
-    recording_duration_ms: int | None = None
+    human_service_ended_at: datetime | None = None
+    total_duration_ms: int | None = None
+    customer_ring_duration_ms: int | None = None
+    agent_wait_duration_ms: int | None = None
+    customer_agent_talk_duration_ms: int | None = None
+    satisfaction_result: str | None = None
+    satisfaction_trigger_source: str | None = None
+    satisfaction_primary_option_id: str | None = None
+    satisfaction_primary_option_label: str | None = None
+    satisfaction_answer_count: int | None = None
+    satisfaction_duration_ms: int | None = None
+    satisfaction: CallSatisfactionDetail | None = None
+    recording_status: str
+    recordings: list[CallRecordingItem] = Field(default_factory=list)
     related_tickets: list[RelatedTicketResponse] = Field(default_factory=list)
-    last_assigned_queue: QueueRecordBrief | None = None
-    queue_duration_seconds: int | None = None
-    metadata: dict = {}
+    last_queue: QueueRecordBrief | None = None
 
 
 class CallTranscriptSegmentSchema(BaseModel):
@@ -191,7 +296,7 @@ class CallTranscriptResponse(BaseModel):
 
 
 class CallUserAssociationResponse(BaseModel):
-    record_id: int
+    record_public_id: UUID
     call_id: str
     identified_number: str | None = None
     normalized_number: str | None = None

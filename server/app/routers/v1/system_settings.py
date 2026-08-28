@@ -10,6 +10,7 @@ from app.schemas.system_settings import (
     SystemSettingsUpdate,
     OrganizationSettingsUpdate,
     CallTranscriptionSettingsUpdate,
+    CallWrapupSettingsUpdate,
     SystemSettingsResponse,
 )
 from app.schemas.call_prompt_tone import (
@@ -65,6 +66,16 @@ async def update_call_transcription_settings(
     """Toggle agent-workstation live transcription for the current tenant."""
     tenant_id = current_user["tenant_id"]
     return await SystemSettingsService.update_call_transcription(db, tenant_id, body.enabled)
+
+
+@router.put("/call-wrapup", response_model=SystemSettingsResponse)
+async def update_call_wrapup_settings(
+    body: CallWrapupSettingsUpdate,
+    principal: EffectivePrincipal = Depends(require_permission(CALL_SETTINGS_PERMISSION)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save the tenant-level after-call work duration (0-60 seconds)."""
+    return await SystemSettingsService.update_call_wrapup(db, principal.tenant_id, body.seconds)
 
 
 @router.get("/call-prompt-tones", response_model=CallPromptToneSettingsResponse)

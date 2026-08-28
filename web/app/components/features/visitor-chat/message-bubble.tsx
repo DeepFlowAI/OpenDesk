@@ -36,6 +36,7 @@ import {
 } from '@/components/assistant-ui/visitor-chat-runtime'
 import { AssistantMarkdownText, MarkdownText, markdownTextRootClass } from '@/components/assistant-ui/markdown-text'
 import type { Locale } from '@/context/locale-store'
+import { formatMessageTime } from '@/lib/message-time'
 import {
   canQuoteMessage,
   messageQuoteFromMetadata,
@@ -57,7 +58,7 @@ type MessageBubbleProps = {
   config: ChannelConfig
   showAvatar: boolean
   showName: boolean
-  locale: string
+  locale: Locale
   messageStatus?: string
   showTime?: boolean
   renderAssistantParts?: boolean
@@ -97,11 +98,11 @@ function isWithinRecallWindow(createdAt: string): boolean {
   return !Number.isNaN(timestamp) && Date.now() - timestamp <= MESSAGE_RECALL_WINDOW_MS
 }
 
-function scrollToVisitorMessage(messageId: number, locale: string) {
+function scrollToVisitorMessage(messageId: number, locale: Locale) {
   if (typeof document === 'undefined') return
   const node = document.querySelector<HTMLElement>(`[data-visitor-message-id="${messageId}"]`)
   if (!node) {
-    window.alert(t('ws.chat.quote.locateFailed', locale as Locale))
+    window.alert(t('ws.chat.quote.locateFailed', locale))
     return
   }
   node.scrollIntoView({ block: 'center', behavior: 'smooth' })
@@ -117,16 +118,14 @@ export function shouldShowVisitorRecalledNotice(
   return Boolean(message.is_recalled && message.sender_type === 'visitor')
 }
 
-function recallText(message: Message, locale: string): string {
+function recallText(message: Message, locale: Locale): string {
   if (message.sender_type === 'visitor') {
-    return locale === 'zh' ? '你撤回了一条消息' : 'You recalled a message'
+    return t('chat.recall.mine', locale)
   }
   if (message.sender_name) {
-    return locale === 'zh'
-      ? `${message.sender_name} 撤回了一条消息`
-      : `${message.sender_name} recalled a message`
+    return t('chat.recall.named', locale, { name: message.sender_name })
   }
-  return locale === 'zh' ? '对方撤回了一条消息' : 'The other party recalled a message'
+  return t('chat.recall.other', locale)
 }
 
 function RecallNotice({
@@ -163,32 +162,8 @@ function RecallNotice({
   )
 }
 
-function formatTime(dateStr: string, locale: string): string {
-  const date = new Date(dateStr)
-  const now = new Date()
-  const diffMs = now.getTime() - date.getTime()
-  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
-
-  const time = date.toLocaleTimeString(locale === 'zh' ? 'zh-CN' : 'en-US', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  })
-
-  if (diffDays === 0 && now.getDate() === date.getDate()) return time
-  if (diffDays <= 1 && now.getDate() - date.getDate() === 1) {
-    return locale === 'zh' ? `昨天 ${time}` : `Yesterday ${time}`
-  }
-  if (date.getFullYear() === now.getFullYear()) {
-    const month = String(date.getMonth() + 1).padStart(2, '0')
-    const day = String(date.getDate()).padStart(2, '0')
-    return `${month}-${day} ${time}`
-  }
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day} ${time}`
+function formatTime(dateStr: string, locale: Locale): string {
+  return formatMessageTime(dateStr, locale, { seconds: true })
 }
 
 function OpenAgentAIDisclaimerNotice({
@@ -196,9 +171,9 @@ function OpenAgentAIDisclaimerNotice({
   locale,
 }: {
   content: string
-  locale: string
+  locale: Locale
 }) {
-  const label = locale === 'zh' ? 'AI 免责声明' : 'AI disclaimer'
+  const label = t('chat.ai.disclaimer', locale)
 
   return (
     <div className="mt-2 flex max-w-full items-start gap-1.5 text-[12px] leading-4 text-muted-foreground">
@@ -238,11 +213,37 @@ function getToolBriefFromArgs(args: unknown): string {
   return ''
 }
 
-function getToolDisplayName(toolName: string, locale: string): string {
+function getToolDisplayName(toolName: string, locale: Locale): string {
   if (!toolName || toolName === 'open_agent_tool') {
-    return locale === 'zh' ? '工具调用' : 'Tool call'
+    return t('chat.ai.toolCall', locale)
   }
   return toolName
+}
+
+export function resolveOpenAgentToolLabel(
+  brief: string,
+  toolName: string,
+  locale: Locale,
+): string {
+  const trimmedBrief = brief.trim()
+  const isGeneratedChineseBrief = trimmedBrief === '工具调用'
+    || trimmedBrief === '调用工具'
+    || (Boolean(toolName) && trimmedBrief === `调用 ${toolName}`)
+  if (!trimmedBrief || isGeneratedChineseBrief) {
+    return getToolDisplayName(toolName, locale)
+  }
+  return trimmedBrief
+}
+
+export function resolveVisitorAssistantName(
+  senderType: Message['sender_type'],
+  senderName: string | null | undefined,
+  locale: Locale,
+): string {
+  if (senderType === 'bot' && (!senderName || senderName === '智能助手')) {
+    return t('chat.quote.sender.bot', locale)
+  }
+  return senderName || ''
 }
 
 function OpenAgentThinkingBlock({
@@ -250,13 +251,13 @@ function OpenAgentThinkingBlock({
   active = false,
   content = '',
 }: {
-  locale: string
+  locale: Locale
   active?: boolean
   content?: string
 }) {
   const [manualExpanded, setManualExpanded] = useState<boolean | null>(() => (active ? true : null))
   const expanded = manualExpanded ?? active
-  const label = locale === 'zh' ? '思考' : 'Thinking'
+  const label = t('chat.ai.thinking', locale)
   const hasContent = content.trim().length > 0
 
   return (
@@ -295,13 +296,13 @@ function OpenAgentThinkingBlock({
   )
 }
 
-function OpenAgentFakeThinkingBubble() {
+function OpenAgentFakeThinkingBubble({ locale }: { locale: Locale }) {
   return (
     <div
       className="inline-flex min-h-10 items-center gap-1 rounded-lg bg-[#F6F6F6] px-4 py-3 text-[#71717A]"
       role="status"
       aria-live="polite"
-      aria-label="正在思考中"
+      aria-label={t('chat.ai.thinking', locale)}
     >
       <span className="inline-block h-1.5 w-1.5 rounded-full bg-current opacity-70 motion-safe:animate-bounce [animation-delay:0ms] [animation-duration:900ms]" />
       <span className="inline-block h-1.5 w-1.5 rounded-full bg-current opacity-70 motion-safe:animate-bounce [animation-delay:150ms] [animation-duration:900ms]" />
@@ -317,7 +318,7 @@ function OpenAgentToolSurface({
 }: {
   label: string
   executing?: boolean
-  locale: string
+  locale: Locale
 }) {
   return (
     <div
@@ -326,7 +327,7 @@ function OpenAgentToolSurface({
     >
       <IconTool size={16} className="shrink-0 text-[#71717A]" aria-hidden />
       <span className="min-w-0 flex-1 truncate font-normal">
-        {label || (locale === 'zh' ? '工具调用' : 'Tool call')}
+        {label || t('chat.ai.toolCall', locale)}
       </span>
       {executing && (
         <IconLoader2 size={16} className="shrink-0 animate-spin text-[#A1A1AA]" aria-hidden />
@@ -341,12 +342,12 @@ function OpenAgentToolPart({
   artifact,
   status,
   locale,
-}: ToolCallMessagePartProps & { locale: string }) {
+}: ToolCallMessagePartProps & { locale: Locale }) {
   const toolArtifact = getToolArtifact(artifact)
   const brief = typeof toolArtifact.brief === 'string' && toolArtifact.brief.trim()
     ? toolArtifact.brief.trim()
     : getToolBriefFromArgs(args)
-  const label = brief || getToolDisplayName(toolName, locale)
+  const label = resolveOpenAgentToolLabel(brief, toolName, locale)
   const executing = toolArtifact.isExecuting === true || status?.type === 'running'
 
   return <OpenAgentToolSurface label={label} executing={executing} locale={locale} />
@@ -357,11 +358,11 @@ function StaticToolCallBlock({
   locale,
 }: {
   block: OpenAgentToolBlock
-  locale: string
+  locale: Locale
 }) {
   return (
     <OpenAgentToolSurface
-      label={block.brief || block.toolName || (locale === 'zh' ? '工具调用' : 'Tool call')}
+      label={resolveOpenAgentToolLabel(block.brief, block.toolName, locale)}
       executing={block.isExecuting}
       locale={locale}
     />
@@ -375,16 +376,16 @@ function OpenAgentTraceSummary({
 }: {
   thinkingCount: number
   toolCount: number
-  locale: string
+  locale: Locale
 }) {
   const parts: string[] = []
   if (thinkingCount > 0) {
-    parts.push(locale === 'zh' ? '已思考' : 'Thought')
+    parts.push(t('chat.ai.thought', locale))
   }
   if (toolCount > 0) {
-    parts.push(locale === 'zh' ? `调用了 ${toolCount} 个工具` : `Used ${toolCount} tool${toolCount > 1 ? 's' : ''}`)
+    parts.push(t('chat.ai.usedTools', locale, { count: toolCount }))
   }
-  return <span className="font-normal">{parts.join(' · ') || (locale === 'zh' ? '查看过程' : 'View steps')}</span>
+  return <span className="font-normal">{parts.join(' · ') || t('chat.ai.viewSteps', locale)}</span>
 }
 
 function OpenAgentProcessBlocks({
@@ -395,7 +396,7 @@ function OpenAgentProcessBlocks({
 }: {
   thinkingBlocks: ReturnType<typeof getOpenAgentThinkingBlocks>
   toolBlocks: OpenAgentToolBlock[]
-  locale: string
+  locale: Locale
   isStreaming: boolean
 }) {
   const [manualOpen, setManualOpen] = useState<boolean | null>(null)
@@ -470,7 +471,7 @@ function StaticOpenAgentTraceBlocks({
   textBlocks: OpenAgentTextBlock[]
   thinkingBlocks: ReturnType<typeof getOpenAgentThinkingBlocks>
   toolBlocks: OpenAgentToolBlock[]
-  locale: string
+  locale: Locale
   bubbleStyle: CSSProperties
   isStreaming: boolean
 }) {
@@ -563,6 +564,7 @@ export function MessageBubble({
   const isUser = message.sender_type === 'visitor'
   const isAssistant = message.sender_type === 'agent' || message.sender_type === 'bot'
   const isBot = message.sender_type === 'bot'
+  const assistantName = resolveVisitorAssistantName(message.sender_type, message.sender_name, locale)
   const assistantAvatarSrc = getAssistantAvatarSrc(message, config)
   const visitorChat = useVisitorChatConfig()
   const [messageMenu, setMessageMenu] = useState<{ x: number; y: number } | null>(null)
@@ -800,7 +802,7 @@ export function MessageBubble({
           className="flex w-full items-center rounded px-3 py-1.5 text-left text-foreground hover:bg-muted"
           onClick={handleQuote}
         >
-          {t('ws.chat.quote.action', locale as Locale)}
+          {t('ws.chat.quote.action', locale)}
         </button>
       )}
       {canRecall && (
@@ -809,7 +811,7 @@ export function MessageBubble({
           className="flex w-full items-center rounded px-3 py-1.5 text-left text-foreground hover:bg-muted"
           onClick={handleRecall}
         >
-          {locale === 'zh' ? '撤回' : 'Recall'}
+          {t('chat.recall.action', locale)}
         </button>
       )}
     </div>
@@ -822,7 +824,7 @@ export function MessageBubble({
   const quoteBlock = quote ? (
     <MessageQuoteBlock
       quote={quote}
-      locale={locale as Locale}
+      locale={locale}
       original={quotedOriginal}
       onClick={() => scrollToVisitorMessage(quote.message_id, locale)}
       audience="visitor"
@@ -833,7 +835,7 @@ export function MessageBubble({
   const embeddedQuoteBlock = quote ? (
     <MessageQuoteBlock
       quote={quote}
-      locale={locale as Locale}
+      locale={locale}
       original={quotedOriginal}
       onClick={() => scrollToVisitorMessage(quote.message_id, locale)}
       variant="embedded"
@@ -842,13 +844,13 @@ export function MessageBubble({
       className="mb-2"
     />
   ) : null
-  const assistantHeader = !isUser && (showTime || (showName && message.sender_name)) ? (
+  const assistantHeader = !isUser && (showTime || (showName && assistantName)) ? (
     <div className="mb-1 flex max-w-full items-center gap-1.5 text-muted-foreground">
       {showTime && (
         <span className="shrink-0 text-[10px]">{formatTime(message.created_at, locale)}</span>
       )}
-      {showName && message.sender_name && (
-        <span className="truncate text-xs font-medium">{message.sender_name}</span>
+      {showName && assistantName && (
+        <span className="truncate text-xs font-medium">{assistantName}</span>
       )}
     </div>
   ) : null
@@ -861,7 +863,7 @@ export function MessageBubble({
         {showAvatar && !isUser && assistantAvatarSrc && (
           <img
             src={assistantAvatarSrc}
-            alt={message.sender_name || ''}
+            alt={assistantName}
             className="h-9 w-9 shrink-0 rounded-full object-cover"
           />
         )}
@@ -869,7 +871,7 @@ export function MessageBubble({
           text={recallText(message, locale)}
           time={showTime ? formatTime(message.created_at, locale) : undefined}
           alignEnd={isUser}
-          editLabel={canEditRecalled ? t('ws.chat.recall.editAgain', locale as Locale) : undefined}
+          editLabel={canEditRecalled ? t('ws.chat.recall.editAgain', locale) : undefined}
           onEdit={canEditRecalled ? handleEditRecalled : undefined}
         />
       </div>
@@ -892,7 +894,7 @@ export function MessageBubble({
         {showAvatar && assistantAvatarSrc && (
           <img
             src={assistantAvatarSrc}
-            alt={message.sender_name || ''}
+            alt={assistantName}
             className="h-9 w-9 shrink-0 rounded-full object-cover"
           />
         )}
@@ -937,7 +939,7 @@ export function MessageBubble({
         {showAvatar && assistantAvatarSrc && (
           <img
             src={assistantAvatarSrc}
-            alt={message.sender_name || ''}
+            alt={assistantName}
             className="h-9 w-9 shrink-0 rounded-full object-cover"
           />
         )}
@@ -948,7 +950,7 @@ export function MessageBubble({
           <div className="w-full min-w-0 space-y-2">
             {quoteBlock}
             {isThinking && thinkingBlocks.length === 0 && visibleToolBlocks.length === 0 && (
-              <OpenAgentFakeThinkingBubble />
+              <OpenAgentFakeThinkingBubble locale={locale} />
             )}
             <StaticOpenAgentTraceBlocks
               textBlocks={textBlocks}
@@ -991,7 +993,7 @@ export function MessageBubble({
       {showAvatar && !isUser && assistantAvatarSrc && (
         <img
           src={assistantAvatarSrc}
-          alt={message.sender_name || ''}
+          alt={assistantName}
           className="h-9 w-9 shrink-0 rounded-full object-cover"
         />
       )}
@@ -1002,7 +1004,7 @@ export function MessageBubble({
 
         <div className={cn(visibleStatus ? 'flex min-w-0 max-w-full items-end gap-1' : 'contents')}>
           {visibleStatus && (
-            <MessageStatusIcon status={visibleStatus} locale={locale as Locale} tone="gray" />
+            <MessageStatusIcon status={visibleStatus} locale={locale} tone="gray" />
           )}
           {attachmentContentType ? (
             <div className="flex min-w-0 max-w-full flex-col">
@@ -1070,13 +1072,13 @@ export function MessageBubble({
             className="mt-1 flex items-center gap-2 text-xs text-destructive"
             data-message-send-failed
           >
-            <span>{locale === 'zh' ? '发送失败' : 'Failed to send'}</span>
+            <span>{t('chat.send.failed', locale)}</span>
             <button
               type="button"
               className="font-medium underline-offset-2 hover:underline"
               onClick={() => onRetryMessage(message)}
             >
-              {locale === 'zh' ? '重新发送' : 'Retry'}
+              {t('chat.send.retry', locale)}
             </button>
           </div>
         )}

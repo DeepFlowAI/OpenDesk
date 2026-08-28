@@ -6,6 +6,7 @@ we can assert the wiring without spinning up FastAPI / Postgres.
 """
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +15,7 @@ import pytest
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.libs.telephony.base import TelephonyRPCError
+from app.services.call_center import outbound_dial_service as ods_mod
 from app.services.call_center.orchestrator import get_orchestrator, reset_orchestrator
 from app.services.call_center.outbound_dial_service import OutboundDialService
 from app.services.cc_agent_resource_service import CcAgentResourceService
@@ -311,3 +313,162 @@ async def test_dial_surfaces_flowkit_trunk_not_found():
                 outbound_phone_number_id="pn-1",
                 destination="13800138000",
             )
+
+
+@pytest.mark.asyncio
+async def test_persist_skips_busy_when_outbound_already_ended(monkeypatch):
+    """Hangup can beat persist; do not write PG busy after ready was restored."""
+    from app.services.call_center.outbound_dial_service import _DialContext
+
+    orch = get_orchestrator()
+    await orch._mark_outbound_ended("out-ended", "rejected", 603)
+    sync = AsyncMock()
+    create = AsyncMock()
+    finalize = AsyncMock(return_value=("rejected", 603))
+    monkeypatch.setattr(
+        "app.services.call_center.outbound_dial_service.CcAgentStatusService.sync_pg_status",
+        sync,
+    )
+    monkeypatch.setattr(
+        "app.services.call_center.outbound_dial_service.CallRecordService.create_for_outbound",
+        create,
+    )
+    monkeypatch.setattr(orch, "finalize_outbound_cdr_if_already_ended", finalize)
+
+    ctx = _DialContext(
+        dest="13800138000",
+        dialed="13800138000",
+        caller_id="+86021",
+        trunk_id="trunk_sh",
+        prefix="",
+        device_type="webrtc",
+        device_identifier=None,
+    )
+    db = AsyncMock()
+    await OutboundDialService._persist_webrtc_outbound(
+        db,
+        tenant_pk=1,
+        employee_id=42,
+        ctx=ctx,
+        call_id="out-ended",
+        result={},
+        call_source="manual",
+        custom_business_info=None,
+        external_context=None,
+    )
+
+    sync.assert_not_awaited()
+    create.assert_awaited_once()
+
+
+class _FakeSessionCM:
+    """Minimal async context manager standing in for AsyncSessionLocal."""
+
+    def __init__(self, db):
+        self._db = db
+
+    async def __aenter__(self):
+        return self._db
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _stub_managed_dial_prereqs(monkeypatch):
+    """Stub everything dial_managed touches before/around the originate RPC."""
+    monkeypatch.setattr(
+        "app.services.call_center.outbound_dial_service.AsyncSessionLocal",
+        lambda: _FakeSessionCM(AsyncMock()),
+    )
+    repo = MagicMock()
+    repo.get_tenant = AsyncMock(return_value=_stub_tenant())
+    repo.get_assigned_by_id = AsyncMock(return_value=_stub_phone_number())
+    monkeypatch.setattr(
+        "app.services.call_center.outbound_dial_service.TenantPhoneNumberRepository",
+        repo,
+    )
+    monkeypatch.setattr(
+        "app.services.agent_call_device_service.AgentCallDeviceService.get_current_device",
+        AsyncMock(return_value={"device_type": "webrtc"}),
+    )
+
+
+def _stub_originate(call_id: str) -> MagicMock:
+    telephony = MagicMock()
+    telephony.call_originate = AsyncMock(
+        return_value={
+            "call_id": call_id,
+            "conversation_id": "conv-1",
+            "status": "originating",
+        }
+    )
+    return telephony
+
+
+@pytest.mark.asyncio
+async def test_dial_managed_returns_before_persist_completes(monkeypatch):
+    """/dial must respond once the originate is accepted; the CDR persist
+    (seconds of DB work) continues in a background task."""
+    _stub_managed_dial_prereqs(monkeypatch)
+    telephony = _stub_originate("out-bg")
+
+    persist_started = asyncio.Event()
+    persist_release = asyncio.Event()
+    persist_done = asyncio.Event()
+
+    async def gated_persist(db, **kwargs):
+        persist_started.set()
+        await persist_release.wait()
+        persist_done.set()
+
+    monkeypatch.setattr(
+        OutboundDialService, "_persist_webrtc_outbound", gated_persist
+    )
+
+    resp = await OutboundDialService.dial_managed(
+        telephony,
+        tenant_pk=1,
+        employee_id=42,
+        outbound_phone_number_id="pn-1",
+        destination="13800138000",
+    )
+
+    # The response is already in hand while the persist is still gated —
+    # before the change this awaited the full DB persist.
+    assert resp.call_id == "out-bg"
+    assert resp.status == "originating"
+    await asyncio.sleep(0)
+    assert persist_started.is_set()
+    assert not persist_done.is_set()
+
+    persist_release.set()
+    tasks = list(ods_mod._background_persist_tasks)
+    assert len(tasks) == 1
+    await asyncio.gather(*tasks)
+    assert persist_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_dial_managed_persist_failure_stays_off_response(monkeypatch, caplog):
+    """A failing background persist must not break an already-accepted dial."""
+    _stub_managed_dial_prereqs(monkeypatch)
+    telephony = _stub_originate("out-err")
+    monkeypatch.setattr(
+        OutboundDialService,
+        "_persist_webrtc_outbound",
+        AsyncMock(side_effect=RuntimeError("db down")),
+    )
+
+    resp = await OutboundDialService.dial_managed(
+        telephony,
+        tenant_pk=1,
+        employee_id=42,
+        outbound_phone_number_id="pn-1",
+        destination="13800138000",
+    )
+
+    assert resp.call_id == "out-err"
+    tasks = list(ods_mod._background_persist_tasks)
+    assert len(tasks) == 1
+    await asyncio.gather(*tasks)  # must not re-raise the persist failure
+    assert "outbound persist failed call_id=out-err" in caplog.text

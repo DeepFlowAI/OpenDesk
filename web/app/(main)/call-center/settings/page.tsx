@@ -4,9 +4,11 @@ import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Switch } from '@/components/ui/switch'
 import { PromptToneSection } from '@/app/components/features/call-prompt-tone/prompt-tone-section'
+import { EmbeddedPagesSection } from '@/app/components/features/conversation-settings/embedded-pages-section'
 import {
   useSystemSettings,
   useUpdateCallTranscription,
+  useUpdateCallWrapup,
 } from '@/service/use-system-settings'
 import {
   useCallPromptTones,
@@ -15,6 +17,8 @@ import {
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import type { CallPromptTone } from '@/models/call-prompt-tone'
+import { OutboundPrescreenIntentEntry } from '@/app/components/features/call-center/outbound-prescreen-intent-entry'
+import { WrapUpSection } from '@/app/components/features/call-center/wrap-up-section'
 
 export default function CallCenterSettingsPage() {
   const { locale } = useLocaleStore()
@@ -22,12 +26,18 @@ export default function CallCenterSettingsPage() {
   const { data: tonesData, isLoading: tonesLoading } = useCallPromptTones()
   const updateTranscription = useUpdateCallTranscription()
   const updateTones = useUpdateCallPromptTones()
+  const updateWrapup = useUpdateCallWrapup()
 
   const [enabled, setEnabled] = useState(false)
   const [scenes, setScenes] = useState<CallPromptTone[]>([])
+  const [wrapupInput, setWrapupInput] = useState('30')
 
   useEffect(() => {
     if (settings) setEnabled(settings.bridge_asr_enabled)
+  }, [settings])
+
+  useEffect(() => {
+    if (settings) setWrapupInput(String(settings.call_wrapup_seconds))
   }, [settings])
 
   useEffect(() => {
@@ -36,13 +46,19 @@ export default function CallCenterSettingsPage() {
 
   const isLoading = settingsLoading || tonesLoading
   const isSaving = updateTranscription.isPending || updateTones.isPending
+  const wrapupSaving = updateWrapup.isPending
 
   const transcriptionDirty = settings ? enabled !== settings.bridge_asr_enabled : false
   const tonesDirty = useMemo(() => {
     if (!tonesData) return false
     return JSON.stringify(scenes) !== JSON.stringify(tonesData.scenes)
   }, [scenes, tonesData])
-  const hasChanges = transcriptionDirty || tonesDirty
+  const wrapupParsed = /^\d+$/.test(wrapupInput.trim()) ? Number(wrapupInput.trim()) : NaN
+  const wrapupValid = Number.isInteger(wrapupParsed) && wrapupParsed >= 0 && wrapupParsed <= 60
+  const wrapupDirty = settings ? wrapupInput.trim() !== String(settings.call_wrapup_seconds) : false
+  // The footer save only covers transcription + prompt tones; wrap-up saves on its own button.
+  const footerDirty = transcriptionDirty || tonesDirty
+  const hasChanges = footerDirty || wrapupDirty
 
   // Client-side guard mirroring the backend save validation: block saving while
   // an enabled scene has empty TTS text or a missing audio asset.
@@ -89,6 +105,16 @@ export default function CallCenterSettingsPage() {
     }
   }
 
+  const handleWrapupSave = async () => {
+    if (!wrapupValid) return
+    try {
+      await updateWrapup.mutateAsync({ seconds: wrapupParsed })
+      toast.success(t('cs.wrapup.saveSuccess', locale))
+    } catch {
+      toast.error(t('cs.saveFailed', locale))
+    }
+  }
+
   if (isLoading) {
     return (
       <div className="flex flex-col gap-4">
@@ -114,6 +140,18 @@ export default function CallCenterSettingsPage() {
         </p>
       </div>
 
+      {/* After-call work duration (saves independently) */}
+      <WrapUpSection
+        locale={locale}
+        value={wrapupInput}
+        onChange={setWrapupInput}
+        onSave={handleWrapupSave}
+        saving={wrapupSaving}
+        dirty={wrapupDirty}
+        valid={wrapupValid}
+        parsed={Number.isInteger(wrapupParsed) ? wrapupParsed : 0}
+      />
+
       {/* Call prompt tones */}
       <PromptToneSection
         locale={locale}
@@ -122,17 +160,25 @@ export default function CallCenterSettingsPage() {
         disabled={isSaving}
       />
 
+      {/* Screen-pop embedded pages */}
+      <EmbeddedPagesSection
+        location="call_screen_pop"
+        basePath="/call-center/settings/embedded-pages"
+      />
+
       {/* Footer actions */}
       <div>
         <button
           type="button"
           onClick={handleSave}
-          disabled={isSaving || !hasChanges || hasInvalidScene}
+          disabled={isSaving || !footerDirty || hasInvalidScene}
           className="flex h-10 items-center justify-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
         >
           {isSaving ? t('cs.saving', locale) : t('cs.save', locale)}
         </button>
       </div>
+
+      <OutboundPrescreenIntentEntry />
     </div>
   )
 }

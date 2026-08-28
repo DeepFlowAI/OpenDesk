@@ -12,6 +12,21 @@ from app.models.employee import Employee
 class EmployeeGroupRepository:
 
     @staticmethod
+    async def list_filter_options(
+        db: AsyncSession,
+        tenant_id: int,
+        group_ids: list[int] | None = None,
+    ) -> list[EmployeeGroup]:
+        """Return tenant groups for lightweight selector options."""
+        if group_ids is not None and not group_ids:
+            return []
+        query = select(EmployeeGroup).where(EmployeeGroup.tenant_id == tenant_id)
+        if group_ids is not None:
+            query = query.where(EmployeeGroup.id.in_(group_ids))
+        result = await db.execute(query.order_by(EmployeeGroup.id.asc()))
+        return list(result.scalars().all())
+
+    @staticmethod
     async def get_paginated(
         db: AsyncSession,
         tenant_id: int,

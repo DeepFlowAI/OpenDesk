@@ -20,6 +20,33 @@ class _FakeSessionCtx:
         return False
 
 
+def _call_record(
+    *,
+    id: int = 1,
+    customer_number: str = "",
+    service_number: str = "",
+    direction: str = "inbound",
+    lifecycle_status: str = "active",
+    first_agent_connected_at=None,
+    customer_connected_at=None,
+    started_at=None,
+    call_id: str | None = None,
+    root_call_id: str | None = None,
+):
+    return SimpleNamespace(
+        id=id,
+        customer_number=customer_number,
+        service_number=service_number,
+        direction=direction,
+        lifecycle_status=lifecycle_status,
+        first_agent_connected_at=first_agent_connected_at,
+        customer_connected_at=customer_connected_at,
+        started_at=started_at,
+        call_id=call_id,
+        root_call_id=root_call_id,
+    )
+
+
 def _patch_deps(
     monkeypatch,
     *,
@@ -31,14 +58,20 @@ def _patch_deps(
     force_release=None,
     mark_in_call=None,
     consult_host=None,
+    satisfaction_execution=None,
+    workspace_context=None,
 ):
     from app.db import redis as redis_mod
     from app.db import session as session_mod
     from app.services.cc_agent_resource_service import CcAgentResourceService
     from app.services.cc_agent_status_service import CcAgentStatusService
     from app.repositories.call_record_repository import CallRecordRepository
+    from app.repositories.call_satisfaction_execution_repository import (
+        CallSatisfactionExecutionRepository,
+    )
     from app.services.agent_call_device_service import AgentCallDeviceService
     from app.services.call_center.call_control_service import CallControlService
+    from app.services.call_workspace_context_service import CallWorkspaceContextService
 
     monkeypatch.setattr(
         redis_mod,
@@ -77,6 +110,11 @@ def _patch_deps(
     )
     monkeypatch.setattr(
         CallControlService,
+        "_customer_leg_alive_in_kernel",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        CallControlService,
         "_resolve_current_call",
         AsyncMock(
             return_value=SimpleNamespace(customer_call_id="cust-root")
@@ -96,9 +134,19 @@ def _patch_deps(
         AsyncMock(return_value=active_cdr),
     )
     monkeypatch.setattr(
+        CallSatisfactionExecutionRepository,
+        "get_by_call_record_id",
+        AsyncMock(return_value=satisfaction_execution),
+    )
+    monkeypatch.setattr(
         AgentCallDeviceService,
         "get_current_device",
         AsyncMock(return_value={"device_type": device_type}),
+    )
+    monkeypatch.setattr(
+        CallWorkspaceContextService,
+        "get_auto_outbound_context",
+        AsyncMock(return_value=workspace_context or {}),
     )
 
 
@@ -118,11 +166,9 @@ async def test_republish_ringing_emits_call_incoming(monkeypatch):
             "queue_id": 9,
             "direction": "inbound",
         },
-        record=SimpleNamespace(
-            from_number="15200001111",
-            to_number="4001889250",
-            device_type="webrtc",
-            state="ringing",
+        record=_call_record(
+            customer_number="15200001111",
+            service_number="4001889250",
         ),
     )
 
@@ -151,9 +197,7 @@ async def test_republish_skips_webrtc_ringing_without_pending_offer(monkeypatch)
             "queue_id": None,
             "direction": "inbound",
         },
-        record=SimpleNamespace(
-            from_number="1", to_number="2", device_type="webrtc", state="ringing"
-        ),
+        record=_call_record(customer_number="1", service_number="2"),
     )
 
     await orch.republish_agent_call_ui(tenant_id=1, employee_id=7)
@@ -175,9 +219,7 @@ async def test_republish_skips_webrtc_ringing_with_empty_offer_id(monkeypatch):
             "queue_id": None,
             "direction": "outbound",
         },
-        record=SimpleNamespace(
-            from_number="1", to_number="2", device_type="webrtc", state="ringing"
-        ),
+        record=_call_record(customer_number="2", service_number="1", direction="outbound"),
     )
 
     await orch.republish_agent_call_ui(tenant_id=1, employee_id=7)
@@ -200,12 +242,12 @@ async def test_republish_in_call_emits_incoming_then_answered(monkeypatch):
             "queue_id": None,
             "direction": "inbound",
         },
-        record=SimpleNamespace(
-            from_number="100",
-            to_number="400",
-            device_type="webrtc",
-            state="in_progress",
-        ),
+        record=_call_record(customer_number="100", service_number="400"),
+        workspace_context={
+            "source": "auto_outbound",
+            "task_id": 12,
+            "record_id": 34,
+        },
     )
 
     await orch.republish_agent_call_ui(tenant_id=1, employee_id=7)
@@ -213,6 +255,9 @@ async def test_republish_in_call_emits_incoming_then_answered(monkeypatch):
     orch.notify_agent_incoming.assert_awaited_once()
     payload = orch.notify_agent_incoming.await_args.kwargs["payload"]
     assert payload["restore"] is True
+    assert payload["source"] == "auto_outbound"
+    assert payload["task_id"] == 12
+    assert payload["record_id"] == 34
     orch.notify_agent_call_answered.assert_awaited_once()
     assert orch.notify_agent_call_answered.await_args.kwargs["call_id"] == "call-9"
 
@@ -236,12 +281,10 @@ async def test_republish_promotes_ringing_to_in_call_when_cdr_answered(monkeypat
             "queue_id": 3,
             "direction": "inbound",
         },
-        record=SimpleNamespace(
-            from_number="19310542271",
-            to_number="4001889250",
-            device_type="sip_phone",
-            state="in_progress",
-            answered_at=datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc),
+        record=_call_record(
+            customer_number="19310542271",
+            service_number="4001889250",
+            first_agent_connected_at=datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc),
         ),
         device_type="sip_phone",
         mark_in_call=mark_in_call,
@@ -274,11 +317,11 @@ async def test_republish_drops_redis_pointer_when_cdr_already_ended(monkeypatch)
             "queue_id": None,
             "direction": "outbound",
         },
-        record=SimpleNamespace(
-            from_number="100",
-            to_number="17695479404",
-            device_type="webrtc",
-            state="completed",
+        record=_call_record(
+            customer_number="17695479404",
+            service_number="100",
+            direction="outbound",
+            lifecycle_status="ended",
         ),
         force_release=release,
         consult_host=None,
@@ -323,12 +366,10 @@ async def test_republish_consult_target_without_cdr_keeps_timer(monkeypatch):
         "get_by_call_id",
         AsyncMock(
             side_effect=lambda _db, call_id, _tid: (
-                SimpleNamespace(
-                    from_number="15200001111",
-                    to_number="4001889250",
-                    device_type="webrtc",
-                    state="in_progress",
-                    answered_at=since,
+                _call_record(
+                    customer_number="15200001111",
+                    service_number="4001889250",
+                    first_agent_connected_at=since,
                     started_at=since,
                 )
                 if call_id == "cust-root"
@@ -370,14 +411,13 @@ async def test_republish_recovers_from_active_cdr_when_redis_drifted(monkeypatch
         },
         record=None,
         device_type="sip_phone",
-        active_cdr=SimpleNamespace(
+        active_cdr=_call_record(
             call_id="leg-consult",
             root_call_id="call-customer",
-            from_number="15200001111",
-            to_number="4001889250",
-            device_type="sip_phone",
+            customer_number="15200001111",
+            service_number="4001889250",
             direction="inbound",
-            state="in_progress",
+            first_agent_connected_at=object(),
         ),
         recover=recover,
     )
@@ -409,11 +449,11 @@ async def test_republish_skips_stuck_ringing_cdr_when_redis_idle(monkeypatch):
         monkeypatch,
         snapshot={"resource_state": "idle", "current_call_id": None},
         record=None,
-        active_cdr=SimpleNamespace(
+        active_cdr=_call_record(
             call_id="stuck-ring",
             root_call_id=None,
-            state="ringing",
             direction="outbound",
+            first_agent_connected_at=None,
         ),
     )
 
@@ -441,3 +481,85 @@ async def test_republish_skips_when_no_redis_in_call_and_no_active_cdr(monkeypat
 
     orch.notify_agent_incoming.assert_not_awaited()
     orch.notify_agent_call_answered.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_republish_skips_recover_while_satisfaction_survey_runs(monkeypatch):
+    """After invite, the CDR stays active for the customer survey. Recovering the
+    agent to in_call would media-reconnect and steal the IVR audio path."""
+
+    orch = CallCenterOrchestrator.__new__(CallCenterOrchestrator)
+    orch._pending_offers = {}
+    orch.notify_agent_incoming = AsyncMock(return_value=True)
+    orch.notify_agent_call_answered = AsyncMock()
+    recover = AsyncMock(return_value=None)
+
+    _patch_deps(
+        monkeypatch,
+        snapshot={
+            "resource_state": "after_call_work",
+            "current_call_id": None,
+            "offer_id": "",
+            "queue_id": None,
+            "direction": None,
+        },
+        record=None,
+        active_cdr=_call_record(
+            id=203,
+            call_id="cust-1",
+            root_call_id="cust-1",
+            customer_number="15200001111",
+            service_number="4001889250",
+            direction="inbound",
+            first_agent_connected_at=object(),
+        ),
+        recover=recover,
+        satisfaction_execution=SimpleNamespace(id=4, status="in_progress"),
+    )
+
+    await orch.republish_agent_call_ui(tenant_id=1, employee_id=7)
+
+    recover.assert_not_awaited()
+    orch.notify_agent_incoming.assert_not_awaited()
+    orch.notify_agent_call_answered.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_republish_skips_in_call_when_customer_leg_gone(monkeypatch):
+    from app.services.call_center.call_control_service import CallControlService
+
+    orch = CallCenterOrchestrator.__new__(CallCenterOrchestrator)
+    orch._pending_offers = {}
+    orch.telephony = MagicMock()
+    orch.notify_agent_incoming = AsyncMock(return_value=True)
+    orch.notify_agent_call_answered = AsyncMock()
+    orch.finalize_agent_call = AsyncMock()
+
+    _patch_deps(
+        monkeypatch,
+        snapshot={
+            "resource_state": "in_call",
+            "current_call_id": "cust-gone",
+            "offer_id": "",
+            "queue_id": None,
+            "direction": "inbound",
+        },
+        record=_call_record(
+            call_id="cust-gone",
+            customer_number="100",
+            service_number="400",
+        ),
+    )
+    monkeypatch.setattr(
+        CallControlService,
+        "_customer_leg_alive_in_kernel",
+        AsyncMock(return_value=False),
+    )
+
+    await orch.republish_agent_call_ui(tenant_id=1, employee_id=7)
+
+    orch.notify_agent_incoming.assert_not_awaited()
+    orch.notify_agent_call_answered.assert_not_awaited()
+    orch.finalize_agent_call.assert_awaited_once()
+    assert orch.finalize_agent_call.await_args.kwargs["call_id"] == "cust-gone"
+    assert orch.finalize_agent_call.await_args.kwargs["reason"] == "media_timeout"

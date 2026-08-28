@@ -1,3 +1,5 @@
+import type { Locale } from '@/lib/languages'
+
 export const RICH_TEXT_IMAGE_PLACEHOLDER_ZH = '[图片]'
 export const RICH_TEXT_IMAGE_PLACEHOLDER_EN = '[Image]'
 
@@ -61,7 +63,7 @@ export function prepareRichTextMessageHtml(html: string): string {
   return doc.body.innerHTML.trim()
 }
 
-export function richTextPreview(html: string, locale: 'zh' | 'en'): string {
+export function richTextPreview(html: string, locale: Locale): string {
   const text = richTextToPlainText(html)
   if (text) return text
   return /<img\b/i.test(html)

@@ -30,6 +30,7 @@ import {
   IconTypography,
 } from '@tabler/icons-react'
 import { EmojiPicker } from './emoji-picker'
+import type { Locale } from '@/lib/languages'
 import { cn } from '@/lib/utils'
 import { richTextListStyleClass } from '@/lib/rich-text-body-classes'
 import { TextColor } from '@/lib/tiptap-text-color'
@@ -47,7 +48,7 @@ type RichTextComposerProps = {
   value: string
   disabled?: boolean
   uploading?: boolean
-  locale: 'zh' | 'en'
+  locale: Locale
   editorHeight?: number
   editorMaxHeight?: number
   endSafeArea?: boolean
@@ -161,7 +162,7 @@ function TextColorPicker({
 }: {
   editor: Editor
   disabled?: boolean
-  locale: 'zh' | 'en'
+  locale: Locale
 }) {
   const rootRef = useRef<HTMLDivElement>(null)
   const [open, setOpen] = useState(false)

@@ -17,22 +17,25 @@ export default function NewOutboundTaskTemplatePage() {
       onSubmit={async (draft) => {
         if (!draft.name.trim()) {
           toast.error('请输入模板名称')
-          return
+          return false
         }
         if (draft.fields.some((field) => !field.name.trim())) {
           toast.error('请填写字段名称')
-          return
+          return false
         }
         try {
           const template = await createTemplate.mutateAsync({
             name: draft.name.trim(),
             description: draft.description.trim() || null,
             fields: draft.fields.map((field) => ({ ...field, name: field.name.trim() })),
+            script: draft.script,
           })
           toast.success('任务模板已保存')
           router.push(`/workspace/engagement/outbound-task-templates/${template.id}`)
+          return true
         } catch {
           toast.error('保存失败，请重试')
+          return false
         }
       }}
     />

@@ -2,13 +2,14 @@
 Unit tests for manual outbound task service.
 """
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
 from app.libs.excel import build_xlsx
-from app.models.outbound_task import OutboundTask, OutboundTaskTarget, OutboundTaskTemplate
+from app.models.outbound_task import OutboundCallRecord, OutboundTask, OutboundTaskTarget, OutboundTaskTemplate
+from app.models.personal_auto_outbound import PersonalAutoOutboundCall
 from app.schemas.outbound_task import (
     BulkAssignRequest,
     BulkDeleteRequest,
@@ -95,6 +96,19 @@ class TestOutboundTaskService:
         assert result.id == item.id
 
     @pytest.mark.asyncio
+    async def test_task_creator_can_read_template_for_task_creation(self):
+        db = AsyncMock()
+        p = principal(["engagement.outbound_task.create"])
+        item = template()
+
+        with patch("app.services.outbound_task_service.OutboundTaskRepository") as repo:
+            repo.get_template = AsyncMock(return_value=item)
+
+            result = await OutboundTaskService.get_template(db, p, item.id)
+
+        assert result.id == item.id
+
+    @pytest.mark.asyncio
     async def test_get_template_hides_other_tenant_template(self):
         db = AsyncMock()
         p = principal(["engagement.outbound_task.template.manage"], tenant_id=1)
@@ -163,6 +177,7 @@ class TestOutboundTaskService:
         p = principal(["engagement.outbound_task.execute", "call.workspace.use"], user_id=10)
         item = target(assignee_id=10)
         active_task = task(status="active")
+        active_task.fields = [{"key": "call_result", "enabled": True, "agent_editable": True}]
         started_at = datetime(2026, 7, 8, 8, 0, tzinfo=timezone.utc)
 
         with patch("app.services.outbound_task_service.OutboundTaskRepository") as repo:
@@ -443,3 +458,254 @@ class TestOutboundTaskService:
                 )
 
         repo.bulk_delete_targets.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_record_redial_requires_next_follow_up_at(self):
+        db = AsyncMock()
+        p = principal(["engagement.outbound_task.execute", "call.workspace.use"], user_id=10)
+        item = target(assignee_id=10)
+        active_task = task(status="active")
+
+        with patch("app.services.outbound_task_service.OutboundTaskRepository") as repo:
+            repo.get_target = AsyncMock(return_value=item)
+            repo.get_task = AsyncMock(return_value=active_task)
+            repo.create_record = AsyncMock()
+
+            with pytest.raises(ValidationError):
+                await OutboundTaskService.create_record(
+                    db,
+                    p,
+                    item.id,
+                    OutboundRecordCreate(target_status="redial"),
+                )
+
+        repo.create_record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_record_rejects_readonly_field(self):
+        db = AsyncMock()
+        p = principal(["engagement.outbound_task.execute", "call.workspace.use"], user_id=10)
+        item = target(assignee_id=10)
+        active_task = task(status="active")
+        active_task.fields = [{"key": "customer_level", "enabled": True, "agent_editable": False}]
+
+        with patch("app.services.outbound_task_service.OutboundTaskRepository") as repo:
+            repo.get_target = AsyncMock(return_value=item)
+            repo.get_task = AsyncMock(return_value=active_task)
+            repo.create_record = AsyncMock()
+
+            with pytest.raises(ValidationError):
+                await OutboundTaskService.create_record(
+                    db,
+                    p,
+                    item.id,
+                    OutboundRecordCreate(
+                        target_status="completed",
+                        field_values={"customer_level": "vip"},
+                    ),
+                )
+
+        repo.create_record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_record_validates_required_field_on_merged_values(self):
+        db = AsyncMock()
+        p = principal(["engagement.outbound_task.execute", "call.workspace.use"], user_id=10)
+        item = target(assignee_id=10)
+        item.field_values = {}
+        active_task = task(status="active")
+        active_task.fields = [
+            {
+                "key": "call_result",
+                "name": "外呼结果",
+                "enabled": True,
+                "required": True,
+                "agent_editable": True,
+            }
+        ]
+
+        with patch("app.services.outbound_task_service.OutboundTaskRepository") as repo:
+            repo.get_target = AsyncMock(return_value=item)
+            repo.get_task = AsyncMock(return_value=active_task)
+            repo.create_record = AsyncMock()
+
+            with pytest.raises(ValidationError):
+                await OutboundTaskService.create_record(
+                    db,
+                    p,
+                    item.id,
+                    OutboundRecordCreate(target_status="completed"),
+                )
+
+        repo.create_record.assert_not_awaited()
+
+
+class TestListMyTasks:
+    @pytest.mark.asyncio
+    async def test_list_my_tasks_requires_execute_permission(self):
+        db = AsyncMock()
+        p = principal([])
+
+        with pytest.raises(ForbiddenError):
+            await OutboundTaskService.list_my_tasks(db, p)
+
+    @pytest.mark.asyncio
+    async def test_list_my_tasks_returns_progress_items(self):
+        db = AsyncMock()
+        p = principal(["engagement.outbound_task.execute", "call.workspace.use"], user_id=10)
+        rows = [
+            {"id": 1, "name": "回访", "status": "active", "due_at": None, "my_total": 50, "my_completed": 5},
+            {"id": 2, "name": "开发", "status": "paused", "due_at": None, "my_total": 40, "my_completed": 12},
+        ]
+
+        with patch("app.services.outbound_task_service.OutboundTaskRepository") as repo:
+            repo.list_my_tasks_with_progress = AsyncMock(return_value=rows)
+
+            result = await OutboundTaskService.list_my_tasks(db, p)
+
+        repo.list_my_tasks_with_progress.assert_awaited_once_with(db, 1, 10)
+        assert result == {"items": rows}
+
+
+class TestListMyTargetRecords:
+    @pytest.mark.asyncio
+    async def test_requires_execute_permission(self):
+        db = AsyncMock()
+        p = principal([])
+
+        with pytest.raises(ForbiddenError):
+            await OutboundTaskService.list_my_target_records(db, p, 3)
+
+    @pytest.mark.asyncio
+    async def test_target_not_found_raises_404(self):
+        db = AsyncMock()
+        p = principal(["engagement.outbound_task.execute", "call.workspace.use"], user_id=10)
+
+        with patch("app.services.outbound_task_service.OutboundTaskRepository") as repo:
+            repo.get_target = AsyncMock(return_value=None)
+
+            with pytest.raises(NotFoundError):
+                await OutboundTaskService.list_my_target_records(db, p, 999)
+
+    @pytest.mark.asyncio
+    async def test_other_agents_target_raises_403(self):
+        db = AsyncMock()
+        p = principal(["engagement.outbound_task.execute", "call.workspace.use"], user_id=10)
+        item = target(assignee_id=11)
+
+        with patch("app.services.outbound_task_service.OutboundTaskRepository") as repo:
+            repo.get_target = AsyncMock(return_value=item)
+
+            with pytest.raises(ForbiddenError):
+                await OutboundTaskService.list_my_target_records(db, p, item.id)
+
+    @pytest.mark.asyncio
+    async def test_merges_manual_and_personal_auto_records_sorted_desc(self):
+        db = AsyncMock()
+        p = principal(
+            ["engagement.outbound_task.execute", "call.workspace.use", "call.record.view"],
+            user_id=10,
+        )
+        item = target(assignee_id=10)
+        manual = OutboundCallRecord(
+            id=11,
+            tenant_id=1,
+            task_id=1,
+            target_id=3,
+            call_record_id=9001,
+            agent_id=10,
+            phone_number="13800000000",
+            started_at=datetime(2026, 8, 16, 6, 30, tzinfo=timezone.utc),
+            duration_ms=None,
+            answered=False,
+            result="未接通",
+            field_values={},
+        )
+        personal = PersonalAutoOutboundCall(
+            id=52,
+            tenant_id=1,
+            session_id=5,
+            task_id=1,
+            target_id=3,
+            call_record_id=8810,
+            phone_number="13800000000",
+            assigned_agent_id=9,
+            started_at=datetime(2026, 8, 17, 2, 0, tzinfo=timezone.utc),
+            answered_at=datetime(2026, 8, 17, 2, 0, 10, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 8, 17, 2, 5, 42, tzinfo=timezone.utc),
+        )
+        employee = MagicMock()
+        employee.id = 9
+        employee.tenant_id = 1
+        employee.display_name = "李楠"
+        employee.nickname = None
+        employee.name = "linan"
+        employee.username = "linan"
+
+        with (
+            patch("app.services.outbound_task_service.OutboundTaskRepository") as repo,
+            patch("app.services.outbound_task_service.EmployeeRepository") as employee_repo,
+            patch("app.services.outbound_task_service.DataScopeService") as scope_service,
+        ):
+            repo.get_target = AsyncMock(return_value=item)
+            repo.list_records_for_target = AsyncMock(return_value=[manual])
+            repo.list_personal_auto_calls_for_target = AsyncMock(return_value=[personal])
+            repo.list_call_record_public_ids = AsyncMock(return_value={9001: "pub-9001"})
+            employee_repo.get_by_ids = AsyncMock(return_value=[employee])
+            scope_service.call_record_ids_in_scope = AsyncMock(return_value={9001})
+
+            result = await OutboundTaskService.list_my_target_records(db, p, item.id)
+
+        items = result["items"]
+        assert [entry["id"] for entry in items] == [52, 11]
+        personal_item = items[0]
+        assert personal_item["source"] == "personal_auto"
+        assert personal_item["answered"] is True
+        assert personal_item["duration_ms"] == 332_000
+        assert personal_item["agent_name"] == "李楠"
+        assert personal_item["can_view_detail"] is False
+        assert personal_item["call_record_public_id"] is None
+        manual_item = items[1]
+        assert manual_item["source"] == "manual"
+        assert manual_item["result"] == "未接通"
+        assert manual_item["can_view_detail"] is True
+        assert manual_item["call_record_public_id"] == "pub-9001"
+        repo.list_call_record_public_ids.assert_awaited_once_with(db, 1, [9001])
+
+    @pytest.mark.asyncio
+    async def test_can_view_detail_false_without_call_record_view_permission(self):
+        db = AsyncMock()
+        p = principal(["engagement.outbound_task.execute", "call.workspace.use"], user_id=10)
+        item = target(assignee_id=10)
+        manual = OutboundCallRecord(
+            id=11,
+            tenant_id=1,
+            task_id=1,
+            target_id=3,
+            call_record_id=9001,
+            agent_id=10,
+            phone_number="13800000000",
+            started_at=datetime(2026, 8, 16, 6, 30, tzinfo=timezone.utc),
+            duration_ms=30_000,
+            answered=True,
+            result="已接通",
+            field_values={},
+        )
+
+        with (
+            patch("app.services.outbound_task_service.OutboundTaskRepository") as repo,
+            patch("app.services.outbound_task_service.EmployeeRepository") as employee_repo,
+            patch("app.services.outbound_task_service.DataScopeService") as scope_service,
+        ):
+            repo.get_target = AsyncMock(return_value=item)
+            repo.list_records_for_target = AsyncMock(return_value=[manual])
+            repo.list_personal_auto_calls_for_target = AsyncMock(return_value=[])
+            repo.list_call_record_public_ids = AsyncMock(return_value={})
+            employee_repo.get_by_ids = AsyncMock(return_value=[])
+            scope_service.call_record_ids_in_scope = AsyncMock()
+
+            result = await OutboundTaskService.list_my_target_records(db, p, item.id)
+
+        assert result["items"][0]["can_view_detail"] is False
+        assert result["items"][0]["call_record_public_id"] is None
+        scope_service.call_record_ids_in_scope.assert_not_awaited()

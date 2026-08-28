@@ -2,9 +2,8 @@
 SIP extension service — tenant-admin management of SIP extensions, multi-agent
 bindings, and registration credentials.
 
-Credential handling mirrors the API-key one-time-secret pattern: the plaintext
-password is generated, hashed for storage and shown to the admin exactly once
-(on create / reset). Only a hash + a masked form are persisted.
+The password is hashed for SIP authentication and encrypted for tenant admins
+who need to configure a phone again later.
 
 Binding grants eligibility only; exclusive occupancy is managed by
 ``SipExtensionOccupancyService``.
@@ -18,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.configs.settings import settings
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
+from app.core.secret_store import decrypt_secret, encrypt_secret
 from app.db.session import AsyncSessionLocal
 from app.models.sip_extension import SipExtension
 from app.repositories.employee_repository import EmployeeRepository
@@ -81,6 +81,15 @@ class SipExtensionService:
             get_telephony_client,
         )
 
+        # Public phone endpoint is a deploy fact (e.g. Kamailio :5070).
+        # FlowKit's listen port is an internal backend address and must not
+        # override SIP_REGISTRAR_* when those are set.
+        host = settings.SIP_REGISTRAR_HOST or ""
+        port = settings.SIP_REGISTRAR_PORT
+        transport = settings.SIP_REGISTRAR_TRANSPORT or ""
+        if host and port is not None and transport:
+            return host, port, transport
+
         try:
             info = await get_telephony_client().registrar_info()
         except TelephonyError:
@@ -88,17 +97,11 @@ class SipExtensionService:
         except Exception:  # noqa: BLE001
             info = None
         if info:
-            host = info.get("host") or settings.SIP_REGISTRAR_HOST
-            port = info.get("port")
+            host = host or (info.get("host") or "")
             if port is None:
-                port = settings.SIP_REGISTRAR_PORT
-            transport = info.get("transport") or settings.SIP_REGISTRAR_TRANSPORT
-            return host or "", port, transport or ""
-        return (
-            settings.SIP_REGISTRAR_HOST,
-            settings.SIP_REGISTRAR_PORT,
-            settings.SIP_REGISTRAR_TRANSPORT,
-        )
+                port = info.get("port")
+            transport = transport or (info.get("transport") or "")
+        return host, port, transport
 
     @staticmethod
     async def _registration_info(
@@ -283,6 +286,7 @@ class SipExtensionService:
                 "auth_account": sip_user_id,
                 "auth_password_hash": SipExtensionService.hash_password(password),
                 "auth_password_masked": SipExtensionService.mask_password(password),
+                "auth_password_ciphertext": encrypt_secret(password),
                 "created_by_actor_type": "employee",
                 "created_by_actor_id": principal.user_id,
             },
@@ -469,6 +473,7 @@ class SipExtensionService:
             {
                 "auth_password_hash": SipExtensionService.hash_password(password),
                 "auth_password_masked": SipExtensionService.mask_password(password),
+                "auth_password_ciphertext": encrypt_secret(password),
                 "registration_status": "unregistered",
                 "last_registered_at": None,
                 "updated_by_actor_type": "employee",
@@ -544,14 +549,21 @@ class SipExtensionService:
                     "当前使用人在线，请先让其下线后重试"
                 )
 
-    # ─────────── copy registration info (masked) ───────────
+    # ─────────── copy registration info ───────────
 
     @staticmethod
     async def get_registration_info(
         db: AsyncSession, principal: EffectivePrincipal, extension_id: int
     ) -> SipRegistrationInfo:
         item = await SipExtensionService.get_scoped(db, principal, extension_id)
-        return await SipExtensionService._registration_info(item, None)
+        ciphertext = item.auth_password_ciphertext
+        if not ciphertext:
+            raise ValidationError("历史分机密码无法恢复，请先重置密码后再复制")
+        try:
+            password = decrypt_secret(ciphertext)
+        except ValueError as exc:
+            raise ValidationError("分机密码无法读取，请重置密码后再复制") from exc
+        return await SipExtensionService._registration_info(item, password)
 
     @staticmethod
     async def get_registration_info_managed(
@@ -560,7 +572,14 @@ class SipExtensionService:
         """Copy registration info; registrar lookup runs with no pooled DB session."""
         async with AsyncSessionLocal() as db:
             item = await SipExtensionService.get_scoped(db, principal, extension_id)
-        return await SipExtensionService._registration_info(item, None)
+            ciphertext = item.auth_password_ciphertext
+            if not ciphertext:
+                raise ValidationError("历史分机密码无法恢复，请先重置密码后再复制")
+            try:
+                password = decrypt_secret(ciphertext)
+            except ValueError as exc:
+                raise ValidationError("分机密码无法读取，请重置密码后再复制") from exc
+        return await SipExtensionService._registration_info(item, password)
 
     # ─────────── enable / disable ───────────
 

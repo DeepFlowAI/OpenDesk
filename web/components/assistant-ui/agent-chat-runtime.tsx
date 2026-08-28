@@ -17,6 +17,7 @@ import {
   type AppendMessage,
 } from '@assistant-ui/react'
 import { useChatStore } from '@/context/chat-store'
+import { dedupeMessagesById } from '@/lib/message-list'
 import { useAuthStore } from '@/context/auth-store'
 import type { Locale } from '@/context/locale-store'
 import {
@@ -27,6 +28,7 @@ import {
   buildKnowledgeSendPlan,
   type KnowledgeSendPlanItem,
 } from '@/app/components/features/knowledge/knowledge-utils'
+import { useConversationAgentDisplayTarget } from '@/service/use-conversation-agent-display-setting'
 import type { Message, Conversation, WorkspaceConversationHistoryItem } from '@/models/conversation'
 import type { ConversationFileUploadResponse } from '@/models/conversation-file'
 import type { EmojiTargetConfig } from '@/models/emoji-setting'
@@ -181,6 +183,10 @@ export function AgentChatRuntimeProvider({
 }: ProviderProps) {
   const { conversation } = chatConfig
   const currentUser = useAuthStore((state) => state.user)
+  const {
+    data: agentDisplayTarget,
+    refetch: refetchAgentDisplayTarget,
+  } = useConversationAgentDisplayTarget()
   const convId = conversation.id
   const [composerMode, setComposerMode] = useState<ComposerMode>(
     chatConfig.canSendPublicReply ? 'public' : 'internal',
@@ -188,7 +194,10 @@ export function AgentChatRuntimeProvider({
   const [quotedMessage, setQuotedMessage] = useState<Message | null>(null)
   const resolvedConversationRef = useRef<Conversation | null>(null)
   const messagesMap = useChatStore((s) => s.messages)
-  const currentMessages = useMemo(() => messagesMap.get(convId) || [], [messagesMap, convId])
+  const currentMessages = useMemo(
+    () => dedupeMessagesById(messagesMap.get(convId) || []),
+    [messagesMap, convId],
+  )
   const imageMessages = useMemo<AgentImageMessage[]>(
     () =>
       currentMessages
@@ -215,14 +224,22 @@ export function AgentChatRuntimeProvider({
     setQuotedMessage(null)
   }, [])
 
+  const resolveOptimisticSenderName = useCallback(async () => {
+    if (agentDisplayTarget) return agentDisplayTarget.sender_name
+    const result = await refetchAgentDisplayTarget()
+    if (result.data) return result.data.sender_name
+    return currentUser?.display_name || currentUser?.name || null
+  }, [agentDisplayTarget, currentUser, refetchAgentDisplayTarget])
+
   const emitSendMessage = useCallback(
-    (payload: {
+    async (payload: {
       conversation_id: number
       content: string
       content_type: string
       quoted_message_id?: number
       client_message_id?: string
     }, retryMessage?: Message) => {
+      const senderName = await resolveOptimisticSenderName()
       const clientMessageId = payload.client_message_id
         || retryMessage?.metadata?.client_message_id
         || createClientMessageId()
@@ -232,7 +249,7 @@ export function AgentChatRuntimeProvider({
         conversation_id: payload.conversation_id,
         sender_type: 'agent',
         sender_id: currentUser?.id ?? null,
-        sender_name: currentUser?.display_name || currentUser?.name || null,
+        sender_name: senderName,
         sender_avatar: currentUser?.avatar ?? null,
         content_type: payload.content_type as Message['content_type'],
         content: payload.content,
@@ -279,7 +296,7 @@ export function AgentChatRuntimeProvider({
         )
       })
     },
-    [currentUser, socket],
+    [currentUser, resolveOptimisticSenderName, socket],
   )
 
   const onRetryMessage = useCallback((message: Message) => {

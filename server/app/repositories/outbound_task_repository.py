@@ -3,16 +3,19 @@ Data access for manual outbound tasks.
 """
 from datetime import datetime
 
-from sqlalchemy import Select, delete, func, or_, select, update
+from sqlalchemy import Select, case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.call_record import CallRecord
 from app.models.outbound_task import (
     OutboundCallRecord,
     OutboundTask,
     OutboundTaskTarget,
     OutboundTaskTemplate,
 )
+from app.models.personal_auto_outbound import PersonalAutoOutboundCall
+from app.models.user import User
 
 
 def _paginate_statement(stmt: Select, page: int, per_page: int) -> Select:
@@ -60,6 +63,29 @@ class OutboundTaskRepository:
         await db.commit()
         await db.refresh(item)
         return item
+
+    @staticmethod
+    async def update_template_if_version(
+        db: AsyncSession,
+        item: OutboundTaskTemplate,
+        data: dict,
+        expected_updated_at: datetime,
+    ) -> OutboundTaskTemplate | None:
+        result = await db.execute(
+            update(OutboundTaskTemplate)
+            .where(
+                OutboundTaskTemplate.id == item.id,
+                OutboundTaskTemplate.updated_at == expected_updated_at,
+            )
+            .values(**data)
+            .returning(OutboundTaskTemplate)
+        )
+        updated = result.scalar_one_or_none()
+        if updated is None:
+            await db.rollback()
+            return None
+        await db.commit()
+        return updated
 
     @staticmethod
     async def delete_template(db: AsyncSession, item: OutboundTaskTemplate) -> None:
@@ -203,8 +229,9 @@ class OutboundTaskRepository:
             filters.append(OutboundTaskTarget.status.in_(["pending", "redial", "completed"]))
 
         stmt = (
-            select(OutboundTaskTarget)
+            select(OutboundTaskTarget, User.name)
             .join(OutboundTask, OutboundTask.id == OutboundTaskTarget.task_id)
+            .outerjoin(User, User.id == OutboundTaskTarget.user_id)
             .options(selectinload(OutboundTaskTarget.task))
             .where(*filters)
         )
@@ -225,11 +252,109 @@ class OutboundTaskRepository:
                 per_page,
             )
         )
-        return list(result.scalars().all()), total
+        items: list[OutboundTaskTarget] = []
+        for target, user_name in result.all():
+            # Ephemeral attribute for API serialization (not an ORM column).
+            target.user_name = user_name  # type: ignore[attr-defined]
+            items.append(target)
+        return items, total
 
     @staticmethod
     async def get_target(db: AsyncSession, target_id: int) -> OutboundTaskTarget | None:
         return await db.get(OutboundTaskTarget, target_id)
+
+    @staticmethod
+    async def list_my_tasks_with_progress(
+        db: AsyncSession,
+        tenant_id: int,
+        assignee_id: int,
+    ) -> list[dict]:
+        """Active/paused tasks that have targets assigned to the agent, with per-agent progress."""
+        stmt = (
+            select(
+                OutboundTask.id,
+                OutboundTask.name,
+                OutboundTask.status,
+                OutboundTask.due_at,
+                func.count(OutboundTaskTarget.id).label("my_total"),
+                func.count(OutboundTaskTarget.id)
+                .filter(OutboundTaskTarget.status == "completed")
+                .label("my_completed"),
+            )
+            .join(
+                OutboundTaskTarget,
+                (OutboundTaskTarget.task_id == OutboundTask.id)
+                & (OutboundTaskTarget.tenant_id == tenant_id)
+                & (OutboundTaskTarget.assignee_id == assignee_id),
+            )
+            .where(OutboundTask.tenant_id == tenant_id, OutboundTask.status.in_(["active", "paused"]))
+            .group_by(OutboundTask.id)
+            .order_by(
+                case((OutboundTask.status == "active", 0), else_=1),
+                OutboundTask.due_at.asc().nulls_last(),
+            )
+        )
+        result = await db.execute(stmt)
+        return [
+            {
+                "id": row.id,
+                "name": row.name,
+                "status": row.status,
+                "due_at": row.due_at,
+                "my_total": int(row.my_total),
+                "my_completed": int(row.my_completed),
+            }
+            for row in result
+        ]
+
+    @staticmethod
+    async def list_records_for_target(
+        db: AsyncSession,
+        tenant_id: int,
+        target_id: int,
+    ) -> list[OutboundCallRecord]:
+        result = await db.execute(
+            select(OutboundCallRecord)
+            .where(
+                OutboundCallRecord.tenant_id == tenant_id,
+                OutboundCallRecord.target_id == target_id,
+            )
+            .order_by(OutboundCallRecord.started_at.desc())
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def list_personal_auto_calls_for_target(
+        db: AsyncSession,
+        tenant_id: int,
+        target_id: int,
+    ) -> list[PersonalAutoOutboundCall]:
+        result = await db.execute(
+            select(PersonalAutoOutboundCall)
+            .where(
+                PersonalAutoOutboundCall.tenant_id == tenant_id,
+                PersonalAutoOutboundCall.target_id == target_id,
+            )
+            .order_by(PersonalAutoOutboundCall.started_at.desc())
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def list_call_record_public_ids(
+        db: AsyncSession,
+        tenant_id: int,
+        call_record_ids: list[int],
+    ) -> dict[int, str]:
+        ids = sorted({call_record_id for call_record_id in call_record_ids if call_record_id})
+        if not ids:
+            return {}
+        result = await db.execute(
+            select(CallRecord.id, CallRecord.public_id).where(
+                CallRecord.tenant_id == tenant_id,
+                CallRecord.id.in_(ids),
+            )
+        )
+        return {row.id: str(row.public_id) for row in result.all()}
 
     @staticmethod
     async def create_target(db: AsyncSession, data: dict) -> OutboundTaskTarget:
@@ -238,6 +363,16 @@ class OutboundTaskRepository:
         await db.commit()
         await db.refresh(item)
         return item
+
+    @staticmethod
+    async def create_targets_bulk(
+        db: AsyncSession, rows: list[dict]
+    ) -> list[OutboundTaskTarget]:
+        items = [OutboundTaskTarget(**row) for row in rows]
+        db.add_all(items)
+        await db.flush()
+        await db.commit()
+        return items
 
     @staticmethod
     async def update_target(db: AsyncSession, item: OutboundTaskTarget, data: dict) -> OutboundTaskTarget:

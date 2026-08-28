@@ -10,6 +10,7 @@ online-chat workspace in Redis. The two are intentionally separate:
 """
 import logging
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 
@@ -20,6 +21,7 @@ from app.libs.telephony.base import BaseTelephonyClient
 from app.repositories.agent_status_repository import AgentStatusRepository
 from app.repositories.agent_webrtc_session_repository import AgentWebRTCSessionRepository
 from app.repositories.call_record_repository import CallRecordRepository
+from app.services.call_workspace_context_service import CallWorkspaceContextService
 from app.services.cc_agent_resource_service import CcAgentResourceService
 
 
@@ -96,6 +98,18 @@ class CcAgentStatusService:
         # Surface active consult so a page refresh can restore 结束咨询 UI
         # (SIP desk-phone and Web phone share the same InCallLegs key).
         result.update(await _consult_fields(tenant_id, employee_id))
+        context_call_id = result.get("wrap_up_call_id") or result.get("current_call_id")
+        if context_call_id:
+            call_record = await CallRecordRepository.get_by_call_id(
+                db, context_call_id, tenant_id
+            )
+            result.update(
+                await CallWorkspaceContextService.get_auto_outbound_context(
+                    db,
+                    tenant_id=tenant_id,
+                    call_record=call_record,
+                )
+            )
         return result
 
     @staticmethod
@@ -254,18 +268,11 @@ class CcAgentStatusService:
                     r, tenant_id, employee_id, status
                 )
             except ConflictError:
-                # The resource is flagged occupied, but this is a *manual* status
-                # change the agent explicitly requested. Occupation left behind by
-                # a failed accept / stale in_call lease would otherwise lock them
-                # out of changing status forever. Honor the explicit action:
-                # force-release the stuck resource and apply the new status.
-                logger.info(
-                    "set_status: force-releasing stuck resource for manual change "
-                    "agent=%s/%s -> %s",
-                    tenant_id, employee_id, status,
-                )
-                await CcAgentResourceService.force_release(
-                    r, tenant_id, employee_id, reason="manual_status_change",
+                # The resource is flagged occupied. It may be a ghost left by a
+                # lost call-end event, so reconcile first; a real active call
+                # must keep the agent locked out of manual status changes.
+                snapshot = await CcAgentStatusService.reconcile_agent(
+                    db, r, tenant_id, employee_id,
                 )
                 snapshot = await CcAgentResourceService.set_visible_status(
                     r, tenant_id, employee_id, status
@@ -355,21 +362,58 @@ class CcAgentStatusService:
         reported status is downgraded to ``offline`` for any agent whose
         Socket.IO connection is gone, otherwise a colleague who closed their tab
         would still appear "就绪" here and be picked as an unreachable target.
+        SIP-phone agents are exempt: they ring on the handset, not the browser,
+        so a missing Socket.IO connection says nothing about reachability.
         """
+        from app.models.agent_call_device import AgentCallDevice
+        from app.models.employee_group import EmployeeGroup, EmployeeGroupMember
         from app.repositories.sip_extension_repository import SipExtensionRepository
+        from app.services.agent_call_device_service import DEVICE_SIP_PHONE
         from app.services.agent_status_service import AgentStatusService
 
         employees = await SipExtensionRepository.list_workspace_agents(
             db, tenant_id, keyword, exclude_employee_id=actor_employee_id
         )
+        employee_ids = [e.id for e in employees]
         status_rows = await AgentStatusRepository.list_for_employees(
-            db, tenant_id, [e.id for e in employees]
+            db, tenant_id, employee_ids
         )
         status_by_id = {row.employee_id: row.status for row in status_rows}
+
+        device_by_id: dict[int, str] = {}
+        group_names_by_id: dict[int, list[str]] = {}
+        if employee_ids:
+            device_rows = (
+                await db.execute(
+                    select(AgentCallDevice).where(
+                        AgentCallDevice.tenant_id == tenant_id,
+                        AgentCallDevice.employee_id.in_(employee_ids),
+                    )
+                )
+            ).scalars().all()
+            device_by_id = {row.employee_id: row.device_type for row in device_rows}
+
+            membership_rows = (
+                await db.execute(
+                    select(
+                        EmployeeGroupMember.employee_id, EmployeeGroup.name
+                    ).join(
+                        EmployeeGroup, EmployeeGroup.id == EmployeeGroupMember.group_id
+                    ).where(
+                        EmployeeGroup.tenant_id == tenant_id,
+                        EmployeeGroupMember.employee_id.in_(employee_ids),
+                    )
+                )
+            ).all()
+            for employee_id, group_name in membership_rows:
+                group_names_by_id.setdefault(employee_id, []).append(group_name)
 
         async def _effective_status(employee_id: int) -> str:
             status = status_by_id.get(employee_id, "offline")
             if status == "offline" or r is None:
+                return status
+            # A SIP handset rings without any browser connection.
+            if device_by_id.get(employee_id) == DEVICE_SIP_PHONE:
                 return status
             # A live status only counts if the browser is actually connected.
             if not await AgentStatusService.is_connected(r, tenant_id, employee_id):
@@ -382,6 +426,7 @@ class CcAgentStatusService:
                 "name": emp.display_name or emp.name or emp.username,
                 "avatar": emp.avatar,
                 "status": await _effective_status(emp.id),
+                "group_names": sorted(group_names_by_id.get(emp.id, [])),
             }
             for emp in employees
         ]
@@ -517,6 +562,8 @@ def _empty_resource_fields() -> dict:
         "consult_target_employee_id": None,
         "consult_state": "none",
         "in_call_since": None,
+        "wrap_up_until": None,
+        "wrap_up_call_id": None,
     }
 
 
@@ -536,6 +583,8 @@ def _resource_fields(snapshot: dict | None) -> dict:
         "consult_target_employee_id": None,
         "consult_state": "none",
         "in_call_since": snapshot.get("in_call_since"),
+        "wrap_up_until": snapshot.get("wrap_up_until"),
+        "wrap_up_call_id": snapshot.get("wrap_up_call_id"),
     }
 
 

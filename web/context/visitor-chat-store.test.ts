@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { Message } from '@/models/conversation'
-import { useVisitorChatStore } from '@/context/visitor-chat-store'
+import {
+  findOptimisticVisitorIndex,
+  useVisitorChatStore,
+} from '@/context/visitor-chat-store'
 
 function message(overrides: Partial<Message>): Message {
   return {
@@ -156,5 +159,65 @@ describe('visitor chat message reconciliation', () => {
     useVisitorChatStore.getState().confirmOptimisticMessage(tempId, confirmed)
 
     expect(useVisitorChatStore.getState().messages).toEqual([confirmed])
+  })
+
+  it('matches an optimistic image by file_id when the JSON string was normalized', () => {
+    const optimistic = message({
+      id: -3,
+      sender_type: 'visitor',
+      sender_id: null,
+      content_type: 'image',
+      content: '{"file_id":"file-1","name":"IMG_0001.jpg","size":1200,"mime_type":"image/jpeg"}',
+    })
+    const confirmed = message({
+      id: 88,
+      sender_type: 'visitor',
+      sender_id: null,
+      content_type: 'image',
+      content: '{"schema_version":1,"file_id":"file-1","name":"IMG_0001.jpg","size":1200,"mime_type":"image/jpeg"}',
+    })
+
+    expect(findOptimisticVisitorIndex([optimistic], confirmed)).toBe(0)
+  })
+
+  it('drops the optimistic photo when the room echo already confirmed it', () => {
+    const tempId = useVisitorChatStore.getState().addOptimisticMessage(
+      'cv_1',
+      '{"file_id":"file-1","name":"IMG_0001.jpg","size":1200,"mime_type":"image/jpeg"}',
+      'image',
+    )
+    const confirmed = message({
+      id: 88,
+      sender_type: 'visitor',
+      sender_id: null,
+      content_type: 'image',
+      content: '{"schema_version":1,"file_id":"file-1","name":"IMG_0001.jpg","size":1200,"mime_type":"image/jpeg"}',
+    })
+
+    useVisitorChatStore.setState({
+      messages: [...useVisitorChatStore.getState().messages, confirmed],
+    })
+    useVisitorChatStore.getState().confirmOptimisticMessage(tempId, confirmed)
+
+    expect(useVisitorChatStore.getState().messages).toEqual([confirmed])
+  })
+})
+
+describe('visitor chat prependMessages', () => {
+  it('does not keep overlapping history ids that crash assistant-ui', () => {
+    useVisitorChatStore.setState({
+      messages: [message({ id: 11, content: 'on screen' }), message({ id: 12 })],
+    })
+
+    useVisitorChatStore.getState().prependMessages([
+      message({ id: 10, content: 'older' }),
+      message({ id: 11, content: 'overlap' }),
+    ])
+
+    expect(useVisitorChatStore.getState().messages.map((item) => [item.id, item.content])).toEqual([
+      [10, 'older'],
+      [11, 'on screen'],
+      [12, 'hello'],
+    ])
   })
 })

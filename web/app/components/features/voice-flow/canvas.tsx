@@ -23,6 +23,7 @@ import {
   type Node,
   type NodeChange,
 } from '@xyflow/react'
+import { toast } from 'sonner'
 
 import { NODE_DRAG_MIME } from './node-toolbar'
 import { NODE_TYPES } from './nodes'
@@ -156,6 +157,9 @@ export function VoiceFlowCanvas({
         handle === 'handoff' &&
         (tgt?.type === 'play' || tgt?.type === 'collect' || tgt?.type === 'condition' || tgt?.type === 'start')
       ) {
+        // The drop is silently ignored by React Flow otherwise; tell the user
+        // why this connection is not allowed.
+        toast.error('「转人工」出口只能连接到队列分配等人工路由节点，不能连接到播放/采集/判断类节点')
         return
       }
       setEdges((eds) => {
@@ -200,9 +204,16 @@ export function VoiceFlowCanvas({
     [onDropNode, readOnly, screenToFlowPosition],
   )
 
-  // Inject `selected` prop into node data so custom views can react.
+  // Inject `selected` prop into node data so custom views can react. Keep
+  // object identity for untouched nodes: remapping every node on each drag
+  // position update makes React Flow re-render all of them mid-drag, which
+  // shows phantom duplicates of the other nodes.
   const decoratedNodes = useMemo(
-    () => nodes.map((n) => ({ ...n, selected: n.id === selectedNodeId })),
+    () =>
+      nodes.map((n) => {
+        const selected = n.id === selectedNodeId
+        return n.selected === selected ? n : { ...n, selected }
+      }),
     [nodes, selectedNodeId],
   )
 

@@ -76,6 +76,7 @@ import { useWorkspaceNotificationAlert } from '@/hooks/use-workspace-notificatio
 import {
   conversationCollaborationKeys,
 } from '@/service/use-conversation-collaboration'
+import type { Locale } from '@/lib/languages'
 
 type QueueUpdatedEvent = {
   action?: string
@@ -110,7 +111,7 @@ function clampAuxiliaryPanelWidth(width: number, maxWidth = AUXILIARY_PANEL_MAX_
   return Math.min(maxWidth, Math.max(AUXILIARY_PANEL_MIN_WIDTH, width))
 }
 
-function buildMessagePreview(msg: Message, locale: 'zh' | 'en'): string {
+function buildMessagePreview(msg: Message, locale: Locale): string {
   if (msg.content_type === 'internal_note') {
     const prefix = locale === 'zh' ? '[内部]' : '[Internal]'
     return `${prefix} ${msg.content}`
@@ -148,7 +149,7 @@ function mergeMessagesById(fetchedMessages: Message[], localMessages: Message[])
 export default function ChatPage() {
   const { token, user } = useAuthStore()
   const { locale } = useLocaleStore()
-  const { socket, connected, connecting, authFailed, connect } = useSocketStore()
+  const { socket, connected, connecting } = useSocketStore()
   const queryClient = useQueryClient()
   const peerConversationScope = getDataScope(user, 'chat.conversation.peer.view')
   const canPeerTab = hasPermission(user, 'chat.conversation.peer.view') && peerConversationScope !== 'self'
@@ -390,25 +391,11 @@ export default function ChatPage() {
     setSelectedQueueTaskId(queueTaskItems[0]?.id ?? null)
   }, [canQueueTab, isQueueTabActive, queueTaskItems, selectedQueueTaskId])
 
-  // Connect Socket.IO on mount
-  useEffect(() => {
-    if (token && !connected && !connecting && !authFailed) {
-      connect(token)
-    }
-  }, [token, connected, connecting, authFailed, connect])
-
-  // When the user switches back to this tab after it was backgrounded (and
-  // possibly frozen by the browser), check if the socket silently died and
-  // force an immediate reconnect + data refresh so the agent state is current
-  // within a single frame rather than waiting for the next reconnection tick.
+  // The workspace layout owns the socket connection for every surface, so this
+  // page only refreshes its own data when the tab comes back to the front.
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        const state = useSocketStore.getState()
-        if (state.authFailed) return
-        if (state.socket && !state.socket.connected) {
-          state.socket.connect()
-        }
         queryClient.invalidateQueries({ queryKey: agentKeys.status })
         queryClient.invalidateQueries({ queryKey: agentKeys.stats })
         queryClient.invalidateQueries({ queryKey: conversationKeys.lists() })
@@ -599,6 +586,21 @@ export default function ChatPage() {
       if (canQueueTab && isQueueTabActive) {
         queryClient.invalidateQueries({ queryKey: queueWorkspaceKeys.lists() })
       }
+    }
+
+    const handleMessageUpdated = (msg: Message) => {
+      if (!msg.conversation_id) return
+      updateMessage(msg.conversation_id, msg)
+      queryClient.setQueriesData<{ items: Message[]; has_more: boolean }>(
+        { queryKey: conversationKeys.messages(msg.conversation_id) },
+        (prev) => {
+          if (!prev) return prev
+          return {
+            ...prev,
+            items: prev.items.map((item) => (item.id === msg.id ? { ...item, ...msg } : item)),
+          }
+        },
+      )
     }
 
     const handleSatisfactionEvent = (data: { message?: Message; conversation_id: number }) => {
@@ -834,6 +836,7 @@ export default function ChatPage() {
 
     socket.on('new_conversation', handleNewConversation)
     socket.on('new_message', handleNewMessage)
+    socket.on('message_updated', handleMessageUpdated)
     socket.on('message_recalled', handleMessageRecalled)
     socket.on('messages_read', handleMessagesRead)
     socket.on('messages_delivered', handleMessagesDelivered)
@@ -855,6 +858,7 @@ export default function ChatPage() {
     return () => {
       socket.off('new_conversation', handleNewConversation)
       socket.off('new_message', handleNewMessage)
+      socket.off('message_updated', handleMessageUpdated)
       socket.off('message_recalled', handleMessageRecalled)
       socket.off('messages_read', handleMessagesRead)
       socket.off('messages_delivered', handleMessagesDelivered)

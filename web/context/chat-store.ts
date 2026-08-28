@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import { dedupeMessagesById } from '@/lib/message-list'
 import type { Conversation, Message } from '@/models/conversation'
 
 export type WorkspaceConversationScope = 'my' | 'peers'
@@ -162,7 +163,7 @@ export const useChatStore = create<ChatState>()(
         set((state) => {
           const map = new Map(state.messages)
           const existing = map.get(conversationId) || []
-          map.set(conversationId, [...msgs, ...existing])
+          map.set(conversationId, dedupeMessagesById([...msgs, ...existing]))
           return { messages: map }
         }),
 

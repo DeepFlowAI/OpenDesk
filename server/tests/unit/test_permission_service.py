@@ -9,6 +9,8 @@ import pytest
 from app.core.exceptions import ValidationError
 from app.services.employee_service import EmployeeService
 from app.services.permission_catalog import (
+    ADMIN_PERMISSION_KEYS,
+    AGENT_PERMISSION_KEYS,
     ALL_PERMISSION_KEYS,
     RESOURCE_CHAT_QUEUE,
     RESOURCE_COLLABORATION_INVITE,
@@ -44,6 +46,12 @@ def test_merge_role_permissions_filters_missing_switches():
     assert "chat.session_record.view" in permissions
     assert "chat.session_record.export" in permissions
     assert "org.employee.view" not in permissions
+
+
+def test_my_schedule_permission_is_opt_in_for_builtin_roles():
+    assert "scheduling.my.view" in ALL_PERMISSION_KEYS
+    assert "scheduling.my.view" not in ADMIN_PERMISSION_KEYS
+    assert "scheduling.my.view" not in AGENT_PERMISSION_KEYS
 
 
 def test_merge_role_data_scopes_uses_widest_scope():

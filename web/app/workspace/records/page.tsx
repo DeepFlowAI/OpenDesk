@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation'
 import { useAuthStore } from '@/context/auth-store'
 import { useSystemInfo } from '@/service/use-system'
 import { getDefaultWorkspaceRecordPath } from '@/config/workspace-permissions'
-import { hasAnyPermission } from '@/utils/permissions'
+import { hasAllPermissions, hasAnyPermission } from '@/utils/permissions'
 
 export default function RecordsPage() {
   const router = useRouter()
@@ -17,7 +17,9 @@ export default function RecordsPage() {
     if (!user) return
     router.replace(
       getDefaultWorkspaceRecordPath(
-        (permissions) => hasAnyPermission(user, permissions),
+        (permissions, requireAll) => requireAll
+          ? hasAllPermissions(user, permissions)
+          : hasAnyPermission(user, permissions),
         reportsEnabled,
       ),
     )

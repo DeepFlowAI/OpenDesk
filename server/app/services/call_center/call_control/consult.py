@@ -74,6 +74,29 @@ class ConsultMixin:
         target_call_id = await _ccs.CallControlService._originate_target(
             telephony, originate_kwargs
         )
+        operation_id = f"consult:{target_call_id}"
+        await _ccs.CallControlService._record_consult_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="consult_started",
+            employee_id=employee_id,
+            target_type=target_type,
+            target_id=target_id,
+            target_name=desc_str,
+            target_call_id=target_call_id,
+        )
+        await _ccs.CallControlService._record_consult_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="consult_target_ringing",
+            employee_id=employee_id,
+            target_type=target_type,
+            target_id=target_id,
+            target_name=desc_str,
+            target_call_id=target_call_id,
+        )
         await consult_session.transition(
             tenant_id=tenant_id,
             host_employee_id=employee_id,
@@ -131,14 +154,43 @@ class ConsultMixin:
                 reason="consult_sip_answered",
                 consult_call_id=target_call_id,
             )
+            await _ccs.CallControlService._record_consult_event(
+                tenant_id=tenant_id,
+                call_id=call.customer_call_id,
+                operation_id=operation_id,
+                event_type="consult_connected",
+                employee_id=employee_id,
+                target_type=target_type,
+                target_id=target_id,
+                target_name=desc_str,
+                target_call_id=target_call_id,
+                result="succeeded",
+            )
+
+        async def _on_consult_failed(reason: str) -> None:
+            await _ccs.CallControlService._restore_after_consult_failure(
+                telephony, tenant_id, employee_id, call, target_call_id, reason
+            )
+            await _ccs.CallControlService._record_consult_event(
+                tenant_id=tenant_id,
+                call_id=call.customer_call_id,
+                operation_id=operation_id,
+                event_type="consult_failed",
+                employee_id=employee_id,
+                target_type=target_type,
+                target_id=target_id,
+                target_name=desc_str,
+                target_call_id=target_call_id,
+                result="failed",
+                reason_code="target_no_answer" if reason in {"timeout", "no_answer"} else "target_unavailable",
+                reason_detail=reason,
+            )
 
         _ccs.CallControlService._spawn_target_wait(
             telephony,
             target_call_id=target_call_id,
             on_answer=_bridge_agent_to_consult,
-            on_fail=lambda reason: _ccs.CallControlService._restore_after_consult_failure(
-                telephony, tenant_id, employee_id, call, target_call_id, reason
-            ),
+            on_fail=_on_consult_failed,
         )
 
         logger.info(
@@ -176,6 +228,25 @@ class ConsultMixin:
         # reconcile sees the in-flight consult, and consult_end can cancel the
         # pending offer by the same id.
         offer_id = uuid.uuid4().hex
+        operation_id = f"consult:{offer_id}"
+        await _ccs.CallControlService._record_consult_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="consult_started",
+            employee_id=employee_id,
+            target_type="employee",
+            target_id=target_employee_id,
+        )
+        await _ccs.CallControlService._record_consult_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="consult_target_ringing",
+            employee_id=employee_id,
+            target_type="employee",
+            target_id=target_employee_id,
+        )
         await consult_session.transition(
             tenant_id=tenant_id,
             host_employee_id=employee_id,
@@ -246,6 +317,18 @@ class ConsultMixin:
                     await _ccs.CallControlService._notify_consult_failed(
                         tenant_id, employee_id, str(exc)
                     )
+                    await _ccs.CallControlService._record_consult_event(
+                        tenant_id=tenant_id,
+                        call_id=call.customer_call_id,
+                        operation_id=operation_id,
+                        event_type="consult_failed",
+                        employee_id=employee_id,
+                        target_type="employee",
+                        target_id=target_employee_id,
+                        result="failed",
+                        reason_code="target_unavailable",
+                        reason_detail=str(exc),
+                    )
                 else:
                     logger.info(
                         "consult webrtc wait ended after cancel agent=%s offer=%s err=%s",
@@ -312,6 +395,18 @@ class ConsultMixin:
                     tenant_id, employee_id, "bridge_failed"
                 )
                 return
+            await _ccs.CallControlService._record_consult_event(
+                tenant_id=tenant_id,
+                call_id=call.customer_call_id,
+                operation_id=operation_id,
+                event_type="consult_connected",
+                employee_id=employee_id,
+                target_type="employee",
+                target_id=target_employee_id,
+                target_name=target_name,
+                target_call_id=target_leg,
+                result="succeeded",
+            )
             # Target answered and the initiator is now bridged to them.
             await _ccs.CallControlService._notify_control_result(
                 tenant_id=tenant_id,
@@ -355,6 +450,7 @@ class ConsultMixin:
         target_employee_id = legs.consult_target_employee_id
         consult_offer_id = legs.consult_offer_id
         was_ringing = consult_session.derive_state(legs) is ConsultState.RINGING
+        operation_id = f"consult:{consult_offer_id or consult_call_id or call.customer_call_id}"
 
         if call.webrtc_call_id and consult_call_id:
             try:
@@ -413,12 +509,66 @@ class ConsultMixin:
 
         await _ccs.CallControlService._stop_tone(telephony, call.customer_call_id)
         if call.webrtc_call_id:
-            await telephony.call_bridge(call.customer_call_id, call.webrtc_call_id)
+            await telephony.call_bridge(
+                call.customer_call_id,
+                call.webrtc_call_id,
+                keepalive_on_peer_hangup=True,
+            )
         logger.info(
             "consult end: agent=%s customer=%s resumed (consult_leg=%s dropped)",
             employee_id, call.customer_call_id, consult_call_id,
         )
+        await _ccs.CallControlService._record_consult_event(
+            tenant_id=tenant_id,
+            call_id=call.customer_call_id,
+            operation_id=operation_id,
+            event_type="consult_canceled" if was_ringing else "consult_ended",
+            employee_id=employee_id,
+            target_type="employee" if target_employee_id is not None else "external",
+            target_id=target_employee_id,
+            target_call_id=consult_call_id,
+            result="canceled" if was_ringing else "succeeded",
+            reason_code="canceled_by_actor" if was_ringing else "normal",
+        )
         return {"ok": True, "call_id": call.customer_call_id}
+
+    @staticmethod
+    async def _record_consult_event(
+        *,
+        tenant_id: int,
+        call_id: str,
+        operation_id: str,
+        event_type: str,
+        employee_id: int,
+        target_type: str,
+        target_id: int | None,
+        target_name: str | None = None,
+        target_call_id: str | None = None,
+        result: str | None = None,
+        reason_code: str | None = None,
+        reason_detail: str | None = None,
+    ) -> None:
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            event_id=f"opendesk:{event_type}:{operation_id}",
+            event_type=event_type,
+            event_category="consult",
+            actor_type="agent",
+            actor_id=str(employee_id),
+            source="opendesk",
+            operation_id=operation_id,
+            call_leg_id=target_call_id,
+            participant_role="consult_target" if target_call_id else None,
+            target_type="external_number" if target_type == "external" else target_type,
+            target_id=str(target_id) if target_id is not None else None,
+            target_name_snapshot=target_name,
+            result=result,
+            reason_code=reason_code,
+            reason_detail=reason_detail,
+        )
 
 # Imported after the mixin class so this module can be imported directly
 # without a circular-import error (call_control_service imports the mixins).

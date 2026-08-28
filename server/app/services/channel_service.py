@@ -21,9 +21,13 @@ from app.core.security import (
 )
 from app.db.session import AsyncSessionLocal
 from app.repositories.channel_repository import ChannelRepository
+from app.repositories.channel_form_config_version_repository import (
+    ChannelFormConfigVersionRepository,
+)
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.service_hours_repository import ServiceHoursRepository
 from app.repositories.user_repository import UserRepository
+from app.models.channel import Channel
 from app.models.service_hours import ServiceHours
 from app.schemas.channel import ChannelCreate, ChannelUpdate
 from app.schemas.channel import (
@@ -43,14 +47,164 @@ from app.schemas.visitor_session import VisitorSessionRequest
 from app.services.agent_status_service import AgentStatusService
 from app.services.open_agent_settings_service import OpenAgentSettingsService
 from app.services.web_sdk_context_service import WebSdkContextService
+from app.services.fd_field_definition_service import FdFieldDefinitionService
+from app.schemas.fd_field_definition import UnifiedFieldResponse
 
 CHANNEL_KEY_RE = re.compile(r"^ch_[A-Za-z0-9_-]{24,}$")
 VISITOR_EXTERNAL_ID_PREFIX = "v_"
 VISITOR_EXTERNAL_ID_RANDOM_BYTES = 24
 MAX_CHANNEL_NAME_LENGTH = 64
+PUBLIC_FORM_SYSTEM_FIELD_KEYS = {"title", "description", "priority"}
+PUBLIC_FORM_FIELD_TYPES = {
+    "single_line_text",
+    "multi_line_text",
+    "number",
+    "date",
+    "time",
+    "datetime",
+    "single_select",
+    "multi_select",
+    "single_select_tree",
+    "multi_select_tree",
+    "email",
+    "phone",
+    "url",
+    "file",
+    "rich_text",
+}
+PUBLIC_FORM_TREE_FIELD_TYPES = {"single_select_tree", "multi_select_tree"}
 
 
 class ChannelService:
+    @staticmethod
+    def _form_field_ref(field: dict) -> str:
+        field_key = field.get("field_key")
+        if field_key is not None:
+            return f"key:{field_key}"
+        return f"id:{field.get('field_id')}"
+
+    @staticmethod
+    def _is_public_form_field(field: dict) -> bool:
+        if field.get("status") != "active":
+            return False
+        field_type = str(field.get("field_type") or "")
+        if field_type not in PUBLIC_FORM_FIELD_TYPES:
+            return False
+        if field.get("source") == "system":
+            return field.get("key") in PUBLIC_FORM_SYSTEM_FIELD_KEYS
+        if field.get("source") != "custom":
+            return False
+        if field_type in PUBLIC_FORM_TREE_FIELD_TYPES:
+            data_source = (field.get("type_config") or {}).get("data_source")
+            if data_source not in (None, "static"):
+                return False
+        return True
+
+    @staticmethod
+    async def _build_form_config_snapshot(
+        db: AsyncSession,
+        tenant_id: int,
+        form_config: dict,
+    ) -> dict:
+        unified = await FdFieldDefinitionService.get_unified_list(
+            db,
+            tenant_id,
+            "ticket",
+            locale="zh",
+        )
+        by_ref: dict[str, dict] = {}
+        for raw_field in unified["items"]:
+            field = UnifiedFieldResponse.model_validate(raw_field).model_dump(mode="json")
+            if field.get("key") is not None:
+                by_ref[f"key:{field['key']}"] = field
+            if field.get("id") is not None:
+                by_ref[f"id:{field['id']}"] = field
+
+        snapshot_fields: list[dict] = []
+        for configured in form_config.get("fields", []):
+            ref = ChannelService._form_field_ref(configured)
+            field = by_ref.get(ref)
+            if not field or not ChannelService._is_public_form_field(field):
+                raise ValidationError("Form field is unavailable for public forms")
+            field["options"] = [
+                option for option in field.get("options", []) if option.get("is_active", True)
+            ]
+            field["tree_nodes"] = [
+                node for node in field.get("tree_nodes", []) if node.get("is_active", True)
+            ]
+            snapshot_fields.append(
+                {
+                    "field_key": configured.get("field_key"),
+                    "field_id": configured.get("field_id"),
+                    "required": bool(configured.get("required")),
+                    "definition": field,
+                }
+            )
+        return {**form_config, "fields": snapshot_fields}
+
+    @staticmethod
+    async def _persist_channel_with_form_version(
+        db: AsyncSession,
+        *,
+        item: Channel | None,
+        payload: dict,
+        previous_config: dict | None,
+        create: bool,
+    ) -> Channel:
+        config = dict(payload.get("config") or {})
+        previous = previous_config or {}
+        previous_version = int(previous.get("form_message_config_version") or 0)
+        form_config = dict(config.get("form_message_config") or {})
+        snapshot = None
+        should_create_version = False
+        if config.get("leave_message_mode") == "form":
+            snapshot = await ChannelService._build_form_config_snapshot(
+                db,
+                int(payload.get("tenant_id") or (item.tenant_id if item else 0)),
+                form_config,
+            )
+            previous_snapshot = (
+                await ChannelFormConfigVersionRepository.get_by_channel_version(
+                    db,
+                    int(payload.get("tenant_id") or (item.tenant_id if item else 0)),
+                    int(item.id if item else 0),
+                    previous_version,
+                )
+                if item is not None and previous_version > 0
+                else None
+            )
+            should_create_version = (
+                create
+                or previous_snapshot is None
+                or previous_snapshot.config != snapshot
+            )
+
+        if should_create_version:
+            config["form_message_config_version"] = previous_version + 1
+        elif previous_version:
+            config["form_message_config_version"] = previous_version
+        else:
+            config["form_message_config_version"] = None
+        payload["config"] = config
+
+        if create:
+            channel = await ChannelRepository.create(db, payload, commit=False)
+        else:
+            if item is None:
+                raise ValueError("Channel item is required for update")
+            channel = await ChannelRepository.update(db, item, payload, commit=False)
+        if should_create_version:
+            await ChannelFormConfigVersionRepository.create(
+                db,
+                tenant_id=channel.tenant_id,
+                channel_id=channel.id,
+                version=int(config["form_message_config_version"]),
+                config=snapshot,
+            )
+        await db.commit()
+        await db.refresh(channel)
+        return channel
+
     @staticmethod
     def generate_visitor_external_id() -> str:
         """Generate a high-entropy anonymous visitor identifier."""
@@ -161,6 +315,7 @@ class ChannelService:
         open_agent_client=None,
     ) -> dict:
         payload = config.model_dump()
+        payload["form_message_config_version"] = config.form_message_config_version
         payload["outside_service_hours_strategy"] = (
             payload.get("outside_service_hours_strategy") or DEFAULT_OUTSIDE_SERVICE_HOURS_STRATEGY
         )
@@ -232,6 +387,13 @@ class ChannelService:
             payload["open_agent_attachment_upload_enabled"] = False
             if payload.get("open_agent_bot_strategy") != "service_hours":
                 payload["open_agent_bot_service_hours_id"] = None
+
+        if payload.get("leave_message_mode") == "form":
+            await ChannelService._build_form_config_snapshot(
+                db,
+                tenant_id,
+                dict(payload.get("form_message_config") or {}),
+            )
 
         return payload
 
@@ -344,7 +506,13 @@ class ChannelService:
         payload["tenant_id"] = tenant_id
         payload["channel_key"] = await ChannelRepository.generate_unique_channel_key(db)
         payload["config"] = await ChannelService._normalize_config(db, tenant_id, data.config)
-        return await ChannelRepository.create(db, payload)
+        return await ChannelService._persist_channel_with_form_version(
+            db,
+            item=None,
+            payload=payload,
+            previous_config=None,
+            create=True,
+        )
 
     @staticmethod
     async def create_managed(
@@ -373,7 +541,13 @@ class ChannelService:
             payload["tenant_id"] = tenant_id
             payload["channel_key"] = await ChannelRepository.generate_unique_channel_key(db)
             payload["config"] = config
-            return await ChannelRepository.create(db, payload)
+            return await ChannelService._persist_channel_with_form_version(
+                db,
+                item=None,
+                payload=payload,
+                previous_config=None,
+                create=True,
+            )
 
     @staticmethod
     def _generate_copy_name(source_name: str, existing_names: list[str]) -> str:
@@ -408,7 +582,14 @@ class ChannelService:
             "favicon_url": item.favicon_url,
             "config": deepcopy(item.config or {}),
         }
-        return await ChannelRepository.create(db, payload)
+        payload["config"]["form_message_config_version"] = None
+        return await ChannelService._persist_channel_with_form_version(
+            db,
+            item=None,
+            payload=payload,
+            previous_config=None,
+            create=True,
+        )
 
     @staticmethod
     async def update(db: AsyncSession, channel_id: int, tenant_id: int, data: ChannelUpdate):
@@ -417,7 +598,13 @@ class ChannelService:
             raise NotFoundError("Channel not found")
         payload = data.model_dump()
         payload["config"] = await ChannelService._normalize_config(db, tenant_id, data.config)
-        return await ChannelRepository.update(db, item, payload)
+        return await ChannelService._persist_channel_with_form_version(
+            db,
+            item=item,
+            payload=payload,
+            previous_config=dict(item.config or {}),
+            create=False,
+        )
 
     @staticmethod
     async def update_managed(
@@ -451,7 +638,13 @@ class ChannelService:
                 raise NotFoundError("Channel not found")
             payload = data.model_dump()
             payload["config"] = config
-            return await ChannelRepository.update(db, item, payload)
+            return await ChannelService._persist_channel_with_form_version(
+                db,
+                item=item,
+                payload=payload,
+                previous_config=dict(item.config or {}),
+                create=False,
+            )
 
     @staticmethod
     async def rotate_key(db: AsyncSession, channel_id: int, tenant_id: int):
@@ -983,7 +1176,21 @@ class ChannelService:
                 visitor_secret=data.visitor_secret,
             ):
                 raise UnauthorizedError("Invalid visitor secret")
-            visitor_external_id = data.visitor_external_id
+            # A valid context token is the stronger identity claim (login upgrade /
+            # account switch). Do not keep renewing a stale anonymous or previous user id.
+            if (
+                context_visitor_external_id
+                and context_visitor_external_id != data.visitor_external_id
+            ):
+                visitor_external_id = context_visitor_external_id
+                issued_visitor_secret = create_visitor_identity_secret(
+                    tenant_id=channel.tenant_id,
+                    channel_id=channel.id,
+                    channel_key_version=channel.channel_key_version,
+                    visitor_external_id=visitor_external_id,
+                )
+            else:
+                visitor_external_id = data.visitor_external_id
         else:
             if data.visitor_secret:
                 raise ValidationError("visitor_external_id is required when visitor_secret is provided")

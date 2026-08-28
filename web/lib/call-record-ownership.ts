@@ -9,11 +9,11 @@
  * a ringing UI — prefer showing 来电 over silently skipping it.
  */
 export function callRecordBelongsToAgent(
-  rec: { agent_id?: number | null } | null | undefined,
+  rec: { last_serving_agent_id?: number | null } | null | undefined,
   myEmployeeId: number | null | undefined,
 ): boolean {
-  if (myEmployeeId == null || rec?.agent_id == null) return false
-  return rec.agent_id === myEmployeeId
+  if (myEmployeeId == null || rec?.last_serving_agent_id == null) return false
+  return rec.last_serving_agent_id === myEmployeeId
 }
 
 /**
@@ -24,14 +24,25 @@ export function callRecordBelongsToAgent(
 export function callRecordAnsweredByAgent(
   rec:
     | {
-        agent_id?: number | null
-        answered_at?: string | null
-        state?: string | null
+        last_serving_agent_id?: number | null
+        first_agent_connected_at?: string | null
+        lifecycle_status?: string | null
       }
     | null
     | undefined,
   myEmployeeId: number | null | undefined,
 ): boolean {
   if (!callRecordBelongsToAgent(rec, myEmployeeId)) return false
-  return !!rec?.answered_at || rec?.state === 'in_progress'
+  return !!rec?.first_agent_connected_at && rec.lifecycle_status === 'active'
+}
+
+/**
+ * True when the CDR shows the customer connected — the only record-level
+ * answer evidence for an outbound call. started_at exists from creation
+ * (the dial time) and must not be treated as an answer.
+ */
+export function callRecordCustomerConnected(
+  rec: { customer_connected_at?: string | null } | null | undefined,
+): boolean {
+  return Boolean(rec?.customer_connected_at)
 }

@@ -29,7 +29,6 @@ from dataclasses import dataclass, field
 from sqlalchemy import desc, select
 
 from app.constants.call_center import (
-    ACTIVE_CALL_RECORD_STATES,
     INCALL_LEGS_KEY_PREFIX,
     ConsultState,
     incall_legs_key,
@@ -66,9 +65,6 @@ from app.services.call_center.call_control.targets import TargetResolutionMixin
 from app.services.call_center.call_control.transfer import TransferMixin
 
 logger = logging.getLogger(__name__)
-
-# States a CallRecord is in while the agent is actively handling the call.
-_ACTIVE_STATES = tuple(ACTIVE_CALL_RECORD_STATES)
 
 # How long (seconds) we wait off the request path for a freshly-originated
 # transfer / consult / conference target leg to answer before giving up and
@@ -135,8 +131,10 @@ class InCallLegs:
     # Prefer this over AgentWebRTCSession — softphone presence sessions can be
     # stale while the real call uses a fresh per-call leg.
     agent_media_call_id: str | None = None
+    customer_held: bool = False
     consult_call_id: str | None = None
     conference_participant_call_id: str | None = None
+    conference_operation_id: str | None = None
     room_id: str | None = None
     room_legs: list[str] = field(default_factory=list)
     # Set only when the consult / transfer target is a colleague reached via the
@@ -158,8 +156,10 @@ class InCallLegs:
     def to_dict(self) -> dict:
         return {
             "agent_media_call_id": self.agent_media_call_id,
+            "customer_held": self.customer_held,
             "consult_call_id": self.consult_call_id,
             "conference_participant_call_id": self.conference_participant_call_id,
+            "conference_operation_id": self.conference_operation_id,
             "room_id": self.room_id,
             "room_legs": list(self.room_legs),
             "consult_target_employee_id": self.consult_target_employee_id,
@@ -172,8 +172,10 @@ class InCallLegs:
     def from_dict(cls, d: dict) -> "InCallLegs":
         return cls(
             agent_media_call_id=d.get("agent_media_call_id"),
+            customer_held=bool(d.get("customer_held", False)),
             consult_call_id=d.get("consult_call_id"),
             conference_participant_call_id=d.get("conference_participant_call_id"),
+            conference_operation_id=d.get("conference_operation_id"),
             room_id=d.get("room_id"),
             room_legs=list(d.get("room_legs") or []),
             consult_target_employee_id=d.get("consult_target_employee_id"),

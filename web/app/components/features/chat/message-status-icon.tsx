@@ -22,6 +22,7 @@ import {
 import { useState } from 'react'
 
 import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 
 export type VisibleMessageStatus = 'sending' | 'offline' | 'unread' | 'read'
@@ -43,13 +44,7 @@ export function resolveVisibleMessageStatus(
 }
 
 function statusLabel(status: VisibleMessageStatus, locale: Locale): string {
-  const labels: Record<VisibleMessageStatus, { zh: string; en: string }> = {
-    sending: { zh: '发送中', en: 'Sending' },
-    offline: { zh: '离线发送', en: 'Sent while offline' },
-    unread: { zh: '未读', en: 'Unread' },
-    read: { zh: '已读', en: 'Read' },
-  }
-  return labels[status][locale]
+  return t(`chat.messageStatus.${status}`, locale)
 }
 
 export function MessageStatusIcon({

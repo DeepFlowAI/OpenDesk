@@ -6,10 +6,12 @@ import { useRouter } from 'next/navigation'
 import { IconBan, IconCheck, IconCircleCheck, IconCopy, IconLoader2 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/context/auth-store'
+import { useChatStore } from '@/context/chat-store'
 import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { hasPermission } from '@/utils/permissions'
 import type { Conversation } from '@/models/conversation'
+import type { EmbeddedPageContext } from '@/models/embedded-page'
 import type { ConversationUserStatisticItem } from '@/models/conversation-user-statistics'
 import type { Ticket } from '@/models/ticket'
 import type { UnifiedField } from '@/models/field-definition'
@@ -23,11 +25,13 @@ import { SessionSummaryFields } from '@/app/components/features/session-summary/
 import { ChatTicketDraftPanel, hasTicketDraft } from '@/app/components/features/chat/chat-ticket-draft-panel'
 import { KnowledgeAssistant, type KnowledgeAssistantActionContext } from '@/app/components/features/knowledge/knowledge-assistant'
 import type { KnowledgeComposerContentType } from '@/app/components/features/knowledge/knowledge-utils'
+import { EmbeddedPagePanel } from '@/app/components/features/chat/embedded-page-panel'
+import { useWorkspaceEmbeddedPages } from '@/service/use-embedded-pages'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { FieldType } from '@/types/field-enums'
 import { getLinkedSelectTypeConfig } from '@/lib/field-linked-select-config'
 
-type AuxiliaryTab = 'basic' | 'summary' | 'ticket' | 'knowledge'
+type AuxiliaryTab = 'basic' | 'summary' | 'ticket' | 'knowledge' | `embedded:${number}`
 
 type Props = {
   conversation: Conversation | null
@@ -104,6 +108,11 @@ export function AuxiliaryPanel({
   const isPeerConversation = conversation?.viewer_relation === 'peer' || conversation?.viewer_relation === 'collaborator'
   const showSummaryTab = !!conversation && !isPeerConversation
   const showTicketTab = !!conversation && canCreateTicket && (ticketDraftOpen || hasTicketDraft(conversation.id))
+  const myConversationView = useChatStore((state) => state.myConversationView)
+  const embeddedPagesQuery = useWorkspaceEmbeddedPages('chat_auxiliary')
+  const embeddedPages = useMemo(() => embeddedPagesQuery.data?.items ?? [], [embeddedPagesQuery.data?.items])
+  const embeddedAgent = embeddedPagesQuery.data?.agent ?? null
+  const [mountedEmbeddedIds, setMountedEmbeddedIds] = useState<ReadonlySet<number>>(new Set())
   const conversationClosed = conversation?.status === 'closed'
   const isWebChannel = conversation?.channel?.channel_type?.toLowerCase() === 'web'
   const knowledgeUseReason = !conversation
@@ -112,8 +121,10 @@ export function AuxiliaryPanel({
       ? t('ws.knowledge.conversationEnded', locale)
       : undefined
   const knowledgeSendReason = knowledgeUseReason ?? (!connected ? t('ws.knowledge.disconnected', locale) : undefined)
-  const visibleActiveTab =
-    (activeTab === 'summary' && !showSummaryTab) || (activeTab === 'ticket' && !showTicketTab)
+  const visibleActiveTab: AuxiliaryTab =
+    (activeTab === 'summary' && !showSummaryTab) ||
+    (activeTab === 'ticket' && !showTicketTab) ||
+    (activeTab.startsWith('embedded:') && !embeddedPages.some((page) => `embedded:${page.id}` === activeTab))
       ? 'basic'
       : activeTab
 
@@ -131,16 +142,30 @@ export function AuxiliaryPanel({
     }
   }, [ticketDraftOpen, showTicketTab])
 
+  const tabDecisionAppliedRef = useRef<number | null>(null)
+
   useEffect(() => {
     const currentId = conversation?.id ?? null
-    if (currentId === prevConversationIdRef.current) return
-    prevConversationIdRef.current = currentId
+    if (currentId !== prevConversationIdRef.current) {
+      prevConversationIdRef.current = currentId
+      tabDecisionAppliedRef.current = null
+    }
 
     if (currentId == null) return
-    if (ticketDraftOpen && showTicketTab) return
+    if (tabDecisionAppliedRef.current === currentId) return
+    if (ticketDraftOpen && showTicketTab) {
+      tabDecisionAppliedRef.current = currentId
+      return
+    }
+    // Wait for the embedded page list before deciding, so default focus is honored on first selection.
+    if (embeddedPagesQuery.isPending) return
+    tabDecisionAppliedRef.current = currentId
+    // History conversations keep the agent's current tab; no default-focus recompute.
+    if (myConversationView === 'history') return
 
-    setActiveTab('basic')
-  }, [conversation?.id, ticketDraftOpen, showTicketTab])
+    const defaultFocusPage = embeddedPages.find((page) => page.default_focus)
+    setActiveTab(defaultFocusPage ? `embedded:${defaultFocusPage.id}` : 'basic')
+  }, [conversation?.id, ticketDraftOpen, showTicketTab, myConversationView, embeddedPages, embeddedPagesQuery.isPending])
 
   useEffect(() => {
     if (activeTab === 'ticket' && !showTicketTab) {
@@ -155,7 +180,29 @@ export function AuxiliaryPanel({
     if (activeTab === 'knowledge' && !canViewKnowledge) {
       setActiveTab(conversation ? 'basic' : 'basic')
     }
-  }, [activeTab, canViewKnowledge, conversation, showSummaryTab, showTicketTab])
+    if (activeTab.startsWith('embedded:') && !embeddedPages.some((page) => `embedded:${page.id}` === activeTab)) {
+      setActiveTab(
+        conversation
+          ? 'basic'
+          : canViewKnowledge
+            ? 'knowledge'
+            : embeddedPages[0]
+              ? `embedded:${embeddedPages[0].id}`
+              : 'basic',
+      )
+    }
+  }, [activeTab, canViewKnowledge, conversation, showSummaryTab, showTicketTab, embeddedPages])
+
+  useEffect(() => {
+    if (!visibleActiveTab.startsWith('embedded:')) return
+    const id = Number(visibleActiveTab.slice('embedded:'.length))
+    setMountedEmbeddedIds((prev) => {
+      if (prev.has(id)) return prev
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+  }, [visibleActiveTab])
 
   useEffect(() => {
     if (!ticketNotice) return
@@ -177,6 +224,39 @@ export function AuxiliaryPanel({
       setTimeout(() => setCopiedField(null), 2000)
     })
   }
+
+  const embeddedContext = useMemo<EmbeddedPageContext>(() => {
+    const visitor = conversation?.visitor ?? null
+    const userRecord = userQuery.data ?? null
+    return {
+      location: 'chat_auxiliary',
+      agent: embeddedAgent ? { id: embeddedAgent.id, name: embeddedAgent.name, email: embeddedAgent.email } : null,
+      conversation: conversation
+        ? {
+            id: conversation.id,
+            channelType: conversation.channel?.channel_type ?? '',
+            status: conversation.status,
+          }
+        : null,
+      visitor: visitor
+        ? {
+            id: visitor.id,
+            name: visitor.name,
+            email: userRecord?.email ?? null,
+            phone: userRecord?.phone ?? null,
+            userId: visitor.id,
+          }
+        : null,
+      call: null,
+      user: visitor
+        ? {
+            id: visitor.id,
+            name: visitor.name,
+            phone: userRecord?.phone ?? null,
+          }
+        : null,
+    }
+  }, [conversation, embeddedAgent, userQuery.data])
 
   const switchTab = (nextTab: AuxiliaryTab) => {
     if (activeTab === 'summary' && nextTab !== 'summary' && summaryDirty) {
@@ -256,9 +336,9 @@ export function AuxiliaryPanel({
           )}
         </div>
       )}
-      {conversation || canViewKnowledge ? (
+      {conversation || canViewKnowledge || embeddedPages.length > 0 ? (
         <>
-          <div className="mx-5 mb-4 mt-5 flex rounded-lg border border-border bg-background p-0.5">
+          <div className="mx-5 mb-4 mt-5 flex overflow-x-auto rounded-lg border border-border bg-background p-0.5">
             {conversation && (
               <>
                 <button
@@ -299,9 +379,21 @@ export function AuxiliaryPanel({
                 {t('ws.knowledge.title', locale)}
               </button>
             )}
+            {embeddedPages.map((page) => (
+              <button
+                key={page.id}
+                type="button"
+                data-testid={`aux-tab-embedded-${page.id}`}
+                title={page.name}
+                onClick={() => switchTab(`embedded:${page.id}`)}
+                className={cn('max-w-[120px] shrink-0 truncate rounded-md px-3 py-1.5 text-xs font-medium transition-colors', visibleActiveTab === `embedded:${page.id}` ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground')}
+              >
+                {page.name}
+              </button>
+            ))}
           </div>
-          <div className={cn('flex-1', visibleActiveTab === 'knowledge' ? 'flex min-h-0 flex-col overflow-hidden' : 'overflow-y-auto px-5 pb-5 pt-0')}>
-            {visibleActiveTab === 'knowledge' ? (
+          <div className={cn('flex-1', visibleActiveTab === 'knowledge' || visibleActiveTab.startsWith('embedded:') ? 'flex min-h-0 flex-col overflow-hidden' : 'overflow-y-auto px-5 pb-5 pt-0')}>
+            {!visibleActiveTab.startsWith('embedded:') && (visibleActiveTab === 'knowledge' ? (
               <KnowledgeAssistant
                 mode="chat"
                 conversationId={conversation?.id ?? null}
@@ -422,7 +514,17 @@ export function AuxiliaryPanel({
               <div className="flex h-full items-center justify-center px-5">
                 <p className="text-sm text-[#737373]">{t('ws.chat.selectHint', locale)}</p>
               </div>
-            )}
+            ))}
+            {embeddedPages
+              .filter((page) => mountedEmbeddedIds.has(page.id))
+              .map((page) => (
+                <EmbeddedPagePanel
+                  key={page.id}
+                  page={page}
+                  context={embeddedContext}
+                  hidden={visibleActiveTab !== `embedded:${page.id}`}
+                />
+              ))}
           </div>
         </>
       ) : (

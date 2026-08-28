@@ -1,119 +1,237 @@
-"""
-CallRecord repository — paginated history + lifecycle write helpers.
-"""
+"""Persistence and query helpers for the call-record projection."""
 from datetime import datetime
+from uuid import UUID
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.constants.call_center import ACTIVE_CALL_RECORD_STATES
 from app.models.call_record import CallRecord
+from app.models.call_record_access_scope import CallRecordAccessScope
 
 
 class CallRecordRepository:
+    @staticmethod
+    async def get_by_id_unscoped(db: AsyncSession, record_id: int) -> CallRecord | None:
+        return await db.get(CallRecord, record_id)
 
     @staticmethod
-    async def get_by_id(db: AsyncSession, record_id: int, tenant_id: int) -> CallRecord | None:
-        q = select(CallRecord).where(
-            CallRecord.id == record_id, CallRecord.tenant_id == tenant_id
-        )
-        return (await db.execute(q)).scalar_one_or_none()
+    async def lock_by_id(db: AsyncSession, record_id: int) -> CallRecord | None:
+        query = select(CallRecord).where(CallRecord.id == record_id).with_for_update()
+        return (await db.execute(query)).scalar_one_or_none()
 
     @staticmethod
-    async def get_by_call_id(db: AsyncSession, call_id: str, tenant_id: int) -> CallRecord | None:
-        q = select(CallRecord).where(
-            CallRecord.call_id == call_id, CallRecord.tenant_id == tenant_id
+    async def get_by_id(
+        db: AsyncSession, record_id: int, tenant_id: int
+    ) -> CallRecord | None:
+        query = select(CallRecord).where(
+            CallRecord.id == record_id,
+            CallRecord.tenant_id == tenant_id,
         )
-        return (await db.execute(q)).scalar_one_or_none()
+        return (await db.execute(query)).scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_public_id(
+        db: AsyncSession, public_id: UUID | str, tenant_id: int
+    ) -> CallRecord | None:
+        query = select(CallRecord).where(
+            CallRecord.public_id == public_id,
+            CallRecord.tenant_id == tenant_id,
+        )
+        return (await db.execute(query)).scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_call_id(
+        db: AsyncSession, call_id: str, tenant_id: int
+    ) -> CallRecord | None:
+        query = select(CallRecord).where(
+            CallRecord.call_id == call_id,
+            CallRecord.tenant_id == tenant_id,
+        )
+        return (await db.execute(query)).scalar_one_or_none()
 
     @staticmethod
     async def get_latest_active_for_agent(
         db: AsyncSession, tenant_id: int, agent_id: int
     ) -> CallRecord | None:
-        q = (
+        access_exists = (
+            select(CallRecordAccessScope.id)
+            .where(
+                CallRecordAccessScope.call_record_id == CallRecord.id,
+                CallRecordAccessScope.tenant_id == tenant_id,
+                CallRecordAccessScope.subject_type == "employee",
+                CallRecordAccessScope.subject_id == agent_id,
+            )
+            .exists()
+        )
+        query = (
             select(CallRecord)
             .where(
                 CallRecord.tenant_id == tenant_id,
-                CallRecord.agent_id == agent_id,
-                CallRecord.state.in_(tuple(ACTIVE_CALL_RECORD_STATES)),
+                CallRecord.lifecycle_status == "active",
+                or_(
+                    CallRecord.initiator_agent_id == agent_id,
+                    CallRecord.last_serving_agent_id == agent_id,
+                    access_exists,
+                ),
             )
             .order_by(desc(CallRecord.started_at))
             .limit(1)
         )
-        return (await db.execute(q)).scalar_one_or_none()
+        return (await db.execute(query)).scalar_one_or_none()
 
     @staticmethod
-    async def find_by_media_call_id(db: AsyncSession, call_id: str) -> CallRecord | None:
-        """Resolve a CDR from a FlowKit media-leg or root_call_id.
-
-        FlowKit `call.recording.completed` uses `call_id` as the SIP leg id
-        for single-leg (phase=ai) recordings, and as `root_call_id` after
-        bridge (phase=bridged). Match either column.
-        """
-
-        q = select(CallRecord).where(CallRecord.call_id == call_id)
-        row = (await db.execute(q)).scalar_one_or_none()
+    async def find_by_media_call_id(
+        db: AsyncSession, call_id: str
+    ) -> CallRecord | None:
+        query = select(CallRecord).where(CallRecord.call_id == call_id)
+        row = (await db.execute(query)).scalar_one_or_none()
         if row is not None:
             return row
-        q = select(CallRecord).where(CallRecord.root_call_id == call_id)
-        return (await db.execute(q)).scalar_one_or_none()
+        query = select(CallRecord).where(CallRecord.root_call_id == call_id)
+        return (await db.execute(query)).scalar_one_or_none()
 
     @staticmethod
     async def get_paginated(
         db: AsyncSession,
         tenant_id: int,
+        *,
         page: int = 1,
         per_page: int = 20,
         direction: str | None = None,
-        agent_id: int | None = None,
+        call_source: str | None = None,
+        lifecycle_status: str | None = None,
+        finalization_status: str | None = None,
+        actual_reception_type: str | None = None,
+        call_result: str | None = None,
+        hangup_party: str | None = None,
+        hangup_reason_code: str | None = None,
+        initiator_agent_id: int | None = None,
+        last_serving_agent_id: int | None = None,
         user_id: int | None = None,
+        last_queue_type: str | None = None,
+        last_queue_id: int | None = None,
+        recording_status: str | None = None,
+        satisfaction_results: list[str] | None = None,
+        satisfaction_trigger_sources: list[str] | None = None,
         keyword: str | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
+        min_total_duration_ms: int | None = None,
+        max_total_duration_ms: int | None = None,
+        min_customer_ring_duration_ms: int | None = None,
+        max_customer_ring_duration_ms: int | None = None,
+        min_agent_wait_duration_ms: int | None = None,
+        max_agent_wait_duration_ms: int | None = None,
+        min_customer_agent_talk_duration_ms: int | None = None,
+        max_customer_agent_talk_duration_ms: int | None = None,
         scope_predicate: ColumnElement | None = None,
     ) -> tuple[list[CallRecord], int]:
-        q = select(CallRecord).where(CallRecord.tenant_id == tenant_id)
+        query = select(CallRecord).where(CallRecord.tenant_id == tenant_id)
         if scope_predicate is not None:
-            q = q.where(scope_predicate)
-        if direction in ("inbound", "outbound"):
-            q = q.where(CallRecord.direction == direction)
-        if agent_id is not None:
-            q = q.where(CallRecord.agent_id == agent_id)
-        if user_id is not None:
-            q = q.where(CallRecord.user_id == user_id)
+            query = query.where(scope_predicate)
+
+        equality_filters = {
+            CallRecord.direction: direction,
+            CallRecord.call_source: call_source,
+            CallRecord.lifecycle_status: lifecycle_status,
+            CallRecord.finalization_status: finalization_status,
+            CallRecord.actual_reception_type: actual_reception_type,
+            CallRecord.call_result: call_result,
+            CallRecord.hangup_party: hangup_party,
+            CallRecord.hangup_reason_code: hangup_reason_code,
+            CallRecord.initiator_agent_id: initiator_agent_id,
+            CallRecord.last_serving_agent_id: last_serving_agent_id,
+            CallRecord.user_id: user_id,
+            CallRecord.last_queue_type: last_queue_type,
+            CallRecord.last_queue_id: last_queue_id,
+            CallRecord.recording_status: recording_status,
+        }
+        for column, value in equality_filters.items():
+            if value is not None:
+                query = query.where(column == value)
+
+        if satisfaction_results:
+            query = query.where(CallRecord.satisfaction_result.in_(satisfaction_results))
+        if satisfaction_trigger_sources:
+            query = query.where(
+                CallRecord.satisfaction_trigger_source.in_(satisfaction_trigger_sources)
+            )
+
         if keyword:
-            kw = f"%{keyword}%"
-            q = q.where(
-                (CallRecord.from_number.ilike(kw))
-                | (CallRecord.to_number.ilike(kw))
-                | (CallRecord.call_id.ilike(kw))
+            pattern = f"%{keyword}%"
+            query = query.where(
+                or_(
+                    CallRecord.customer_number.ilike(pattern),
+                    CallRecord.service_number.ilike(pattern),
+                    CallRecord.call_id.ilike(pattern),
+                )
             )
         if start_time is not None:
-            q = q.where(CallRecord.started_at >= start_time)
+            query = query.where(CallRecord.started_at >= start_time)
         if end_time is not None:
-            q = q.where(CallRecord.started_at <= end_time)
+            query = query.where(CallRecord.started_at <= end_time)
+        duration_filters = (
+            (CallRecord.total_duration_ms, min_total_duration_ms, max_total_duration_ms),
+            (
+                CallRecord.customer_ring_duration_ms,
+                min_customer_ring_duration_ms,
+                max_customer_ring_duration_ms,
+            ),
+            (
+                CallRecord.agent_wait_duration_ms,
+                min_agent_wait_duration_ms,
+                max_agent_wait_duration_ms,
+            ),
+            (
+                CallRecord.customer_agent_talk_duration_ms,
+                min_customer_agent_talk_duration_ms,
+                max_customer_agent_talk_duration_ms,
+            ),
+        )
+        for column, minimum, maximum in duration_filters:
+            if minimum is not None:
+                query = query.where(column >= minimum)
+            if maximum is not None:
+                query = query.where(column <= maximum)
 
-        count_q = select(func.count()).select_from(q.subquery())
-        total = (await db.execute(count_q)).scalar_one()
-
+        count_query = select(func.count()).select_from(query.subquery())
+        total = (await db.execute(count_query)).scalar_one()
         offset = (page - 1) * per_page
-        q = q.order_by(desc(CallRecord.started_at)).offset(offset).limit(per_page)
-        rows = list((await db.execute(q)).scalars().all())
+        query = (
+            query.order_by(desc(CallRecord.started_at), desc(CallRecord.id))
+            .offset(offset)
+            .limit(per_page)
+        )
+        rows = list((await db.execute(query)).scalars().all())
         return rows, total
 
     @staticmethod
-    async def create(db: AsyncSession, data: dict) -> CallRecord:
+    async def create(
+        db: AsyncSession, data: dict, *, commit: bool = True
+    ) -> CallRecord:
         row = CallRecord(**data)
         db.add(row)
-        await db.commit()
-        await db.refresh(row)
+        if commit:
+            await db.commit()
+            await db.refresh(row)
+        else:
+            await db.flush()
         return row
 
     @staticmethod
-    async def update(db: AsyncSession, row: CallRecord, patch: dict) -> CallRecord:
-        for k, v in patch.items():
-            setattr(row, k, v)
-        await db.commit()
-        await db.refresh(row)
+    async def update(
+        db: AsyncSession,
+        row: CallRecord,
+        patch: dict,
+        *,
+        commit: bool = True,
+    ) -> CallRecord:
+        for key, value in patch.items():
+            setattr(row, key, value)
+        if commit:
+            await db.commit()
+            await db.refresh(row)
+        else:
+            await db.flush()
         return row

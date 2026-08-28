@@ -78,13 +78,15 @@ def _active_row(**overrides):
     base = dict(
         id=1,
         tenant_id=7,
-        agent_id=42,
-        state="in_progress",
+        last_serving_agent_id=42,
+        initiator_agent_id=None,
+        lifecycle_status="active",
+        direction="inbound",
         started_at=None,
         root_call_id="sip-customer",
         call_id="sip-customer",
-        from_number="10086",
-        to_number="400",
+        customer_number="10086",
+        service_number="400",
         user_id=None,
     )
     base.update(overrides)
@@ -458,19 +460,17 @@ async def test_transfer_webrtc_employee_rekeys_exactly_once(monkeypatch):
     orch = _fake_orchestrator(monkeypatch)
     _seed_bridged_workflow(orch, call_id="sip-customer", employee_id=42)
 
-    # Track only mark_in_call (WebRTC path does not go through SIP reserve helper).
-    marked: list[tuple] = []
+    # Track only rekey (WebRTC path does not go through SIP reserve helper).
+    rekeyed: list[tuple] = []
 
-    async def _mark_in_call(
-        _r, tenant_id, employee_id, *, call_id, direction, offer_id=None, **_kw
-    ):
-        marked.append((tenant_id, employee_id, call_id, direction, offer_id))
-        return {"resource_state": "in_call"}
+    async def _rekey_current_call(_r, tenant_id, employee_id, *, call_id):
+        rekeyed.append((tenant_id, employee_id, call_id))
+        return {"resource_state": "in_call", "current_call_id": call_id}
 
     monkeypatch.setattr(
         ccs_module.CcAgentResourceService,
-        "mark_in_call",
-        staticmethod(_mark_in_call),
+        "rekey_current_call",
+        staticmethod(_rekey_current_call),
     )
 
     tel = MockTelephonyClient()
@@ -483,7 +483,7 @@ async def test_transfer_webrtc_employee_rekeys_exactly_once(monkeypatch):
     for _ in range(5):
         await asyncio.sleep(0)
 
-    assert marked == [(7, 99, "sip-customer", "inbound", None)]
+    assert rekeyed == [(7, 99, "sip-customer")]
 
 
 # ───────────────────────── Fix: wrap-up busy + legs ─────────────────────────

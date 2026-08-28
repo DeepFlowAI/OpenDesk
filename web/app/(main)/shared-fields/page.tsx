@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
+import { HTTPError } from 'ky'
 import { arrayMove } from '@dnd-kit/sortable'
 import { IconPlus, IconPencil, IconTrash } from '@tabler/icons-react'
 import {
@@ -22,6 +23,7 @@ import {
 } from '@/types/field-enums'
 import type { FieldType as FieldTypeEnum, ApplicableModule } from '@/types/field-enums'
 import type { FdFieldDefinition } from '@/models/field-definition'
+import type { Locale } from '@/lib/languages'
 
 function ConfirmModal({
   title,
@@ -65,7 +67,7 @@ function ConfirmModal({
   )
 }
 
-function StatusBadge({ status, locale }: { status: string; locale: 'zh' | 'en' }) {
+function StatusBadge({ status, locale }: { status: string; locale: Locale }) {
   const isActive = status === 'active'
   const label = isActive ? t('sf.status.active', locale) : t('sf.status.inactive', locale)
   return (
@@ -79,13 +81,13 @@ function StatusBadge({ status, locale }: { status: string; locale: 'zh' | 'en' }
   )
 }
 
-function ModuleTags({ modules, locale }: { modules: string[] | null; locale: 'zh' | 'en' }) {
+function ModuleTags({ modules, locale }: { modules: string[] | null; locale: Locale }) {
   if (!modules || modules.length === 0) return <span className="text-sm text-muted-foreground">-</span>
   return (
     <div className="flex flex-wrap gap-1">
       {modules.map((m) => {
         const label =
-          APPLICABLE_MODULE_LABELS[m as ApplicableModule]?.[locale] ?? m
+          APPLICABLE_MODULE_LABELS[m as ApplicableModule]?.[locale === 'zh' ? 'zh' : 'en'] ?? m
         return (
           <span
             key={m}
@@ -168,10 +170,23 @@ export default function SharedFieldsListPage() {
       await deleteMutation.mutateAsync(deleteTarget.id)
       setDeleteTarget(null)
       showToast('success', 'sf.deleteSuccess')
-    } catch {
+    } catch (error) {
+      if (error instanceof HTTPError) {
+        const body = await error.response.json().catch(() => null) as {
+          details?: { references?: Array<{ dashboard_name?: string }> }
+        } | null
+        const names = [...new Set((body?.details?.references ?? []).map((item) => item.dashboard_name).filter(Boolean))]
+        if (names.length > 0) {
+          setToast({
+            type: 'error',
+            text: t('sf.delete.dashboardReferenced', locale, { names: names.join('、') }),
+          })
+          return
+        }
+      }
       showToast('error', 'sf.deleteFailed')
     }
-  }, [deleteTarget, deleteMutation, showToast])
+  }, [deleteTarget, deleteMutation, locale, showToast])
 
   const formatDate = (dateStr: string | null) => {
     if (!dateStr) return '-'
@@ -294,7 +309,7 @@ export default function SharedFieldsListPage() {
                 >
                   {sortItems.map((field) => {
                     const typeLabel =
-                      FIELD_TYPE_LABELS[field.field_type as FieldTypeEnum]?.[locale] ?? field.field_type
+                      FIELD_TYPE_LABELS[field.field_type as FieldTypeEnum]?.[locale === 'zh' ? 'zh' : 'en'] ?? field.field_type
                     const sid = poolFieldSortId(field)
                     return (
                       <SortableFieldTableRow
@@ -326,7 +341,7 @@ export default function SharedFieldsListPage() {
               ) : (
                 items.map((field, idx) => {
                   const typeLabel =
-                    FIELD_TYPE_LABELS[field.field_type as FieldTypeEnum]?.[locale] ?? field.field_type
+                    FIELD_TYPE_LABELS[field.field_type as FieldTypeEnum]?.[locale === 'zh' ? 'zh' : 'en'] ?? field.field_type
 
                   return (
                     <div

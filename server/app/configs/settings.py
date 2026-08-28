@@ -39,11 +39,48 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = Field(default="postgresql+asyncpg://localhost:5432/opendesk")
     AUTO_MIGRATE: bool = Field(default=True, description="Run alembic upgrade head on startup")
+    # Engine-level ERROR when any SQL exceeds this many milliseconds, even if
+    # the statement later succeeds. 0 disables.
+    DB_SLOW_QUERY_MS: int = Field(default=10000, ge=0)
 
     REDIS_URL: str | None = Field(default=None)
 
+    # Custom dashboard execution and tenant-wide resource governance
+    DASHBOARD_SANDBOX_PROVIDER: str = Field(default="subprocess")
+    DASHBOARD_RUN_WALL_SECONDS: float = Field(default=8.0, ge=1.0, le=30.0)
+    DASHBOARD_RUN_CPU_SECONDS: int = Field(default=2, ge=1, le=10)
+    DASHBOARD_RUN_MEMORY_MB: int = Field(default=128, ge=64, le=512)
+    DASHBOARD_RUN_MAX_QUERIES: int = Field(default=8, ge=1, le=20)
+    DASHBOARD_QUERY_STATEMENT_TIMEOUT_MS: int = Field(default=5000, ge=100, le=30000)
+    DASHBOARD_RUN_MAX_OUTPUT_BYTES: int = Field(default=1024 * 1024, ge=1024)
+    DASHBOARD_RUN_MAX_LOG_BYTES: int = Field(default=16 * 1024, ge=1024)
+    DASHBOARD_PAGE_MAX_QUERIES: int = Field(default=80, ge=1, le=500)
+    DASHBOARD_MAX_CONCURRENCY: int = Field(default=3, ge=1, le=20)
+    DASHBOARD_TENANT_MAX_CONCURRENCY: int = Field(default=8, ge=1, le=100)
+    DASHBOARD_TENANT_MAX_QUEUED: int = Field(default=30, ge=1, le=500)
+    DASHBOARD_QUEUE_WAIT_SECONDS: float = Field(default=10.0, ge=0.5, le=60.0)
+    DASHBOARD_TENANT_RATE_PER_MINUTE: int = Field(default=240, ge=1)
+    DASHBOARD_TENANT_BURST_PER_SECOND: int = Field(default=60, ge=1)
+    DASHBOARD_EMPLOYEE_RATE_PER_MINUTE: int = Field(default=60, ge=1)
+    DASHBOARD_REFRESH_COOLDOWN_SECONDS: int = Field(default=5, ge=1, le=60)
+    DASHBOARD_RESULT_CACHE_SECONDS: int = Field(default=60, ge=1, le=3600)
+    DASHBOARD_RESOURCE_COOLDOWN_FAILURES: int = Field(default=3, ge=1, le=20)
+    DASHBOARD_RESOURCE_COOLDOWN_SECONDS: int = Field(default=300, ge=10, le=3600)
+
     # Message Queue
     MESSAGE_QUEUE_PROVIDER: str = Field(default="redis_streams")
+
+    # Tenant event webhook delivery
+    WEBHOOK_PROVIDER: str = Field(default="http")
+    EVENT_DELIVERY_WORKER_ENABLED: bool = Field(default=True)
+    EVENT_DELIVERY_SCAN_INTERVAL_SECONDS: int = Field(default=5, ge=1)
+    EVENT_DELIVERY_SCAN_BATCH_SIZE: int = Field(default=50, ge=1, le=500)
+    EVENT_DELIVERY_CONCURRENCY: int = Field(default=10, ge=1, le=100)
+    EVENT_DELIVERY_CLAIM_STALE_SECONDS: int = Field(default=120, ge=30)
+    EVENT_DELIVERY_TIMEOUT_SECONDS: float = Field(default=5.0, ge=1.0, le=30.0)
+    EVENT_DELIVERY_RETENTION_DAYS: int = Field(default=90, ge=1, le=3650)
+    EVENT_DELIVERY_CLEANUP_INTERVAL_SECONDS: int = Field(default=60, ge=10)
+    EVENT_DELIVERY_CLEANUP_BATCH_SIZE: int = Field(default=1000, ge=1, le=10000)
 
     # OpenAgent integration
     OPEN_AGENT_PROVIDER: str = Field(default="http")
@@ -79,6 +116,28 @@ class Settings(BaseSettings):
     OPEN_AGENT_BOT_TIMEOUT_SECONDS: int = Field(default=3600, ge=60)
     OPEN_AGENT_BOT_TIMEOUT_SCAN_INTERVAL_SECONDS: int = Field(default=60, ge=5)
     OPEN_AGENT_BOT_TIMEOUT_SCAN_BATCH_SIZE: int = Field(default=100, ge=1, le=500)
+    CALL_WRAPUP_TIMEOUT_WORKER_ENABLED: bool = Field(default=True)
+    CALL_WRAPUP_TIMEOUT_SCAN_INTERVAL_SECONDS: int = Field(default=2, ge=1)
+
+    # ── Auto outbound dial engine (触达中心 · 自动外呼) ────────────────────
+    AUTO_OUTBOUND_DIAL_WORKER_ENABLED: bool = Field(default=True)
+    AUTO_OUTBOUND_DIAL_SCAN_INTERVAL_SECONDS: int = Field(default=5, ge=1)
+    AUTO_OUTBOUND_DIAL_BATCH_SIZE: int = Field(default=50, ge=1, le=500)
+    AUTO_OUTBOUND_AUTO_PAUSE_CONSECUTIVE_FAILURES: int = Field(default=5, ge=1, le=100)
+    # Tenant-wide in-flight cap across all auto-outbound tasks. 0 = unconstrained.
+    AUTO_OUTBOUND_TENANT_MAX_CONCURRENCY: int = Field(default=0, ge=0, le=5000)
+    # Simulation path for acceptance tests when real trunks are unavailable.
+    # Keep default False; enable explicitly for e2e / demos.
+    AUTO_OUTBOUND_SIMULATION_ENABLED: bool = Field(default=False)
+    AUTO_OUTBOUND_SIMULATION_ANSWER_RATE: float = Field(default=0.6, ge=0.0, le=1.0)
+    AUTO_OUTBOUND_SIMULATION_MIN_RING_SECONDS: float = Field(default=2.0, ge=0.0)
+    AUTO_OUTBOUND_SIMULATION_MAX_RING_SECONDS: float = Field(default=8.0, ge=0.0)
+    AUTO_OUTBOUND_SIMULATION_MIN_TALK_SECONDS: float = Field(default=5.0, ge=0.0)
+    AUTO_OUTBOUND_SIMULATION_MAX_TALK_SECONDS: float = Field(default=20.0, ge=0.0)
+    AUTO_OUTBOUND_SIMULATION_WEIGHT_NO_ANSWER: float = Field(default=0.5, ge=0.0)
+    AUTO_OUTBOUND_SIMULATION_WEIGHT_BUSY: float = Field(default=0.2, ge=0.0)
+    AUTO_OUTBOUND_SIMULATION_WEIGHT_POWER_OFF: float = Field(default=0.2, ge=0.0)
+    AUTO_OUTBOUND_SIMULATION_WEIGHT_INVALID: float = Field(default=0.1, ge=0.0)
 
     SMTP_HOST: str = Field(default="")
     SMTP_PORT: int = Field(default=465)
@@ -114,6 +173,36 @@ class Settings(BaseSettings):
         description="Comma-separated accepted JWT audiences for Tenant Platform SSO.",
     )
 
+    # ── Bulk SMS send engine (触达中心 · 短信群发) ───────────────────────
+    SMS_BULK_SEND_WORKER_ENABLED: bool = Field(default=True)
+    SMS_BULK_SEND_SCAN_INTERVAL_SECONDS: int = Field(default=5, ge=1)
+    SMS_BULK_SEND_BATCH_SIZE: int = Field(default=50, ge=1, le=500)
+    SMS_BULK_SEND_CLAIM_STALE_SECONDS: int = Field(default=300, ge=60)
+    SMS_BULK_SEND_TIMEOUT_SECONDS: int = Field(default=30, ge=1, le=300)
+    SMS_BULK_SEND_AUTO_PAUSE_CONSECUTIVE_FAILURES: int = Field(default=20, ge=1, le=500)
+
+    # SMS channel (single send). Default "mock" keeps local/dev offline-safe;
+    # set "aliyun" with the credentials below to send via Aliyun SMS.
+    SMS_PROVIDER: str = Field(default="mock")
+    ALIYUN_SMS_ACCESS_KEY_ID: str = Field(default="")
+    ALIYUN_SMS_ACCESS_KEY_SECRET: str = Field(default="")
+    ALIYUN_SMS_ENDPOINT: str = Field(default="dysmsapi.aliyuncs.com")
+    # Shared token required on provider delivery-receipt callbacks.
+    SMS_CALLBACK_TOKEN: str = Field(default="")
+
+    # VOD (video-on-demand) channel for learning-center course videos. Default
+    # "mock" keeps local/dev offline-safe; set "aliyun" with the credentials
+    # below to upload/playback via Aliyun VOD.
+    VOD_PROVIDER: str = Field(default="mock")
+    ALIYUN_VOD_ACCESS_KEY_ID: str = Field(default="")
+    ALIYUN_VOD_ACCESS_KEY_SECRET: str = Field(default="")
+    ALIYUN_VOD_ENDPOINT: str = Field(default="vod.cn-shanghai.aliyuncs.com")
+    # Transcode template group used for upload/transcode requests; empty falls
+    # back to the console default group.
+    ALIYUN_VOD_TEMPLATE_GROUP_ID: str = Field(default="")
+    # Shared token required on provider transcode-event callbacks.
+    ALIYUN_VOD_CALLBACK_TOKEN: str = Field(default="")
+
     # Knowledge recommendation embeddings
     KNOWLEDGE_EMBEDDING_PROVIDER: str = Field(default="aliyun")
     KNOWLEDGE_EMBEDDING_MODEL: str = Field(default="text-embedding-v4")
@@ -125,6 +214,23 @@ class Settings(BaseSettings):
     ALIYUN_DASHSCOPE_EMBEDDING_URL: str = Field(
         default="https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
     )
+
+    # Provider-neutral LLM completion and local language detection
+    LLM_PROVIDER: str = Field(default="litellm")
+    LLM_PRIMARY_MODEL: str = Field(default="deepseek/deepseek-v4-flash")
+    LLM_PRIMARY_API_KEY: str = Field(default="")
+    LLM_PRIMARY_API_BASE: str = Field(default="https://api.deepseek.com/v1")
+    LLM_BACKUP_MODEL: str = Field(default="openai/deepseek-v4-flash")
+    LLM_BACKUP_API_KEY: str = Field(default="")
+    LLM_BACKUP_API_BASE: str = Field(default="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    LLM_TIMEOUT_SECONDS: float = Field(default=8.0, ge=1.0)
+    LLM_MAX_RETRIES: int = Field(default=1, ge=0, le=5)
+    LANGUAGE_DETECTOR_PROVIDER: str = Field(default="fasttext")
+    FASTTEXT_LANGUAGE_MODEL_PATH: str = Field(default="")
+    LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD: float = Field(default=0.65, ge=0.0, le=1.0)
+    LANGUAGE_DETECTION_MIN_LATIN_LETTERS: int = Field(default=10, ge=1)
+    LANGUAGE_DETECTION_MIN_LATIN_WORDS: int = Field(default=4, ge=1)
+    LANGUAGE_DECISION_RECENT_VISITOR_MESSAGES: int = Field(default=5, ge=1, le=20)
 
     # Storage / OSS
     STORAGE_PROVIDER: str = Field(default="aliyun_oss")
@@ -143,6 +249,10 @@ class Settings(BaseSettings):
     # takes precedence over TELEPHONY_WS_URL (single URL still works as a
     # one-element list). Empty → fall back to TELEPHONY_WS_URL.
     TELEPHONY_WS_URLS: str = Field(default="")
+    # Optional read-only FlowKit endpoints used only during reconnect
+    # reconciliation. In single-active blue/green, the stable URL points at
+    # the new color while established calls may still drain on the old color.
+    TELEPHONY_RECONCILE_WS_URLS: str = Field(default="")
     TELEPHONY_SDK_NAME: str = Field(default="opendesk-cc")
     TELEPHONY_SDK_VERSION: str = Field(default="1.0.0")
     TELEPHONY_RPC_TIMEOUT: float = Field(default=30.0)
@@ -155,6 +265,11 @@ class Settings(BaseSettings):
     # first tenant in DB. Multi-tenant deployments should switch to DID-based
     # routing instead.
     CALL_CENTER_DEFAULT_TENANT_SLUG: str = Field(default="")
+    # When true, inbound SIP is handled only if the dialed DID is assigned to
+    # a tenant in this environment's catalog. Unknown or unassigned numbers
+    # are ignored (no answer / hangup) so another OpenDesk sharing the same
+    # FlowKit can own them. Default false keeps the single-tenant fallback.
+    CALL_CENTER_SKIP_UNOWNED_DID: bool = Field(default=False)
     # Seconds to wait for in-flight call workflows to finish on process
     # shutdown (blue/green drain) before force-finalizing leftovers.
     CALL_CENTER_DRAIN_TIMEOUT: int = Field(default=1800)
@@ -183,6 +298,7 @@ class Settings(BaseSettings):
     # Grace window after lease expiry where inbound stays accepted (covers
     # OpenDesk restarts). 0 = old behavior (instant drop on heartbeat stop).
     FLOWKIT_TELECOM_STALE_ACCEPTABLE_SEC: int = Field(default=30)
+
     OSS_ACCESS_KEY: str = Field(default="")
     OSS_SECRET_KEY: str = Field(default="")
     OSS_ADDR: str = Field(default="", description="Public access URL prefix, e.g. https://bucket.oss-cn-beijing.aliyuncs.com")

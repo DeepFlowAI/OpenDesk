@@ -50,6 +50,7 @@ class SipExtension(Base, TimestampMixin, AuditActorMixin):
 
     auth_password_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     auth_password_masked: Mapped[str] = mapped_column(String(40), nullable=False)
+    auth_password_ciphertext: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     registration_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="unregistered", server_default="unregistered"

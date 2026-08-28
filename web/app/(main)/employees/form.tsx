@@ -3,6 +3,7 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import { IconChevronDown, IconPhotoPlus, IconLoader2, IconX } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
+import { LANGUAGE_OPTIONS } from '@/lib/languages'
 import { t } from '@/utils/i18n'
 import { useUploadAvatar } from '@/service/use-upload'
 import { useEmployeeGroups } from '@/service/use-employee-groups'
@@ -41,38 +42,65 @@ function FormSelect({
   options,
   onChange,
   width = 120,
+  searchable = false,
+  searchPlaceholder,
 }: {
   value: string
-  options: { value: string; label: string }[]
+  options: { value: string; label: string; keywords?: string }[]
   onChange: (v: string) => void
   width?: number
+  searchable?: boolean
+  searchPlaceholder?: string
 }) {
   const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
   const selected = options.find((o) => o.value === value)
+  const filtered = query
+    ? options.filter((o) =>
+        `${o.label} ${o.keywords ?? ''}`.toLowerCase().includes(query.toLowerCase())
+      )
+    : options
+  const close = () => {
+    setOpen(false)
+    setQuery('')
+  }
   return (
     <div className="relative" style={{ width }}>
       <button
         type="button"
-        onClick={() => setOpen(!open)}
+        onClick={() => (open ? close() : setOpen(true))}
         className="flex h-10 w-full items-center justify-between rounded-lg border border-border px-3 text-sm text-foreground/80"
       >
-        <span>{selected?.label ?? value}</span>
-        <IconChevronDown size={16} className="text-muted-foreground" />
+        <span className="truncate">{selected?.label ?? value}</span>
+        <IconChevronDown size={16} className="shrink-0 text-muted-foreground" />
       </button>
       {open && (
-        <div className="absolute top-11 left-0 z-20 w-full rounded-lg border border-border bg-white py-1 shadow-lg">
-          {options.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              onClick={() => { onChange(opt.value); setOpen(false) }}
-              className={`block w-full px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${
-                opt.value === value ? 'font-medium text-foreground' : 'text-foreground/80'
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
+        <div className="absolute bottom-11 left-0 z-20 w-full rounded-lg border border-border bg-white py-1 shadow-lg">
+          {searchable && (
+            <div className="border-b border-border px-2 pb-1">
+              <input
+                autoFocus
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder={searchPlaceholder}
+                className="h-8 w-full rounded-md px-2 text-sm focus:outline-none"
+              />
+            </div>
+          )}
+          <div className="max-h-56 overflow-y-auto">
+            {filtered.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => { onChange(opt.value); close() }}
+                className={`block w-full px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${
+                  opt.value === value ? 'font-medium text-foreground' : 'text-foreground/80'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -163,7 +191,10 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit, qu
   }, [selectedRoles])
 
   const hasChannelEligibility = useMemo(() => {
-    if (selectedRoles.some((role) => role.permissions.includes('chat.workspace.use') || role.permissions.includes('call.workspace.use'))) {
+    if (selectedRoles.some((role) => {
+      const permissions = role.permissions ?? []
+      return permissions.includes('chat.workspace.use') || permissions.includes('call.workspace.use')
+    })) {
       return true
     }
     return legacyRoles.includes('agent')
@@ -171,8 +202,7 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit, qu
 
   const langOptions = useMemo(() => [
     { value: 'system', label: t('emp.form.lang.system', locale) },
-    { value: 'zh', label: t('emp.form.lang.zh', locale) },
-    { value: 'en', label: t('emp.form.lang.en', locale) },
+    ...LANGUAGE_OPTIONS,
   ], [locale])
 
   const validate = useCallback((): FormErrors => {
@@ -198,6 +228,10 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit, qu
       if (Object.keys(errs).length > 0) return
 
       const mc = parseInt(maxConcurrent, 10)
+      // Send role_ids only. The legacy `roles` string list (`admin`/`agent`) is
+      // derived server-side from the selected role rows; shipping both lets a
+      // stale or mismatched `roles` value fail schema validation even when the
+      // chosen role_ids are valid (including built-in system roles).
       if (isEdit) {
         const payload: UpdateEmployeePayload = {
           name: name.trim(),
@@ -207,7 +241,6 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit, qu
           email: email.trim(),
           phone: phone.trim() || null,
           avatar: avatar || null,
-          roles: legacyRoles,
           role_ids: roleIds,
           max_concurrent: isNaN(mc) ? 10 : mc,
           default_language: defaultLanguage,
@@ -225,7 +258,6 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit, qu
           phone: phone.trim() || null,
           password,
           avatar: avatar || null,
-          roles: legacyRoles,
           role_ids: roleIds,
           max_concurrent: isNaN(mc) ? 10 : mc,
           default_language: defaultLanguage,
@@ -234,7 +266,7 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit, qu
         onSubmit(payload, queuePolicyPayloads)
       }
     },
-    [name, nickname, jobNumber, username, email, phone, password, legacyRoles, roleIds, groupIds, maxConcurrent, defaultLanguage, isEdit, validate, onSubmit, avatar, queuePoliciesValid, queuePolicyPayloads, locale]
+    [name, nickname, jobNumber, username, email, phone, password, roleIds, groupIds, maxConcurrent, defaultLanguage, isEdit, validate, onSubmit, avatar, queuePoliciesValid, queuePolicyPayloads, locale]
   )
 
   const handleQueueSettingsChange = useCallback((payloads: QueuePolicyUpsertPayload[], valid: boolean) => {
@@ -611,7 +643,14 @@ export default function EmployeeForm({ initialData, isEdit = false, onSubmit, qu
       {/* Language */}
       <div className="flex flex-col gap-1.5">
         <label className="text-sm font-medium text-foreground/80">{t('emp.form.language', locale)}</label>
-        <FormSelect value={defaultLanguage} options={langOptions} onChange={setDefaultLanguage} width={140} />
+        <FormSelect
+          value={defaultLanguage}
+          options={langOptions}
+          onChange={setDefaultLanguage}
+          width={220}
+          searchable
+          searchPlaceholder={t('settings.lang.search', locale)}
+        />
       </div>
     </form>
   )

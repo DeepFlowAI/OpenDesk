@@ -41,6 +41,13 @@ export const useTenantPhoneNumbers = (params?: TenantPhoneNumberListParams) =>
       }),
   })
 
+export const useMyOutboundNumbers = () =>
+  useQuery({
+    queryKey: [...tenantPhoneNumberKeys.all, 'my-outbound'] as const,
+    queryFn: () =>
+      get<TenantPhoneNumberListResponse>('v1/call-center/agents/me/outbound-numbers'),
+  })
+
 export const useTenantPhoneNumber = (id: string, enabled = true) =>
   useQuery({
     queryKey: tenantPhoneNumberKeys.detail(id),

@@ -17,6 +17,7 @@ deferred — that's a UX policy on top of this primitive.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -48,6 +49,10 @@ from app.services.cc_agent_status_service import CcAgentStatusService
 
 logger = logging.getLogger(__name__)
 
+# In-flight post-dial persist tasks. The set holds a strong reference until
+# completion so a running task is never garbage-collected mid-flight.
+_background_persist_tasks: set[asyncio.Task] = set()
+
 
 # Carrier-local digit strings and +E.164. Visual separators allowed; caller
 # is expected to strip them, but we accept and forward as-is — FlowKit
@@ -78,6 +83,9 @@ class OutboundDialService:
         outbound_phone_number_id: str,
         destination: str,
         r: aioredis.Redis | None = None,
+        call_source: str = "agent_dial",
+        custom_business_info: str | None = None,
+        external_context: dict | None = None,
     ) -> DialOutboundResponse:
         """Dial without holding a DB session across FlowKit RPCs (CLAUDE.md §8)."""
         async with AsyncSessionLocal() as db:
@@ -105,6 +113,9 @@ class OutboundDialService:
                 employee_id=employee_id,
                 ctx=ctx,
                 r=r,
+                call_source=call_source,
+                custom_business_info=custom_business_info,
+                external_context=external_context,
             )
         return await OutboundDialService._dial_webrtc_managed(
             telephony,
@@ -112,6 +123,9 @@ class OutboundDialService:
             employee_id=employee_id,
             ctx=ctx,
             r=r,
+            call_source=call_source,
+            custom_business_info=custom_business_info,
+            external_context=external_context,
         )
 
     @staticmethod
@@ -124,6 +138,9 @@ class OutboundDialService:
         outbound_phone_number_id: str,
         destination: str,
         r: aioredis.Redis | None = None,
+        call_source: str = "agent_dial",
+        custom_business_info: str | None = None,
+        external_context: dict | None = None,
     ) -> DialOutboundResponse:
         """Injected-session entry for unit tests. Production uses ``dial_managed``."""
         ctx = await OutboundDialService._load_dial_context(
@@ -150,6 +167,9 @@ class OutboundDialService:
                 employee_id=employee_id,
                 ctx=ctx,
                 r=r,
+                call_source=call_source,
+                custom_business_info=custom_business_info,
+                external_context=external_context,
             )
         return await OutboundDialService._dial_webrtc_with_db(
             db,
@@ -158,6 +178,9 @@ class OutboundDialService:
             employee_id=employee_id,
             ctx=ctx,
             r=r,
+            call_source=call_source,
+            custom_business_info=custom_business_info,
+            external_context=external_context,
         )
 
     @staticmethod
@@ -169,15 +192,24 @@ class OutboundDialService:
         ctx: _DialContext,
         call_id: str,
         result: dict,
+        call_source: str,
+        custom_business_info: str | None,
+        external_context: dict | None,
     ) -> None:
-        try:
-            await CcAgentStatusService.sync_pg_status(
-                db, tenant_pk, employee_id, "busy", None
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "Agent status busy sync failed for outbound call_id=%s", call_id
-            )
+        from app.services.call_center.orchestrator import get_orchestrator
+
+        # A carrier reject can land before this persist runs. Writing busy
+        # after hangup already restored ready strands the agent on busy.
+        already_ended = await get_orchestrator().outbound_ended_reason(call_id)
+        if already_ended is None:
+            try:
+                await CcAgentStatusService.sync_pg_status(
+                    db, tenant_pk, employee_id, "busy", None
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Agent status busy sync failed for outbound call_id=%s", call_id
+                )
 
         try:
             await CallRecordService.create_for_outbound(
@@ -190,8 +222,17 @@ class OutboundDialService:
                 agent_id=employee_id,
                 device_type=ctx.device_type,
                 device_identifier=ctx.device_identifier,
+                call_source=call_source,
+                custom_business_info=custom_business_info,
+                external_context=external_context,
             )
             await db.commit()
+
+            await get_orchestrator().finalize_outbound_cdr_if_already_ended(
+                db,
+                tenant_id=tenant_pk,
+                call_id=call_id,
+            )
         except Exception:  # noqa: BLE001 — CDR failure must not abort the call
             logger.exception("CDR create_for_outbound failed call_id=%s", call_id)
 
@@ -357,6 +398,9 @@ class OutboundDialService:
         employee_id: int,
         ctx: _DialContext,
         r: aioredis.Redis | None,
+        call_source: str,
+        custom_business_info: str | None,
+        external_context: dict | None,
     ) -> DialOutboundResponse:
         call_id, result = await OutboundDialService._originate_webrtc(
             telephony,
@@ -365,15 +409,21 @@ class OutboundDialService:
             ctx=ctx,
             r=r,
         )
-        async with AsyncSessionLocal() as db:
-            await OutboundDialService._persist_webrtc_outbound(
-                db,
-                tenant_pk=tenant_pk,
-                employee_id=employee_id,
-                ctx=ctx,
-                call_id=call_id,
-                result=result,
-            )
+        # Respond as soon as the kernel accepts the originate — the callee may
+        # already be ringing. Post-dial bookkeeping (PG busy mirror, CDR, user
+        # identification) is seconds of DB work and runs in the background;
+        # early carrier hangs are still reconciled inside the persist via
+        # outbound_ended_reason / finalize_outbound_cdr_if_already_ended.
+        OutboundDialService._schedule_webrtc_persist(
+            tenant_pk=tenant_pk,
+            employee_id=employee_id,
+            ctx=ctx,
+            call_id=call_id,
+            result=result,
+            call_source=call_source,
+            custom_business_info=custom_business_info,
+            external_context=external_context,
+        )
         logger.info(
             "outbound dial: tenant=%s employee=%s caller=%s -> %s (dialed=%s) "
             "call_id=%s trunk=%s prefix=%s",
@@ -387,6 +437,63 @@ class OutboundDialService:
         )
 
     @staticmethod
+    def _schedule_webrtc_persist(
+        *,
+        tenant_pk: int,
+        employee_id: int,
+        ctx: _DialContext,
+        call_id: str,
+        result: dict,
+        call_source: str,
+        custom_business_info: str | None,
+        external_context: dict | None,
+    ) -> None:
+        task = asyncio.create_task(
+            OutboundDialService._persist_webrtc_outbound_managed(
+                tenant_pk=tenant_pk,
+                employee_id=employee_id,
+                ctx=ctx,
+                call_id=call_id,
+                result=result,
+                call_source=call_source,
+                custom_business_info=custom_business_info,
+                external_context=external_context,
+            ),
+            name=f"outbound-persist:{call_id}",
+        )
+        _background_persist_tasks.add(task)
+        task.add_done_callback(_background_persist_tasks.discard)
+
+    @staticmethod
+    async def _persist_webrtc_outbound_managed(
+        *,
+        tenant_pk: int,
+        employee_id: int,
+        ctx: _DialContext,
+        call_id: str,
+        result: dict,
+        call_source: str,
+        custom_business_info: str | None,
+        external_context: dict | None,
+    ) -> None:
+        """Background persist on its own short session; errors stay logged, never raised."""
+        try:
+            async with AsyncSessionLocal() as db:
+                await OutboundDialService._persist_webrtc_outbound(
+                    db,
+                    tenant_pk=tenant_pk,
+                    employee_id=employee_id,
+                    ctx=ctx,
+                    call_id=call_id,
+                    result=result,
+                    call_source=call_source,
+                    custom_business_info=custom_business_info,
+                    external_context=external_context,
+                )
+        except Exception:  # noqa: BLE001 — bookkeeping must not fail a live call
+            logger.exception("outbound persist failed call_id=%s", call_id)
+
+    @staticmethod
     async def _dial_webrtc_with_db(
         db: AsyncSession,
         telephony: BaseTelephonyClient,
@@ -395,6 +502,9 @@ class OutboundDialService:
         employee_id: int,
         ctx: _DialContext,
         r: aioredis.Redis | None,
+        call_source: str,
+        custom_business_info: str | None,
+        external_context: dict | None,
     ) -> DialOutboundResponse:
         """WebRTC dial using an injected session for post-RPC persistence (tests)."""
         call_id, result = await OutboundDialService._originate_webrtc(
@@ -411,6 +521,9 @@ class OutboundDialService:
             ctx=ctx,
             call_id=call_id,
             result=result,
+            call_source=call_source,
+            custom_business_info=custom_business_info,
+            external_context=external_context,
         )
         logger.info(
             "outbound dial: tenant=%s employee=%s caller=%s -> %s (dialed=%s) "
@@ -432,6 +545,9 @@ class OutboundDialService:
         employee_id: int,
         ctx: _DialContext,
         r: aioredis.Redis | None,
+        call_source: str,
+        custom_business_info: str | None,
+        external_context: dict | None,
     ) -> DialOutboundResponse:
         """SIP-phone fast path with no DB session across call.originate."""
         assert ctx.sip_user_id is not None
@@ -490,6 +606,9 @@ class OutboundDialService:
                 trunk_id=ctx.trunk_id,
                 device_type=ctx.device_type,
                 device_identifier=ctx.device_identifier,
+                call_source=call_source,
+                custom_business_info=custom_business_info,
+                external_context=external_context,
             ),
             timeout_sec=OutboundDialService._EXTENSION_ANSWER_TIMEOUT_SEC,
         )

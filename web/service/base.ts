@@ -2,9 +2,11 @@ import ky, { HTTPError } from 'ky'
 import { logAuthEvent } from '@/utils/auth-log'
 import { adoptNewerTokenIfAny, readStoredToken } from '@/utils/auth-session'
 import {
-  clearStoredAuth,
+  SESSION_EXPIRED_REASON,
+  SESSION_REPLACED_REASON,
   isSessionReplacedCode,
   readApiErrorCode,
+  redirectToSessionExpiredLogin,
   redirectToSessionReplacedLogin,
 } from '@/utils/session-replacement'
 
@@ -17,6 +19,13 @@ export function normalizeApiBase(raw: string | undefined): string {
 // We intentionally avoid a hard-coded localhost fallback so production builds
 // never silently target an internal/dev address.
 const API_BASE = normalizeApiBase(process.env.NEXT_PUBLIC_API_URL)
+
+let runtimeAccessToken: string | null = null
+
+/** Short-lived token for isolated surfaces such as the embedded call iframe. */
+export function setRuntimeAccessToken(token: string | null): void {
+  runtimeAccessToken = token
+}
 
 /**
  * Result of a token refresh attempt.
@@ -73,6 +82,19 @@ function bearerTokenFromRequest(request: Request): string | null {
   const header = request.headers.get('Authorization')
   if (!header?.startsWith('Bearer ')) return null
   return header.slice('Bearer '.length)
+}
+
+/**
+ * Auth endpoints that return 401 for bad credentials (not an expired session).
+ * The global afterResponse hook must not clear storage / reload on these.
+ */
+export function isCredentialChallengeUrl(url: string): boolean {
+  return (
+    url.includes('/auth/login') ||
+    url.includes('/auth/sso') ||
+    url.includes('/auth/send-verify-code') ||
+    url.includes('/auth/reset-password')
+  )
 }
 
 /**
@@ -166,7 +188,7 @@ const client = ky.create({
   hooks: {
     beforeRequest: [
       (request) => {
-        const token = localStorage.getItem('auth_token')
+        const token = runtimeAccessToken || localStorage.getItem('auth_token')
         if (token) request.headers.set('Authorization', `Bearer ${token}`)
       },
     ],
@@ -174,12 +196,19 @@ const client = ky.create({
       async (request, _options, response) => {
         if (response.status !== 401) return
         const requestToken = bearerTokenFromRequest(request)
+        if (runtimeAccessToken && requestToken === runtimeAccessToken) return
+        // Wrong password / SSO / reset-password 401s must reach the page
+        // error UI. Do not treat them as session expiry (which reloads /login
+        // and flashes away the "invalid credentials" message).
+        if (isCredentialChallengeUrl(request.url)) return
         const code = await readApiErrorCode(response)
         if (isSessionReplacedCode(code)) {
           if (await skipClearIfNewerToken(requestToken, 'session_replaced', request.url)) return
           await logAuthEvent('session_cleared', {
             trigger: 'session_replaced',
             path: request.url,
+            redirect_reason: SESSION_REPLACED_REASON,
+            api_error_code: code,
           }, { immediate: true })
           redirectToSessionReplacedLogin()
           return
@@ -190,12 +219,13 @@ const client = ky.create({
           await logAuthEvent('session_cleared', {
             trigger: 'refresh_endpoint_401',
             path: request.url,
+            redirect_reason: SESSION_EXPIRED_REASON,
+            api_error_code: code,
           }, { immediate: true })
-          clearStoredAuth()
-          window.location.href = '/login'
+          redirectToSessionExpiredLogin()
           return
         }
-        logAuthEvent('api_unauthorized', { path: request.url })
+        logAuthEvent('api_unauthorized', { path: request.url, api_error_code: code })
         // refreshAccessToken reads localStorage — capture that token so the
         // post-refresh clear gate compares against what was actually refreshed,
         // not the (possibly older) Authorization header on this request.
@@ -215,6 +245,8 @@ const client = ky.create({
           await logAuthEvent('session_cleared', {
             trigger: 'refresh_session_replaced',
             path: request.url,
+            redirect_reason: SESSION_REPLACED_REASON,
+            refresh_outcome: outcome.status,
           }, { immediate: true })
           redirectToSessionReplacedLogin()
           return
@@ -224,9 +256,11 @@ const client = ky.create({
         await logAuthEvent('session_cleared', {
           trigger: 'refresh_after_api_401',
           path: request.url,
+          redirect_reason: SESSION_EXPIRED_REASON,
+          refresh_outcome: outcome.status,
+          api_error_code: code,
         }, { immediate: true })
-        clearStoredAuth()
-        window.location.href = '/login'
+        redirectToSessionExpiredLogin()
         return
       },
     ],

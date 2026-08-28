@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { DataScopeValue, PermissionNode, Role, RolePayload } from '@/models/role'
 import { usePermissionTree } from '@/service/use-roles'
 import { useLocaleStore } from '@/context/locale-store'
+import type { Locale } from '@/lib/languages'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 
@@ -15,11 +16,11 @@ type Props = {
   onSubmit: (payload: RolePayload) => void
 }
 
-function permissionLabel(node: PermissionNode, locale: 'zh' | 'en') {
+function permissionLabel(node: PermissionNode, locale: Locale) {
   return locale === 'zh' ? node.name : node.name_en
 }
 
-function scopeLabel(scope: DataScopeValue, locale: 'zh' | 'en') {
+function scopeLabel(scope: DataScopeValue, locale: Locale) {
   if (locale === 'zh') {
     if (scope === 'all') return '全部'
     if (scope === 'group') return '所在组'

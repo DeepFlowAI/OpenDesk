@@ -1,4 +1,5 @@
 import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import type { Message, MessageQuote } from '@/models/conversation'
 
 const QUOTABLE_CONTENT_TYPES = new Set(['text', 'rich_text', 'image', 'file'])
@@ -34,10 +35,10 @@ function stripHtml(html: string): string {
 }
 
 function fallbackSenderName(senderType: string, locale: Locale): string {
-  if (senderType === 'visitor') return locale === 'zh' ? '访客' : 'Visitor'
-  if (senderType === 'agent') return locale === 'zh' ? '客服' : 'Agent'
-  if (senderType === 'bot') return locale === 'zh' ? '机器人' : 'Bot'
-  return locale === 'zh' ? '消息' : 'Message'
+  if (senderType === 'visitor') return t('chat.quote.sender.visitor', locale)
+  if (senderType === 'agent') return t('chat.quote.sender.agent', locale)
+  if (senderType === 'bot') return t('chat.quote.sender.bot', locale)
+  return t('chat.quote.sender.message', locale)
 }
 
 export function messageQuoteFromMetadata(metadata?: Record<string, unknown> | null): MessageQuote | null {
@@ -81,16 +82,16 @@ export function quoteFromMessage(message: Message, locale: Locale): MessageQuote
     if (plain) {
       summary = plain.slice(0, QUOTE_SUMMARY_MAX_LENGTH)
     } else if (/<img\b/i.test(message.content)) {
-      summary = locale === 'zh' ? '图片' : 'Image'
+      summary = t('chat.quote.image', locale)
     } else {
-      summary = locale === 'zh' ? '富文本' : 'Rich text'
+      summary = t('chat.quote.richText', locale)
     }
   } else if (message.content_type === 'image') {
-    summary = locale === 'zh' ? '图片' : 'Image'
+    summary = t('chat.quote.image', locale)
   } else if (message.content_type === 'file') {
     summary = fileName
-      ? `${locale === 'zh' ? '文件：' : 'File: '}${fileName}`
-      : locale === 'zh' ? '文件' : 'File'
+      ? t('chat.quote.fileWithName', locale, { name: fileName })
+      : t('chat.quote.file', locale)
   }
 
   return {
@@ -127,19 +128,19 @@ export function quoteSummaryLabel(
   original?: Message | null,
 ): string {
   if (quote.is_recalled || original?.is_recalled) {
-    return locale === 'zh' ? '原消息已撤回' : 'Original message was recalled'
+    return t('chat.quote.recalled', locale)
   }
-  if (quote.content_type === 'image') return locale === 'zh' ? '图片' : 'Image'
+  if (quote.content_type === 'image') return t('chat.quote.image', locale)
   if (quote.content_type === 'file') {
     const fileName = quote.file_name || (original ? fileNameFromContent(original.content) : null)
     return fileName
-      ? `${locale === 'zh' ? '文件：' : 'File: '}${fileName}`
-      : locale === 'zh' ? '文件' : 'File'
+      ? t('chat.quote.fileWithName', locale, { name: fileName })
+      : t('chat.quote.file', locale)
   }
   const summary = original
     ? quoteFromMessage(original, locale).summary
     : quote.summary
-  return summary?.trim() || (locale === 'zh' ? '原消息不可查看' : 'Original message unavailable')
+  return summary?.trim() || t('chat.quote.unavailable', locale)
 }
 
 export function quoteAriaLabel(
@@ -150,12 +151,8 @@ export function quoteAriaLabel(
 ): string {
   const summary = quoteSummaryLabel(quote, locale, original)
   if (!shouldShowQuoteSenderLabel(quote, audience)) {
-    return locale === 'zh'
-      ? `引用消息：${summary}`
-      : `Quoted message: ${summary}`
+    return t('chat.quote.aria', locale, { summary })
   }
   const sender = quoteSenderLabel(quote, locale)
-  return locale === 'zh'
-    ? `引用 ${sender} 的消息：${summary}`
-    : `Quoted message from ${sender}: ${summary}`
+  return t('chat.quote.ariaFrom', locale, { sender, summary })
 }

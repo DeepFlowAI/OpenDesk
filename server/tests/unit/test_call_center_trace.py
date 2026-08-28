@@ -85,10 +85,15 @@ async def test_recording_completed_log_carries_trace_id(monkeypatch):
     orch_logger.setLevel(logging.INFO)
     try:
         await orch._on_recording_completed(
-            CallEvent(
-                method="call.recording.completed",
-                data={"call_id": "media-1", "oss_url": "oss://rec/1.wav"},
-            )
+                CallEvent(
+                    method="call.recording.completed",
+                    data={
+                        "call_id": "media-1",
+                        "event_id": "flowkit:event:rec-1",
+                        "recording_id": "flowkit:recording:rec-1",
+                        "storage_key": "recordings/rec-1.wav",
+                    },
+                )
         )
     finally:
         orch_logger.removeHandler(handler)

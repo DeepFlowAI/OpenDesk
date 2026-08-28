@@ -85,7 +85,7 @@ VISITOR_HISTORY_PAGE_SIZE = 10
 VISITOR_HISTORY_MESSAGE_LIMIT = 200
 VISITOR_HISTORY_TOTAL_MESSAGE_LIMIT = 1000
 VISITOR_UNREAD_OFFLINE_REPLY_LIMIT = 3
-WORKSPACE_MY_HISTORY_HOURS = 24
+WORKSPACE_MY_HISTORY_DAYS = 30
 WORKSPACE_MY_HISTORY_PAGE_SIZE = 20
 PEER_VIEW_PERMISSION = "chat.conversation.peer.view"
 PEER_MESSAGE_SEND_PERMISSION = "chat.conversation.peer_message.send"
@@ -238,6 +238,16 @@ class ConversationService:
             raise ConflictError("Conversation is no longer queued")
         if conversation.group_id is None:
             raise ConflictError("Conversation has no queue target")
+
+        if config.leave_message_mode == "form":
+            return {
+                "ok": True,
+                "source": QUEUE_WAITING_LEAVE_MESSAGE_SOURCE,
+                "queue_type": QueueType.EMPLOYEE_GROUP.value,
+                "queue_id": conversation.group_id,
+                "leave_message_prompt": config.leave_message_prompt,
+                "deferred": True,
+            }
 
         task = await QueueTaskRepository.get_active_conversation_task_for_update(
             db,
@@ -396,6 +406,16 @@ class ConversationService:
             payload["conversation_public_id"] = conversation_public_id
         else:
             payload["conversation_id"] = conversation_id if conversation_id is not None else msg.conversation_id
+        if visitor_facing and msg.sender_type == MessageSenderType.AGENT.value:
+            projected_metadata = dict(payload.get("metadata") or {})
+            translation = projected_metadata.pop("translation", None)
+            if (
+                isinstance(translation, dict)
+                and translation.get("status") == "translated"
+                and isinstance(translation.get("translated_text"), str)
+            ):
+                payload["content"] = translation["translated_text"]
+            payload["metadata"] = projected_metadata
         return payload
 
     @staticmethod
@@ -1271,6 +1291,10 @@ class ConversationService:
             "sender_type": MessageSenderType.SYSTEM.value,
             "content_type": MessageContentType.SYSTEM.value,
             "content": sys_content,
+            "metadata_": {
+                "event_type": "conversation_started" if agent_id else "queue_entered",
+                "started_by": "visitor",
+            },
         })
         await ConversationRepository.update_last_message(
             db,
@@ -1767,7 +1791,7 @@ class ConversationService:
     ) -> dict:
         """Get the current agent's recently ended workspace conversations."""
         safe_limit = min(max(limit, 1), WORKSPACE_MY_HISTORY_PAGE_SIZE)
-        ended_since = datetime.now(timezone.utc) - timedelta(hours=WORKSPACE_MY_HISTORY_HOURS)
+        ended_since = datetime.now(timezone.utc) - timedelta(days=WORKSPACE_MY_HISTORY_DAYS)
         conversations = await ConversationRepository.get_recent_closed_by_agent(
             db,
             tenant_id=tenant_id,
@@ -1970,6 +1994,10 @@ class ConversationService:
             "sender_type": MessageSenderType.SYSTEM.value,
             "content_type": MessageContentType.SYSTEM.value,
             "content": end_text,
+            "metadata_": {
+                "event_type": "conversation_ended",
+                "ended_by": ended_by,
+            },
         })
         await ConversationRepository.update_last_message(db, conv.id, end_text, now)
         logger.info(

@@ -3,7 +3,7 @@ Manual outbound task models.
 """
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -23,8 +23,13 @@ class OutboundTaskTemplate(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(80), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     fields: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    script: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_by_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
     updated_by_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
+
+    @property
+    def has_script(self) -> bool:
+        return self.script is not None
 
 
 class OutboundTask(Base, TimestampMixin):
@@ -52,9 +57,14 @@ class OutboundTask(Base, TimestampMixin):
     assignment_mode: Mapped[str] = mapped_column(String(32), nullable=False, server_default="manual")
     assignee_scope_ids: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     fields: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    script_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     template: Mapped["OutboundTaskTemplate | None"] = relationship("OutboundTaskTemplate")
     targets: Mapped[list["OutboundTaskTarget"]] = relationship("OutboundTaskTarget", back_populates="task", cascade="all, delete-orphan")
+
+    @property
+    def has_script(self) -> bool:
+        return self.script_snapshot is not None
 
 
 class OutboundTaskTarget(Base, TimestampMixin):
@@ -95,7 +105,7 @@ class OutboundCallRecord(Base, TimestampMixin):
     tenant_id: Mapped[int] = mapped_column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
     task_id: Mapped[int] = mapped_column(Integer, ForeignKey("outbound_tasks.id", ondelete="CASCADE"), nullable=False)
     target_id: Mapped[int] = mapped_column(Integer, ForeignKey("outbound_task_targets.id", ondelete="CASCADE"), nullable=False)
-    call_record_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("call_records.id", ondelete="SET NULL"), nullable=True)
+    call_record_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("call_records.id", ondelete="SET NULL"), nullable=True)
     agent_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
     phone_number: Mapped[str] = mapped_column(String(64), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

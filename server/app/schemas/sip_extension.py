@@ -116,11 +116,7 @@ class SipExtensionListResponse(PaginatedResponse):
 
 
 class SipRegistrationInfo(BaseModel):
-    """One-time full registration info shown after create / reset.
-
-    ``auth_password`` is present ONLY in create / reset responses. The copy
-    endpoint returns the masked password instead.
-    """
+    """Full registration info available to extension administrators."""
 
     registration_server: str
     registration_port: int | None = None

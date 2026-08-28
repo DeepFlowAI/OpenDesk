@@ -6,7 +6,24 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 
 VALID_ROLES = {"admin", "agent"}
-VALID_LANGUAGES = {"system", "zh", "en"}
+VALID_LANGUAGES = {
+    "system",
+    "zh",
+    "en",
+    "fr-FR",
+    "es-ES",
+    "es-419",
+    "pt-BR",
+    "pt-PT",
+    "it-IT",
+    "nl-NL",
+    "pl-PL",
+    "ru-RU",
+    "tr-TR",
+    "th-TH",
+    "vi-VN",
+    "id-ID",
+}
 
 
 class EmployeeRoleAssignment(BaseModel):

@@ -23,6 +23,15 @@ from app.core.exceptions import ConflictError, ValidationError
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_epoch(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
 # Re-export for existing importers (queue.py, tests, etc.).
 __all__ = [
     "ACTIVE_RESOURCE_STATES",
@@ -258,7 +267,7 @@ class CcAgentResourceService:
             allow_non_ready=True,
         )
         if reserved is None:
-            raise ConflictError("Current call resource is occupied")
+            raise ConflictError("当前有通话占用，请结束后再拨号")
         return reserved
 
     @classmethod
@@ -605,6 +614,77 @@ class CcAgentResourceService:
         return None
 
     @classmethod
+    async def rekey_current_call(
+        cls,
+        r: aioredis.Redis,
+        tenant_id: int,
+        employee_id: int,
+        *,
+        call_id: str,
+    ) -> dict | None:
+        """Re-point an occupied resource at a different call id.
+
+        Blind transfer to a browser-ring colleague hands the customer over:
+        the target answered on the internal consult leg (``internal:<offer>``),
+        so their resource stays keyed on that leg. Once they own the customer
+        call it must be re-keyed, or the customer's own ``call.hangup``
+        finalize trips the "belongs to another call" guard and the agent's
+        status / CDR never settle. Unlike ``mark_in_call`` — whose repeat
+        with a different call_id is a deliberate no-op covering the
+        internal-ring double-drive — this update is explicit. No-op when the
+        resource is gone, not occupied, or already keyed on the call.
+        """
+        key = cls.key(tenant_id, employee_id)
+        for _ in range(3):
+            async with r.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.hgetall(key)
+                    current = cls._snapshot_from_raw(employee_id, raw) if raw else None
+                    if not current or current.get("resource_state") not in {
+                        "reserved",
+                        "ringing",
+                        "in_call",
+                    }:
+                        return current
+                    previous_call_id = current.get("current_call_id") or ""
+                    if previous_call_id == call_id:
+                        return current
+                    mapping = cls._base_mapping(
+                        visible_status=current.get("visible_status") or "busy",
+                        resource_state=current.get("resource_state") or "in_call",
+                        current_call_id=call_id,
+                        offer_id=current.get("offer_id"),
+                        queue_id=current.get("queue_id"),
+                        direction=current.get("direction") or "inbound",
+                        reserved_until=current.get("reserved_until_epoch")
+                        or (cls._now_epoch() + cls.IN_CALL_LEASE_SEC),
+                        last_assigned_at=current.get("last_assigned_at"),
+                        previous_visible_status=current.get(
+                            "previous_visible_status"
+                        ),
+                        in_call_since=current.get("in_call_since"),
+                    )
+                    pipe.multi()
+                    pipe.hset(key, mapping=mapping)
+                    await pipe.execute()
+                    cls._log_transition(
+                        tenant_id=tenant_id,
+                        employee_id=employee_id,
+                        from_state=current.get("resource_state"),
+                        to_state=current.get("resource_state") or "in_call",
+                        visible_from=current.get("visible_status"),
+                        visible_to=current.get("visible_status"),
+                        call_id=call_id,
+                        offer_id=current.get("offer_id"),
+                        reason=f"rekey_current_call:from={previous_call_id or '-'}",
+                    )
+                    return cls._snapshot_from_raw(employee_id, mapping)
+                except WatchError:
+                    continue
+        return None
+
+    @classmethod
     async def force_release(
         cls,
         r: aioredis.Redis,
@@ -626,13 +706,16 @@ class CcAgentResourceService:
         active_call_ids,
         *,
         renew: bool = True,
+        release_missing: bool = True,
     ) -> list[tuple[int, int, str]]:
         """Reconcile in_call resources against the kernel's active calls.
 
         Releases any agent stuck in_call whose call is no longer active in the
         kernel (its end event was lost); refreshes the lease for calls still
-        live. Returns the released ``(tenant_id, employee_id, call_id)`` tuples
-        so the caller can also close the corresponding stale call records.
+        live. When the kernel snapshot is incomplete, ``release_missing=False``
+        preserves unknown calls rather than risking a false release. Returns
+        the released ``(tenant_id, employee_id, call_id)`` tuples so the caller
+        can also close the corresponding stale call records.
         """
         active = {c for c in (active_call_ids or []) if c}
         released: list[tuple[int, int, str]] = []
@@ -664,6 +747,8 @@ class CcAgentResourceService:
                             r, tenant_id, employee_id, call_id=call_id
                         )
                     continue
+                if not release_missing:
+                    continue
                 await cls.release(
                     r,
                     tenant_id,
@@ -678,6 +763,49 @@ class CcAgentResourceService:
         return released
 
     @classmethod
+    async def list_expired_wrapups(
+        cls,
+        r: aioredis.Redis,
+        *,
+        limit: int = 200,
+    ) -> list[tuple[int, int, str | None]]:
+        """Return ``(tenant_id, employee_id, call_id)`` for agents whose
+        after-call-work deadline has passed. Read-only; the caller flips the
+        resource to ready so a lost sweep round simply retries next tick."""
+        now = cls._now_epoch()
+        expired: list[tuple[int, int, str | None]] = []
+        cursor = 0
+        while True:
+            cursor, keys = await r.scan(
+                cursor=cursor, match="cc:agent:resource:*", count=200
+            )
+            for raw_key in keys:
+                key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+                parts = key.split(":")
+                if len(parts) != 5:
+                    continue
+                try:
+                    tenant_id = int(parts[3])
+                    employee_id = int(parts[4])
+                except ValueError:
+                    continue
+                raw = await r.hgetall(key)
+                if not raw:
+                    continue
+                snap = cls._snapshot_from_raw(employee_id, raw)
+                if snap.get("resource_state") != "after_call_work":
+                    continue
+                deadline = snap.get("wrap_up_until_epoch")
+                if deadline is None or deadline > now:
+                    continue
+                expired.append((tenant_id, employee_id, snap.get("wrap_up_call_id")))
+                if len(expired) >= limit:
+                    return expired
+            if cursor == 0:
+                break
+        return expired
+
+    @classmethod
     async def mark_after_call_work(
         cls,
         r: aioredis.Redis,
@@ -686,13 +814,19 @@ class CcAgentResourceService:
         *,
         call_id: str | None = None,
         reason: str = "call_hangup",
+        wrap_up_seconds: int | None = None,
     ) -> dict:
         key = cls.key(tenant_id, employee_id)
+        wrap_up_until: float | None = None
+        if wrap_up_seconds and wrap_up_seconds > 0:
+            wrap_up_until = cls._now_epoch() + wrap_up_seconds
         mapping = cls._base_mapping(
             visible_status="after_call_work",
             resource_state="after_call_work",
             last_released_at=cls._now_iso(),
             last_release_reason=reason,
+            wrap_up_until=wrap_up_until,
+            wrap_up_call_id=call_id,
         )
         if call_id:
             for _ in range(3):
@@ -896,6 +1030,12 @@ class CcAgentResourceService:
                     if current and cls._is_expired(current):
                         resource = cls.resource_for_visible(visible)
                     if visible == "offline":
+                        # Inbound skips this agent. Outbound is a user click —
+                        # raise a specific 409 so the workspace can show why.
+                        if allow_non_ready:
+                            raise ConflictError(
+                                "当前为离线状态，请先切换到就绪后再拨号"
+                            )
                         return None
                     if not allow_non_ready and visible != "ready":
                         return None
@@ -965,6 +1105,8 @@ class CcAgentResourceService:
         last_release_reason: str | None = None,
         previous_visible_status: str | None = None,
         in_call_since: str | datetime | None = None,
+        wrap_up_until: float | str | None = None,
+        wrap_up_call_id: str | None = None,
     ) -> dict[str, str]:
         now = CcAgentResourceService._now_iso()
         return {
@@ -980,6 +1122,8 @@ class CcAgentResourceService:
             "last_release_reason": last_release_reason or "",
             "previous_visible_status": previous_visible_status or "",
             "in_call_since": CcAgentResourceService._format_datetime(in_call_since),
+            "wrap_up_until": str(wrap_up_until) if wrap_up_until is not None else "",
+            "wrap_up_call_id": wrap_up_call_id or "",
             "updated_at": now,
         }
 
@@ -1017,6 +1161,13 @@ class CcAgentResourceService:
             "last_release_reason": val("last_release_reason") or None,
             "previous_visible_status": val("previous_visible_status") or None,
             "in_call_since": CcAgentResourceService._parse_datetime(val("in_call_since")),
+            "wrap_up_until_epoch": _parse_epoch(val("wrap_up_until")),
+            "wrap_up_until": (
+                datetime.fromtimestamp(_parse_epoch(val("wrap_up_until")), timezone.utc)
+                if _parse_epoch(val("wrap_up_until")) is not None
+                else None
+            ),
+            "wrap_up_call_id": val("wrap_up_call_id") or None,
             "resource_updated_at": CcAgentResourceService._parse_datetime(val("updated_at")),
         }
 

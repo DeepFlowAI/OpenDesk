@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { normalizeApiBase } from '@/service/base'
+import { isCredentialChallengeUrl, normalizeApiBase } from '@/service/base'
 
 describe('normalizeApiBase', () => {
   it('strips a single trailing slash so refresh URLs have no double slash', () => {
@@ -22,5 +22,20 @@ describe('normalizeApiBase', () => {
     expect(normalizeApiBase('')).toBe('')
     expect(normalizeApiBase(undefined)).toBe('')
     expect(`${normalizeApiBase('')}/v1/auth/refresh`).toBe('/v1/auth/refresh')
+  })
+})
+
+describe('isCredentialChallengeUrl', () => {
+  it('matches login / sso / password-reset auth endpoints', () => {
+    expect(isCredentialChallengeUrl('https://x/api/v1/auth/login')).toBe(true)
+    expect(isCredentialChallengeUrl('https://x/api/v1/auth/sso')).toBe(true)
+    expect(isCredentialChallengeUrl('https://x/api/v1/auth/send-verify-code')).toBe(true)
+    expect(isCredentialChallengeUrl('https://x/api/v1/auth/reset-password')).toBe(true)
+  })
+
+  it('does not match session endpoints that should clear auth on 401', () => {
+    expect(isCredentialChallengeUrl('https://x/api/v1/auth/refresh')).toBe(false)
+    expect(isCredentialChallengeUrl('https://x/api/v1/auth/me')).toBe(false)
+    expect(isCredentialChallengeUrl('https://x/api/v1/tickets')).toBe(false)
   })
 })

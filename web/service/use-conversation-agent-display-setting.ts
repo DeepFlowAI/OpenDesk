@@ -3,6 +3,7 @@ import { get, put } from './base'
 import type {
   ConversationAgentDisplaySetting,
   ConversationAgentDisplaySettingPayload,
+  ConversationAgentDisplayTarget,
 } from '@/models/conversation-agent-display-setting'
 
 const NS = 'conversation-agent-display-setting'
@@ -10,6 +11,7 @@ const NS = 'conversation-agent-display-setting'
 export const conversationAgentDisplaySettingKeys = {
   all: [NS] as const,
   current: () => [...conversationAgentDisplaySettingKeys.all, 'current'] as const,
+  agentTarget: () => [...conversationAgentDisplaySettingKeys.all, 'agent-target'] as const,
 }
 
 export const useConversationAgentDisplaySetting = () =>
@@ -20,13 +22,21 @@ export const useConversationAgentDisplaySetting = () =>
     retry: false,
   })
 
+export const useConversationAgentDisplayTarget = () =>
+  useQuery({
+    queryKey: conversationAgentDisplaySettingKeys.agentTarget(),
+    queryFn: () =>
+      get<ConversationAgentDisplayTarget>('v1/conversation-settings/agent-display-name/agent'),
+    retry: false,
+  })
+
 export const useSaveConversationAgentDisplaySetting = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (payload: ConversationAgentDisplaySettingPayload) =>
       put<ConversationAgentDisplaySetting>('v1/conversation-settings/agent-display-name', { json: payload }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: conversationAgentDisplaySettingKeys.current() })
+      qc.invalidateQueries({ queryKey: conversationAgentDisplaySettingKeys.all })
     },
   })
 }

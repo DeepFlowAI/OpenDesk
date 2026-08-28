@@ -30,7 +30,10 @@ type TranscriptEvent = {
  *
  * At most one open (final === false) bubble exists per role. Partials for that
  * role only grow the text (never shrink) so ASR revisions mid-utterance do not
- * flicker; a matching final replaces the open bubble in place.
+ * flicker; a matching final replaces the open bubble in place. A shorter
+ * partial that is NOT a prefix of the open text is a new utterance (the
+ * previous final got lost) — keep the old line and append a fresh bubble
+ * instead of replacing its text, so the transcript only ever grows.
  */
 export function applyTranscriptEvent(
   prev: TranscriptBubble[],
@@ -46,6 +49,23 @@ export function applyTranscriptEvent(
 
   if (openIdx >= 0) {
     const open = prev[openIdx]
+    if (
+      !event.final &&
+      event.text.length < open.text.length &&
+      !open.text.startsWith(event.text)
+    ) {
+      const finalized: TranscriptBubble = { ...open, final: true }
+      let maxId = 0
+      for (const bubble of prev) {
+        if (bubble.id > maxId) maxId = bubble.id
+      }
+      return [
+        ...prev.slice(0, openIdx),
+        finalized,
+        ...prev.slice(openIdx + 1),
+        { id: maxId + 1, role: event.role, text: event.text, final: false },
+      ]
+    }
     const nextText =
       event.final || event.text.length >= open.text.length ? event.text : open.text
     const updated: TranscriptBubble = {
@@ -97,7 +117,7 @@ export function CallTranscriptPanel({
   callId: string
   live: boolean
   /** When live captions were cleared (e.g. remount after browsing history), show persisted lines. */
-  fallbackRecordId?: number | null
+  fallbackRecordId?: string | null
   /** Real customer leg id when `callId` is a synthetic internal offer id. */
   sourceCallId?: string | null
 }) {
@@ -112,12 +132,14 @@ export function CallTranscriptPanel({
   const historyQuery = useCallTranscript(fallbackRecordId ?? null)
   const historySegments = historyQuery.data?.segments
 
-  // A new call starts a fresh transcript.
+  // Media-leg rebuilds (transfer handover, reconnect) can swap `callId`
+  // mid-conversation; only a genuinely new conversation clears live captions.
+  const conversationKey = sourceCallId ?? callId
   useEffect(() => {
     setCaptions([])
     hydratedCallIdRef.current = null
     nextIdRef.current = 0
-  }, [callId])
+  }, [conversationKey])
 
   // Seed in-memory captions from DB so refresh mid-call keeps prior lines.
   useEffect(() => {
@@ -211,7 +233,7 @@ export function CallTranscriptPanel({
  * Persisted transcript for a finished/historical call. Hidden when the call has
  * no stored lines (e.g. it never reached a human agent).
  */
-export function CallTranscriptHistory({ recordId }: { recordId: number }) {
+export function CallTranscriptHistory({ recordId }: { recordId: string }) {
   const { data, isLoading } = useCallTranscript(recordId)
   const segments = data?.segments ?? []
   return (

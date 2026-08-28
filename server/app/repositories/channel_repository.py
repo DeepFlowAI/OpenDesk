@@ -56,20 +56,31 @@ class ChannelRepository:
         raise RuntimeError("Failed to generate a unique channel key")
 
     @staticmethod
-    async def create(db: AsyncSession, data: dict) -> Channel:
+    async def create(db: AsyncSession, data: dict, commit: bool = True) -> Channel:
         item = Channel(**data)
         db.add(item)
-        await db.commit()
-        await db.refresh(item)
+        if commit:
+            await db.commit()
+            await db.refresh(item)
+        else:
+            await db.flush()
         return item
 
     @staticmethod
-    async def update(db: AsyncSession, item: Channel, data: dict) -> Channel:
+    async def update(
+        db: AsyncSession,
+        item: Channel,
+        data: dict,
+        commit: bool = True,
+    ) -> Channel:
         for key, value in data.items():
             if hasattr(item, key):
                 setattr(item, key, value)
-        await db.commit()
-        await db.refresh(item)
+        if commit:
+            await db.commit()
+            await db.refresh(item)
+        else:
+            await db.flush()
         return item
 
     @staticmethod

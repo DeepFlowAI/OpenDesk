@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 
-from app.constants.call_center import ACTIVE_CALL_RECORD_STATES, CcSocketEvent
+from app.constants.call_center import CcSocketEvent
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,9 @@ class AgentPushMixin:
         from app.db.session import AsyncSessionLocal
         from app.repositories.call_record_repository import CallRecordRepository
         from app.services.agent_call_device_service import AgentCallDeviceService
+        from app.services.call_workspace_context_service import (
+            CallWorkspaceContextService,
+        )
 
         from app.services.cc_agent_status_service import CcAgentStatusService
 
@@ -75,14 +78,14 @@ class AgentPushMixin:
         offer_id = snap.get("offer_id") or ""
         queue_id = snap.get("queue_id")
         direction = snap.get("direction") or "inbound"
-        _active_cdr_states = ACTIVE_CALL_RECORD_STATES
-
         from_number = ""
         to_number = ""
         device_type = None
         answered_at = None
         call_type = None
         source_call_id = None
+        workspace_call_record = None
+        workspace_context: dict[str, str | int] = {}
         try:
             async with AsyncSessionLocal() as db:
                 # Redis resource can drift (e.g. SIP desk-phone consult after a
@@ -94,22 +97,51 @@ class AgentPushMixin:
                     active = await CallRecordRepository.get_latest_active_for_agent(
                         db, tenant_id, employee_id
                     )
-                    if active is None or (active.state or "") != "in_progress":
+                    if active is None or active.first_agent_connected_at is None:
                         logger.info(
                             "republish call UI: skip agent=%s/%s "
                             "state=%s call_id=%s (no live in_progress CDR)",
                             tenant_id, employee_id, state, call_id,
                         )
                         return
+                    # After inviting a survey the CDR stays active for the
+                    # customer leg, but the agent has already left. Recovering
+                    # them to in_call would media-reconnect and steal the
+                    # survey's audio path.
+                    from app.repositories.call_satisfaction_execution_repository import (
+                        CallSatisfactionExecutionRepository,
+                    )
+
+                    survey = await CallSatisfactionExecutionRepository.get_by_call_record_id(
+                        db, active.id
+                    )
+                    if survey is not None and survey.status in {
+                        "preparing",
+                        "in_progress",
+                    }:
+                        logger.info(
+                            "republish call UI: skip agent=%s/%s call_id=%s "
+                            "(customer in satisfaction survey execution=%s)",
+                            tenant_id,
+                            employee_id,
+                            active.root_call_id or active.call_id,
+                            survey.id,
+                        )
+                        return
                     call_id = active.root_call_id or active.call_id
+                    workspace_call_record = active
                     state = "in_call"
                     offer_id = ""
-                    from_number = active.from_number or ""
-                    to_number = active.to_number or ""
-                    device_type = active.device_type
+                    if active.direction == "inbound":
+                        from_number = active.customer_number or ""
+                        to_number = active.service_number or ""
+                    else:
+                        from_number = active.service_number or ""
+                        to_number = active.customer_number or ""
                     direction = active.direction or "inbound"
                     answered_at = (
-                        getattr(active, "answered_at", None)
+                        active.first_agent_connected_at
+                        or active.customer_connected_at
                         or getattr(active, "started_at", None)
                     )
                     try:
@@ -132,7 +164,7 @@ class AgentPushMixin:
                     record = await CallRecordRepository.get_by_call_id(
                         db, call_id, tenant_id
                     )
-                    if record is None or (record.state or "") not in _active_cdr_states:
+                    if record is None or record.lifecycle_status != "active":
                         # Consult targets are keyed on their WebRTC leg and have
                         # no CDR — keep the UI if a host still lists them.
                         from app.services.call_center.call_control_service import (
@@ -147,7 +179,7 @@ class AgentPushMixin:
                                 "republish call UI: drop ghost redis call "
                                 "agent=%s/%s call_id=%s cdr_state=%s",
                                 tenant_id, employee_id, call_id,
-                                getattr(record, "state", None),
+                                getattr(record, "lifecycle_status", None),
                             )
                             try:
                                 await _orch.CcAgentResourceService.force_release(
@@ -172,16 +204,25 @@ class AgentPushMixin:
                                 db, source_call_id, tenant_id
                             )
                             if host_rec is not None:
-                                from_number = host_rec.from_number or ""
-                                to_number = host_rec.to_number or ""
+                                if host_rec.direction == "inbound":
+                                    from_number = host_rec.customer_number or ""
+                                    to_number = host_rec.service_number or ""
+                                else:
+                                    from_number = host_rec.service_number or ""
+                                    to_number = host_rec.customer_number or ""
                         except Exception:  # noqa: BLE001
                             pass
                     else:
-                        from_number = record.from_number or ""
-                        to_number = record.to_number or ""
-                        device_type = record.device_type
+                        workspace_call_record = record
+                        if record.direction == "inbound":
+                            from_number = record.customer_number or ""
+                            to_number = record.service_number or ""
+                        else:
+                            from_number = record.service_number or ""
+                            to_number = record.customer_number or ""
                         answered_at = (
-                            getattr(record, "answered_at", None)
+                            record.first_agent_connected_at
+                            or record.customer_connected_at
                             or getattr(record, "started_at", None)
                         )
                         # SIP desk-phone can answer on the handset while Redis stays
@@ -189,8 +230,7 @@ class AgentPushMixin:
                         # 通话中 instead of a fake 来电 UI.
                         if (
                             state == "ringing"
-                            and (record.state or "") == "in_progress"
-                            and getattr(record, "answered_at", None) is not None
+                            and record.first_agent_connected_at is not None
                         ):
                             prev_offer = offer_id
                             state = "in_call"
@@ -215,6 +255,13 @@ class AgentPushMixin:
                         db, tenant_id, employee_id
                     )
                     device_type = (device or {}).get("device_type")
+                workspace_context = (
+                    await CallWorkspaceContextService.get_auto_outbound_context(
+                        db,
+                        tenant_id=tenant_id,
+                        call_record=workspace_call_record,
+                    )
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "republish call UI: CDR lookup failed call_id=%s", call_id
@@ -243,6 +290,58 @@ class AgentPushMixin:
         if answered_at is None:
             answered_at = snap.get("in_call_since")
 
+        # CDR can stay in_progress after the customer leg left the kernel
+        # without a SIP BYE (e.g. RTP idle timeout). Do not resurrect 通话中.
+        if state == "in_call":
+            customer_leg_id = source_call_id or call_id
+            try:
+                from app.services.call_center.call_control_service import (
+                    CallControlService,
+                )
+
+                alive = await CallControlService._customer_leg_alive_in_kernel(
+                    self.telephony, customer_leg_id
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "republish call UI: kernel alive check failed "
+                    "agent=%s/%s call_id=%s",
+                    tenant_id, employee_id, customer_leg_id, exc_info=True,
+                )
+                alive = None
+            if alive is False:
+                logger.info(
+                    "republish call UI: skip agent=%s/%s call_id=%s "
+                    "(customer leg not in kernel)",
+                    tenant_id, employee_id, customer_leg_id,
+                )
+                try:
+                    await self.finalize_agent_call(
+                        tenant_id=tenant_id,
+                        employee_id=employee_id,
+                        call_id=customer_leg_id,
+                        reason="media_timeout",
+                        mark_cdr_completed=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "republish call UI: finalize after dead customer failed "
+                        "agent=%s/%s call_id=%s",
+                        tenant_id, employee_id, customer_leg_id, exc_info=True,
+                    )
+                    try:
+                        await _orch.CcAgentResourceService.force_release(
+                            r, tenant_id, employee_id,
+                            reason="republish_dead_customer_leg",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "republish call UI: force_release failed "
+                            "agent=%s/%s",
+                            tenant_id, employee_id, exc_info=True,
+                        )
+                return
+
         payload = {
             "offer_id": offer_id,
             "call_id": call_id,
@@ -251,6 +350,7 @@ class AgentPushMixin:
             "queue_id": queue_id,
             "direction": direction,
         }
+        payload.update(workspace_context)
         if device_type:
             payload["device_type"] = device_type
         if call_type:

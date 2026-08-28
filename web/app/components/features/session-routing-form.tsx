@@ -76,6 +76,20 @@ function normalizeConditionValue(
   return String(value ?? '')
 }
 
+function normalizeQueueTargetIds(targetIds: unknown): number[] {
+  if (!Array.isArray(targetIds)) return []
+  return targetIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
+}
+
+function normalizeQueueSource(
+  source: Partial<SessionRoutingQueueSource> | null | undefined
+): SessionRoutingQueueSource {
+  return {
+    source_type: source?.source_type ?? 'employee_group',
+    target_ids: normalizeQueueTargetIds(source?.target_ids),
+  }
+}
+
 function serializeRoutingComparePayload(
   name: string,
   enabled: boolean,
@@ -87,10 +101,7 @@ function serializeRoutingComparePayload(
     name: name.trim(),
     enabled,
     target_strategy: targetStrategy,
-    target_queue_sources: targetSources.map((source) => ({
-      source_type: source.source_type,
-      target_ids: source.target_ids.map((id) => Number(id)),
-    })),
+    target_queue_sources: targetSources.map((source) => normalizeQueueSource(source)),
     conditions: conditions.map((c) => ({
       condition_type: c.condition_type,
       operator: c.operator,
@@ -363,7 +374,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
     setTargetStrategy(rule.target_strategy ?? 'sequential_overflow')
     const existingSources =
       rule.target_queue_sources?.length
-        ? rule.target_queue_sources
+        ? rule.target_queue_sources.map((source) => normalizeQueueSource(source))
         : rule.target_group_id
           ? [{ source_type: 'employee_group' as const, target_ids: [rule.target_group_id] }]
           : []
@@ -392,7 +403,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
     if (rule && initialized) {
       const existingSources =
         rule.target_queue_sources?.length
-          ? rule.target_queue_sources
+          ? rule.target_queue_sources.map((source) => normalizeQueueSource(source))
           : rule.target_group_id
             ? [{ source_type: 'employee_group' as const, target_ids: [rule.target_group_id] }]
             : []
@@ -410,10 +421,9 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
 
   const normalizedQueueSources = useMemo<SessionRoutingQueueSource[]>(
     () =>
-      queueRows.map(({ _key: _, source_type, target_ids }) => ({
-        source_type,
-        target_ids: target_ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0),
-      })),
+      queueRows.map(({ _key: _, source_type, target_ids }) =>
+        normalizeQueueSource({ source_type, target_ids })
+      ),
     [queueRows]
   )
 
@@ -845,7 +855,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                     {row.source_type === 'user_field' ? (
                       <>
                         <select
-                          value={row.target_ids[0] ? String(row.target_ids[0]) : ''}
+                          value={row.target_ids?.[0] ? String(row.target_ids[0]) : ''}
                           onChange={(e) =>
                             updateQueueRow(row._key, {
                               target_ids: e.target.value ? [Number(e.target.value)] : [],
@@ -866,7 +876,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                       </>
                     ) : row.source_type === 'employee' ? (
                       <QueueTargetMultiSelect
-                        value={row.target_ids}
+                        value={row.target_ids ?? []}
                         onChange={(targetIds) => updateQueueRow(row._key, { target_ids: targetIds })}
                         options={employeeTargetOptions}
                         placeholder={t('sr.target.placeholder.employee', locale)}
@@ -875,7 +885,7 @@ export function SessionRoutingForm({ ruleId }: SessionRoutingFormProps) {
                       />
                     ) : (
                       <QueueTargetMultiSelect
-                        value={row.target_ids}
+                        value={row.target_ids ?? []}
                         onChange={(targetIds) => updateQueueRow(row._key, { target_ids: targetIds })}
                         options={groupTargetOptions}
                         placeholder={t('sr.target.placeholder.employeeGroup', locale)}

@@ -249,3 +249,47 @@ def test_workflow_clear_buffered_play_end():
     )
     assert wf.clear_buffered("call.play_end") == 2
     assert list(wf._pending_events) == [("call.dtmf", {"digit": "1"})]
+
+
+@pytest.mark.asyncio
+async def test_hold_loop_silent_when_queue_prompt_text_empty(monkeypatch):
+    """queue_prompt_text="" disables the transfer prompt: while holding in
+    queue no hold TTS plays; only the final failure prompt is spoken."""
+    monkeypatch.setattr("app.db.redis.redis_client", _Redis())
+    monkeypatch.setattr("app.db.session.AsyncSessionLocal", lambda: _Session())
+    monkeypatch.setattr(
+        "app.services.call_center.assign_queue.AssignQueueSelector.select",
+        AsyncMock(return_value=AssignQueueSelection(candidate=_candidate(), candidates=[])),
+    )
+    picker = SimpleNamespace(
+        pick_ready_agent_for_queue=AsyncMock(return_value=None),
+        has_agent_on_call_for_queue=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(nodes_module, "get_queue_picker", lambda: picker)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    say = AsyncMock()
+    monkeypatch.setattr(AssignQueueExecutor, "_say", say)
+
+    telephony = SimpleNamespace(call_hangup=AsyncMock(), call_stop=AsyncMock())
+    ctx = ExecutionContext(call_id="call-1", tenant_id=7, variables={}, telephony=telephony)
+    step = await AssignQueueExecutor().execute(
+        ctx,
+        {
+            "id": "aq-1",
+            "type": "assign_queue",
+            "data": {
+                "employee_group_id": 9,
+                "timeout_seconds": 30,
+                "queue_wait_seconds": 20,
+                "queue_wait_retry_seconds": 5,
+                "queue_prompt_text": "",
+            },
+        },
+    )
+
+    # Exactly one say: the failure prompt after the wait times out. No hold prompts.
+    say.assert_awaited_once()
+    assert say.await_args.args[1] == AssignQueueExecutor._failure_prompt({}, "agent_no_answer")
+    assert isinstance(step, WaitForEvent)
+    assert ctx.variables["sys.assign_queue_status"] == "agent_no_answer"

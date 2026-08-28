@@ -11,6 +11,7 @@ import {
   IconChevronRight,
   IconX,
   IconTicket,
+  IconArrowLeft,
 } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
@@ -79,6 +80,10 @@ export default function WorkspaceTicketsPage() {
   const user = useAuthStore((state) => state.user)
   const router = useRouter()
   const searchParams = useSearchParams()
+  const sourceDashboardId = searchParams.get('from') === 'dashboard'
+    ? searchParams.get('dashboardId')
+    : null
+  const sourceDashboardFilterValues = searchParams.get('dashboardFilterValues')
 
   const { data: views, isLoading: viewsLoading } = useEnabledTicketViews()
   const { data: viewCountsData } = useTicketViewCounts()
@@ -132,7 +137,9 @@ export default function WorkspaceTicketsPage() {
   const [search, setSearch] = useState('')
   const [searchInput, setSearchInput] = useState('')
 
-  const [tempConditions, setTempConditions] = useState<ConditionItem[]>([])
+  const [tempConditions, setTempConditions] = useState<ConditionItem[]>(() => (
+    parseDashboardTicketConditions(searchParams.get('filters'))
+  ))
   const [tempConditionLogic, setTempConditionLogic] = useState<'and' | 'or'>('and')
   const hasActiveFilter = tempConditions.length > 0
 
@@ -390,6 +397,25 @@ export default function WorkspaceTicketsPage() {
 
       {/* Right: Main — same chrome as workspace users / org lists (3.1 pen) */}
       <div className="flex flex-1 flex-col overflow-hidden bg-white">
+        {sourceDashboardId && (
+          <div className="flex items-center justify-between border-b border-border bg-muted/50 px-5 py-2 text-sm">
+            <span className="text-muted-foreground">
+              {locale === 'zh' ? '正在查看仪表盘下钻结果' : 'Viewing dashboard drilldown results'}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                const params = new URLSearchParams()
+                if (sourceDashboardFilterValues) params.set('filterValues', sourceDashboardFilterValues)
+                router.push(`/workspace/records/dashboards/${sourceDashboardId}${params.size ? `?${params.toString()}` : ''}`)
+              }}
+              className="flex items-center gap-1.5 font-medium text-primary hover:underline"
+            >
+              <IconArrowLeft size={15} />
+              {locale === 'zh' ? '返回仪表盘' : 'Back to dashboard'}
+            </button>
+          </div>
+        )}
         <div className="flex items-center justify-between px-5 pb-2.5 pt-3.5">
           <h3 className="text-base font-semibold text-foreground">
             {selectedViewId === 'all'
@@ -672,6 +698,22 @@ export default function WorkspaceTicketsPage() {
 }
 
 // ── Helpers ──
+
+function parseDashboardTicketConditions(raw: string | null): ConditionItem[] {
+  if (!raw) return []
+  try {
+    const values = JSON.parse(raw) as unknown
+    if (!Array.isArray(values)) return []
+    return values.slice(0, 40).filter((item): item is ConditionItem => {
+      if (!item || typeof item !== 'object') return false
+      const condition = item as Partial<ConditionItem>
+      return typeof condition.operator === 'string'
+        && (typeof condition.field_key === 'string' || typeof condition.field_id === 'number')
+    })
+  } catch {
+    return []
+  }
+}
 
 function buildTicketsUrl(
   viewId: number | 'all',

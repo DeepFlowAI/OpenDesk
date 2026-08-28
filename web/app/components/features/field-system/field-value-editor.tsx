@@ -14,6 +14,8 @@ import { UserSelect } from '@/app/components/features/ticket/user-select'
 import { EmployeeSelect } from '@/app/components/features/ticket/employee-select'
 import { EmployeeGroupSelect } from '@/app/components/features/ticket/employee-group-select'
 import { useOrganization, useQueryOrganizations } from '@/service/use-organizations'
+import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import {
   coalescePillOptions,
   type FieldSelectOption,
@@ -33,6 +35,8 @@ type FieldValueEditorProps = {
   className?: string
   autoFocus?: boolean
   dropdownPlacement?: 'top' | 'bottom'
+  uploadFile?: (file: File) => Promise<import('./field-file-editor').FieldFileAttachment>
+  locale?: Locale
 }
 
 const inputClass =
@@ -58,6 +62,34 @@ const DEFAULT_PLACEHOLDERS: Record<string, string> = {
   organization_select: '请选择组织',
   employee_select: '请选择员工',
   group_select: '请选择负责组',
+}
+
+const DEFAULT_PLACEHOLDER_KEYS: Record<FieldType, string> = {
+  [FieldType.SINGLE_LINE_TEXT]: 'field.placeholder.input',
+  [FieldType.MULTI_LINE_TEXT]: 'field.placeholder.input',
+  [FieldType.NUMBER]: 'field.placeholder.input',
+  [FieldType.DATE]: 'field.placeholder.select',
+  [FieldType.TIME]: 'field.placeholder.select',
+  [FieldType.DATETIME]: 'field.placeholder.select',
+  [FieldType.SINGLE_SELECT]: 'field.placeholder.select',
+  [FieldType.MULTI_SELECT]: 'field.placeholder.select',
+  [FieldType.SINGLE_SELECT_TREE]: 'field.placeholder.select',
+  [FieldType.MULTI_SELECT_TREE]: 'field.placeholder.select',
+  [FieldType.EMAIL]: 'field.placeholder.input',
+  [FieldType.PHONE]: 'field.placeholder.input',
+  [FieldType.URL]: 'field.placeholder.input',
+  [FieldType.FILE]: 'field.file.upload',
+  [FieldType.RICH_TEXT]: 'field.placeholder.input',
+  [FieldType.USER_SELECT]: 'field.placeholder.user',
+  [FieldType.ORGANIZATION_SELECT]: 'field.placeholder.organization',
+  [FieldType.EMPLOYEE_SELECT]: 'field.placeholder.employee',
+  [FieldType.GROUP_SELECT]: 'field.placeholder.group',
+}
+
+export function resolveDefaultFieldPlaceholder(fieldType: FieldType, locale?: Locale): string {
+  return locale
+    ? t(DEFAULT_PLACEHOLDER_KEYS[fieldType], locale)
+    : DEFAULT_PLACEHOLDERS[fieldType] ?? ''
 }
 
 type UnifiedFieldValueEditorProps = Omit<FieldValueEditorProps, 'fieldType' | 'options' | 'treeNodes'> & {
@@ -172,8 +204,11 @@ export function FieldValueEditor({
   className,
   autoFocus = false,
   dropdownPlacement,
+  uploadFile,
+  locale,
 }: FieldValueEditorProps) {
-  const ph = placeholder ?? (typeConfig.placeholder as string) ?? DEFAULT_PLACEHOLDERS[fieldType] ?? ''
+  const defaultPlaceholder = resolveDefaultFieldPlaceholder(fieldType, locale)
+  const ph = placeholder ?? (typeConfig.placeholder as string) ?? defaultPlaceholder ?? ''
 
   switch (fieldType) {
     case FieldType.SINGLE_LINE_TEXT:
@@ -330,6 +365,8 @@ export function FieldValueEditor({
           placeholder={ph}
           disabled={disabled}
           className={className}
+          uploadFile={uploadFile}
+          locale={locale}
         />
       )
 

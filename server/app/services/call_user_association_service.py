@@ -7,7 +7,9 @@ user when there is no match, and stores the durable link on call_records.user_id
 from __future__ import annotations
 
 import re
-from typing import Any
+from datetime import datetime, timezone
+from uuid import UUID
+from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,11 +18,12 @@ from app.models.call_record import CallRecord
 from app.models.user import User
 from app.repositories.call_record_repository import CallRecordRepository
 from app.repositories.user_repository import UserRepository
+from app.schemas.call_trajectory import CallEventCreate
+from app.schemas.permission import EffectivePrincipal
 from app.schemas.user import UserCreate
+from app.services.data_scope_service import DataScopeService
+from app.services.call_trajectory_service import CallTrajectoryService
 from app.services.user_service import UserService
-
-
-ASSOCIATION_META_KEY = "user_association"
 
 
 def normalize_phone_digits(value: str | None) -> str:
@@ -56,18 +59,23 @@ def customer_number_for_call(
 
 class CallUserAssociationService:
     @staticmethod
-    async def identify_for_record_id(
+    async def identify_for_public_id(
         db: AsyncSession,
-        tenant_id: int,
-        record_id: int,
+        public_id: UUID,
+        principal: EffectivePrincipal,
         *,
         actor_id: int | None = None,
     ) -> dict:
-        row = await CallRecordRepository.get_by_id(db, record_id, tenant_id)
+        row = await CallRecordRepository.get_by_public_id(
+            db,
+            public_id,
+            principal.tenant_id,
+        )
         if not row:
             raise NotFoundError("Call record not found")
+        await DataScopeService.assert_call_record_in_scope(db, principal, row)
         return await CallUserAssociationService.identify_for_record(
-            db, tenant_id, row, actor_id=actor_id
+            db, principal.tenant_id, row, actor_id=actor_id
         )
 
     @staticmethod
@@ -83,17 +91,9 @@ class CallUserAssociationService:
             if user and user.tenant_id == tenant_id:
                 return CallUserAssociationService.to_response(row, user=user)
 
-        number = customer_number_for_call(row.direction, row.from_number, row.to_number)
+        number = row.customer_number
         keys = phone_match_keys(number)
         if not keys:
-            await CallUserAssociationService._set_association_metadata(
-                db,
-                row,
-                status="unknown",
-                number=number,
-                normalized_number="",
-                candidate_user_ids=[],
-            )
             return CallUserAssociationService.to_response(row)
 
         matches = await CallUserAssociationService._find_matching_users(db, tenant_id, keys)
@@ -112,15 +112,11 @@ class CallUserAssociationService:
             return CallUserAssociationService.to_response(row, user=user)
 
         if len(matches) > 1:
-            await CallUserAssociationService._set_association_metadata(
-                db,
+            return CallUserAssociationService.to_response(
                 row,
+                candidates=matches,
                 status="multiple",
-                number=number,
-                normalized_number=sorted(keys)[0],
-                candidate_user_ids=[user.id for user in matches],
             )
-            return CallUserAssociationService.to_response(row, candidates=matches)
 
         created_user = await CallUserAssociationService._create_user_from_number(
             db, tenant_id, number or sorted(keys)[0], actor_id
@@ -135,22 +131,31 @@ class CallUserAssociationService:
             normalized_number=sorted(keys)[0],
             candidate_user_ids=[],
         )
-        return CallUserAssociationService.to_response(row, user=created_user)
+        return CallUserAssociationService.to_response(
+            row,
+            user=created_user,
+            status="created",
+        )
 
     @staticmethod
     async def link_user(
         db: AsyncSession,
-        tenant_id: int,
-        record_id: int,
+        public_id: UUID,
+        principal: EffectivePrincipal,
         user_id: int,
     ) -> dict:
-        row = await CallRecordRepository.get_by_id(db, record_id, tenant_id)
+        row = await CallRecordRepository.get_by_public_id(
+            db,
+            public_id,
+            principal.tenant_id,
+        )
         if not row:
             raise NotFoundError("Call record not found")
+        await DataScopeService.assert_call_record_in_scope(db, principal, row)
         user = await UserRepository.get_by_id(db, user_id)
-        if not user or user.tenant_id != tenant_id:
+        if not user or user.tenant_id != principal.tenant_id:
             raise NotFoundError("User not found")
-        number = customer_number_for_call(row.direction, row.from_number, row.to_number)
+        number = row.customer_number
         await CallUserAssociationService._link_user(
             db,
             row,
@@ -164,33 +169,55 @@ class CallUserAssociationService:
         return CallUserAssociationService.to_response(row, user=user)
 
     @staticmethod
-    async def candidate_users(db: AsyncSession, tenant_id: int, row: CallRecord) -> list[User]:
-        meta = CallUserAssociationService._association_meta(row)
-        candidate_ids = meta.get("candidate_user_ids") if isinstance(meta, dict) else []
-        if not isinstance(candidate_ids, list):
-            return []
-        parsed_ids: list[int] = []
-        for user_id in candidate_ids:
-            try:
-                parsed_ids.append(int(user_id))
-            except (TypeError, ValueError):
-                continue
-        return await UserRepository.list_by_ids(
+    async def unlink_user(
+        db: AsyncSession,
+        public_id: UUID,
+        principal: EffectivePrincipal,
+    ) -> dict:
+        row = await CallRecordRepository.get_by_public_id(
             db,
-            tenant_id,
-            parsed_ids,
+            public_id,
+            principal.tenant_id,
         )
+        if not row:
+            raise NotFoundError("Call record not found")
+        await DataScopeService.assert_call_record_in_scope(db, principal, row)
+        event_id = f"opendesk:user-disassociated:{row.id}:{uuid4().hex}"
+        await CallTrajectoryService.append_event(
+            db,
+            call_record_id=row.id,
+            payload=CallEventCreate(
+                event_id=event_id,
+                event_type="user_disassociated",
+                event_category="lifecycle",
+                actor_type="agent",
+                actor_id=str(principal.user_id),
+                source="opendesk",
+                source_event_id=event_id,
+                occurred_at=datetime.now(timezone.utc),
+                details={"method": "manual"},
+            ),
+        )
+        row.user_id = None
+        return CallUserAssociationService.to_response(row)
+
+    @staticmethod
+    async def candidate_users(db: AsyncSession, tenant_id: int, row: CallRecord) -> list[User]:
+        if row.user_id is not None:
+            return []
+        keys = phone_match_keys(row.customer_number)
+        if not keys:
+            return []
+        matches = await CallUserAssociationService._find_matching_users(
+            db, tenant_id, keys
+        )
+        return matches if len(matches) > 1 else []
 
     @staticmethod
     def status_for_record(row: CallRecord) -> str:
-        meta = CallUserAssociationService._association_meta(row)
-        status = meta.get("status") if isinstance(meta, dict) else None
-        if isinstance(status, str) and status:
-            return status
         if row.user_id:
             return "linked"
-        number = customer_number_for_call(row.direction, row.from_number, row.to_number)
-        return "unlinked" if normalize_phone_digits(number) else "unknown"
+        return "unlinked" if normalize_phone_digits(row.customer_number) else "unknown"
 
     @staticmethod
     def brief_user(user: User | None) -> dict | None:
@@ -210,20 +237,15 @@ class CallUserAssociationService:
         *,
         user: User | None = None,
         candidates: list[User] | None = None,
+        status: str | None = None,
     ) -> dict:
-        meta = CallUserAssociationService._association_meta(row)
-        number = meta.get("number") if isinstance(meta, dict) else None
-        normalized_number = meta.get("normalized_number") if isinstance(meta, dict) else None
-        if not isinstance(number, str):
-            number = customer_number_for_call(row.direction, row.from_number, row.to_number)
-        if not isinstance(normalized_number, str):
-            normalized_number = normalize_phone_digits(number)
+        number = row.customer_number
         return {
-            "record_id": row.id,
+            "record_public_id": row.public_id,
             "call_id": row.call_id,
             "identified_number": number,
-            "normalized_number": normalized_number,
-            "status": CallUserAssociationService.status_for_record(row),
+            "normalized_number": normalize_phone_digits(number),
+            "status": status or CallUserAssociationService.status_for_record(row),
             "user": CallUserAssociationService.brief_user(user),
             "candidates": [
                 brief
@@ -277,59 +299,26 @@ class CallUserAssociationService:
         normalized_number: str,
         candidate_user_ids: list[int],
     ) -> None:
-        await CallUserAssociationService._update_row_association(
-            db,
-            row,
-            user_id=user_id,
-            metadata={
-                "status": status,
-                "method": method,
-                "number": number,
-                "normalized_number": normalized_number,
-                "candidate_user_ids": candidate_user_ids,
-            },
-        )
-
-    @staticmethod
-    async def _set_association_metadata(
-        db: AsyncSession,
-        row: CallRecord,
-        *,
-        status: str,
-        number: str | None,
-        normalized_number: str,
-        candidate_user_ids: list[int],
-    ) -> None:
-        await CallUserAssociationService._update_row_association(
-            db,
-            row,
-            user_id=None,
-            metadata={
-                "status": status,
-                "number": number,
-                "normalized_number": normalized_number,
-                "candidate_user_ids": candidate_user_ids,
-            },
-        )
-
-    @staticmethod
-    async def _update_row_association(
-        db: AsyncSession,
-        row: CallRecord,
-        *,
-        user_id: int | None,
-        metadata: dict[str, Any],
-    ) -> None:
-        extra = dict(row.extra_metadata or {})
-        extra[ASSOCIATION_META_KEY] = metadata
+        del status, number, normalized_number, candidate_user_ids
+        event_id = f"opendesk:user-associated:{row.id}:{uuid4().hex}"
         await CallRecordRepository.update(
-            db,
-            row,
-            {"user_id": user_id, "extra_metadata": extra},
+            db, row, {"user_id": user_id}, commit=False
         )
-
-    @staticmethod
-    def _association_meta(row: CallRecord) -> dict[str, Any]:
-        extra = row.extra_metadata or {}
-        meta = extra.get(ASSOCIATION_META_KEY) if isinstance(extra, dict) else None
-        return meta if isinstance(meta, dict) else {}
+        await CallTrajectoryService.append_event(
+            db,
+            call_record_id=row.id,
+            payload=CallEventCreate(
+                event_id=event_id,
+                event_type="user_associated",
+                event_category="lifecycle",
+                actor_type="system" if method.startswith("auto") else "agent",
+                target_type="user",
+                target_id=str(user_id),
+                source="opendesk",
+                source_event_id=event_id,
+                occurred_at=datetime.now(timezone.utc),
+                details={"method": method},
+            ),
+            commit=False,
+        )
+        await db.commit()

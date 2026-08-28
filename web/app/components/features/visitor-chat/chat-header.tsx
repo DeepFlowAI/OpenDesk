@@ -1,6 +1,8 @@
 'use client'
 
 import type { ChannelPublicConfig } from '@/service/use-visitor-chat'
+import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import { IconVolume, IconVolumeOff, IconX } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 
@@ -9,7 +11,7 @@ type ChatHeaderProps = {
   isMobile: boolean
   isEmbed?: boolean
   onEmbedClose?: () => void
-  locale?: string
+  locale?: Locale
   messageSoundEnabled?: boolean
   onMessageSoundEnabledChange?: (enabled: boolean) => void
 }
@@ -31,12 +33,8 @@ export function ChatHeader({
   const canToggleSound = typeof messageSoundEnabled === 'boolean' && typeof onMessageSoundEnabledChange === 'function'
   const soundEnabled = messageSoundEnabled === true
   const soundLabel = soundEnabled
-    ? locale === 'zh'
-      ? '关闭消息提醒音'
-      : 'Mute message sound'
-    : locale === 'zh'
-      ? '开启消息提醒音'
-      : 'Unmute message sound'
+    ? t('chat.sound.mute', locale)
+    : t('chat.sound.unmute', locale)
   const handleSoundToggle = () => {
     if (typeof messageSoundEnabled !== 'boolean') return
     onMessageSoundEnabledChange?.(!messageSoundEnabled)

@@ -13,3 +13,8 @@ export type ConversationAgentDisplaySetting = {
 export type ConversationAgentDisplaySettingPayload = {
   display_mode: AgentDisplayMode
 }
+
+export type ConversationAgentDisplayTarget = {
+  display_mode: AgentDisplayMode
+  sender_name: string | null
+}

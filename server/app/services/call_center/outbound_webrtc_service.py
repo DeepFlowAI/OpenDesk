@@ -38,6 +38,29 @@ class OutboundCallEndedError(BusinessError):
 logger = logging.getLogger(__name__)
 
 
+async def _raise_if_outbound_ended(
+    telephony: BaseTelephonyClient,
+    orchestrator,
+    *,
+    outbound_call_id: str,
+    webrtc_call_id: str | None = None,
+) -> None:
+    ended = await orchestrator.outbound_ended_reason(outbound_call_id)
+    if ended is None:
+        return
+    if webrtc_call_id:
+        try:
+            await telephony.call_hangup(
+                webrtc_call_id, reason="outbound_already_ended"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "outbound webrtc hangup after SIP end failed: %s", exc,
+            )
+    reason, sip_status = ended
+    raise OutboundCallEndedError(reason=reason, sip_status=sip_status)
+
+
 class OutboundWebRTCService:
 
     @staticmethod
@@ -68,16 +91,25 @@ class OutboundWebRTCService:
         # Race guard: carrier may have already rejected before the browser
         # finished getUserMedia + SDP. Return 410 so the frontend can show
         # the actual SIP reason instead of a generic "通道连接失败".
-        ended = await orchestrator.outbound_ended_reason(outbound_call_id)
-        if ended is not None:
-            reason, sip_status = ended
-            raise OutboundCallEndedError(reason=reason, sip_status=sip_status)
+        await _raise_if_outbound_ended(
+            telephony, orchestrator, outbound_call_id=outbound_call_id,
+        )
 
         result = await telephony.webrtc_offer(sdp)
         webrtc_call_id = result.get("call_id")
         answer_sdp = result.get("sdp")
         if not webrtc_call_id or not answer_sdp:
             raise ValidationError("FlowKit webrtc.offer returned incomplete payload")
+
+        # webrtc.offer / call.answer are slow enough that a 486/480 can land
+        # while they run. Re-check before pairing; otherwise the agent
+        # WebRTC leg stays up and the workbench remains on 外呼中.
+        await _raise_if_outbound_ended(
+            telephony,
+            orchestrator,
+            outbound_call_id=outbound_call_id,
+            webrtc_call_id=webrtc_call_id,
+        )
 
         # webrtc.offer leaves the leg in `idle` state. FlowKit's call.bridge
         # requires both legs in `active`, so advance this one now — mirrors
@@ -89,6 +121,13 @@ class OutboundWebRTCService:
             logger.warning(
                 "outbound webrtc call.answer failed (continuing): %s", exc,
             )
+
+        await _raise_if_outbound_ended(
+            telephony,
+            orchestrator,
+            outbound_call_id=outbound_call_id,
+            webrtc_call_id=webrtc_call_id,
+        )
 
         await orchestrator.pair_outbound_webrtc(
             outbound_call_id=outbound_call_id,

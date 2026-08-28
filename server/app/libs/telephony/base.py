@@ -133,7 +133,14 @@ class BaseTelephonyClient(ABC):
         """Speak `text` on the call. Returns `play_id`."""
 
     @abstractmethod
-    async def call_listen(self, call_id: str, *, timeout_ms: int | None = None) -> None: ...
+    async def call_listen(
+        self,
+        call_id: str,
+        *,
+        timeout_ms: int | None = None,
+        adaptive_barge_in: bool | None = None,
+        performance: dict | None = None,
+    ) -> None: ...
 
     @abstractmethod
     async def call_stop(self, call_id: str, *, target: str = "all") -> None:
@@ -179,6 +186,7 @@ class BaseTelephonyClient(ABC):
         transcribe: bool = True,
         *,
         keepalive_on_peer_hangup: bool = False,
+        user_call_id: str | None = None,
     ) -> None:
         """Bridge two call legs.
 
@@ -189,6 +197,9 @@ class BaseTelephonyClient(ABC):
         `keepalive_on_peer_hangup` keeps the surviving leg alive when the other
         side hangs up (consult A↔B). Default False matches two-party calls
         where either hangup ends both legs.
+
+        `user_call_id` explicitly identifies the customer leg when transport
+        direction cannot describe participant roles, such as outbound calls.
         """
 
     @abstractmethod
@@ -310,6 +321,7 @@ class BaseTelephonyClient(ABC):
         trunk_id: str | None = None,
         timeout_ms: int | None = None,
         headers: dict[str, str] | None = None,
+        request_id: str | None = None,
     ) -> dict:
         """Start an outbound call. Returns `{call_id, conversation_id, status}`.
 
@@ -322,10 +334,21 @@ class BaseTelephonyClient(ABC):
         - `trunk_id`: which Trunk to route through; omitted → kernel default
           (system_outbound for single-trunk deployments)
 
+        - `request_id`: optional idempotency key. The kernel returns the same
+          `call_id` when the same key is retried while the first attempt is
+          still live (or within a short reconcile window).
+
         Errors mapped to TelephonyRPCError:
         - `-32602 trunk_id not found` / `trunk not ready for outbound`
         - `-32008 originate concurrent limit reached`
         """
+
+    async def originate_capacity(self) -> dict | None:
+        """Optional kernel originate quota: in_flight / max / remaining.
+
+        Return None when the provider does not expose capacity.
+        """
+        return None
 
     @abstractmethod
     async def extension_query(self, extension: str) -> dict:
@@ -354,6 +377,21 @@ class BaseTelephonyClient(ABC):
     @abstractmethod
     async def call_list(self) -> list[dict]:
         """Return all active calls. Used to recover after orchestrator restart."""
+
+    async def call_alive(self, call_id: str) -> bool | None:
+        """Probe whether ``call_id`` is still live in the media kernel.
+
+        Three-valued result:
+        - ``True`` — an authoritative kernel answered and the call is present
+        - ``False`` — an authoritative kernel answered and the call is absent
+        - ``None`` — cannot decide (kernel unreachable, incomplete multi-kernel
+          coverage, RPC error). Callers must fail open.
+
+        Default implementation returns ``None`` so providers that cannot probe
+        safely never invent a definitive answer.
+        """
+
+        return None
 
     # ── WebRTC signaling (agent browser) ──
 

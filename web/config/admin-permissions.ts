@@ -7,11 +7,14 @@ export type AdminNavIconKey =
   | 'phoneNumbers'
   | 'sipExtensions'
   | 'callSummary'
+  | 'sms'
   | 'callSettings'
+  | 'callIntegrations'
   | 'conversationSettings'
   | 'channels'
   | 'sessionRouting'
   | 'sessionSummary'
+  | 'lingomaster'
   | 'userFields'
   | 'organizationFields'
   | 'userViews'
@@ -21,9 +24,11 @@ export type AdminNavIconKey =
   | 'sharedFields'
   | 'ticketViews'
   | 'ticketWorkflows'
+  | 'customDashboards'
   | 'systemSettings'
   | 'serviceHours'
   | 'apiKeys'
+  | 'eventSubscriptions'
   | 'openAgent'
 
 export type AdminNavItem = {
@@ -62,7 +67,9 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
       { labelKey: 'nav.phoneNumbers', href: '/call-center/phone-numbers', iconKey: 'phoneNumbers', permission: 'call.admin.number.manage' },
       { labelKey: 'nav.sipExtensions', href: '/call-center/extensions', iconKey: 'sipExtensions', permission: 'call.admin.extension.manage' },
       { labelKey: 'nav.callSummary', href: '/call-summary', iconKey: 'callSummary', permission: 'call.admin.summary_config.manage' },
+      { labelKey: 'nav.smsTemplates', href: '/call-center/sms', iconKey: 'sms', permission: 'call.admin.sms.manage' },
       { labelKey: 'nav.callSettings', href: '/call-center/settings', iconKey: 'callSettings', permission: 'call.admin.settings.manage' },
+      { labelKey: 'nav.callIntegrations', href: '/call-center/integrations', iconKey: 'callIntegrations', permission: 'call.admin.embed.manage' },
     ],
   },
   {
@@ -72,6 +79,7 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
       { labelKey: 'nav.channels', href: '/channels', iconKey: 'channels', permission: 'chat.admin.channel.manage' },
       { labelKey: 'nav.sessionRouting', href: '/session-routing', iconKey: 'sessionRouting', permission: 'chat.admin.routing.manage' },
       { labelKey: 'nav.sessionSummary', href: '/session-summary', iconKey: 'sessionSummary', permission: 'chat.admin.summary_config.manage' },
+      { labelKey: 'nav.lingomaster', href: '/online-service/lingomaster', iconKey: 'lingomaster', permission: 'chat.admin.lingomaster.manage' },
     ],
   },
   {
@@ -94,10 +102,17 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
     ],
   },
   {
+    labelKey: 'nav.group.analytics',
+    items: [
+      { labelKey: 'nav.customDashboards', href: '/custom-dashboards', iconKey: 'customDashboards', permission: 'report.dashboard.manage' },
+    ],
+  },
+  {
     labelKey: 'nav.group.globalSettings',
     items: [
       { labelKey: 'nav.systemSettings', href: '/system-settings', iconKey: 'systemSettings', permission: 'settings.system.manage' },
       { labelKey: 'nav.apiKeys', href: '/api-keys', iconKey: 'apiKeys', permission: 'admin.access', superAdminOnly: true },
+      { labelKey: 'nav.eventSubscriptions', href: '/event-subscriptions', iconKey: 'eventSubscriptions', permission: 'admin.access', superAdminOnly: true },
       { labelKey: 'nav.serviceHours', href: '/service-hours', iconKey: 'serviceHours', permission: 'settings.service_hours.manage' },
       { labelKey: 'nav.openAgent', href: '/open-agent-settings', iconKey: 'openAgent', permission: 'settings.open_agent.manage' },
     ],
@@ -113,12 +128,15 @@ export const ADMIN_ROUTE_RULES: AdminRouteRule[] = [
   { prefix: '/flow-studio', permissions: ['call.admin.flow.manage'] },
   { prefix: '/call-center/phone-numbers', permissions: ['call.admin.number.manage'] },
   { prefix: '/call-center/extensions', permissions: ['call.admin.extension.manage'] },
+  { prefix: '/call-center/sms', permissions: ['call.admin.sms.manage'] },
   { prefix: '/call-center/settings', permissions: ['call.admin.settings.manage'] },
+  { prefix: '/call-center/integrations', permissions: ['call.admin.embed.manage'] },
   { prefix: '/call-summary', permissions: ['call.admin.summary_config.manage'] },
   { prefix: '/online-service/conversation-settings', permissions: ['chat.admin.settings.manage'] },
   { prefix: '/channels', permissions: ['chat.admin.channel.manage'] },
   { prefix: '/session-routing', permissions: ['chat.admin.routing.manage'] },
   { prefix: '/session-summary', permissions: ['chat.admin.summary_config.manage'] },
+  { prefix: '/online-service/lingomaster', permissions: ['admin.access', 'chat.admin.lingomaster.manage'] },
   { prefix: '/user-fields', permissions: ['crm.admin.user_field.manage'] },
   { prefix: '/organization-fields', permissions: ['crm.admin.org_field.manage'] },
   { prefix: '/user-views', permissions: ['crm.admin.user_view.manage'] },
@@ -128,8 +146,10 @@ export const ADMIN_ROUTE_RULES: AdminRouteRule[] = [
   { prefix: '/shared-fields', permissions: ['ticket.admin.shared_field.manage'] },
   { prefix: '/ticket-views', permissions: ['ticket.admin.view.manage'] },
   { prefix: '/ticket-workflows', permissions: ['ticket.admin.workflow.manage'] },
+  { prefix: '/custom-dashboards', permissions: ['admin.access', 'report.dashboard.manage'] },
   { prefix: '/system-settings', permissions: ['settings.system.manage'] },
   { prefix: '/api-keys', permissions: ['admin.access'], superAdminOnly: true },
+  { prefix: '/event-subscriptions', permissions: ['admin.access'], superAdminOnly: true },
   { prefix: '/service-hours', permissions: ['settings.service_hours.manage'] },
   { prefix: '/open-agent-settings', permissions: ['settings.open_agent.manage'] },
 ].sort((a, b) => b.prefix.length - a.prefix.length)

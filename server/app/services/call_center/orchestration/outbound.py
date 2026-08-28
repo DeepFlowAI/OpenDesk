@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import asyncio
+
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     from app.libs.telephony import CallEvent
     from app.services.call_center.orchestrator import SipOutboundDialParams
@@ -20,25 +23,42 @@ class OutboundMixin:
 
     # ────────────────── Outbound (agent-initiated) tracking ──────────────────
 
-    # SIP failure reasons that can arrive before register_outbound_call runs.
+    # SIP / originate failures that can arrive before register_outbound_call.
     # Inbound hangups use different reasons (remote_bye / media_eof / …).
     _OUTBOUND_EARLY_FAIL_REASONS = frozenset({
         "rejected",
         "busy",
         "no_answer",
         "originate_failed",
+        "originate_rejected",
         "local_cancel",
+        "canceled",
+        "timeout",
         "alloc_failed",
         "invite_failed",
         "ringing_failed",
         "answer_failed",
         "bind_failed",
+        "ack_failed",
+        "no_g711",
+        "bad_answer_sdp",
+        "mediaio_failed",
         "at_capacity",
+        "server_stopping",
     })
 
     @classmethod
-    def _is_outbound_early_fail(cls, reason: object) -> bool:
-        return isinstance(reason, str) and reason in cls._OUTBOUND_EARLY_FAIL_REASONS
+    def _is_outbound_early_fail(
+        cls, reason: object, sip_status: object = None
+    ) -> bool:
+        if isinstance(reason, str) and reason in cls._OUTBOUND_EARLY_FAIL_REASONS:
+            return True
+        # Final SIP responses can race register even when the reason string
+        # is one we have not listed yet (new FlowKit buckets, carrier extras).
+        try:
+            return sip_status is not None and int(sip_status) >= 400
+        except (TypeError, ValueError):
+            return False
 
     async def register_outbound_call(
         self,
@@ -108,6 +128,7 @@ class OutboundMixin:
             data = json.loads(raw)
             ended = (data.get("reason"), data.get("sip_status"))
             self._outbound_ended[call_id] = ended
+            self._outbound_ended_detail_store()[call_id] = data
             return ended
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -117,15 +138,23 @@ class OutboundMixin:
         call_id: str,
         reason: str | None,
         sip_status: int | None,
+        *,
+        hangup_details: Mapping[str, Any] | None = None,
     ) -> None:
         self._outbound_ended[call_id] = (reason, sip_status)
+        payload = {
+            "reason": reason,
+            "sip_status": sip_status,
+            **(hangup_details or {}),
+        }
+        self._outbound_ended_detail_store()[call_id] = payload
         redis = _orch._get_redis_client()
         if redis is None:
             return
         try:
             await redis.set(
                 self._outbound_ended_key(call_id),
-                json.dumps({"reason": reason, "sip_status": sip_status}),
+                json.dumps(payload),
                 ex=self._OUTBOUND_CLEANUP_DELAY_SEC,
             )
         except Exception:  # noqa: BLE001
@@ -133,11 +162,51 @@ class OutboundMixin:
                 "outbound ended redis set failed call_id=%s", call_id, exc_info=True
             )
 
+    async def finalize_outbound_cdr_if_already_ended(
+        self,
+        db: "AsyncSession",
+        *,
+        tenant_id: int,
+        call_id: str,
+    ) -> tuple[str | None, int | None] | None:
+        """Close a CDR created after an early carrier hangup event."""
+
+        ended = await self.outbound_ended_reason(call_id)
+        if ended is None:
+            return None
+        reason, sip_status = ended
+        details = self._outbound_ended_detail_store().get(call_id)
+        if details is None:
+            redis = _orch._get_redis_client()
+            if redis is not None:
+                try:
+                    raw = await redis.get(self._outbound_ended_key(call_id))
+                    details = json.loads(raw) if raw else None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    details = None
+        await _orch.CallRecordService.mark_completed(
+            db,
+            tenant_id,
+            call_id,
+            hangup_reason=reason,
+            end_state="failed",
+            hangup_details=details,
+        )
+        await db.commit()
+        logger.info(
+            "outbound late CDR finalized call_id=%s reason=%s sip_status=%s",
+            call_id,
+            reason,
+            sip_status,
+        )
+        return ended
+
     async def _delayed_outbound_cleanup(self, call_id: str) -> None:
         import asyncio as _aio
         await _aio.sleep(self._OUTBOUND_CLEANUP_DELAY_SEC)
         self._outbound_originators.pop(call_id, None)
         self._outbound_ended.pop(call_id, None)
+        self._outbound_ended_detail_store().pop(call_id, None)
         redis = _orch._get_redis_client()
         if redis is None:
             return
@@ -146,11 +215,20 @@ class OutboundMixin:
                 self._outbound_originator_key(call_id),
                 self._outbound_ended_key(call_id),
                 self._outbound_webrtc_key(call_id),
+                self._outbound_answered_key(call_id),
+                self._outbound_bridged_key(call_id),
             )
         except Exception:  # noqa: BLE001
             logger.warning(
                 "outbound redis cleanup failed call_id=%s", call_id, exc_info=True
             )
+
+    def _outbound_ended_detail_store(self) -> dict[str, dict[str, Any]]:
+        store = getattr(self, "_outbound_ended_details", None)
+        if store is None:
+            store = {}
+            self._outbound_ended_details = store
+        return store
 
     async def _delayed_trace_cleanup(self, call_id: str) -> None:
         import asyncio as _aio
@@ -188,22 +266,144 @@ class OutboundMixin:
         browser WebRTC leg for Web-phone agents, or the physical SIP-extension
         leg for SIP-phone agents. The bridge logic is identical either way."""
 
+        if await self.outbound_ended_reason(outbound_call_id) is not None:
+            logger.info(
+                "skip webrtc pair; outbound already ended call_id=%s",
+                outbound_call_id,
+            )
+            return
+
         self._outbound_webrtc_pairs[outbound_call_id] = webrtc_call_id
         redis = _orch._get_redis_client()
-        if redis is None:
-            return
+        if redis is not None:
+            try:
+                await redis.set(
+                    self._outbound_webrtc_key(outbound_call_id),
+                    webrtc_call_id,
+                    ex=self._OUTBOUND_STATE_TTL_SEC,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "outbound webrtc pair redis set failed call_id=%s",
+                    outbound_call_id,
+                    exc_info=True,
+                )
+        await self._try_bridge_outbound_media(outbound_call_id)
+
+    async def _mark_outbound_answered(self, call_id: str) -> None:
+        answered_calls = getattr(self, "_outbound_answered", None)
+        if answered_calls is None:
+            answered_calls = self._outbound_answered = set()
+        answered_calls.add(call_id)
+        redis = _orch._get_redis_client()
+        if redis is not None:
+            try:
+                await redis.set(
+                    self._outbound_answered_key(call_id),
+                    "1",
+                    ex=self._OUTBOUND_STATE_TTL_SEC,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "outbound answered redis set failed call_id=%s",
+                    call_id,
+                    exc_info=True,
+                )
+
+    async def _try_bridge_outbound_media(self, call_id: str) -> bool:
+        """Join the customer and agent legs once both asynchronous events exist."""
+        if await self.outbound_ended_reason(call_id) is not None:
+            return False
+
+        redis = _orch._get_redis_client()
+        webrtc_call_id = self._outbound_webrtc_pairs.get(call_id)
+        answered = call_id in getattr(self, "_outbound_answered", set())
+        if redis is not None:
+            try:
+                pair_raw, answered_raw = await redis.mget(
+                    self._outbound_webrtc_key(call_id),
+                    self._outbound_answered_key(call_id),
+                )
+                if webrtc_call_id is None and pair_raw is not None:
+                    webrtc_call_id = (
+                        pair_raw if isinstance(pair_raw, str) else pair_raw.decode()
+                    )
+                answered = answered or answered_raw is not None
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "outbound bridge state read failed call_id=%s", call_id,
+                    exc_info=True,
+                )
+        if not answered or not webrtc_call_id:
+            return False
+
+        claimed = False
+        if redis is not None:
+            try:
+                claimed = bool(await redis.set(
+                    self._outbound_bridged_key(call_id), "1",
+                    nx=True, ex=self._OUTBOUND_STATE_TTL_SEC,
+                ))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "outbound bridge claim failed call_id=%s", call_id,
+                    exc_info=True,
+                )
+                return False
+        else:
+            bridge_claims = getattr(self, "_outbound_bridge_claims", None)
+            if bridge_claims is None:
+                bridge_claims = self._outbound_bridge_claims = set()
+            if call_id not in bridge_claims:
+                bridge_claims.add(call_id)
+                claimed = True
+        if not claimed:
+            return False
+
+        info = await self._peek_outbound_originator(call_id)
+        if info is None:
+            await self._release_outbound_bridge_claim(call_id)
+            return False
+        tenant_id, employee_id, _did = info
         try:
-            await redis.set(
-                self._outbound_webrtc_key(outbound_call_id),
+            from app.services.system_settings_service import SystemSettingsService
+
+            transcribe = await SystemSettingsService.is_bridge_asr_enabled_managed(tenant_id)
+            try:
+                await self.telephony.call_stop(webrtc_call_id, target="play")
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "outbound: stopping ringback failed leg=%s", webrtc_call_id,
+                    exc_info=True,
+                )
+            await self.telephony.call_bridge(
+                call_id,
                 webrtc_call_id,
-                ex=self._OUTBOUND_STATE_TTL_SEC,
+                transcribe=transcribe,
+                keepalive_on_peer_hangup=True,
+                user_call_id=call_id,
             )
+            async with _orch.AsyncSessionLocal() as db:
+                await _orch.CallRecordService.mark_reception_started(
+                    db, tenant_id, call_id,
+                    agent_id=employee_id, agent_leg_id=webrtc_call_id,
+                )
+            await self._pop_outbound_webrtc(call_id)
+            logger.info("outbound auto-bridge: sip=%s webrtc=%s", call_id, webrtc_call_id)
+            return True
         except Exception:  # noqa: BLE001
-            logger.warning(
-                "outbound webrtc pair redis set failed call_id=%s",
-                outbound_call_id,
-                exc_info=True,
-            )
+            await self._release_outbound_bridge_claim(call_id)
+            logger.exception("outbound auto-bridge failed sip=%s webrtc=%s", call_id, webrtc_call_id)
+            return False
+
+    async def _release_outbound_bridge_claim(self, call_id: str) -> None:
+        getattr(self, "_outbound_bridge_claims", set()).discard(call_id)
+        redis = _orch._get_redis_client()
+        if redis is not None:
+            try:
+                await redis.delete(self._outbound_bridged_key(call_id))
+            except Exception:  # noqa: BLE001
+                logger.warning("outbound bridge claim cleanup failed call_id=%s", call_id)
 
     def register_leg_wait(self, call_id: str) -> "_asyncio.Future[dict]":
         """Await a leg's first answered/hangup. Returns a Future resolved with
@@ -408,15 +608,16 @@ class OutboundMixin:
             outbound_call_id=call_id, webrtc_call_id=extension_leg_call_id,
         )
 
-        try:
-            async with _orch.AsyncSessionLocal() as db:
-                await _orch.CcAgentStatusService.sync_pg_status(
-                    db, params.tenant_pk, params.employee_id, "busy", None,
+        if await self.outbound_ended_reason(call_id) is None:
+            try:
+                async with _orch.AsyncSessionLocal() as db:
+                    await _orch.CcAgentStatusService.sync_pg_status(
+                        db, params.tenant_pk, params.employee_id, "busy", None,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "sip outbound status busy sync failed call_id=%s", call_id,
                 )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "sip outbound status busy sync failed call_id=%s", call_id,
-            )
 
         try:
             async with _orch.AsyncSessionLocal() as db:
@@ -430,8 +631,16 @@ class OutboundMixin:
                     agent_id=params.employee_id,
                     device_type=params.device_type,
                     device_identifier=params.device_identifier,
+                    call_source=params.call_source,
+                    custom_business_info=params.custom_business_info,
+                    external_context=params.external_context,
                 )
                 await db.commit()
+                await self.finalize_outbound_cdr_if_already_ended(
+                    db,
+                    tenant_id=params.tenant_pk,
+                    call_id=call_id,
+                )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "sip outbound CDR create_for_outbound failed call_id=%s", call_id,
@@ -611,6 +820,21 @@ class OutboundMixin:
 
     async def _on_outbound_answered(self, event: CallEvent) -> None:
         call_id = event.data.get("call_id") or ""
+        # Auto-outbound (agentless) dial engine — Redis session mapping wins
+        # over agent-originator state so system dials never enter the
+        # WebRTC bridge / agent busy path.
+        if call_id:
+            try:
+                from app.services.auto_outbound import try_handle_auto_outbound_answered
+
+                if await try_handle_auto_outbound_answered(
+                    call_id, event.data.get("request_id")
+                ):
+                    return
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "auto_outbound answered hook failed call_id=%s", call_id
+                )
         # SIP-phone two-stage: the agent's extension leg answered. Wake the
         # dialer waiting on it so it proceeds to originate the customer.
         self._resolve_leg_wait(call_id, {"answered": True})
@@ -644,40 +868,10 @@ class OutboundMixin:
         except Exception:  # noqa: BLE001
             logger.exception("CDR mark_answered (outbound) failed call_id=%s", call_id)
 
-        # Bridge to the agent's pre-built WebRTC leg so audio flows instantly.
-        # No pairing means the agent never POSTed /dial-webrtc/offer — call
-        # still goes through SIP but agent has no media path. We surface the
-        # answered event regardless so the UI advances.
-        webrtc_call_id = await self._pop_outbound_webrtc(call_id)
-        if webrtc_call_id:
-            # Read the tenant's live-transcription toggle on a short session that
-            # closes before the bridge RPC (no DB session held across I/O).
-            from app.services.system_settings_service import SystemSettingsService
-
-            transcribe = await SystemSettingsService.is_bridge_asr_enabled_managed(tenant_id)
-            # An agent who dialled on their handset has been hearing ringback on
-            # this leg. It loops until told otherwise, so it would play over the
-            # conversation. No-op for the other dial paths, which play nothing.
-            try:
-                await self.telephony.call_stop(webrtc_call_id, target="play")
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "outbound: stopping ringback failed leg=%s", webrtc_call_id,
-                    exc_info=True,
-                )
-            try:
-                await self.telephony.call_bridge(call_id, webrtc_call_id, transcribe=transcribe)
-                logger.info(
-                    "outbound auto-bridge: sip=%s webrtc=%s", call_id, webrtc_call_id,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "outbound auto-bridge failed sip=%s webrtc=%s",
-                    call_id, webrtc_call_id,
-                )
-        else:
+        await self._mark_outbound_answered(call_id)
+        if not await self._try_bridge_outbound_media(call_id):
             logger.warning(
-                "outbound answered without WebRTC pairing (no audio path): %s",
+                "outbound answered awaiting WebRTC pairing: %s",
                 call_id,
             )
         await self.notify_agent_outbound_event(

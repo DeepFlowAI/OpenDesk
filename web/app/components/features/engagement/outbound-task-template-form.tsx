@@ -2,6 +2,7 @@
 
 import Link from 'next/link'
 import { useEffect, useMemo, useState } from 'react'
+import { toast } from 'sonner'
 import {
   IconArrowDown,
   IconArrowLeft,
@@ -11,7 +12,9 @@ import {
   IconTrash,
 } from '@tabler/icons-react'
 import { FieldTypeConfig, type OptionItem, type TreeNodeItem } from '@/app/components/features/field-system'
-import type { OutboundTaskField, OutboundTaskTemplate } from '@/models/outbound-task'
+import { OutboundScriptEditor } from '@/app/components/features/engagement/outbound-script-editor'
+import { validateOutboundScript } from '@/app/components/features/engagement/outbound-script-utils'
+import type { OutboundScript, OutboundTaskField, OutboundTaskTemplate } from '@/models/outbound-task'
 import { FIELD_TYPE_LABELS, FieldType, SELECT_FIELD_TYPES, TREE_FIELD_TYPES } from '@/types/field-enums'
 import { cn } from '@/lib/utils'
 
@@ -19,6 +22,8 @@ type TemplateDraft = {
   name: string
   description: string
   fields: OutboundTaskField[]
+  script: OutboundScript | null
+  expectedUpdatedAt: string | null
 }
 
 type OutboundTaskTemplateFormProps = {
@@ -27,7 +32,7 @@ type OutboundTaskTemplateFormProps = {
   template?: OutboundTaskTemplate
   loading?: boolean
   saving?: boolean
-  onSubmit: (draft: TemplateDraft) => Promise<void>
+  onSubmit: (draft: TemplateDraft) => Promise<boolean>
 }
 
 const supportedFieldTypes: FieldType[] = [
@@ -101,16 +106,55 @@ export function OutboundTaskTemplateForm({
       name: template?.name ?? '',
       description: template?.description ?? '',
       fields: normalizeFields(template?.fields ?? []),
+      script: template?.script ?? null,
+      expectedUpdatedAt: template?.updated_at ?? null,
     }),
     [template],
   )
   const [draft, setDraft] = useState(initialDraft)
+  const [savedDraft, setSavedDraft] = useState(initialDraft)
+  const [activeTab, setActiveTab] = useState<'basic' | 'fields' | 'script'>('basic')
   const [editingKey, setEditingKey] = useState<string | null>(initialDraft.fields[0]?.key ?? null)
+  const dirty = JSON.stringify(draft) !== JSON.stringify(savedDraft)
 
   useEffect(() => {
+    if (dirty) return
     setDraft(initialDraft)
+    setSavedDraft(initialDraft)
     setEditingKey(initialDraft.fields[0]?.key ?? null)
-  }, [initialDraft])
+  }, [dirty, initialDraft])
+
+  useEffect(() => {
+    const tab = new URLSearchParams(window.location.search).get('tab')
+    if (tab === 'fields' || tab === 'script') setActiveTab(tab)
+  }, [])
+
+  useEffect(() => {
+    if (!dirty) return
+    const beforeUnload = (event: BeforeUnloadEvent) => event.preventDefault()
+    window.addEventListener('beforeunload', beforeUnload)
+    return () => window.removeEventListener('beforeunload', beforeUnload)
+  }, [dirty])
+
+  const switchTab = (tab: 'basic' | 'fields' | 'script') => {
+    setActiveTab(tab)
+    const url = new URL(window.location.href)
+    url.searchParams.set('tab', tab)
+    window.history.replaceState(window.history.state, '', url)
+  }
+
+  const submit = async () => {
+    if (draft.script) {
+      const issues = validateOutboundScript(draft.script)
+      if (issues.length > 0) {
+        switchTab('script')
+        toast.error(issues[0].message)
+        return
+      }
+    }
+    const normalized = { ...draft, fields: normalizeFields(draft.fields) }
+    if (await onSubmit(normalized)) setSavedDraft(normalized)
+  }
 
   const setField = (key: string, updater: (field: OutboundTaskField) => OutboundTaskField) => {
     setDraft((current) => ({
@@ -155,18 +199,19 @@ export function OutboundTaskTemplateForm({
     <div className="flex h-full flex-col overflow-hidden">
       <header className="flex shrink-0 items-center justify-between border-b border-border px-6 py-4">
         <div className="flex items-center gap-3">
-          <Link href="/workspace/engagement/outbound-task-templates" className="rounded-md p-2 hover:bg-muted">
+          <Link href="/workspace/engagement/outbound-task-templates" onClick={(event) => { if (dirty && !window.confirm('当前任务模板有未保存的修改，确定放弃并离开？')) event.preventDefault() }} className="rounded-md p-2 hover:bg-muted">
             <IconArrowLeft size={18} />
           </Link>
           <div>
             <h1 className="text-xl font-semibold text-foreground">{title}</h1>
             <p className="mt-1 text-sm text-muted-foreground">维护模板基础信息和创建任务时复制的字段结构</p>
           </div>
+          {dirty && <span className="rounded-full bg-warning/10 px-2 py-1 text-xs font-medium text-warning">未保存</span>}
         </div>
         <button
           type="button"
-          onClick={() => void onSubmit({ ...draft, fields: normalizeFields(draft.fields) })}
-          disabled={saving}
+          onClick={() => void submit()}
+          disabled={!dirty || saving}
           className="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-60"
         >
           <IconDeviceFloppy size={16} />
@@ -174,9 +219,18 @@ export function OutboundTaskTemplateForm({
         </button>
       </header>
 
-      <main className="min-h-0 flex-1 overflow-auto p-6">
+      <nav className="flex h-12 shrink-0 items-end gap-5 border-b border-border px-6" aria-label="模板配置">
+        {([['basic', '基本信息'], ['fields', '任务字段'], ['script', '外呼话术']] as const).map(([tab, label]) => (
+          <button key={tab} type="button" onClick={() => switchTab(tab)} className={cn('h-12 border-b-2 px-1 text-sm', activeTab === tab ? 'border-foreground font-medium text-foreground' : 'border-transparent text-muted-foreground')}>{label}</button>
+        ))}
+      </nav>
+
+      <main className={cn('min-h-0 flex-1', activeTab === 'script' ? 'overflow-hidden' : 'overflow-auto p-6')}>
+        {activeTab === 'script' ? (
+          <OutboundScriptEditor value={draft.script} templateName={draft.name} existingTemplate={Boolean(template)} onChange={(script) => setDraft((current) => ({ ...current, script }))} />
+        ) : (
         <div className="mx-auto max-w-5xl space-y-6">
-          <section>
+          {activeTab === 'basic' && <section>
             <h2 className="mb-4 text-base font-semibold">基础信息</h2>
             <div className="grid gap-4">
               <label className="grid gap-1.5 text-sm">
@@ -197,9 +251,9 @@ export function OutboundTaskTemplateForm({
                 />
               </label>
             </div>
-          </section>
+          </section>}
 
-          <section>
+          {activeTab === 'fields' && <section>
             <div className="mb-4 flex items-center justify-between">
               <div>
                 <h2 className="text-base font-semibold">字段结构</h2>
@@ -263,8 +317,9 @@ export function OutboundTaskTemplateForm({
                 })}
               </div>
             )}
-          </section>
+          </section>}
         </div>
+        )}
       </main>
     </div>
   )

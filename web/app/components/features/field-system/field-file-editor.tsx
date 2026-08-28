@@ -5,8 +5,11 @@ import { useDropzone, type Accept, type FileRejection } from 'react-dropzone'
 import { IconLoader2, IconPaperclip, IconX } from '@tabler/icons-react'
 import { useUploadCustomFieldFile } from '@/service/use-upload'
 import { cn } from '@/lib/utils'
+import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 
 export type FieldFileAttachment = {
+  file_id?: string
   url: string
   name: string
   size?: number
@@ -95,6 +98,8 @@ type FieldFileEditorProps = {
   placeholder?: string
   disabled?: boolean
   className?: string
+  uploadFile?: (file: File) => Promise<FieldFileAttachment>
+  locale?: Locale
 }
 
 /**
@@ -108,8 +113,11 @@ export function FieldFileEditor({
   placeholder = '',
   disabled = false,
   className,
+  uploadFile,
+  locale = 'zh',
 }: FieldFileEditorProps) {
   const [localError, setLocalError] = useState<string | null>(null)
+  const [externalUploadPending, setExternalUploadPending] = useState(false)
   const uploadMutation = useUploadCustomFieldFile()
 
   const maxCount = Math.max(1, Number(typeConfig.max_file_count) || 1)
@@ -125,7 +133,7 @@ export function FieldFileEditor({
   const blocked = typeConfig.blocked_mime_types as string | undefined
 
   const files = normalizeFileValue(value)
-  const busy = uploadMutation.isPending
+  const busy = uploadMutation.isPending || externalUploadPending
   const slotFull = files.length >= maxCount
   const dropDisabled = disabled || busy || slotFull
 
@@ -136,7 +144,7 @@ export function FieldFileEditor({
 
       const nextSlots = maxCount - files.length
       if (nextSlots <= 0) {
-        setLocalError('已达到最大文件数量')
+        setLocalError(t('field.file.error.maxCount', locale))
         return
       }
 
@@ -148,44 +156,56 @@ export function FieldFileEditor({
         0,
       )
 
-      for (const file of toAdd) {
-        if (isExtensionBlocked(file.name, blocked)) {
-          setLocalError(`不允许的文件类型: ${file.name}`)
-          return
+      setExternalUploadPending(Boolean(uploadFile))
+      try {
+        for (const file of toAdd) {
+          if (isExtensionBlocked(file.name, blocked)) {
+            setLocalError(t('field.file.error.blockedType', locale, { name: file.name }))
+            return
+          }
+          if (maxBytes != null && file.size > maxBytes) {
+            setLocalError(t('field.file.error.tooLarge', locale, { name: file.name }))
+            return
+          }
+          if (maxTotalBytes != null && runningTotalBytes + file.size > maxTotalBytes) {
+            setLocalError(t('field.file.error.totalTooLarge', locale))
+            return
+          }
+          try {
+            const meta = uploadFile
+              ? await uploadFile(file)
+              : await uploadMutation.mutateAsync(file)
+            uploaded.push(meta)
+            runningTotalBytes += typeof meta.size === 'number' ? meta.size : file.size
+          } catch {
+            setLocalError(t('field.file.error.uploadFailed', locale, { name: file.name }))
+            return
+          }
         }
-        if (maxBytes != null && file.size > maxBytes) {
-          setLocalError(`文件过大: ${file.name}`)
-          return
-        }
-        if (maxTotalBytes != null && runningTotalBytes + file.size > maxTotalBytes) {
-          setLocalError('已超出总文件体积上限')
-          return
-        }
-        try {
-          const meta = await uploadMutation.mutateAsync(file)
-          uploaded.push(meta)
-          runningTotalBytes += typeof meta.size === 'number' ? meta.size : file.size
-        } catch {
-          setLocalError(`上传失败: ${file.name}`)
-          return
-        }
-      }
 
-      onChange(uploaded.length > 0 ? uploaded : null)
+        onChange(uploaded.length > 0 ? uploaded : null)
+      } finally {
+        setExternalUploadPending(false)
+      }
     },
-    [files, maxCount, maxBytes, maxTotalBytes, blocked, onChange, uploadMutation],
+    [files, maxCount, maxBytes, maxTotalBytes, blocked, locale, onChange, uploadFile, uploadMutation],
   )
 
   const onDrop = useCallback(
     async (acceptedFiles: File[], fileRejections: FileRejection[]) => {
       if (fileRejections.length > 0) {
         const codes = fileRejections[0].errors.map((e) => e.code).join(', ')
-        setLocalError(codes.includes('file-invalid-type') ? '文件类型不允许' : '无法添加该文件')
+        setLocalError(t(
+          codes.includes('file-invalid-type')
+            ? 'field.file.error.invalidType'
+            : 'field.file.error.addFailed',
+          locale,
+        ))
         if (acceptedFiles.length === 0) return
       }
       await processFiles(acceptedFiles)
     },
-    [processFiles],
+    [locale, processFiles],
   )
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -223,10 +243,10 @@ export function FieldFileEditor({
           ) : (
             <IconPaperclip size={18} className="shrink-0" />
           )}
-          {busy ? '上传中…' : placeholder}
+          {busy ? t('field.file.uploading', locale) : placeholder}
         </span>
         {!busy && !slotFull && (
-          <span className="text-xs text-muted-foreground/80">点击选择或拖拽文件到此处</span>
+          <span className="text-xs text-muted-foreground/80">{t('field.file.dropHint', locale)}</span>
         )}
       </div>
 
@@ -243,7 +263,7 @@ export function FieldFileEditor({
                 rel="noopener noreferrer"
                 className="min-w-0 truncate text-primary underline-offset-2 hover:underline"
               >
-                {f.name || `文件 ${i + 1}`}
+                {f.name || t('field.file.fallbackName', locale, { index: i + 1 })}
               </a>
               <button
                 type="button"
@@ -253,7 +273,7 @@ export function FieldFileEditor({
                   removeAt(i)
                 }}
                 className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
-                aria-label="Remove file"
+                aria-label={t('field.file.remove', locale)}
               >
                 <IconX size={16} />
               </button>

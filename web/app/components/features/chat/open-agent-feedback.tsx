@@ -2,6 +2,8 @@
 
 import { useMemo, useState } from 'react'
 import { IconLoader2, IconThumbDown, IconThumbUp, IconX } from '@tabler/icons-react'
+import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
 
 export type OpenAgentFeedbackRating = 'like' | 'dislike'
@@ -24,7 +26,7 @@ type OpenAgentFeedbackProps = {
   messageId: number
   senderType: string
   metadata?: Record<string, unknown>
-  locale: string
+  locale: Locale
   enabled?: boolean
   readonly?: boolean
   align?: 'start' | 'end'
@@ -62,17 +64,17 @@ export function resolveOpenAgentFeedback(metadata?: Record<string, unknown>): Op
   }
 }
 
-function feedbackText(rating: OpenAgentFeedbackRating | null, locale: string): string {
-  if (rating === 'like') return locale === 'zh' ? '已点赞' : 'Liked'
-  if (rating === 'dislike') return locale === 'zh' ? '已点踩' : 'Disliked'
-  return locale === 'zh' ? '反馈' : 'Feedback'
+function feedbackText(rating: OpenAgentFeedbackRating | null, locale: Locale): string {
+  if (rating === 'like') return t('chat.feedback.liked', locale)
+  if (rating === 'dislike') return t('chat.feedback.disliked', locale)
+  return t('chat.feedback.label', locale)
 }
 
-function formatFeedbackTime(value: string | null, locale: string): string | null {
+function formatFeedbackTime(value: string | null, locale: Locale): string | null {
   if (!value) return null
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return null
-  return date.toLocaleString(locale === 'zh' ? 'zh-CN' : 'en-US', {
+  return date.toLocaleString(locale, {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
@@ -123,7 +125,7 @@ export function OpenAgentFeedback({
       setSubmitted(true)
       window.setTimeout(() => setSubmitted(false), 1600)
     } catch {
-      setError(locale === 'zh' ? '提交失败，请重试' : 'Failed to submit')
+      setError(t('chat.feedback.submitFailed', locale))
     } finally {
       setPendingRating(null)
     }
@@ -157,8 +159,8 @@ export function OpenAgentFeedback({
           )}
           onClick={() => void submit('like')}
           disabled={pendingRating !== null}
-          title={locale === 'zh' ? '点赞' : 'Like'}
-          aria-label={locale === 'zh' ? '点赞' : 'Like'}
+          title={t('chat.feedback.like', locale)}
+          aria-label={t('chat.feedback.like', locale)}
           aria-pressed={feedback.rating === 'like'}
         >
           {pendingRating === 'like' ? <IconLoader2 size={14} className="animate-spin" /> : <IconThumbUp size={14} />}
@@ -175,14 +177,14 @@ export function OpenAgentFeedback({
             setError('')
           }}
           disabled={pendingRating !== null}
-          title={locale === 'zh' ? '点踩' : 'Dislike'}
-          aria-label={locale === 'zh' ? '点踩' : 'Dislike'}
+          title={t('chat.feedback.dislike', locale)}
+          aria-label={t('chat.feedback.dislike', locale)}
           aria-pressed={feedback.rating === 'dislike'}
         >
           {pendingRating === 'dislike' ? <IconLoader2 size={14} className="animate-spin" /> : <IconThumbDown size={14} />}
         </button>
         {submitted && (
-          <span className="text-[#16803C]">{locale === 'zh' ? '已提交' : 'Submitted'}</span>
+          <span className="text-[#16803C]">{t('chat.feedback.submitted', locale)}</span>
         )}
       </div>
       {error && <span className="text-destructive">{error}</span>}
@@ -191,13 +193,13 @@ export function OpenAgentFeedback({
           <div className="w-full max-w-sm rounded-lg bg-white p-4 shadow-xl">
             <div className="mb-3 flex items-center justify-between gap-3">
               <div className="text-sm font-medium text-[#18181B]">
-                {locale === 'zh' ? '点踩原因' : 'Dislike reason'}
+                {t('chat.feedback.dislikeReason', locale)}
               </div>
               <button
                 type="button"
                 className="inline-flex h-7 w-7 items-center justify-center rounded-md text-[#71717A] hover:bg-[#F4F4F5]"
                 onClick={() => setCommentOpen(false)}
-                aria-label={locale === 'zh' ? '关闭' : 'Close'}
+                aria-label={t('chat.feedback.close', locale)}
               >
                 <IconX size={16} />
               </button>
@@ -207,7 +209,7 @@ export function OpenAgentFeedback({
               maxLength={500}
               onChange={(event) => setComment(event.target.value)}
               className="min-h-24 w-full resize-none rounded-md border border-[#E4E4E7] px-3 py-2 text-sm text-[#18181B] outline-none focus:border-[#4A8C5C]"
-              placeholder={locale === 'zh' ? '可选，告诉我们哪里没有解决问题' : 'Optional, tell us what was not helpful'}
+              placeholder={t('chat.feedback.commentPlaceholder', locale)}
             />
             <div className="mt-2 flex items-center justify-between gap-3 text-xs text-[#A1A1AA]">
               <span>{comment.length}/500</span>
@@ -217,7 +219,7 @@ export function OpenAgentFeedback({
                   className="rounded-md px-3 py-1.5 text-[#71717A] hover:bg-[#F4F4F5]"
                   onClick={() => setCommentOpen(false)}
                 >
-                  {locale === 'zh' ? '取消' : 'Cancel'}
+                  {t('chat.feedback.cancel', locale)}
                 </button>
                 <button
                   type="button"
@@ -226,8 +228,8 @@ export function OpenAgentFeedback({
                   onClick={() => void submit('dislike', comment.trim() || null)}
                 >
                   {pendingRating === 'dislike'
-                    ? (locale === 'zh' ? '提交中' : 'Submitting')
-                    : (locale === 'zh' ? '提交' : 'Submit')}
+                    ? t('chat.feedback.submitting', locale)
+                    : t('chat.feedback.submit', locale)}
                 </button>
               </div>
             </div>

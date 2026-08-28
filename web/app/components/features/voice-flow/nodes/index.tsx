@@ -3,7 +3,7 @@
  * Custom ReactFlow node visuals for the voice flow editor. All node types
  * live in this single file to keep the surface compact; each gets ~30 lines.
  */
-import { Handle, Position, useEdges, useNodes, type NodeProps } from '@xyflow/react'
+import { Handle, Position, useEdges, useNodeId, useNodes, type NodeProps } from '@xyflow/react'
 import {
   IconPlayerPlay,
   IconVolume,
@@ -79,6 +79,18 @@ function NodeCard({
   )
 }
 
+// Display title with a per-type ordinal (e.g. "纯语音 2") when the flow has
+// multiple nodes of the same type, so duplicates stay distinguishable.
+// Ordinal follows insertion order (nodes array order, persisted in the graph).
+function useOrdinalTitle(type: string, base: string): string {
+  const id = useNodeId()
+  const nodes = useNodes()
+  const sameType = nodes.filter((n) => n.type === type)
+  if (sameType.length < 2) return base
+  const idx = sameType.findIndex((n) => n.id === id)
+  return idx >= 0 ? `${base} ${idx + 1}` : base
+}
+
 // ──────────────── start ────────────────
 
 export function StartNodeView({ selected }: NodeProps) {
@@ -109,6 +121,7 @@ function PlayAudioPreview({ assetId }: { assetId: number }) {
 
 export function PlayNodeView({ data, selected }: NodeProps) {
   const d = data as PlayData
+  const title = useOrdinalTitle('play', '纯语音')
   const preview =
     d.prompt.kind === 'tts' ? (
       d.prompt.text || '未配置语音文案'
@@ -119,7 +132,7 @@ export function PlayNodeView({ data, selected }: NodeProps) {
     <NodeCard
       color={NODE_COLOR.play}
       icon={<IconVolume size={14} />}
-      title="纯语音"
+      title={title}
       badge="play"
       selected={selected}
     >
@@ -145,12 +158,13 @@ const COLLECT_OUTLETS: { key: 'success' | 'no_input' | 'no_match' | 'error'; lab
 
 export function CollectNodeView({ data, selected }: NodeProps) {
   const d = data as CollectData
+  const title = useOrdinalTitle('collect', '收集输入')
   const modeLabel = { single: '单位数字', multi: '多位数字', any: '任意按键' }[d.input.mode]
   return (
     <NodeCard
       color={NODE_COLOR.collect}
       icon={<IconKeyboard size={14} />}
-      title="收集输入"
+      title={title}
       badge="collect"
       selected={selected}
     >
@@ -178,11 +192,12 @@ export function CollectNodeView({ data, selected }: NodeProps) {
 
 export function ConditionNodeView({ data, selected }: NodeProps) {
   const d = data as ConditionData
+  const title = useOrdinalTitle('condition', '信息判定')
   return (
     <NodeCard
       color={NODE_COLOR.condition}
       icon={<IconGitBranch size={14} />}
-      title="信息判定"
+      title={title}
       badge="condition"
       selected={selected}
     >
@@ -237,11 +252,12 @@ export function AssignQueueNodeView({ data, selected }: NodeProps) {
   // workflow ends (user is now talking directly to the agent through the
   // kernel), so there's no `next` outlet — connecting `timeout` is only
   // required if you want a custom path when no agent picks up in time.
+  const title = useOrdinalTitle('assign_queue', '分配队列')
   return (
     <NodeCard
       color={NODE_COLOR.assign_queue}
       icon={<IconUserCheck size={14} />}
-      title="分配队列"
+      title={title}
       badge="assignQueue"
       selected={selected}
     >
@@ -326,11 +342,12 @@ export function VoiceSpeedNodeView({ id, data, selected }: NodeProps) {
   const handoffEdge = edges.find((e) => e.source === id && (e.sourceHandle ?? 'next') === 'handoff')
   const targetNode = handoffEdge ? nodes.find((n) => n.id === handoffEdge.target) : undefined
   const handoffConfigured = Boolean(handoffEdge && targetNode)
+  const title = useOrdinalTitle('voicespeed', 'VoiceSpeed')
   return (
     <NodeCard
       color={NODE_COLOR.voicespeed}
       icon={<IconRobot size={14} />}
-      title="VoiceSpeed"
+      title={title}
       badge="voicespeed"
       selected={selected}
     >
@@ -357,6 +374,7 @@ export function VoiceSpeedNodeView({ id, data, selected }: NodeProps) {
 
 export function HangupNodeView({ data, selected }: NodeProps) {
   const d = data as HangupData
+  const title = useOrdinalTitle('hangup', '挂断')
   return (
     <div
       className="relative flex h-10 items-center gap-2 rounded-full px-4 text-sm text-white shadow"
@@ -366,7 +384,7 @@ export function HangupNodeView({ data, selected }: NodeProps) {
       }}
     >
       <IconPhoneOff size={16} />
-      <span className="font-medium">挂断</span>
+      <span className="font-medium">{title}</span>
       {d.pre_play && <span className="text-[10px] opacity-80">含播报</span>}
       <Handle
         type="target"

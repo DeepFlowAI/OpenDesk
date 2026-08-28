@@ -11,6 +11,7 @@ import { richTextPreview } from '@/lib/rich-text-message'
 import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
 import { SessionDetailDrawer } from '@/app/components/features/session-records/session-detail-drawer'
 import type { Conversation, Message, WorkspaceConversationHistoryItem } from '@/models/conversation'
+import type { Locale } from '@/lib/languages'
 
 type Props = {
   conversation: Conversation | null
@@ -31,7 +32,7 @@ function useDebouncedValue(value: string): string {
   return debounced
 }
 
-function formatPanelTime(dateStr: string | null | undefined, locale: 'zh' | 'en'): string {
+function formatPanelTime(dateStr: string | null | undefined, locale: Locale): string {
   if (!dateStr) return locale === 'zh' ? '未知时间' : 'Unknown time'
   const date = new Date(dateStr)
   return date.toLocaleString(locale === 'zh' ? 'zh-CN' : 'en-US', {
@@ -76,7 +77,7 @@ function highlightText(text: string, keyword: string) {
   ))
 }
 
-function senderLabel(message: Message, locale: 'zh' | 'en'): string {
+function senderLabel(message: Message, locale: Locale): string {
   if (isWelcomeLikeContentType(message.content_type)) return locale === 'zh' ? '欢迎语' : 'Welcome'
   if (message.sender_name) return message.sender_name
   if (message.sender_type === 'visitor') return locale === 'zh' ? '访客' : 'Visitor'
@@ -85,7 +86,7 @@ function senderLabel(message: Message, locale: 'zh' | 'en'): string {
   return locale === 'zh' ? '系统' : 'System'
 }
 
-function renderMessageContent(message: Message, keyword: string, locale: 'zh' | 'en') {
+function renderMessageContent(message: Message, keyword: string, locale: Locale) {
   if (message.content_type === 'image') return t('ws.chat.image', locale)
   if (message.content_type === 'file') return locale === 'zh' ? '[文件]' : '[File]'
   if (message.content_type === 'rich_text' || isWelcomeLikeContentType(message.content_type)) {
@@ -95,7 +96,7 @@ function renderMessageContent(message: Message, keyword: string, locale: 'zh' | 
   return highlightText(message.content, keyword)
 }
 
-function conversationTitle(conversation: WorkspaceConversationHistoryItem, locale: 'zh' | 'en'): string {
+function conversationTitle(conversation: WorkspaceConversationHistoryItem, locale: Locale): string {
   const startedAt = formatPanelTime(
     conversation.started_at || conversation.created_at || conversation.last_message_at,
     locale,
@@ -113,7 +114,7 @@ function ConversationBlock({
 }: {
   conversation: WorkspaceConversationHistoryItem
   keyword: string
-  locale: 'zh' | 'en'
+  locale: Locale
   onOpenDetail: (recordId: number) => void
 }) {
   const visibleMessages = useMemo(

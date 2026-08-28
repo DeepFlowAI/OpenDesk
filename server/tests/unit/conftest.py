@@ -26,3 +26,23 @@ def _block_real_asyncpg_connect(monkeypatch):
         raise RuntimeError(_GUARD_MESSAGE)
 
     monkeypatch.setattr(asyncpg, "connect", _forbidden)
+
+
+@pytest.fixture(autouse=True)
+def _stub_call_trajectory_telemetry(monkeypatch):
+    """Keep best-effort trajectory telemetry from opening DB sessions in unit tests."""
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallTrajectoryService.append_for_call_id_best_effort",
+        _noop,
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordService.mark_reception_transferred_managed",
+        _noop,
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordService.mark_reception_started",
+        _noop,
+    )

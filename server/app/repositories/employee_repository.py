@@ -237,10 +237,16 @@ class EmployeeRepository:
         if role_id_filters:
             normalized_role_ids = [role_id for role_id in dict.fromkeys(role_id_filters) if role_id > 0]
             if normalized_role_ids:
-                base = base.join(
-                    EmployeeRole,
-                    EmployeeRole.employee_id == Employee.id,
-                ).where(EmployeeRole.role_id.in_(normalized_role_ids)).distinct()
+                # IN-subquery instead of JOIN + DISTINCT: DISTINCT on employees.*
+                # fails on PostgreSQL because `roles` / `preferences` are json
+                # (no equality operator). The subquery only needs employee ids.
+                base = base.where(
+                    Employee.id.in_(
+                        select(EmployeeRole.employee_id).where(
+                            EmployeeRole.role_id.in_(normalized_role_ids)
+                        )
+                    )
+                )
 
         if status == "active":
             base = base.where(Employee.is_active.is_(True))

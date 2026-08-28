@@ -29,6 +29,7 @@ import {
   operatorsForFieldType,
   valueShape,
 } from '@/components/filter'
+import type { Locale } from '@/lib/languages'
 
 export type FieldOption = {
   value: string
@@ -116,7 +117,7 @@ function resolveFieldName(
 }
 
 function buildSummary(
-  rule: FdInteractionRule, locale: 'zh' | 'en', fields: FieldOption[],
+  rule: FdInteractionRule, locale: Locale, fields: FieldOption[],
 ): string {
   const conds = (rule.conditions ?? [])
     .map((c) => {
@@ -396,7 +397,7 @@ function RuleEditDrawer({
   isSaving,
   availableFields,
 }: {
-  locale: 'zh' | 'en'
+  locale: Locale
   draft: DraftRule
   setDraft: (fn: DraftRule | ((d: DraftRule | null) => DraftRule | null)) => void
   onSave: () => void

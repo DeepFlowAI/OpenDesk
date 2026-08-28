@@ -25,6 +25,7 @@ import {
 } from '@/types/field-enums'
 import type { UnifiedField } from '@/models/field-definition'
 import type { FieldType as FieldTypeEnum } from '@/types/field-enums'
+import type { Locale } from '@/lib/languages'
 
 function ConfirmModal({
   title,
@@ -68,8 +69,8 @@ function ConfirmModal({
   )
 }
 
-function SourceBadge({ source, locale }: { source: string; locale: 'zh' | 'en' }) {
-  const label = FIELD_SOURCE_LABELS[source as keyof typeof FIELD_SOURCE_LABELS]?.[locale] ?? source
+function SourceBadge({ source, locale }: { source: string; locale: Locale }) {
+  const label = FIELD_SOURCE_LABELS[source as keyof typeof FIELD_SOURCE_LABELS]?.[locale === 'zh' ? 'zh' : 'en'] ?? source
   const isSystem = source === FieldSource.SYSTEM
   return (
     <span
@@ -82,7 +83,7 @@ function SourceBadge({ source, locale }: { source: string; locale: 'zh' | 'en' }
   )
 }
 
-function StatusBadge({ status, locale }: { status: string; locale: 'zh' | 'en' }) {
+function StatusBadge({ status, locale }: { status: string; locale: Locale }) {
   const isActive = status === 'active'
   const label = isActive ? t('uf.status.active', locale) : t('uf.status.inactive', locale)
   return (
@@ -372,7 +373,7 @@ export default function UserFieldsListPage() {
                   {sortItems.map((field) => {
                     const isCustom = field.source === 'custom'
                     const typeLabel =
-                      FIELD_TYPE_LABELS[field.field_type as FieldTypeEnum]?.[locale] ?? field.field_type
+                      FIELD_TYPE_LABELS[field.field_type as FieldTypeEnum]?.[locale === 'zh' ? 'zh' : 'en'] ?? field.field_type
                     const uid = fieldUid(field)
                     return (
                       <SortableFieldTableRow
@@ -412,7 +413,7 @@ export default function UserFieldsListPage() {
                 items.map((field, idx) => {
                   const isCustom = field.source === 'custom'
                   const typeLabel =
-                    FIELD_TYPE_LABELS[field.field_type as FieldTypeEnum]?.[locale] ?? field.field_type
+                    FIELD_TYPE_LABELS[field.field_type as FieldTypeEnum]?.[locale === 'zh' ? 'zh' : 'en'] ?? field.field_type
 
                   return (
                     <div

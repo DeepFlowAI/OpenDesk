@@ -10,7 +10,7 @@ import { json } from '@codemirror/lang-json'
 import { okaidiaInit } from '@uiw/codemirror-theme-okaidia'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
-import type { AssistPanelConfigValue, ChannelConfig, ChannelCustomButton, CreateChannelPayload } from '@/models/channel'
+import type { AssistPanelConfigValue, Channel, ChannelConfig, ChannelCustomButton, ChannelFormMessageConfig, CreateChannelPayload } from '@/models/channel'
 import { useChannel, useCreateChannel, useUpdateChannel } from '@/service/use-channels'
 import { useOpenAgentAgents, useOpenAgentAttachmentHandoffStatus, useOpenAgentSettings } from '@/service/use-open-agent-settings'
 import { useServiceHours } from '@/service/use-service-hours'
@@ -34,6 +34,9 @@ import {
   type AssistPanelEventName,
   type AssistPanelStatus,
 } from '@/app/components/features/visitor-chat/assist-panel-runtime'
+import { LANGUAGE_OPTIONS, type Locale } from '@/lib/languages'
+import { FormMessageSettings } from '@/app/components/features/channels/form-message-settings'
+import { validateFormMessageConfig } from '@/lib/form-message-fields'
 
 const DEFAULT_OFFLINE_TITLE = '当前客服不在线'
 const DEFAULT_OFFLINE_MESSAGE = '您好，当前客服不在线，您可以稍后再来咨询，我们会尽快为您服务。'
@@ -46,6 +49,15 @@ const DEFAULT_QUEUE_FULL_LEAVE_MESSAGE_BUTTON_LABEL = '留言'
 const QUEUE_COUNT_VARIABLE = '{{current_queue_count}}'
 const DEFAULT_OPEN_AGENT_INPUT_PLACEHOLDER = '输入消息...'
 const DEFAULT_OPEN_AGENT_HANDOFF_LABEL = '转人工'
+const DEFAULT_FORM_MESSAGE_CONFIG: ChannelFormMessageConfig = {
+  title: '请留下您的信息',
+  description: '请填写以下信息，我们会尽快与您联系。',
+  submit_label: '提交',
+  success_title: '提交成功',
+  success_description: '我们已收到您的信息，会尽快与您联系。',
+  show_ticket_number: true,
+  fields: [],
+}
 const MAX_CUSTOM_BUTTONS = 8
 const DEFAULT_ASSIST_PANEL_CODE = `export default function AssistApp({ api, status, config }) {
   const items = Array.isArray(config.items) ? config.items : []
@@ -116,12 +128,17 @@ const DEFAULT_CONFIG: ChannelConfig = {
   embed_button_icon_color: null,
   send_button_bg_color: null,
   input_placeholder: null,
+  language_strategy: 'browser',
+  default_language: 'en',
   service_hours_enabled: false,
   service_hours_id: null,
   outside_service_hours_strategy: 'offline_message',
   offline_title: DEFAULT_OFFLINE_TITLE,
   offline_message: DEFAULT_OFFLINE_MESSAGE,
   leave_message_prompt: DEFAULT_LEAVE_MESSAGE_PROMPT,
+  leave_message_mode: 'conversation',
+  form_message_config: DEFAULT_FORM_MESSAGE_CONFIG,
+  form_message_config_version: null,
   restricted_service_message: DEFAULT_RESTRICTED_SERVICE_MESSAGE,
   queue_message: DEFAULT_QUEUE_MESSAGE,
   queue_full_message: DEFAULT_QUEUE_FULL_MESSAGE,
@@ -225,7 +242,7 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
-function validateCustomButtonGroup(buttons: ChannelCustomButton[], locale: 'zh' | 'en'): string | null {
+function validateCustomButtonGroup(buttons: ChannelCustomButton[], locale: Locale): string | null {
   if (buttons.length > MAX_CUSTOM_BUTTONS) return t('ch.form.customButtons.maxCount', locale)
   for (let i = 0; i < buttons.length; i += 1) {
     const button = normalizeCustomButton(buttons[i])
@@ -481,6 +498,30 @@ function stripHtml(value: string): string {
 
 function formatAssistPanelConfig(value: Record<string, AssistPanelConfigValue> | null | undefined): string {
   return JSON.stringify(value && typeof value === 'object' ? value : {}, null, 2)
+}
+
+// Single source of truth for shaping a server channel into form state and its
+// dirty-check snapshot: the backend may rewrite config fields on save (e.g.
+// bump form_message_config_version), so snapshots must derive from server data.
+function buildChannelFormState(channel: Channel) {
+  const config: ChannelConfig = {
+    ...DEFAULT_CONFIG,
+    ...channel.config,
+    form_message_config: {
+      ...DEFAULT_FORM_MESSAGE_CONFIG,
+      ...channel.config.form_message_config,
+    },
+  }
+  const assistPanelConfigText = formatAssistPanelConfig(channel.config.assist_panel_config)
+  const snapshot = JSON.stringify({
+    name: channel.name.trim(),
+    access_mode: channel.access_mode ?? 'url',
+    logo_url: channel.logo_url ?? null,
+    favicon_url: channel.favicon_url ?? null,
+    config,
+    assist_panel_config_text: assistPanelConfigText,
+  })
+  return { config, assistPanelConfigText, snapshot }
 }
 
 function isAssistPanelConfig(value: unknown): value is Record<string, AssistPanelConfigValue> {
@@ -853,6 +894,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   const [offlineTitleError, setOfflineTitleError] = useState('')
   const [offlineMessageError, setOfflineMessageError] = useState('')
   const [leaveMessagePromptError, setLeaveMessagePromptError] = useState('')
+  const [formMessageError, setFormMessageError] = useState('')
   const [restrictedServiceMessageError, setRestrictedServiceMessageError] = useState('')
   const [queueMessageError, setQueueMessageError] = useState('')
   const [queueFullMessageError, setQueueFullMessageError] = useState('')
@@ -886,12 +928,13 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   useEffect(() => {
     if (isNew) { if (!initialized) setInitialized(true); return }
     if (!channel || initialized) return
+    const initialState = buildChannelFormState(channel)
     setName(channel.name)
     setAccessMode(channel.access_mode === 'embed' ? 'embed' : 'url')
     setLogoUrl(channel.logo_url ?? '')
     setFaviconUrl(channel.favicon_url ?? '')
-    setConfig({ ...DEFAULT_CONFIG, ...channel.config })
-    setAssistPanelConfigText(formatAssistPanelConfig(channel.config.assist_panel_config))
+    setConfig(initialState.config)
+    setAssistPanelConfigText(initialState.assistPanelConfigText)
     setAssistPanelPreviewConfig(channel.config.assist_panel_config ?? {})
     setSavedChannelKey(channel.channel_key)
     setInitialized(true)
@@ -901,16 +944,7 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
   useEffect(() => {
     if (isNew) { setSavedSnapshot(''); return }
     if (channel && initialized) {
-      setSavedSnapshot(
-        JSON.stringify({
-          name: channel.name.trim(),
-          access_mode: channel.access_mode ?? 'url',
-          logo_url: channel.logo_url ?? null,
-          favicon_url: channel.favicon_url ?? null,
-          config: { ...DEFAULT_CONFIG, ...channel.config },
-          assist_panel_config_text: formatAssistPanelConfig(channel.config.assist_panel_config),
-        }),
-      )
+      setSavedSnapshot(buildChannelFormState(channel).snapshot)
     }
   }, [isNew, channel, initialized])
 
@@ -1027,6 +1061,17 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
     setAssistPanelCodeError('')
     setAssistPanelConfigError('')
     setAssistPanelPreviewStatus('')
+    if (config.leave_message_mode === 'form') {
+      const validationKey = validateFormMessageConfig(config.form_message_config)
+      const validationMessage = validationKey
+        ? t(`ch.form.formMessage.error.${validationKey}`, locale)
+        : formMessageError
+      if (validationMessage) {
+        setActiveTab('service')
+        setFormMessageError(validationMessage)
+        return
+      }
+    }
 
     const assistTitle = config.assist_panel_title?.trim() ?? ''
     const assistCode = config.assist_panel_react_code?.trim() ?? ''
@@ -1236,7 +1281,6 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       const parsed = parseAssistPanelConfig(assistPanelConfigText)
       if (parsed.ok) assistPanelConfig = parsed.value
     }
-    const nextAssistPanelConfigText = formatAssistPanelConfig(assistPanelConfig)
     const nextConfig = {
       ...config,
       outside_service_hours_strategy: config.outside_service_hours_strategy,
@@ -1274,23 +1318,24 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
       favicon_url: faviconUrl.trim() || null,
       config: nextConfig,
     }
-    const snap = JSON.stringify({ name: trimmed, access_mode: accessMode, logo_url: body.logo_url ?? null, favicon_url: body.favicon_url ?? null, config: nextConfig, assist_panel_config_text: nextAssistPanelConfigText })
     try {
       if (isNew || !savedId) {
         const created = await createMut.mutateAsync(body)
+        const synced = buildChannelFormState(created)
         setSavedId(created.id)
         setSavedChannelKey(created.channel_key)
-        setConfig(nextConfig)
-        setAssistPanelConfigText(nextAssistPanelConfigText)
-        setAssistPanelPreviewConfig(assistPanelConfig)
-        setSavedSnapshot(snap)
+        setConfig(synced.config)
+        setAssistPanelConfigText(synced.assistPanelConfigText)
+        setAssistPanelPreviewConfig(created.config.assist_panel_config ?? {})
+        setSavedSnapshot(synced.snapshot)
         router.replace(`/channels/web/${created.id}`)
       } else {
-        await updateMut.mutateAsync({ id: savedId, data: body })
-        setConfig(nextConfig)
-        setAssistPanelConfigText(nextAssistPanelConfigText)
-        setAssistPanelPreviewConfig(assistPanelConfig)
-        setSavedSnapshot(snap)
+        const updated = await updateMut.mutateAsync({ id: savedId, data: body })
+        const synced = buildChannelFormState(updated)
+        setConfig(synced.config)
+        setAssistPanelConfigText(synced.assistPanelConfigText)
+        setAssistPanelPreviewConfig(updated.config.assist_panel_config ?? {})
+        setSavedSnapshot(synced.snapshot)
       }
     } catch { /* error handled by mutation */ }
   }
@@ -1375,7 +1420,46 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
 
           <Separator />
 
-          {/* ── Section 2: Appearance ── */}
+          {/* ── Section 2: Language ── */}
+          <SectionTitle>{t('ch.section.language', locale)}</SectionTitle>
+          <div className="flex flex-col gap-2">
+            <FieldLabel label={t('ch.form.languageStrategy', locale)} required />
+            <SegmentedControl
+              options={[
+                { value: 'browser' as const, label: t('ch.form.languageStrategy.browser', locale) },
+                { value: 'fixed' as const, label: t('ch.form.languageStrategy.fixed', locale) },
+              ]}
+              value={config.language_strategy}
+              onChange={(value) => updateConfig('language_strategy', value)}
+            />
+            <p className="text-xs leading-5 text-muted-foreground">
+              {t('ch.form.languageStrategy.hint', locale)}
+            </p>
+          </div>
+          <div className="flex flex-col gap-2">
+            <FieldLabel label={t('ch.form.defaultLanguage', locale)} required />
+            <select
+              value={config.default_language}
+              onChange={(event) => updateConfig('default_language', event.target.value as ChannelConfig['default_language'])}
+              className="h-10 w-full rounded-lg border border-border bg-white px-3.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            >
+              {LANGUAGE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+            <p className="text-xs leading-5 text-muted-foreground">
+              {t(
+                config.language_strategy === 'browser'
+                  ? 'ch.form.defaultLanguage.browserHint'
+                  : 'ch.form.defaultLanguage.fixedHint',
+                locale,
+              )}
+            </p>
+          </div>
+
+          <Separator />
+
+          {/* ── Section 3: Appearance ── */}
           <SectionTitle>{t('ch.section.appearance', locale)}</SectionTitle>
 
           {/* Sub: Page background */}
@@ -1895,6 +1979,15 @@ export function ChannelForm({ channelId }: ChannelFormProps) {
                   onErrorClear={() => setHumanCustomButtonsError('')}
                 />
               </div>
+
+              <FormMessageSettings
+                mode={config.leave_message_mode}
+                config={config.form_message_config}
+                error={formMessageError}
+                onModeChange={(mode) => updateConfig('leave_message_mode', mode)}
+                onChange={(formConfig) => updateConfig('form_message_config', formConfig)}
+                onValidationChange={setFormMessageError}
+              />
 
               <div className="rounded-lg border border-border bg-card p-5">
                 <div className="flex items-start justify-between gap-6">

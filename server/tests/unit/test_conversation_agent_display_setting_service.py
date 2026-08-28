@@ -83,3 +83,47 @@ def test_resolve_agent_name_falls_back_when_nickname_missing():
     result = ConversationAgentDisplaySettingService.resolve_agent_name(agent, "nickname")
 
     assert result == "Name"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("display_mode", "expected_name"),
+    [("name", "Legal Name"), ("nickname", "Nick")],
+)
+async def test_get_agent_target_uses_configured_display_mode(
+    monkeypatch,
+    display_mode: str,
+    expected_name: str,
+):
+    setting = SimpleNamespace(
+        id=5,
+        tenant_id=12,
+        display_mode=display_mode,
+        updated_by_id=7,
+        updated_by_name="Admin",
+        updated_at=datetime.now(timezone.utc),
+    )
+    agent = SimpleNamespace(
+        tenant_id=12,
+        display_name="Legal Name",
+        name="Name",
+        nickname="Nick",
+        username="user",
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_agent_display_setting_service.ConversationAgentDisplaySettingRepository.get_by_tenant",
+        AsyncMock(return_value=setting),
+    )
+    monkeypatch.setattr(
+        "app.services.conversation_agent_display_setting_service.EmployeeRepository.get_by_id",
+        AsyncMock(return_value=agent),
+    )
+
+    result = await ConversationAgentDisplaySettingService.get_agent_target(
+        AsyncMock(),
+        tenant_id=12,
+        agent_id=7,
+    )
+
+    assert result.display_mode == display_mode
+    assert result.sender_name == expected_name

@@ -38,7 +38,33 @@ vi.mock('@/app/components/features/chat/message-attachment', async () => {
   }
 })
 
-import { MessageBubble, resolveVisitorVisibleMessageStatus } from './message-bubble'
+import {
+  MessageBubble,
+  resolveOpenAgentToolLabel,
+  resolveVisitorAssistantName,
+  resolveVisitorVisibleMessageStatus,
+} from './message-bubble'
+
+describe('visitor OpenAgent localization', () => {
+  it.each([
+    ['工具调用', '', 'Tool call'],
+    ['调用工具', '', 'Tool call'],
+    ['调用 search_docs', 'search_docs', 'search_docs'],
+  ])('replaces generated Chinese tool label %s', (brief, toolName, expected) => {
+    expect(resolveOpenAgentToolLabel(brief, toolName, 'en')).toBe(expected)
+  })
+
+  it('keeps bot-provided tool copy unchanged', () => {
+    expect(resolveOpenAgentToolLabel('Searching the knowledge base', 'search_docs', 'en')).toBe(
+      'Searching the knowledge base',
+    )
+  })
+
+  it('localizes only the default Chinese assistant name', () => {
+    expect(resolveVisitorAssistantName('bot', '智能助手', 'en')).toBe('Bot')
+    expect(resolveVisitorAssistantName('bot', 'Acme Assistant', 'en')).toBe('Acme Assistant')
+  })
+})
 
 describe('visitor file messages', () => {
   it('enables inline video playback on the shared attachment renderer', () => {

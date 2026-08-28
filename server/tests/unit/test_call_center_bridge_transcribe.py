@@ -61,3 +61,9 @@ async def test_flowkit_client_omits_transcribe_when_true():
         "call.bridge",
         {"call_id": "c1", "other_call_id": "c2", "transcribe": False},
     )
+
+    await client.call_bridge("c1", "c2", user_call_id="c1")
+    assert sent[-1] == (
+        "call.bridge",
+        {"call_id": "c1", "other_call_id": "c2", "user_call_id": "c1"},
+    )

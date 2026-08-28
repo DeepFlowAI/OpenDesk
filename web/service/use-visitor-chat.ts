@@ -66,6 +66,7 @@ export type LeaveQueuedConversationMessageResponse = {
   queue_type: OfflineMessageQueueType
   queue_id: number
   leave_message_prompt: string
+  deferred?: boolean
 }
 
 const visitorEnvironmentJson = (environment?: VisitorEnvironmentPayload | null) => ({

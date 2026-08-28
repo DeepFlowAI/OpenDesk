@@ -118,10 +118,17 @@ class SipTrunkService:
                 status_code=409,
                 code="DUPLICATE_TRUNK_NAME",
             )
+        trunk_id = (payload.id or "").strip() or f"trunk_{uuid.uuid4().hex[:12]}"
+        if await SipTrunkRepository.get_by_id(db, trunk_id):
+            raise BusinessError(
+                "SIP trunk id already exists",
+                status_code=409,
+                code="DUPLICATE_TRUNK_ID",
+            )
         row = await SipTrunkRepository.create(
             db,
             {
-                "id": f"trunk_{uuid.uuid4().hex[:12]}",
+                "id": trunk_id,
                 "supplier_name": payload.supplier_name.strip(),
                 "trunk_name": payload.trunk_name.strip(),
                 "trunk_types": list(payload.trunk_types),

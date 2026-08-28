@@ -42,6 +42,15 @@ export function knowledgeDocumentHasComposerSendableContent(
   return knowledgeDocumentHasComposerBody(document, contentType) || document.attachments.length > 0
 }
 
+export function knowledgeDocumentHasInlineImage(document: KnowledgeDocument): boolean {
+  return /<img\b/i.test(document.content_html)
+}
+
+/** Image/attachment articles need a preview dialog in the composer suggestion flow. */
+export function knowledgeDocumentNeedsSuggestionDialog(document: KnowledgeDocument): boolean {
+  return knowledgeDocumentHasInlineImage(document) || document.attachments.length > 0
+}
+
 export function buildKnowledgeSendPlan(params: {
   messageHtml: string
   messageText: string

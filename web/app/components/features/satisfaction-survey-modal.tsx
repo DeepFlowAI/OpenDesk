@@ -3,6 +3,8 @@
 import { useMemo, useState, type CSSProperties } from 'react'
 import { IconLoader2, IconStar, IconX } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
+import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import type {
   SatisfactionSubmissionPayload,
   SatisfactionSurveyRecord,
@@ -10,8 +12,6 @@ import type {
   SatisfactionTypeSettings,
   ServiceSatisfactionSettings,
 } from '@/models/satisfaction-survey'
-
-type Locale = 'zh' | 'en' | string
 
 type FormValue = {
   rating_option_key: string
@@ -40,8 +40,8 @@ const EMPTY_VALUE: FormValue = {
 const EMOJI_RATING_ICONS = ['😡', '😐', '😀']
 
 function typeLabel(type: SatisfactionSurveyType, locale: Locale) {
-  if (type === 'service') return locale === 'zh' ? '服务满意度' : 'Service satisfaction'
-  return locale === 'zh' ? '产品满意度' : 'Product satisfaction'
+  if (type === 'service') return t('chat.survey.serviceSatisfaction', locale)
+  return t('chat.survey.productSatisfaction', locale)
 }
 
 function selectedOption(settings: SatisfactionTypeSettings, optionKey: string) {
@@ -59,16 +59,16 @@ function validateSection(
   locale: Locale,
 ): string | null {
   const option = selectedOption(settings, value.rating_option_key)
-  if (!option) return locale === 'zh' ? '请选择评分' : 'Please select a rating'
+  if (!option) return t('chat.survey.validation.rating', locale)
   if (type === 'service' && (settings as ServiceSatisfactionSettings).show_resolution && value.resolved === null) {
-    return locale === 'zh' ? '请选择是否解决' : 'Please select whether the issue was resolved'
+    return t('chat.survey.validation.resolved', locale)
   }
   const remarkEnabled = settings.remark_enabled !== false
   if (remarkEnabled && option.remark_requirement === 'required' && !value.remark.trim()) {
-    return locale === 'zh' ? '请填写备注' : 'Please enter a comment'
+    return t('chat.survey.validation.comment', locale)
   }
   if (remarkEnabled && value.remark.length > 500) {
-    return locale === 'zh' ? '备注最多 500 字' : 'Comment can be up to 500 characters'
+    return t('chat.survey.validation.commentMax', locale)
   }
   return null
 }
@@ -197,14 +197,14 @@ function ResolutionSelector({
   onChange: (value: FormValue) => void
 }) {
   const options = [
-    { label: locale === 'zh' ? '解决' : 'Resolved', value: true },
-    { label: locale === 'zh' ? '未解决' : 'Unresolved', value: false },
+    { label: t('chat.survey.resolved', locale), value: true },
+    { label: t('chat.survey.unresolved', locale), value: false },
   ]
 
   return (
     <div className="flex flex-col items-center gap-2 text-center">
       <span className="text-sm font-medium text-foreground">
-        {locale === 'zh' ? '是否解决' : 'Issue resolved'}
+        {t('chat.survey.issueResolved', locale)}
       </span>
       <div className="flex justify-center gap-2">
         {options.map((item) => (
@@ -327,7 +327,7 @@ function SectionEditor({
         <textarea
           value={value.remark}
           onChange={(e) => onChange({ ...value, remark: e.target.value.slice(0, 500) })}
-          placeholder={settings.remark_placeholder || (locale === 'zh' ? '请输入您的评价（选填）' : 'Share your feedback (optional)')}
+          placeholder={settings.remark_placeholder || t('chat.survey.remarkPlaceholder', locale)}
           className="min-h-20 w-full resize-none rounded-md border border-border bg-white p-3 text-sm text-foreground outline-none placeholder:text-muted-foreground focus:ring-1 focus:ring-ring"
         />
       )}
@@ -352,9 +352,9 @@ export function SatisfactionSurveyModal({
   const [sectionErrors, setSectionErrors] = useState<Record<string, string | null>>({})
   const snapshot = record.config_snapshot
   const surveyTypes = record.survey_types
-  const modalTitle = locale === 'zh' ? '满意度评价' : 'Rate your experience'
-  const submitText = locale === 'zh' ? '提交评价' : 'Submit'
-  const laterText = locale === 'zh' ? '稍后评价' : 'Maybe later'
+  const modalTitle = t('chat.survey.title', locale)
+  const submitText = t('chat.survey.submit', locale)
+  const laterText = t('chat.survey.later', locale)
   const sendButtonStyle = {
     '--opendesk-send-button-bg': sendButtonBgColor || 'var(--color-primary)',
   } as CSSProperties
@@ -407,7 +407,7 @@ export function SatisfactionSurveyModal({
             type="button"
             onClick={onClose}
             className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
-            aria-label={locale === 'zh' ? '关闭' : 'Close'}
+            aria-label={t('chat.survey.close', locale)}
           >
             <IconX size={18} />
           </button>
@@ -416,7 +416,7 @@ export function SatisfactionSurveyModal({
         <div className="px-4 py-1">
           {success ? (
             <div className="py-10 text-center text-sm font-medium text-foreground">
-              {locale === 'zh' ? '感谢评价' : 'Thanks for your feedback'}
+              {t('chat.survey.thanks', locale)}
             </div>
           ) : (
             <>

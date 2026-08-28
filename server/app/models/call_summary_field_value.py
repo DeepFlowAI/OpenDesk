@@ -1,7 +1,7 @@
 """
 CallSummaryFieldValue model - per-call-record values for call summary forms.
 """
-from sqlalchemy import ForeignKey, Index, Integer, String, text
+from sqlalchemy import BigInteger, ForeignKey, Index, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -36,7 +36,7 @@ class CallSummaryFieldValue(Base, TimestampMixin):
         Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     call_record_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("call_records.id", ondelete="CASCADE"), nullable=False
+        BigInteger, ForeignKey("call_records.id", ondelete="CASCADE"), nullable=False
     )
     field_definition_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("fd_field_definitions.id", ondelete="CASCADE"), nullable=True

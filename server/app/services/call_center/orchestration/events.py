@@ -5,15 +5,76 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
-
-from app.constants.call_center import ACTIVE_CALL_RECORD_STATES
 
 if TYPE_CHECKING:
     from app.libs.telephony import CallEvent
 
 
+def _recording_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
 class EventHandlersMixin:
+
+    async def _reconcile_active_call_ids(self) -> tuple[set[str], bool]:
+        """Return active calls across every configured blue/green color.
+
+        The stable entry only sees the newly active color. A short-lived,
+        read-only query of both color endpoints prevents an API restart during
+        drain from declaring old-color calls ended. Cleanup is allowed only
+        when every configured endpoint answered successfully.
+        """
+        from app.configs.settings import settings
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        urls = [
+            value.strip()
+            for value in settings.TELEPHONY_RECONCILE_WS_URLS.split(",")
+            if value.strip()
+        ]
+        if not urls:
+            calls = await self.telephony.call_list()
+            return {str(c["call_id"]) for c in calls if c.get("call_id")}, True
+
+        active: set[str] = set()
+        complete = True
+        for url in urls:
+            client = FlowKitTelephonyClient(
+                ws_url=url,
+                sdk_name=f"{settings.TELEPHONY_SDK_NAME}-reconcile",
+                sdk_version=settings.TELEPHONY_SDK_VERSION,
+                rpc_timeout=min(settings.TELEPHONY_RPC_TIMEOUT, 5.0),
+            )
+            try:
+                await asyncio.wait_for(client._open_and_handshake(), timeout=5.0)
+                client._start_recv_loop()
+                calls = await client.call_list()
+                active.update(str(c["call_id"]) for c in calls if c.get("call_id"))
+            except ConnectionRefusedError:
+                # A stopped color has no surviving calls. This is the normal
+                # single-active steady state, not an incomplete snapshot.
+                continue
+            except Exception as exc:  # noqa: BLE001
+                complete = False
+                _orch.logger.warning(
+                    "Reconnect reconcile endpoint unavailable url=%s err=%s; "
+                    "stale calls will not be released in this pass",
+                    url,
+                    exc,
+                )
+            finally:
+                await client.disconnect()
+        return active, complete
 
     # ────────────────── Event handlers ──────────────────
 
@@ -112,6 +173,37 @@ class EventHandlersMixin:
         if not call_id:
             return
 
+        to_extension = data.get("to", "").replace("sip:", "").split("@")[0]
+        if self._personal_outbound_extensions and not to_extension:
+            pending_extension = next(iter(self._personal_outbound_extensions))
+            self._personal_outbound_extensions.discard(pending_extension)
+            _orch.logger.info(
+                "Skipping call.incoming for pending personal outbound extension=%s call_id=%s",
+                pending_extension,
+                call_id,
+            )
+            return
+        if to_extension in self._personal_outbound_extensions:
+            self._personal_outbound_extensions.discard(to_extension)
+            _orch.logger.info(
+                "Skipping call.incoming for personal outbound extension=%s call_id=%s",
+                to_extension,
+                call_id,
+            )
+            return
+
+        if self.personal_auto_outbound.owns_call(call_id):
+            _orch.logger.info(
+                "Skipping call.incoming for personal outbound call_id=%s", call_id
+            )
+            return
+
+        if data.get("direction") == "outbound":
+            _orch.logger.info(
+                "Skipping call.incoming for outbound call_id=%s", call_id
+            )
+            return
+
         # FlowKit pushes `call.incoming` for BOTH inbound SIP calls AND any
         # agent-side `webrtc.offer`. We only orchestrate the customer-side
         # orchestrate the customer-side SIP legs here; agent WebRTC legs are
@@ -177,12 +269,24 @@ class EventHandlersMixin:
             return
 
         t0 = time.perf_counter()
+        routing_started_at = datetime.now(timezone.utc)
 
         # Per-DID tenant routing: bind the call to the tenant that owns the
-        # dialed number. Fall back to the single default tenant when the DID
-        # isn't in the catalog (keeps single-tenant deployments working).
+        # dialed number. When this environment shares FlowKit with another
+        # OpenDesk, skip unknown/unassigned DIDs so the owner environment
+        # can answer. Otherwise fall back to the default tenant (OSS).
         tenant_id = await self._resolve_tenant_id_for_did(to_number)
         if tenant_id is None:
+            from app.configs.settings import settings
+
+            if settings.CALL_CENTER_SKIP_UNOWNED_DID:
+                _orch.logger.info(
+                    "Skipping call.incoming call_id=%s to=%s — DID not assigned here",
+                    call_id,
+                    to_number,
+                )
+                await self._release_call(call_id)
+                return
             tenant_id = await self._resolve_tenant_id()
         if tenant_id is None:
             _orch.logger.warning("Inbound call %s: no tenant resolved; hanging up", call_id)
@@ -234,6 +338,67 @@ class EventHandlersMixin:
                 voice_flow_version_id=voice_flow_version_id,
                 identify_user=False,
             )
+            from app.services.call_trajectory_service import CallTrajectoryService
+
+            await CallTrajectoryService.append_for_call_id_best_effort(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                event_id=f"opendesk:routing-started:{call_id}",
+                event_type="routing_started",
+                event_category="routing",
+                actor_type="system",
+                source="opendesk",
+                occurred_at=routing_started_at,
+                trace_id=trace_id,
+            )
+            await CallTrajectoryService.append_for_call_id_best_effort(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                event_id=f"opendesk:route-matched:{call_id}",
+                event_type="route_matched",
+                event_category="routing",
+                actor_type="system",
+                source="opendesk",
+                occurred_at=datetime.now(timezone.utc),
+                target_type=("bot" if rule.target_type == "voicespeed_agent" else "voice_flow"),
+                target_id=str(
+                    rule.voicespeed_agent_id
+                    if rule.target_type == "voicespeed_agent"
+                    else voice_flow_version_id or voice_flow_id or getattr(rule, "id", "")
+                ),
+                target_name_snapshot=(
+                    rule.voicespeed_agent_name
+                    if rule.target_type == "voicespeed_agent"
+                    else getattr(rule, "name", None)
+                ),
+                result="succeeded",
+                trace_id=trace_id,
+                details={
+                    "voice_flow_id": voice_flow_id,
+                    "voice_flow_version_id": voice_flow_version_id,
+                    "routing_rule_id": getattr(rule, "id", None),
+                },
+            )
+            if any(
+                node.get("type") in {"play", "collect", "condition"}
+                for node in graph.get("nodes", [])
+            ):
+                await CallTrajectoryService.append_for_call_id_best_effort(
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    event_id=f"opendesk:ivr-entered:{call_id}",
+                    event_type="ivr_entered",
+                    event_category="ivr",
+                    actor_type="system",
+                    source="opendesk",
+                    occurred_at=datetime.now(timezone.utc),
+                    target_type="voice_flow",
+                    target_id=str(
+                        voice_flow_version_id or voice_flow_id or getattr(rule, "id", "")
+                    ),
+                    result="succeeded",
+                    trace_id=trace_id,
+                )
         t_route_ms = (time.perf_counter() - t0) * 1000 - t_did_ms
 
         workflow = _orch.VoiceFlowWorkflow(
@@ -253,6 +418,22 @@ class EventHandlersMixin:
         self._workflows[call_id] = workflow
 
         await self.telephony.call_answer(call_id)
+        from app.services.call_trajectory_service import CallTrajectoryService
+
+        await CallTrajectoryService.append_for_call_id_best_effort(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            event_id=f"flowkit:customer-connected:{call_id}",
+            event_type="customer_connected",
+            event_category="lifecycle",
+            actor_type="customer",
+            source="flowkit",
+            occurred_at=datetime.now(timezone.utc),
+            call_leg_id=call_id,
+            participant_role="customer",
+            result="succeeded",
+            trace_id=trace_id,
+        )
         t_answer_ms = (time.perf_counter() - t0) * 1000
         # Identify in parallel with RTP warmup — never block the greeting.
         asyncio.create_task(
@@ -362,19 +543,18 @@ class EventHandlersMixin:
         else:
             role, final = self._TRANSCRIPT_EVENT_ROLES.get(event.method, ("user", True))
         try:
-            rt = _orch.get_realtime_transport()
-            room = f"agent:{agent['tenant_id']}:{agent['employee_id']}"
-            await rt.emit(
-                "cc.transcript",
-                {
+            await _orch.emit_to_agent(
+                tenant_id=agent["tenant_id"],
+                employee_id=agent["employee_id"],
+                method="cc.transcript",
+                payload={
                     "call_id": call_id,
                     "role": role,
                     "text": text,
                     "final": final,
                     "seq": event.data.get("seq"),
                 },
-                room=room,
-                namespace="/chat",
+                transport=_orch.get_realtime_transport(),
             )
         except Exception:  # noqa: BLE001
             _orch.logger.exception("cc.transcript push failed call_id=%s", call_id)
@@ -416,13 +596,12 @@ class EventHandlersMixin:
         if not info:
             return
         try:
-            rt = _orch.get_realtime_transport()
-            room = f"agent:{info['tenant_id']}:{info['employee_id']}"
-            await rt.emit(
-                "cc.webrtc.ice",
-                {"call_id": call_id, "candidate": candidate},
-                room=room,
-                namespace="/chat",
+            await _orch.emit_to_agent(
+                tenant_id=info["tenant_id"],
+                employee_id=info["employee_id"],
+                method="cc.webrtc.ice",
+                payload={"call_id": call_id, "candidate": candidate},
+                transport=_orch.get_realtime_transport(),
             )
         except Exception:  # noqa: BLE001
             _orch.logger.exception("webrtc.ice emit failed")
@@ -482,17 +661,17 @@ class EventHandlersMixin:
         if not bound_ids:
             return
         try:
-            rt = _orch.get_realtime_transport()
             payload = {
                 "extension_number": updated.extension_number,
                 "registration_status": updated.registration_status,
             }
             for emp_id in bound_ids:
-                await rt.emit(
-                    "cc.device_registration_changed",
-                    payload,
-                    room=f"agent:{updated.tenant_id}:{emp_id}",
-                    namespace="/chat",
+                await _orch.emit_to_agent(
+                    tenant_id=updated.tenant_id,
+                    employee_id=emp_id,
+                    method="cc.device_registration_changed",
+                    payload=payload,
+                    transport=_orch.get_realtime_transport(),
                 )
         except Exception:  # noqa: BLE001
             _orch.logger.exception("cc.device_registration_changed push failed")
@@ -581,9 +760,36 @@ class EventHandlersMixin:
         # browser can complete getUserMedia + createOffer.
         outbound_info = await self._peek_outbound_originator(call_id)
         await self._pop_outbound_webrtc(call_id)
+        getattr(self, "_outbound_answered", set()).discard(call_id)
+        getattr(self, "_outbound_bridge_claims", set()).discard(call_id)
         reason = event.data.get("reason")
         sip_status = event.data.get("sip_status")
-        if outbound_info is not None or self._is_outbound_early_fail(reason):
+        hangup_details = {
+            key: event.data.get(key)
+            for key in (
+                "sip_status",
+                "sip_reason",
+                "sip_warning",
+                "sip_reason_hdr",
+                "sip_call_id",
+            )
+            if event.data.get(key) is not None
+        }
+        # Auto-outbound dial engine: finalize target/record when this call_id
+        # was originated by the system dialer (Redis session mapping).
+        try:
+            from app.services.auto_outbound import try_handle_auto_outbound_ended
+
+            await try_handle_auto_outbound_ended(
+                call_id, reason, sip_status, event.data.get("request_id")
+            )
+        except Exception:  # noqa: BLE001
+            _orch.logger.exception(
+                "auto_outbound ended hook failed call_id=%s", call_id
+            )
+        if outbound_info is not None or self._is_outbound_early_fail(
+            reason, sip_status
+        ):
             # Supplier-facing SIP detail from FlowKit (status phrase / Warning /
             # Reason / Call-ID). Keep in OpenDesk logs so triage can paste it
             # without SSHing into the kernel host.
@@ -600,28 +806,20 @@ class EventHandlersMixin:
             )
 
         if outbound_info is not None:
-            await self._mark_outbound_ended(call_id, reason, sip_status)
+            await self._mark_outbound_ended(
+                call_id, reason, sip_status, hangup_details=hangup_details
+            )
             import asyncio as _aio
             _aio.create_task(self._delayed_outbound_cleanup(call_id))
-            tenant_id_out, employee_id_out, _did = outbound_info
-            await self.notify_agent_outbound_event(
-                tenant_id=tenant_id_out,
-                employee_id=employee_id_out,
-                method="cc.outbound_hangup",
-                payload={
-                    "call_id": call_id,
-                    "reason": reason,
-                    "sip_status": sip_status,
-                    "sip_reason": event.data.get("sip_reason"),
-                    "sip_warning": event.data.get("sip_warning"),
-                    "sip_reason_hdr": event.data.get("sip_reason_hdr"),
-                    "sip_call_id": event.data.get("sip_call_id"),
-                },
-            )
-        elif self._is_outbound_early_fail(reason):
+            # Push cc.outbound_hangup only after Redis/PG status is restored
+            # below. The workbench refetches on that event; notifying first
+            # leaves the agent stuck on busy until the next 30s poll.
+        elif self._is_outbound_early_fail(reason, sip_status):
             # Hangup beat register_outbound_call: still remember the SIP
             # failure so dial-webrtc returns 410 with the real reason.
-            await self._mark_outbound_ended(call_id, reason, sip_status)
+            await self._mark_outbound_ended(
+                call_id, reason, sip_status, hangup_details=hangup_details
+            )
             import asyncio as _aio
             _aio.create_task(self._delayed_outbound_cleanup(call_id))
             _orch.logger.info(
@@ -657,26 +855,37 @@ class EventHandlersMixin:
                 row = (
                     await db.execute(select(CallRecord).where(CallRecord.call_id == call_id))
                 ).scalar_one_or_none()
-                was_answered = bool(row and row.answered_at)
+                was_answered = bool(row and row.customer_connected_at)
                 if row is not None:
                     await _orch.CallRecordService.mark_completed(
-                        db, row.tenant_id, call_id, hangup_reason=event.data.get("reason"),
+                        db,
+                        row.tenant_id,
+                        call_id,
+                        hangup_reason=event.data.get("reason"),
+                        hangup_party=event.data.get("hangup_party"),
+                        hangup_details=hangup_details,
                     )
 
                 redis = _orch._get_redis_client()
                 if outbound_info is not None:
                     tenant_id_out, employee_id_out, _did = outbound_info
                     if was_answered:
-                        if redis is not None:
-                            await _orch.CcAgentResourceService.mark_after_call_work(
-                                redis,
-                                tenant_id_out,
-                                employee_id_out,
-                                call_id=call_id,
-                                reason=event.data.get("reason") or "call_hangup",
-                            )
-                        await _orch.CcAgentStatusService.sync_pg_status(
-                            db, tenant_id_out, employee_id_out, "after_call_work", None
+                        from app.services.call_wrapup_service import (
+                            apply_post_call_agent_status,
+                            resolve_effective_wrapup_seconds,
+                        )
+
+                        wrapup_seconds = await resolve_effective_wrapup_seconds(
+                            db, tenant_id_out, call_id
+                        )
+                        await apply_post_call_agent_status(
+                            db,
+                            redis,
+                            tenant_id_out,
+                            employee_id_out,
+                            call_id=call_id,
+                            reason=event.data.get("reason") or "call_hangup",
+                            wrapup_seconds=wrapup_seconds,
                         )
                     elif redis is not None:
                         released = await _orch.CcAgentResourceService.release(
@@ -734,20 +943,50 @@ class EventHandlersMixin:
                             bridged_agent.get("employee_id"),
                             exc_info=True,
                         )
-                    if redis is not None:
-                        await _orch.CcAgentResourceService.mark_after_call_work(
-                            redis,
+                    # Customer↔agent bridges are keepalive so an agent browser
+                    # refresh cannot drop the caller. When the customer leg is
+                    # the one that ended, FlowKit keeps the agent leg up for a
+                    # reconnect that will never come — hang it up explicitly or
+                    # the browser stays in-call until FlowKit's survivor sweep.
+                    try:
+                        from app.services.call_center.call_control_service import (
+                            _legs,
+                        )
+
+                        agent_legs = await _legs(
                             bridged_agent["tenant_id"],
                             bridged_agent["employee_id"],
-                            call_id=call_id,
-                            reason=event.data.get("reason") or "call_hangup",
                         )
-                    await _orch.CcAgentStatusService.set_status(
+                        agent_media_leg = agent_legs.agent_media_call_id
+                    except Exception:  # noqa: BLE001
+                        agent_media_leg = None
+                    if agent_media_leg:
+                        try:
+                            await self.telephony.call_hangup(
+                                agent_media_leg, reason="customer_hangup"
+                            )
+                        except Exception:  # noqa: BLE001
+                            _orch.logger.debug(
+                                "agent leg already gone leg=%s",
+                                agent_media_leg,
+                                exc_info=True,
+                            )
+                    from app.services.call_wrapup_service import (
+                        apply_post_call_agent_status,
+                        resolve_effective_wrapup_seconds,
+                    )
+
+                    wrapup_seconds = await resolve_effective_wrapup_seconds(
+                        db, bridged_agent["tenant_id"], call_id
+                    )
+                    await apply_post_call_agent_status(
                         db,
+                        redis,
                         bridged_agent["tenant_id"],
                         bridged_agent["employee_id"],
-                        "after_call_work",
-                        None,
+                        call_id=call_id,
+                        reason=event.data.get("reason") or "call_hangup",
+                        wrapup_seconds=wrapup_seconds,
                     )
                     await _orch.AgentWebRTCSessionService.set_busy(
                         db,
@@ -766,11 +1005,118 @@ class EventHandlersMixin:
                         bridged_agent["tenant_id"],
                         bridged_agent["employee_id"],
                     )
+                # The workflow is gone but the CDR names a serving agent —
+                # e.g. an auto-outbound reception popped its workflow right
+                # after the bridge, or the process restarted mid-call. Settle
+                # that agent only when their resource is still in_call on this
+                # exact call, so an agent who already moved on is untouched.
+                if (
+                    bridged_agent is None
+                    and outbound_info is None
+                    and row is not None
+                    and was_answered
+                    and row.last_serving_agent_id is not None
+                    and redis is not None
+                ):
+                    await self._settle_orphaned_serving_agent(
+                        db,
+                        redis,
+                        tenant_id=row.tenant_id,
+                        employee_id=int(row.last_serving_agent_id),
+                        call_id=call_id,
+                        reason=event.data.get("reason") or "call_hangup",
+                    )
                 if outbound_info:
                     _tid, _eid, _ = outbound_info
                     await self._maybe_release_sip_occupancy(redis, _tid, _eid)
         except Exception:  # noqa: BLE001
             _orch.logger.exception("Failed to finalize CDR / status for call_id=%s", call_id)
+
+        if outbound_info is not None:
+            tenant_id_out, employee_id_out, _did = outbound_info
+            await self.notify_agent_outbound_event(
+                tenant_id=tenant_id_out,
+                employee_id=employee_id_out,
+                method="cc.outbound_hangup",
+                payload={
+                    "call_id": call_id,
+                    "reason": reason,
+                    "sip_status": sip_status,
+                    "sip_reason": event.data.get("sip_reason"),
+                    "sip_warning": event.data.get("sip_warning"),
+                    "sip_reason_hdr": event.data.get("sip_reason_hdr"),
+                    "sip_call_id": event.data.get("sip_call_id"),
+                },
+            )
+
+    async def _settle_orphaned_serving_agent(
+        self,
+        db,
+        redis,
+        *,
+        tenant_id: int,
+        employee_id: int,
+        call_id: str,
+        reason: str,
+    ) -> None:
+        """Best-effort post-call reset for a serving agent whose call has no
+        live workflow left to drive the normal bridged-agent path."""
+        try:
+            snapshot = await _orch.CcAgentResourceService.get_snapshot(
+                redis, tenant_id, employee_id
+            )
+        except Exception:  # noqa: BLE001
+            _orch.logger.warning(
+                "orphaned serving-agent settle: snapshot failed agent=%s/%s call=%s",
+                tenant_id,
+                employee_id,
+                call_id,
+                exc_info=True,
+            )
+            return
+        if (
+            not snapshot
+            or snapshot.get("resource_state") != "in_call"
+            or snapshot.get("current_call_id") != call_id
+        ):
+            return
+        try:
+            from app.services.call_wrapup_service import (
+                apply_post_call_agent_status,
+                resolve_effective_wrapup_seconds,
+            )
+
+            wrapup_seconds = await resolve_effective_wrapup_seconds(
+                db, tenant_id, call_id
+            )
+            await apply_post_call_agent_status(
+                db,
+                redis,
+                tenant_id,
+                employee_id,
+                call_id=call_id,
+                reason=reason,
+                wrapup_seconds=wrapup_seconds,
+            )
+            await _orch.AgentWebRTCSessionService.set_busy(
+                db, tenant_id, employee_id, busy=False
+            )
+        except Exception:  # noqa: BLE001
+            _orch.logger.warning(
+                "orphaned serving-agent settle failed agent=%s/%s call=%s",
+                tenant_id,
+                employee_id,
+                call_id,
+                exc_info=True,
+            )
+            return
+        await self.notify_agent_call_ended(
+            tenant_id=tenant_id,
+            employee_id=employee_id,
+            call_id=call_id,
+            reason=reason,
+        )
+        await self._maybe_release_sip_occupancy(redis, tenant_id, employee_id)
 
     async def _maybe_release_sip_occupancy(
         self,
@@ -857,6 +1203,15 @@ class EventHandlersMixin:
         """
 
         self.bind_call_trace(call_id)
+        # Satisfaction handoff also ends here (agent → after-call-work) while
+        # the customer stays on the survey. Dropping that live workflow would
+        # leave play_end / DTMF / hangup with nowhere to go — the first prompt
+        # plays, then the survey freezes and the execution never finalizes.
+        current = self.active_workflow(call_id)
+        from app.services.call_center.satisfaction_workflow import SatisfactionWorkflow
+
+        if not (isinstance(current, SatisfactionWorkflow) and not current.done.is_set()):
+            await self.discard_call_state(call_id)
         redis = _orch._get_redis_client()
         try:
             async with _orch.AsyncSessionLocal() as db:
@@ -872,16 +1227,22 @@ class EventHandlersMixin:
                         await _orch.CallRecordService.mark_completed(
                             db, row.tenant_id, call_id, hangup_reason=reason,
                         )
-                if redis is not None:
-                    await _orch.CcAgentResourceService.mark_after_call_work(
-                        redis,
-                        tenant_id,
-                        employee_id,
-                        call_id=call_id,
-                        reason=reason or "call_hangup",
-                    )
-                await _orch.CcAgentStatusService.sync_pg_status(
-                    db, tenant_id, employee_id, "after_call_work", None,
+                from app.services.call_wrapup_service import (
+                    apply_post_call_agent_status,
+                    resolve_effective_wrapup_seconds,
+                )
+
+                wrapup_seconds = await resolve_effective_wrapup_seconds(
+                    db, tenant_id, call_id
+                )
+                await apply_post_call_agent_status(
+                    db,
+                    redis,
+                    tenant_id,
+                    employee_id,
+                    call_id=call_id,
+                    reason=reason or "call_hangup",
+                    wrapup_seconds=wrapup_seconds,
                 )
                 await _orch.AgentWebRTCSessionService.set_busy(
                     db, tenant_id, employee_id, busy=False,
@@ -924,8 +1285,11 @@ class EventHandlersMixin:
                     select(CallRecord)
                     .where(
                         CallRecord.tenant_id == tenant_id,
-                        CallRecord.agent_id == employee_id,
-                        CallRecord.state.in_(tuple(ACTIVE_CALL_RECORD_STATES)),
+                        (
+                            (CallRecord.last_serving_agent_id == employee_id)
+                            | (CallRecord.initiator_agent_id == employee_id)
+                        ),
+                        CallRecord.lifecycle_status == "active",
                     )
                     .order_by(desc(CallRecord.started_at))
                     .limit(1)
@@ -1021,30 +1385,37 @@ class EventHandlersMixin:
         return {"ok": True, "call_id": target_call_id}
 
     async def _on_recording_completed(self, event: CallEvent) -> None:
-        """Persist telephony kernel recording URL onto the CDR."""
+        """Persist one telephony recording artifact onto the target CDR model."""
 
         data = event.data
         call_id = data.get("call_id")
-        oss_url = data.get("oss_url")
-        if not call_id or not oss_url:
+        recording_id = data.get("recording_id")
+        storage_key = data.get("storage_key")
+        source_event_id = data.get("event_id")
+        if not call_id or not recording_id or not source_event_id:
             _orch.logger.warning(
-                "call.recording.completed missing call_id/oss_url: %s", data,
+                "call.recording.completed missing call_id/recording_id/event_id: %s",
+                data,
             )
             return
-        # Broadcast to every node; only the call's owner persists it (others
-        # would double-write the same CDR).
-        if not await self._owns_call(call_id):
-            return
+        # Recording finalization normally arrives after call.ended has released
+        # the transient call owner. Persist on every consumer and let the stable
+        # recording/event identifiers converge through database upserts.
         self.bind_call_trace(call_id)
         try:
             async with _orch.AsyncSessionLocal() as db:
                 saved = await _orch.CallRecordService.save_recording(
                     db,
                     call_id=call_id,
-                    url=oss_url,
-                    partial=bool(data.get("partial", False)),
+                    recording_id=str(recording_id),
+                    storage_key=str(storage_key) if storage_key else None,
+                    source_event_id=str(source_event_id),
+                    status="partial" if bool(data.get("partial", False)) else "completed",
+                    call_leg_id=data.get("call_leg_id") or call_id,
                     phase=data.get("phase"),
-                    header_patched=data.get("header_patched"),
+                    started_at=_recording_datetime(data.get("started_at")),
+                    ended_at=_recording_datetime(data.get("ended_at")),
+                    duration_ms=data.get("duration_ms"),
                 )
             if saved:
                 _orch.logger.info(
@@ -1064,14 +1435,20 @@ class EventHandlersMixin:
         """After WS reconnect, query active calls so we don't lose state."""
 
         try:
-            calls = await self.telephony.call_list()
-            _orch.logger.info("Reconnect: %d active calls in kernel", len(calls))
+            active_ids, complete = await self._reconcile_active_call_ids()
+            _orch.logger.info(
+                "Reconnect: %d active calls across reconcile endpoints complete=%s",
+                len(active_ids),
+                complete,
+            )
+            await self.personal_auto_outbound.restore_running_sessions(
+                active_ids, complete=complete
+            )
             # Any agent left in_call whose call is no longer in the kernel lost
             # its end event while the WS was down — free it so the agent isn't
             # stranded on "busy" forever.
-            active_ids = {c.get("call_id") for c in calls if c.get("call_id")}
             released = await _orch.CcAgentResourceService.reconcile_in_call(
-                _orch._get_redis_client(), active_ids
+                _orch._get_redis_client(), active_ids, release_missing=complete
             )
             if released:
                 _orch.logger.info(
@@ -1142,7 +1519,6 @@ class EventHandlersMixin:
                     n_registered,
                     n_unregistered,
                 )
-                rt = _orch.get_realtime_transport()
                 for ext in flipped:
                     try:
                         async with _orch.AsyncSessionLocal() as db:
@@ -1156,11 +1532,12 @@ class EventHandlersMixin:
                             "registration_status": ext.registration_status,
                         }
                         for emp_id in bound_ids:
-                            await rt.emit(
-                                "cc.device_registration_changed",
-                                payload,
-                                room=f"agent:{ext.tenant_id}:{emp_id}",
-                                namespace="/chat",
+                            await _orch.emit_to_agent(
+                                tenant_id=ext.tenant_id,
+                                employee_id=emp_id,
+                                method="cc.device_registration_changed",
+                                payload=payload,
+                                transport=_orch.get_realtime_transport(),
                             )
                     except Exception:  # noqa: BLE001
                         _orch.logger.exception("device_registration_changed push failed")

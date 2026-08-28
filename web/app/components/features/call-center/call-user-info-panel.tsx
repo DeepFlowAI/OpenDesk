@@ -25,7 +25,7 @@ import { useUpdateUser, useUser } from '@/service/use-users'
 import { FieldType } from '@/types/field-enums'
 
 type Props = {
-  recordId: number | null | undefined
+  recordId: string | null | undefined
   fallbackNumber: string
   /** Direct user ref when there is no local CDR (consult / transfer target). */
   userRef?: string | number | null
@@ -77,7 +77,7 @@ export function CallUserInfoPanel({ recordId, fallbackNumber, userRef = null }: 
   const recordQuery = useCallRecord(recordId)
   const identifyUser = useIdentifyCallRecordUser()
   const linkUser = useLinkCallRecordUser()
-  const attemptedIdentifyRef = useRef<number | null>(null)
+  const attemptedIdentifyRef = useRef<string | null>(null)
 
   const record = recordQuery.data ?? null
   const associatedUserRef =
@@ -154,7 +154,7 @@ export function CallUserInfoPanel({ recordId, fallbackNumber, userRef = null }: 
           isSaving={linkUser.isPending}
           onSelect={(userId) => {
             if (!recordId) return
-            linkUser.mutate({ recordId, userId })
+            linkUser.mutate({ publicId: recordId, userId })
           }}
         />
       ) : userQuery.isLoading || fieldsQuery.isLoading ? (

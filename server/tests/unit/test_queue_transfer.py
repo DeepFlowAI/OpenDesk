@@ -526,7 +526,7 @@ async def test_queue_wait_handover_works_after_initiator_leg_gone(monkeypatch):
     monkeypatch.setattr(CallControlService, "_queue_transfer_pick_agent", _pick)
 
     async def _ring(*_a, **_kw):
-        return True, "agent-leg-new", True
+        return True, "agent-leg-new", True, True
 
     monkeypatch.setattr(CallControlService, "_queue_transfer_ring_agent", _ring)
 
@@ -576,6 +576,7 @@ async def test_queue_wait_handover_works_after_initiator_leg_gone(monkeypatch):
             "call_id": "sip-customer",
             "other_call_id": "agent-leg-new",
             "transcribe": True,
+            "keepalive_on_peer_hangup": True,
         },
     ) in tel.recorded
     assert sum(
@@ -616,7 +617,7 @@ async def test_first_pick_answers_and_handover(monkeypatch):
     monkeypatch.setattr(CallControlService, "_queue_transfer_pick_agent", _pick)
 
     async def _ring(*_a, **_kw):
-        return True, "agent-leg-1", True
+        return True, "agent-leg-1", True, True
 
     monkeypatch.setattr(CallControlService, "_queue_transfer_ring_agent", _ring)
 
@@ -702,6 +703,7 @@ async def test_first_pick_answers_and_handover(monkeypatch):
             "call_id": "sip-customer",
             "other_call_id": "agent-leg-1",
             "transcribe": True,
+            "keepalive_on_peer_hangup": True,
         },
     ) in tel.recorded
     assert restored == [(7, "sip-customer")]
@@ -756,8 +758,8 @@ async def test_first_agent_no_answer_second_answers(monkeypatch):
     async def _ring(*_a, **kw):
         ring_targets.append(kw["employee_id"])
         if kw["employee_id"] == 11:
-            return False, None, True
-        return True, "leg-12", True
+            return False, None, True, True
+        return True, "leg-12", True, True
 
     monkeypatch.setattr(CallControlService, "_queue_transfer_ring_agent", _ring)
 
@@ -889,7 +891,7 @@ async def test_customer_gone_stops_without_ringing(monkeypatch):
 
     async def _ring(*_a, **_kw):
         rings.append(1)
-        return False, None, False
+        return False, None, False, False
 
     monkeypatch.setattr(CallControlService, "_queue_transfer_ring_agent", _ring)
 
@@ -934,7 +936,7 @@ async def test_cancel_releases_reserved_agent(monkeypatch):
     async def _ring(*_a, **_kw):
         started.set()
         await asyncio.sleep(60)
-        return False, None, True
+        return False, None, True, True
 
     monkeypatch.setattr(CallControlService, "_queue_transfer_ring_agent", _ring)
 
@@ -994,7 +996,7 @@ async def test_bridge_failure_releases_and_continues(monkeypatch):
     monkeypatch.setattr(CallControlService, "_queue_transfer_pick_agent", _pick)
 
     async def _ring(*_a, **kw):
-        return True, f"leg-{kw['employee_id']}", True
+        return True, f"leg-{kw['employee_id']}", True, True
 
     monkeypatch.setattr(CallControlService, "_queue_transfer_ring_agent", _ring)
 
@@ -1154,8 +1156,8 @@ async def test_handover_bridge_failure_returns_false_without_reassign(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_enqueue_marks_queued_handover_restores_in_progress(monkeypatch):
-    """bind_queue at enqueue; restore only patches state after bridge."""
+async def test_enqueue_marks_queue_without_rewriting_lifecycle(monkeypatch):
+    """Queue handoff appends queue facts without changing CDR lifecycle."""
 
     tracker = SessionTracker()
     _install_tracked_session(monkeypatch, tracker)
@@ -1190,13 +1192,7 @@ async def test_enqueue_marks_queued_handover_restores_in_progress(monkeypatch):
     )
     assert bind_calls == [(7, "sip-customer", "employee_group", 5, "queued")]
 
-    answered_at = object()
-    row = SimpleNamespace(
-        call_id="sip-customer",
-        state="queued",
-        answered_at=answered_at,
-        ring_duration=1200,
-    )
+    row = SimpleNamespace(call_id="sip-customer", lifecycle_status="active")
 
     async def _get_by_call_id(_db, call_id, tenant_id):
         assert call_id == "sip-customer"
@@ -1220,10 +1216,7 @@ async def test_enqueue_marks_queued_handover_restores_in_progress(monkeypatch):
 
     await CallControlService._queue_transfer_restore_in_progress(7, "sip-customer")
 
-    assert update_patches == [{"state": "in_progress"}]
-    assert row.answered_at is answered_at
-    assert row.ring_duration == 1200
-    assert row.state == "in_progress"
+    assert update_patches == []
 
 
 @pytest.mark.asyncio
@@ -1259,7 +1252,7 @@ async def test_hold_tone_not_started_when_first_pick_succeeds(monkeypatch):
     monkeypatch.setattr(CallControlService, "_queue_transfer_pick_agent", _pick)
 
     async def _ring(*_a, **_kw):
-        return True, "leg-1", True
+        return True, "leg-1", True, True
 
     monkeypatch.setattr(CallControlService, "_queue_transfer_ring_agent", _ring)
 
@@ -1375,7 +1368,7 @@ async def test_sip_unavailable_releases_without_call_ended_notify(monkeypatch):
         _release,
     )
 
-    answered, leg, pushed = await CallControlService._queue_transfer_ring_sip(
+    answered, leg, pushed, is_webrtc = await CallControlService._queue_transfer_ring_sip(
         MockTelephonyClient(),
         tenant_id=7,
         queue_id=5,
@@ -1386,6 +1379,7 @@ async def test_sip_unavailable_releases_without_call_ended_notify(monkeypatch):
         caller_number="13800000000",
         called_number="400",
     )
+    assert is_webrtc is False
     assert (answered, leg, pushed) == (False, None, False)
 
     await CallControlService._queue_transfer_release_agent(
@@ -1443,7 +1437,7 @@ async def test_incoming_payload_includes_customer_numbers(monkeypatch):
 
     accept_task = asyncio.create_task(_accept_soon())
 
-    answered, leg, pushed = await CallControlService._queue_transfer_ring_webrtc(
+    answered, leg, pushed, _is_webrtc = await CallControlService._queue_transfer_ring_webrtc(
         tenant_id=7,
         queue_id=5,
         customer_call_id="sip-customer",
@@ -1458,6 +1452,7 @@ async def test_incoming_payload_includes_customer_numbers(monkeypatch):
     assert answered is True
     assert leg == "webrtc-leg"
     assert pushed is True
+    assert _is_webrtc is True
     assert orch.incoming
     payload = orch.incoming[0][2]
     assert payload["from"] == "13800000000"
@@ -1482,7 +1477,7 @@ async def test_webrtc_ring_skips_offline_agent_immediately(monkeypatch):
         _is_connected,
     )
 
-    answered, leg, pushed = await CallControlService._queue_transfer_ring_webrtc(
+    answered, leg, pushed, _is_webrtc = await CallControlService._queue_transfer_ring_webrtc(
         tenant_id=7,
         queue_id=5,
         customer_call_id="sip-customer",
@@ -1492,6 +1487,7 @@ async def test_webrtc_ring_skips_offline_agent_immediately(monkeypatch):
     )
 
     assert (answered, leg, pushed) == (False, None, False)
+    assert _is_webrtc is True
     assert orch.incoming == []
     assert orch.offers == {}
     assert orch.cancelled_offers == []

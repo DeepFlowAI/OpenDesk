@@ -88,6 +88,7 @@ class Conversation(Base, TimestampMixin):
     open_agent_last_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     open_agent_handoff_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     open_agent_handoff_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    lingomaster_settings: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     # Materialized reception-segment aggregates (redundant, read-only). Written
     # in bulk after the conversation ends so session-record lists read them
     # without aggregating the per-segment fact table at query time.

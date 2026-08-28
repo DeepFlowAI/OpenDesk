@@ -606,6 +606,7 @@ export function KnowledgeAssistant({
                 </Button>
                 <Button
                   type="button"
+                  autoFocus
                   onClick={() => void handleConfirmSend()}
                   disabled={sending || Boolean(confirmDisabledReason)}
                 >

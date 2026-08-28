@@ -13,6 +13,7 @@ import {
 } from '@/utils/validators'
 import { cn } from '@/lib/utils'
 import { LegalFooter } from '@/components/legal-footer'
+import { LanguageSwitcher } from '@/components/language-switcher'
 
 const LAST_TENANT_KEY = 'opendesk_last_tenant'
 const COOLDOWN_SECONDS = 60
@@ -37,7 +38,7 @@ export default function ForgotPasswordPageWrapper() {
 function ForgotPasswordPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { locale, setLocale } = useLocaleStore()
+  const { locale } = useLocaleStore()
   const sendCodeMutation = useSendVerifyCode()
   const resetMutation = useResetPassword()
 
@@ -295,32 +296,7 @@ function ForgotPasswordPage() {
           <IconHeadset size={28} className="text-foreground" />
           <span className="font-sans text-xl font-semibold text-foreground">OpenDesk</span>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setLocale('zh')}
-            className={cn(
-              'rounded-md px-3 py-2 text-sm font-medium transition-colors',
-              locale === 'zh'
-                ? 'bg-border text-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            中文
-          </button>
-          <button
-            type="button"
-            onClick={() => setLocale('en')}
-            className={cn(
-              'rounded-md px-3 py-2 text-sm transition-colors',
-              locale === 'en'
-                ? 'bg-border font-medium text-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            English
-          </button>
-        </div>
+        <LanguageSwitcher />
       </div>
 
       {/* Main area */}

@@ -48,6 +48,7 @@ function user(partial: Partial<UserInfo> = {}): UserInfo {
     is_super_admin: false,
     group_ids: [],
     preferences: {},
+    default_language: 'system',
     ...partial,
   }
 }

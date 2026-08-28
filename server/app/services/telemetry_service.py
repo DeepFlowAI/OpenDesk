@@ -62,33 +62,62 @@ def _coerce_str(value: Any) -> str:
 # Rate-limit per-event INFO logging so a frontend stuck in a reconnect loop
 # (e.g. a tab firing `socket_connect_requested` every few hundred ms) can't
 # flood the log backend. warn/error events are never throttled — those are the
-# signal we want to keep. Limits are per event name within a sliding window.
+# signal we want to keep. Limits apply within a sliding window.
 _LOG_WINDOW_SECONDS = 10.0
 _LOG_MAX_PER_WINDOW = 5
+# Signed-in app events are budgeted per device rather than per event name: an
+# agent workspace emits only a handful of events per call, and a shared budget
+# would let one busy agent's calls hide another agent's, losing exactly the
+# audit trail needed to explain a stuck workspace. Per device the budget still
+# caps a tab stuck in a loop.
+_APP_LOG_MAX_PER_WINDOW = 20
+# Per-device keys would otherwise accumulate for every device ever seen.
+_LOG_KEYS_BEFORE_PRUNE = 4096
 _log_hits: dict[str, deque[float]] = defaultdict(deque)
 _log_suppressed: dict[str, int] = defaultdict(int)
 
 
-def _frontend_log_decision(name: str) -> tuple[bool, int]:
+def _prune_log_hits(cutoff: float) -> None:
+    """Drop windows that have fully expired, keeping the key set bounded."""
+    stale = [key for key, hits in _log_hits.items() if not hits or hits[-1] < cutoff]
+    for key in stale:
+        _log_hits.pop(key, None)
+        _log_suppressed.pop(key, None)
+
+
+def _frontend_log_decision(
+    key: str,
+    max_per_window: int = _LOG_MAX_PER_WINDOW,
+) -> tuple[bool, int]:
     """Return ``(allow, suppressed_since_last_allow)`` for an INFO event."""
     now = time.monotonic()
-    hits = _log_hits[name]
     cutoff = now - _LOG_WINDOW_SECONDS
+    if len(_log_hits) > _LOG_KEYS_BEFORE_PRUNE:
+        _prune_log_hits(cutoff)
+    hits = _log_hits[key]
     while hits and hits[0] < cutoff:
         hits.popleft()
-    if len(hits) < _LOG_MAX_PER_WINDOW:
+    if len(hits) < max_per_window:
         hits.append(now)
-        return True, _log_suppressed.pop(name, 0)
-    _log_suppressed[name] += 1
+        return True, _log_suppressed.pop(key, 0)
+    _log_suppressed[key] += 1
     return False, 0
 
 
-def _log_frontend_event(event: TelemetryEvent, extra: dict[str, str]) -> None:
+def _log_frontend_event(
+    event: TelemetryEvent,
+    extra: dict[str, str],
+    *,
+    throttle_key: str | None = None,
+    max_per_window: int = _LOG_MAX_PER_WINDOW,
+) -> None:
     level = _level_to_log(event.level)
     if level >= logging.WARNING:
         logger.log(level, "frontend event: %s", event.name, extra=extra)
         return
-    allow, suppressed = _frontend_log_decision(event.name)
+    allow, suppressed = _frontend_log_decision(
+        throttle_key or event.name, max_per_window
+    )
     if not allow:
         return
     if suppressed:
@@ -257,7 +286,12 @@ class TelemetryService:
                     _request_id_var.set("-")
 
                 extra = _build_extra(event, common_attrs, app_attrs)
-                _log_frontend_event(event, extra)
+                _log_frontend_event(
+                    event,
+                    extra,
+                    throttle_key=f"{event.name}:{body.common.device_id}",
+                    max_per_window=_APP_LOG_MAX_PER_WINDOW,
+                )
         finally:
             _trace_id_var.set(prev_trace)
             _request_id_var.set(prev_req)

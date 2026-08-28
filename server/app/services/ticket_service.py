@@ -17,6 +17,7 @@ from app.models.ticket import Ticket
 from app.models.ticket_view import TicketView
 from app.models.fd_field_definition import FdFieldDefinition
 from app.repositories.conversation_repository import ConversationRepository
+from app.repositories.channel_form_submission_repository import ChannelFormSubmissionRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.repositories.employee_group_repository import EmployeeGroupRepository
 from app.repositories.ticket_change_repository import TicketChangeRepository
@@ -406,7 +407,7 @@ class TicketService:
         db: AsyncSession,
         tenant_id: int,
         conversation_ids: list[int],
-    ) -> dict[int, str]:
+    ) -> dict[int, tuple[str, str]]:
         ids = sorted(set(conversation_ids))
         if not ids:
             return {}
@@ -427,18 +428,21 @@ class TicketService:
         if not ids:
             return {}
         result = await db.execute(
-            select(CallRecord.id, CallRecord.call_id)
+            select(CallRecord.id, CallRecord.call_id, CallRecord.public_id)
             .where(CallRecord.tenant_id == tenant_id)
             .where(CallRecord.id.in_(ids))
         )
-        return {row.id: row.call_id for row in result.all()}
+        return {
+            row.id: (row.call_id, str(row.public_id))
+            for row in result.all()
+        }
 
     @staticmethod
     def _enrich_response(
         ticket: Ticket,
         slot_to_key: dict[str, str],
         conversation_public_ids: dict[int, str] | None = None,
-        call_record_call_ids: dict[int, str] | None = None,
+        call_record_call_ids: dict[int, tuple[str, str]] | None = None,
     ) -> dict:
         resp = TicketResponse.model_validate(ticket).model_dump()
         conversation_id = getattr(ticket, "conversation_id", None)
@@ -446,7 +450,10 @@ class TicketService:
             resp["conversation_public_id"] = (conversation_public_ids or {}).get(conversation_id)
         call_record_id = getattr(ticket, "call_record_id", None)
         if call_record_id is not None:
-            resp["call_record_call_id"] = (call_record_call_ids or {}).get(call_record_id)
+            call_record_ref = (call_record_call_ids or {}).get(call_record_id)
+            if call_record_ref is not None:
+                resp["call_record_call_id"] = call_record_ref[0]
+                resp["call_record_public_id"] = call_record_ref[1]
         custom_fields: dict[str, object] = {}
         for slot_col, field_key in slot_to_key.items():
             val = getattr(ticket, slot_col, None)
@@ -478,7 +485,31 @@ class TicketService:
             tenant_id,
             [item.call_record_id] if item.call_record_id is not None else [],
         )
-        return TicketService._enrich_response(item, slot_to_key, conversation_public_ids, call_record_call_ids)
+        response = TicketService._enrich_response(
+            item,
+            slot_to_key,
+            conversation_public_ids,
+            call_record_call_ids,
+        )
+        form_submission = await ChannelFormSubmissionRepository.get_detail_by_ticket_id(
+            db,
+            tenant_id,
+            ticket_id,
+        )
+        if form_submission:
+            submission, channel_name, source_conversation_public_id = form_submission
+            response["form_submission"] = {
+                "channel_id": submission.channel_id,
+                "channel_name": channel_name,
+                "source": submission.source,
+                "submitted_at": submission.created_at,
+                "conversation_public_id": source_conversation_public_id,
+                "field_snapshot": sorted(
+                    submission.field_snapshot or [],
+                    key=lambda field: int(field.get("sort_order", 0)),
+                ),
+            }
+        return response
 
     @staticmethod
     async def create_ticket(
@@ -486,6 +517,7 @@ class TicketService:
         tenant_id: int,
         data: TicketCreate,
         actor_id: int | None = None,
+        commit: bool = True,
     ) -> dict:
         key_to_slot = await TicketService._get_key_to_slot_map(db, tenant_id)
 
@@ -575,8 +607,11 @@ class TicketService:
         )
         if create_rows:
             await TicketChangeRepository.create_many(db, create_rows, commit=False)
-        await db.commit()
-        await db.refresh(ticket)
+        if commit:
+            await db.commit()
+            await db.refresh(ticket)
+        else:
+            await db.flush()
         slot_to_key = await TicketService._get_field_key_slot_map(db, tenant_id)
         conversation_id = getattr(ticket, "conversation_id", None)
         conversation_public_ids = await TicketService._get_conversation_public_id_map(

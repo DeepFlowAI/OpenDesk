@@ -6,6 +6,7 @@ DB-touching helpers stubbed so no database or Redis is required. Telephony is a
 mock; we assert both the control-plane RPCs and the operation-trail writes.
 """
 import importlib
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -24,6 +25,7 @@ active_calls = importlib.import_module("app.extensions.reports.lib.active_calls"
 intervention_state = importlib.import_module("app.extensions.reports.lib.intervention_state")
 svc_mod = importlib.import_module("app.extensions.reports.services.call_intervention_service")
 CallInterventionService = svc_mod.CallInterventionService
+call_control = importlib.import_module("app.services.call_center.call_control_service")
 
 ALL_PERMS = [
     "call.monitor.view",
@@ -34,6 +36,40 @@ ALL_PERMS = [
     "call.monitor.force_hangup",
     "call.workspace.use",
 ]
+
+
+@pytest.mark.asyncio
+async def test_intervention_trail_writes_structured_trajectory(monkeypatch):
+    append = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallTrajectoryService.append_for_call_id",
+        append,
+    )
+
+    await intervention_state.append_trail_event(
+        AsyncMock(),
+        1,
+        "call-1",
+        {
+            "supervisor_id": 10,
+            "mode": "takeover",
+            "event": "succeeded",
+            "reason": "quality_risk",
+        },
+    )
+
+    payload = append.await_args.kwargs
+    assert payload["event_type"] == "supervisor_takeover_completed"
+    assert payload["event_category"] == "supervisor"
+    assert payload["actor_type"] == "supervisor"
+    assert payload["reason_code"] == "quality_risk"
+
+
+@pytest.fixture(autouse=True)
+def clear_call_control_room_state():
+    call_control._in_call_state.clear()
+    yield
+    call_control._in_call_state.clear()
 
 
 def _principal(user_id=10, tenant_id=1, permissions=None, scope="all"):
@@ -157,6 +193,19 @@ def stub_db(monkeypatch):
 
     fake_status.calls = []
 
+    async def fake_close(db, tenant_id, employee_id):
+        fake_close.calls.append((tenant_id, employee_id))
+
+    fake_close.calls = []
+
+    async def fake_finalize(redis, principal, resolved):
+        fake_finalize.calls.append((principal.tenant_id, principal.user_id, resolved.agent_id))
+        fake_status.calls.append((resolved.agent_id, "after_call_work"))
+        fake_close.calls.append((principal.tenant_id, resolved.agent_id))
+        call_control._in_call_state.pop((principal.tenant_id, resolved.agent_id), None)
+
+    fake_finalize.calls = []
+
     notified: list[dict] = []
 
     async def fake_notify(principal, agent_id, event, payload):
@@ -169,10 +218,23 @@ def stub_db(monkeypatch):
     monkeypatch.setattr(
         svc_mod.CcAgentStatusService, "sync_pg_status", staticmethod(fake_status)
     )
+    monkeypatch.setattr(
+        svc_mod.AgentWebRTCSessionService, "close", staticmethod(fake_close)
+    )
+    monkeypatch.setattr(
+        CallInterventionService, "_finalize_takeover_state", staticmethod(fake_finalize)
+    )
     intervention_state._local_call_locks.clear()
     intervention_state._local_supervisor_calls.clear()
     intervention_state._local_supervisor_legs.clear()
-    return {"trail": trail, "target": target, "status": fake_status, "notified": notified}
+    return {
+        "trail": trail,
+        "target": target,
+        "status": fake_status,
+        "session_close": fake_close,
+        "finalize": fake_finalize,
+        "notified": notified,
+    }
 
 
 async def _establish_leg(mock, principal, call_id, redis=None, sdp="v=0"):
@@ -222,9 +284,9 @@ class TestPhaseDerivation:
         )
         assert await CallInterventionService._derive_phase(1, 99) == "consulting"
 
-    async def test_open_room_is_three_way(self, monkeypatch):
+    async def test_intervention_room_alone_remains_single(self, monkeypatch):
         _patch_legs(monkeypatch, call_control.InCallLegs(room_id="room-1"))
-        assert await CallInterventionService._derive_phase(1, 99) == "three_way"
+        assert await CallInterventionService._derive_phase(1, 99) == "single"
 
     async def test_ringing_participant_is_three_way(self, monkeypatch):
         _patch_legs(
@@ -325,6 +387,37 @@ class TestSupervisorLeg:
         )
         assert target == (1, "call-1")
 
+    async def test_register_leg_after_refresh_replaces_stale_supervisor_leg(self, stub_db):
+        mock = MockTelephonyClient()
+        p = _principal()
+        await _establish_leg(mock, p, "call-1")
+        await CallInterventionService.whisper(mock, None, p, "call-1")
+
+        mock.webrtc_offer_response = {
+            "call_id": "refreshed-supervisor-leg",
+            "sdp": "v=0\r\nmock-answer",
+        }
+        mock.recorded.clear()
+        await CallInterventionService.register_supervisor_leg(
+            mock, None, p, "call-1", "v=0-refreshed"
+        )
+
+        assert (
+            "room.replace_leg",
+            {
+                "room_id": "mock-room",
+                "old_call_id": "mock-webrtc-call",
+                "new_call_id": "refreshed-supervisor-leg",
+            },
+        ) in mock.recorded
+        assert (
+            "call.hangup",
+            {"call_id": "mock-webrtc-call", "reason": "supervisor_media_replaced"},
+        ) in mock.recorded
+        holder = await intervention_state.get_call_holder(None, 1, "call-1")
+        assert holder is not None
+        assert holder.supervisor_call_id == "refreshed-supervisor-leg"
+
 
 @pytest.mark.asyncio
 class TestSupervisorIce:
@@ -423,6 +516,10 @@ class TestWhisper:
              "speaker_call_id": "mock-webrtc-call", "gain": 0.0},
         ) in mock.recorded
         assert any(n["event"] == "cc.supervisor_whisper" for n in stub_db["notified"])
+        legs = call_control._in_call_state[(1, 99)]
+        assert legs.room_id == "mock-room"
+        assert legs.agent_media_call_id == "agent-leg-1"
+        assert legs.room_legs == ["cust-leg-1", "agent-leg-1", "mock-webrtc-call"]
 
     async def test_whisper_without_leg_rejected(self, stub_db):
         mock = MockTelephonyClient()
@@ -453,6 +550,28 @@ class TestBarge:
         await CallInterventionService.barge(mock, None, p, "call-1")
         # No second room.create — the existing room is reused.
         assert not any(r[0] == "room.create" for r in mock.recorded)
+
+    async def test_new_supervisor_reuses_room_left_by_previous_monitor(self, stub_db):
+        mock = MockTelephonyClient()
+        first = _principal(user_id=10)
+        await _establish_leg(mock, first, "call-1")
+        await CallInterventionService.whisper(mock, None, first, "call-1")
+        await CallInterventionService.stop(mock, None, first, "call-1")
+
+        second = _principal(user_id=11)
+        mock.webrtc_offer_response = {
+            "call_id": "second-supervisor-leg",
+            "sdp": "v=0\r\nmock-answer",
+        }
+        await _establish_leg(mock, second, "call-1")
+        mock.recorded.clear()
+        await CallInterventionService.barge(mock, None, second, "call-1")
+
+        assert not any(r[0] == "room.create" for r in mock.recorded)
+        assert (
+            "room.add_leg",
+            {"room_id": "mock-room", "call_id": "second-supervisor-leg"},
+        ) in mock.recorded
 
 
 @pytest.mark.asyncio
@@ -497,6 +616,8 @@ class TestTakeover:
         # the WebRTC teardown doesn't surface as an ICE error.
         assert any(n["event"] == "cc.call_hangup" for n in stub_db["notified"])
         assert (99, "after_call_work") in stub_db["status"].calls
+        assert stub_db["finalize"].calls == [(1, 10, 99)]
+        assert (1, 99) not in call_control._in_call_state
         events = [e["event"] for e in stub_db["trail"]]
         assert "reception_segment_intent" in events and "succeeded" in events
         assert any(n["event"] == "cc.supervisor_takeover" for n in stub_db["notified"])
@@ -537,6 +658,68 @@ class TestTakeover:
         )
         assert result["mode"] == "takeover"
         assert not any(r[0] == "room.close" for r in mock.recorded)
+
+
+@pytest.mark.asyncio
+class TestTakeoverStateFinalization:
+    async def test_reassigns_owner_and_clears_original_agent_reconnect_state(
+        self, monkeypatch
+    ):
+        row = type("CallRow", (), {"last_serving_agent_id": 99})()
+        calls: list[tuple] = []
+
+        class Result:
+            def scalar_one_or_none(self):
+                return row
+
+        class FakeDb:
+            async def execute(self, statement):
+                return Result()
+
+            async def commit(self):
+                calls.append(("commit",))
+
+        class FakeSessionContext:
+            async def __aenter__(self):
+                return FakeDb()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_close(db, tenant_id, employee_id):
+            calls.append(("close_session", tenant_id, employee_id))
+
+        async def fake_status(db, tenant_id, employee_id, status, reason=None):
+            calls.append(("status", tenant_id, employee_id, status, reason))
+
+        async def fake_clear(tenant_id, employee_id):
+            calls.append(("clear_legs", tenant_id, employee_id))
+
+        monkeypatch.setattr(svc_mod, "AsyncSessionLocal", FakeSessionContext)
+        monkeypatch.setattr(
+            svc_mod.AgentWebRTCSessionService, "close", staticmethod(fake_close)
+        )
+        monkeypatch.setattr(
+            svc_mod.CcAgentStatusService, "sync_pg_status", staticmethod(fake_status)
+        )
+        monkeypatch.setattr(call_control, "_clear_legs", fake_clear)
+
+        target = svc_mod._ResolvedTarget(
+            record_id=1,
+            call_id="call-1",
+            customer_call_id="customer-1",
+            agent_id=99,
+            agent_call_id="agent-leg-1",
+            phase="single",
+        )
+        await CallInterventionService._finalize_takeover_state(
+            None, _principal(), target
+        )
+
+        assert row.last_serving_agent_id == 10
+        assert ("close_session", 1, 99) in calls
+        assert ("status", 1, 99, "after_call_work", "supervisor_takeover") in calls
+        assert ("clear_legs", 1, 99) in calls
 
 
 @pytest.mark.asyncio
@@ -686,3 +869,140 @@ class TestReasonValidation:
     def test_empty_reason_rejected(self):
         with pytest.raises(ValidationError):
             CallInterventionService.validate_reason("", None)
+
+
+# ─────────────────── call.hangup → monitor-lock release ───────────────────
+
+reports_ext = importlib.import_module("app.extensions.reports")
+
+
+class _HangupEvent:
+    def __init__(self, call_id):
+        self.data = {"call_id": call_id}
+
+
+class TestCallHangupMonitorRelease:
+    """The reports ``call.hangup`` handler frees monitor locks for both event
+    shapes: the whole call ending, and a supervisor media leg dying on its own
+    (e.g. the supervisor's browser closed mid-whisper)."""
+
+    @pytest.fixture(autouse=True)
+    def clean_locks(self):
+        intervention_state._local_call_locks.clear()
+        intervention_state._local_supervisor_calls.clear()
+        intervention_state._local_supervisor_legs.clear()
+        yield
+        intervention_state._local_call_locks.clear()
+        intervention_state._local_supervisor_calls.clear()
+        intervention_state._local_supervisor_legs.clear()
+
+    @pytest.fixture
+    def handler_env(self, monkeypatch):
+        """In-process locks (no Redis); trail appends captured; no real DB."""
+
+        async def no_redis():
+            return None
+
+        trail: list[dict] = []
+
+        async def fake_append(db, tenant_id, call_id, entry):
+            trail.append({"tenant_id": tenant_id, "call_id": call_id, **entry})
+
+        class FakeResult:
+            def __init__(self, row=None):
+                self._row = row
+
+            def scalar_one_or_none(self):
+                return self._row
+
+        class FakeSession:
+            row = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def execute(self, *args, **kwargs):
+                return FakeResult(self.row)
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr(reports_ext, "_optional_redis", no_redis)
+        monkeypatch.setattr(intervention_state, "append_trail_event", fake_append)
+        monkeypatch.setattr("app.db.session.AsyncSessionLocal", lambda: FakeSession())
+        return {"trail": trail, "session_cls": FakeSession}
+
+    async def test_supervisor_leg_hangup_releases_monitor_lock(self, handler_env):
+        await intervention_state.acquire(
+            None, 1, "call-1",
+            intervention_state.MonitorHolder(
+                supervisor_id=10, name="Sup", mode="whisper",
+                supervisor_call_id="sup-leg-1", room_id="room-1",
+            ),
+        )
+        await intervention_state.set_supervisor_leg_index(None, 1, "call-1", "sup-leg-1")
+
+        await reports_ext._on_call_hangup_release_monitor(_HangupEvent("sup-leg-1"))
+
+        assert await intervention_state.get_call_holder(None, 1, "call-1") is None
+        assert await intervention_state.supervisor_busy_on(None, 1, 10) is None
+        assert await intervention_state.get_supervisor_leg_target(None, "sup-leg-1") is None
+        assert handler_env["trail"] == [
+            {
+                "tenant_id": 1,
+                "call_id": "call-1",
+                "supervisor_id": 10,
+                "mode": "whisper",
+                "event": "ended",
+                "detail": "supervisor_leg_hangup",
+            }
+        ]
+
+    async def test_stale_leg_index_does_not_free_new_holders_lock(self, handler_env):
+        # A refresh re-negotiated the supervisor leg: the holder moved on to
+        # "new-leg" while the old leg's index entry is still around. The old
+        # leg's late hangup must not release the refreshed session's lock.
+        await intervention_state.acquire(
+            None, 1, "call-1",
+            intervention_state.MonitorHolder(
+                supervisor_id=10, name="Sup", mode="whisper",
+                supervisor_call_id="new-leg", room_id="room-1",
+            ),
+        )
+        await intervention_state.set_supervisor_leg_index(None, 1, "call-1", "old-leg")
+
+        await reports_ext._on_call_hangup_release_monitor(_HangupEvent("old-leg"))
+
+        holder = await intervention_state.get_call_holder(None, 1, "call-1")
+        assert holder is not None and holder.supervisor_call_id == "new-leg"
+        assert handler_env["trail"] == []
+
+    async def test_customer_call_hangup_releases_holder(self, handler_env):
+        from types import SimpleNamespace
+
+        handler_env["session_cls"].row = SimpleNamespace(tenant_id=1)
+        await intervention_state.acquire(
+            None, 1, "call-1",
+            intervention_state.MonitorHolder(
+                supervisor_id=10, name="Sup", mode="listen",
+                supervisor_call_id="sup-leg-9",
+            ),
+        )
+        await intervention_state.set_supervisor_leg_index(None, 1, "call-1", "sup-leg-9")
+
+        await reports_ext._on_call_hangup_release_monitor(_HangupEvent("call-1"))
+
+        assert await intervention_state.get_call_holder(None, 1, "call-1") is None
+        assert await intervention_state.get_supervisor_leg_target(None, "sup-leg-9") is None
+        assert handler_env["trail"] == [
+            {
+                "tenant_id": 1,
+                "call_id": "call-1",
+                "supervisor_id": 10,
+                "mode": "listen",
+                "event": "ended",
+            }
+        ]

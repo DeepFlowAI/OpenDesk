@@ -26,6 +26,9 @@ import {
 import { isLeaveMessagePromptMessage } from '@/lib/offline-message-event'
 import { getOpenAgentWelcomeBlocksFromMetadata } from '@/lib/open-agent-welcome-message'
 import { isWelcomeLikeContentType } from '@/lib/welcome-message-content-type'
+import type { Locale } from '@/context/locale-store'
+import { formatMessageTime } from '@/lib/message-time'
+import { t } from '@/utils/i18n'
 
 type MessageListProps = {
   messages: Message[]
@@ -33,7 +36,7 @@ type MessageListProps = {
   agentTyping: boolean
   hasMore: boolean
   loading: boolean
-  locale: string
+  locale: Locale
   welcomeMessage: string
   onLoadMore: () => void
 }
@@ -55,26 +58,8 @@ function shouldShowName(current: Message, prev: Message | null): boolean {
   return prev.sender_type !== current.sender_type || prev.sender_id !== current.sender_id
 }
 
-function formatTimestamp(dateStr: string, locale: string): string {
-  const date = new Date(dateStr)
-  const now = new Date()
-  const time = date.toLocaleTimeString(locale === 'zh' ? 'zh-CN' : 'en-US', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  })
-
-  const diffDays = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24))
-  if (diffDays === 0 && now.getDate() === date.getDate()) return time
-  if (diffDays <= 1 && now.getDate() - date.getDate() === 1) {
-    return locale === 'zh' ? `昨天 ${time}` : `Yesterday ${time}`
-  }
-  if (date.getFullYear() === now.getFullYear()) {
-    const m = String(date.getMonth() + 1).padStart(2, '0')
-    const d = String(date.getDate()).padStart(2, '0')
-    return `${m}-${d} ${time}`
-  }
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${time}`
+function formatTimestamp(dateStr: string, locale: Locale): string {
+  return formatMessageTime(dateStr, locale)
 }
 
 function VisitorWelcomeBubble({
@@ -176,7 +161,7 @@ export function MessageList({
           {loading ? (
             <IconLoader2 size={14} className="animate-spin" />
           ) : (
-            locale === 'zh' ? '加载更多' : 'Load more'
+            t('chat.loadMore', locale)
           )}
         </button>
       )}

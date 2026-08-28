@@ -17,6 +17,8 @@ export const CcSocketEvent = {
   DEVICE_REGISTRATION_CHANGED: 'cc.device_registration_changed',
   WEBRTC_ICE: 'cc.webrtc.ice',
   TRANSCRIPT: 'cc.transcript',
+  WRAP_UP_STARTED: 'cc.wrap_up_started',
+  WRAP_UP_TIMEOUT: 'cc.wrap_up_timeout',
 } as const
 
 export type CcSocketEventName = (typeof CcSocketEvent)[keyof typeof CcSocketEvent]

@@ -95,6 +95,22 @@ async def test_reconcile_renews_live_lease(fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_incomplete_reconcile_does_not_release_unknown_call(fake_redis):
+    await _put_in_call(fake_redis, call_id="old-color-call")
+
+    released = await Svc.reconcile_in_call(
+        fake_redis,
+        active_call_ids=set(),
+        release_missing=False,
+    )
+
+    assert released == []
+    snap = await Svc.get_snapshot(fake_redis, 7, 42)
+    assert snap["resource_state"] == "in_call"
+    assert snap["current_call_id"] == "old-color-call"
+
+
+@pytest.mark.asyncio
 async def test_recover_from_sources_leases_rebuilt_in_call(fake_redis):
     # Rebuilding in_call from a (possibly stale) call record must carry a lease
     # so the agent self-heals instead of being resurrected into permanent busy.

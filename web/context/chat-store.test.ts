@@ -230,3 +230,23 @@ describe('workspace message reconciliation', () => {
     expect(useChatStore.getState().conversations.map((item) => item.unread_count)).toEqual([0, 4])
   })
 })
+
+describe('workspace prependMessages', () => {
+  it('does not keep overlapping history ids that crash assistant-ui', () => {
+    useChatStore.getState().setMessages(10, [
+      message({ id: 11, content: 'on screen' }),
+      message({ id: 12 }),
+    ])
+
+    useChatStore.getState().prependMessages(10, [
+      message({ id: 10, content: 'older' }),
+      message({ id: 11, content: 'overlap' }),
+    ])
+
+    expect(useChatStore.getState().messages.get(10)?.map((item) => [item.id, item.content])).toEqual([
+      [10, 'older'],
+      [11, 'on screen'],
+      [12, 'hello'],
+    ])
+  })
+})

@@ -59,7 +59,7 @@ export function UserRelatedTimeline({
 }: UserRelatedTimelineProps) {
   const [timelineTab, setTimelineTab] = useState<TimelineTab>('all')
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null)
-  const [selectedCallId, setSelectedCallId] = useState<number | null>(null)
+  const [selectedCallId, setSelectedCallId] = useState<string | null>(null)
   const currentUser = useAuthStore((state) => state.user)
   const canViewCallRecords = hasPermission(currentUser, 'call.record.view')
 
@@ -245,7 +245,7 @@ function TimelineEventCard({
   isZh: boolean
   resolveFieldDef: (fieldKey: string) => UnifiedField | undefined
   onOpenSession: (sessionId: number) => void
-  onOpenCall: (callId: number) => void
+  onOpenCall: (callId: string) => void
 }) {
   if (event.type === 'change') {
     return (
@@ -266,7 +266,7 @@ function TimelineEventCard({
       <CallTimelineCard
         record={event.call}
         isZh={isZh}
-        onOpen={() => onOpenCall(event.call.id)}
+        onOpen={() => onOpenCall(event.call.public_id)}
       />
     )
   }
@@ -337,10 +337,10 @@ function CallTimelineCard({
           </span>
         </TimelineMeta>
         <TimelineMeta label={isZh ? '接待客服' : 'Agent'}>
-          <span className="text-foreground">{record.agent_name || '-'}</span>
+          <span className="text-foreground">{record.last_serving_agent_name || '-'}</span>
         </TimelineMeta>
         <TimelineMeta label={isZh ? '时长' : 'Duration'}>
-          <span className="text-foreground">{formatCallRecordDuration(record.talk_duration_ms)}</span>
+          <span className="text-foreground">{formatCallRecordDuration(record.customer_agent_talk_duration_ms)}</span>
         </TimelineMeta>
       </div>
       <div className="mt-2 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
@@ -349,7 +349,7 @@ function CallTimelineCard({
         </TimelineMeta>
         <TimelineMeta label={isZh ? '状态' : 'Status'}>
           <span className="rounded-md bg-muted px-1.5 py-0.5 text-foreground">
-            {record.state || '-'}
+            {record.call_result || record.lifecycle_status}
           </span>
         </TimelineMeta>
       </div>

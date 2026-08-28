@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from 'react'
 import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import type { AssistPanelConfigValue } from '@/models/channel'
 
 export type AssistPanelStatus = {
@@ -54,8 +55,6 @@ type AssistAppProps = {
   config: Record<string, AssistPanelConfigValue>
 }
 
-type AssistAppComponent = React.ComponentType<AssistAppProps>
-
 const UNSUPPORTED_ASSIST_PANEL_PATTERNS = [
   /<\s*script\b/i,
   /\bimport\s*(?:\(|[^;\n]+from\b)/i,
@@ -90,7 +89,7 @@ function transformDefaultExport(source: string): string {
   return code.replace(/\bexport\s+default\b/, 'return')
 }
 
-function compileAssistPanelComponent(source: string): AssistAppComponent {
+export function compileAssistPanelComponent<P = AssistAppProps>(source: string): React.ComponentType<P> {
   if (!validateAssistPanelCodeSource(source)) {
     throw new Error('Unsupported React code')
   }
@@ -152,7 +151,7 @@ function compileAssistPanelComponent(source: string): AssistAppComponent {
   if (typeof component !== 'function' && (typeof component !== 'object' || component === null)) {
     throw new Error('Default export must be a React component')
   }
-  return component as AssistAppComponent
+  return component as React.ComponentType<P>
 }
 
 export function getAssistPanelCodeError(source: string): string | null {
@@ -201,7 +200,7 @@ function AssistPanelRuntimeError({ locale, message }: { locale: Locale; message:
   return (
     <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-3 text-xs leading-5 text-destructive">
       <p className="font-medium">
-        {locale === 'zh' ? '辅助信息加载失败' : 'Failed to load help content'}
+        {t('chat.assistPanel.loadFailed', locale)}
       </p>
       <p className="mt-1 break-words text-destructive/80">{message}</p>
     </div>

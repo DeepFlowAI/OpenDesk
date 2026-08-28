@@ -4,13 +4,15 @@ import { useEffect, useState, type MouseEvent } from 'react'
 import { IconX } from '@tabler/icons-react'
 import type { ConversationAnnouncementPublic } from '@/models/conversation-announcement'
 import { ANNOUNCEMENT_BACKGROUND_VALUES } from '@/models/conversation-announcement'
+import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import { SafeHtml } from '@/components/safe-html'
 import { cn } from '@/lib/utils'
 
 type VisitorAnnouncementProps = {
   announcement: ConversationAnnouncementPublic | null
   visible: boolean
-  locale: string
+  locale: Locale
   suppressAutoPopup?: boolean
 }
 
@@ -85,7 +87,7 @@ export function VisitorAnnouncement({
             }}
             className="shrink-0 rounded-md px-2 py-1 text-xs font-semibold text-stone-800 hover:bg-black/5"
           >
-            {locale === 'zh' ? '详情' : 'Details'}
+            {t('chat.announcement.details', locale)}
           </button>
         </div>
       </div>
@@ -103,7 +105,7 @@ export function VisitorAnnouncement({
               type="button"
               onClick={closeModal}
               className="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-lg text-stone-700 hover:bg-black/5"
-              aria-label={locale === 'zh' ? '关闭公告详情' : 'Close announcement details'}
+              aria-label={t('chat.announcement.close', locale)}
             >
               <IconX size={18} />
             </button>

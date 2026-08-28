@@ -4,8 +4,10 @@ import {
   buildKnowledgeSendPlan,
   knowledgeDocumentHasComposerBody,
   knowledgeDocumentHasComposerSendableContent,
+  knowledgeDocumentHasInlineImage,
   knowledgeDocumentHasMessageBody,
   knowledgeDocumentHasSendableContent,
+  knowledgeDocumentNeedsSuggestionDialog,
   knowledgeHtmlToComposerText,
   knowledgeHtmlToMessageText,
   stripKnowledgeHtml,
@@ -168,5 +170,16 @@ describe('knowledge document sendable content', () => {
     const document = knowledgeDocument('<p><br></p>')
 
     expect(knowledgeDocumentHasSendableContent(document)).toBe(false)
+  })
+
+  it('flags image and attachment documents for the suggestion dialog', () => {
+    const imageOnly = knowledgeDocument('<p><img src="https://cdn.example.com/a.png"></p>')
+    const attachmentOnly = knowledgeDocument('<p></p>', 1)
+    const plainText = knowledgeDocument('<p>正文</p>')
+
+    expect(knowledgeDocumentHasInlineImage(imageOnly)).toBe(true)
+    expect(knowledgeDocumentNeedsSuggestionDialog(imageOnly)).toBe(true)
+    expect(knowledgeDocumentNeedsSuggestionDialog(attachmentOnly)).toBe(true)
+    expect(knowledgeDocumentNeedsSuggestionDialog(plainText)).toBe(false)
   })
 })

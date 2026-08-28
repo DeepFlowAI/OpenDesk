@@ -3,6 +3,29 @@ import type { FieldType } from '@/types/field-enums'
 
 export type OutboundTaskStatus = 'draft' | 'active' | 'paused' | 'completed' | 'archived'
 export type OutboundTargetStatus = 'pending' | 'calling' | 'redial' | 'completed' | 'do_not_call' | 'invalid_number'
+export type OutboundScriptNodeType = 'start' | 'script' | 'branch' | 'end'
+
+export type OutboundScriptBranch = {
+  id: string
+  label: string
+  next_node_id: string
+}
+
+export type OutboundScriptNode = {
+  id: string
+  type: OutboundScriptNodeType
+  title: string
+  content?: string | null
+  agent_tip?: string | null
+  next_node_id?: string | null
+  branches: OutboundScriptBranch[]
+  position: { x: number; y: number }
+}
+
+export type OutboundScript = {
+  version: 1
+  nodes: OutboundScriptNode[]
+}
 
 export type OutboundTaskField = {
   key: string
@@ -22,6 +45,8 @@ export type OutboundTaskTemplate = {
   name: string
   description: string | null
   fields: OutboundTaskField[]
+  script?: OutboundScript | null
+  has_script?: boolean
   created_by_id: number | null
   updated_by_id: number | null
   created_at: string | null
@@ -52,11 +77,20 @@ export type OutboundTask = {
   assignment_mode: string
   assignee_scope_ids: number[]
   fields: OutboundTaskField[]
+  script_snapshot?: OutboundScript | null
+  has_script?: boolean
   created_by_id: number | null
   updated_by_id: number | null
   created_at: string | null
   updated_at: string | null
   stats: OutboundTaskStats
+}
+
+export type OutboundTargetTaskContext = {
+  id: number
+  name: string
+  fields: OutboundTaskField[]
+  has_script: boolean
 }
 
 export type OutboundTarget = {
@@ -65,6 +99,7 @@ export type OutboundTarget = {
   task_id: number
   phone_number: string
   user_id: number | null
+  user_name: string | null
   assignee_id: number | null
   status: OutboundTargetStatus
   field_values: Record<string, unknown>
@@ -76,7 +111,7 @@ export type OutboundTarget = {
   total_talk_duration_ms: number
   created_at: string | null
   updated_at: string | null
-  task?: OutboundTask | null
+  task?: OutboundTargetTaskContext | null
 }
 
 export type OutboundRecord = {
@@ -101,9 +136,12 @@ export type CreateOutboundTemplatePayload = {
   name: string
   description?: string | null
   fields?: OutboundTaskField[]
+  script?: OutboundScript | null
 }
 
-export type UpdateOutboundTemplatePayload = CreateOutboundTemplatePayload
+export type UpdateOutboundTemplatePayload = CreateOutboundTemplatePayload & {
+  expected_updated_at?: string | null
+}
 
 export type CreateOutboundTaskPayload = {
   template_id: number
@@ -186,6 +224,37 @@ export type OutboundTemplateListResponse = PaginatedResponse<OutboundTaskTemplat
 export type OutboundTaskListResponse = PaginatedResponse<OutboundTask>
 export type OutboundTargetListResponse = PaginatedResponse<OutboundTarget>
 export type OutboundRecordListResponse = PaginatedResponse<OutboundRecord>
+
+export type MyOutboundTaskItem = {
+  id: number
+  name: string
+  status: OutboundTaskStatus
+  due_at: string | null
+  my_total: number
+  my_completed: number
+}
+
+export type MyOutboundTaskListResponse = {
+  items: MyOutboundTaskItem[]
+}
+
+export type MyOutboundTargetRecordItem = {
+  id: number
+  source: 'manual' | 'personal_auto'
+  started_at: string
+  answered: boolean
+  result: string | null
+  duration_ms: number | null
+  agent_id: number | null
+  agent_name: string | null
+  call_record_id: number | null
+  call_record_public_id: string | null
+  can_view_detail: boolean
+}
+
+export type MyOutboundTargetRecordsResponse = {
+  items: MyOutboundTargetRecordItem[]
+}
 
 export const OUTBOUND_TASK_STATUS_LABELS: Record<OutboundTaskStatus, string> = {
   draft: '草稿',

@@ -1,7 +1,8 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
-import { IconLoader2, IconX } from '@tabler/icons-react'
+import { Select as SelectPrimitive } from '@base-ui/react/select'
+import { IconLoader2, IconSearch, IconX } from '@tabler/icons-react'
 import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
@@ -16,13 +17,13 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
   Select,
-  SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { cn } from '@/lib/utils'
 import { normalizeRobotQaKeyword, robotQaAnswerMarkdownFromMessage } from '@/lib/robot-qa-message-content'
 import type { Message } from '@/models/conversation'
 import type { RobotQaDirectory, RobotQaRuntime } from '@/models/robot-qa'
@@ -84,6 +85,7 @@ export function RobotQaCreateDialog({
 
   const [directoryId, setDirectoryId] = useState('')
   const [directorySearch, setDirectorySearch] = useState('')
+  const [directoryOpen, setDirectoryOpen] = useState(false)
   const [question, setQuestion] = useState('')
   const [answer, setAnswer] = useState(initialAnswer)
   const [keywords, setKeywords] = useState<string[]>([])
@@ -93,6 +95,7 @@ export function RobotQaCreateDialog({
   const [answerError, setAnswerError] = useState('')
   const [keywordError, setKeywordError] = useState('')
   const questionRef = useRef<HTMLInputElement>(null)
+  const directorySearchRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (!open) return
@@ -103,6 +106,7 @@ export function RobotQaCreateDialog({
     if (!open) return
     setQuestion('')
     setDirectorySearch('')
+    setDirectoryOpen(false)
     setAnswer(initialAnswer)
     setKeywords([])
     setKeywordInput('')
@@ -111,6 +115,12 @@ export function RobotQaCreateDialog({
     setAnswerError('')
     setKeywordError('')
   }, [initialAnswer, message.id, open])
+
+  useEffect(() => {
+    if (!directoryOpen) return
+    const timer = window.setTimeout(() => directorySearchRef.current?.focus(), 0)
+    return () => window.clearTimeout(timer)
+  }, [directoryOpen])
 
   const dirty = question.length > 0
     || answer !== initialAnswer
@@ -245,32 +255,65 @@ export function RobotQaCreateDialog({
                 {isZh ? '目标知识库暂无 QA 目录，请先在 OpenAgent 创建目录' : 'This knowledge base has no QA directories. Create one in OpenAgent first.'}
               </p>
             ) : (
-              <div className="space-y-2">
-                <Input
-                  type="search"
-                  value={directorySearch}
-                  disabled={createQa.isPending}
-                  placeholder={isZh ? '搜索 QA 目录' : 'Search QA directories'}
-                  onChange={(event) => setDirectorySearch(event.target.value)}
-                />
-                <Select
-                  items={directorySelectItems}
-                  value={directoryId}
-                  onValueChange={(value) => setDirectoryId(value ?? '')}
-                  disabled={directories.isLoading || createQa.isPending}
-                >
-                  <SelectTrigger id="robot-qa-directory" className="w-full">
-                    <SelectValue placeholder={directories.isLoading ? (isZh ? '加载中…' : 'Loading…') : (isZh ? '请选择目录' : 'Select a directory')} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {filteredDirectories.map((item) => (
-                      <SelectItem key={item.id} value={String(item.id)}>
-                        {robotQaDirectoryLabel(item)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+              <Select
+                items={directorySelectItems}
+                value={directoryId}
+                open={directoryOpen}
+                onOpenChange={(nextOpen) => {
+                  setDirectoryOpen(nextOpen)
+                  if (!nextOpen) setDirectorySearch('')
+                }}
+                onValueChange={(value) => setDirectoryId(value ?? '')}
+                disabled={directories.isLoading || createQa.isPending}
+              >
+                <SelectTrigger id="robot-qa-directory" className="w-full">
+                  <SelectValue placeholder={isZh ? '请选择目录' : 'Select a directory'} />
+                </SelectTrigger>
+                <SelectPrimitive.Portal>
+                  <SelectPrimitive.Positioner
+                    side="bottom"
+                    sideOffset={4}
+                    align="start"
+                    alignItemWithTrigger={false}
+                    className="isolate z-50"
+                  >
+                    <SelectPrimitive.Popup
+                      className={cn(
+                        'relative isolate z-50 w-(--anchor-width) min-w-36 origin-(--transform-origin) overflow-hidden rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100',
+                        'data-[side=bottom]:slide-in-from-top-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95',
+                        'data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95',
+                      )}
+                    >
+                      <div className="flex items-center gap-2 border-b border-border px-2.5 py-2">
+                        <IconSearch size={14} className="shrink-0 text-muted-foreground" />
+                        <input
+                          ref={directorySearchRef}
+                          type="text"
+                          value={directorySearch}
+                          placeholder={isZh ? '搜索 QA 目录' : 'Search QA directories'}
+                          className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground"
+                          onChange={(event) => setDirectorySearch(event.target.value)}
+                          onKeyDown={(event) => event.stopPropagation()}
+                          onClick={(event) => event.stopPropagation()}
+                        />
+                      </div>
+                      <SelectPrimitive.List className="max-h-60 overflow-y-auto p-1">
+                        {filteredDirectories.length === 0 ? (
+                          <div className="px-2 py-3 text-center text-xs text-muted-foreground">
+                            {isZh ? '无匹配目录' : 'No matching directories'}
+                          </div>
+                        ) : (
+                          filteredDirectories.map((item) => (
+                            <SelectItem key={item.id} value={String(item.id)}>
+                              {robotQaDirectoryLabel(item)}
+                            </SelectItem>
+                          ))
+                        )}
+                      </SelectPrimitive.List>
+                    </SelectPrimitive.Popup>
+                  </SelectPrimitive.Positioner>
+                </SelectPrimitive.Portal>
+              </Select>
             )}
           </div>
 

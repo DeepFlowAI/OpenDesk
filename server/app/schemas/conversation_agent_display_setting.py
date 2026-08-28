@@ -22,3 +22,8 @@ class ConversationAgentDisplaySettingResponse(ConversationAgentDisplaySettingPay
     updated_by_id: int | None = None
     updated_by_name: str | None = None
     updated_at: datetime | None = None
+
+
+class ConversationAgentDisplayTargetResponse(BaseModel):
+    display_mode: AgentDisplayMode
+    sender_name: str | None = None

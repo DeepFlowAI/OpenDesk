@@ -288,7 +288,7 @@ function FieldRow({
   const def = poolFields.find((fd) => fd.id === field.field_definition_id)
   const name = def?.name ?? field.field_key ?? '—'
   const typeLabel = def?.field_type
-    ? FIELD_TYPE_LABELS[def.field_type as FieldType]?.[locale as 'zh' | 'en'] ?? def.field_type
+    ? FIELD_TYPE_LABELS[def.field_type as FieldType]?.[locale === 'zh' ? 'zh' : 'en'] ?? def.field_type
     : '—'
 
   return (
@@ -382,7 +382,7 @@ function PoolModal({
                   <div>
                     <span className="text-sm font-medium text-foreground">{fd.name}</span>
                     <span className="ml-3 text-xs text-muted-foreground">
-                      {FIELD_TYPE_LABELS[fd.field_type as FieldType]?.[locale as 'zh' | 'en'] ?? fd.field_type}
+                      {FIELD_TYPE_LABELS[fd.field_type as FieldType]?.[locale === 'zh' ? 'zh' : 'en'] ?? fd.field_type}
                     </span>
                   </div>
                   <button
@@ -1116,7 +1116,7 @@ function ConfirmDialog({
 function buildRuleSummary(rule: CsSummaryInteractionRule, locale: string): string {
   if (rule.name) return rule.name
 
-  const lang = locale as 'zh' | 'en'
+  const lang = locale === 'zh' ? 'zh' : 'en'
   const conds = (rule.conditions as unknown as RuleCondition[]) ?? []
   const acts = (rule.actions as unknown as RuleAction[]) ?? []
 

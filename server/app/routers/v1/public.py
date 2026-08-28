@@ -49,6 +49,12 @@ from app.schemas.visitor_session import (
     VisitorSessionRequest,
     VisitorSessionResponse,
 )
+from app.schemas.channel_form_submission import (
+    PublicFormMessageConfigResponse,
+    PublicFormMessageFileResponse,
+    PublicFormMessageSubmitRequest,
+    PublicFormMessageSubmitResponse,
+)
 from app.services.channel_service import ChannelService
 from app.services.conversation_file_service import ConversationFileService
 from app.services.conversation_service import ConversationService
@@ -58,6 +64,7 @@ from app.services.offline_message_service import OfflineMessageService
 from app.services.satisfaction_survey_record_service import SatisfactionSurveyRecordService
 from app.services.telemetry_service import TelemetryService
 from app.services.web_sdk_context_service import WebSdkContextService
+from app.services.channel_form_submission_service import ChannelFormSubmissionService
 
 router = APIRouter(prefix="/public", tags=["Public"])
 _TELEMETRY_BODY_BYTES_CAP = 256 * 1024
@@ -181,6 +188,53 @@ async def create_visitor_session(
 ):
     """Create a visitor session token bound to the public channel key."""
     return await ChannelService.create_visitor_session(db, channel_key, body)
+
+
+@router.get(
+    "/form-messages/config",
+    response_model=PublicFormMessageConfigResponse,
+)
+async def get_form_message_config_public(
+    db: AsyncSession = Depends(get_db),
+    visitor_context: dict = Depends(get_visitor_context),
+):
+    """Get the immutable form version opened by the current visitor."""
+    return await ChannelFormSubmissionService.get_public_config(db, visitor_context)
+
+
+@router.post(
+    "/form-messages/submit",
+    response_model=PublicFormMessageSubmitResponse,
+)
+async def submit_form_message_public(
+    body: PublicFormMessageSubmitRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+    visitor_context: dict = Depends(get_visitor_context),
+):
+    """Atomically create one ticket and snapshot for a visitor form submission."""
+    return await ChannelFormSubmissionService.submit(db, redis, visitor_context, body)
+
+
+@router.post(
+    "/form-messages/files",
+    response_model=PublicFormMessageFileResponse,
+)
+async def upload_form_message_file_public(
+    request: Request,
+    file: UploadFile = File(...),
+    version: int = Form(..., gt=0),
+    field_ref: str = Form(..., min_length=3, max_length=80),
+    authorization: str | None = Header(None),
+):
+    """Upload a file for a visitor-visible form field without holding a DB session."""
+    visitor_context = await get_visitor_context_short_session(request, authorization)
+    return await ChannelFormSubmissionService.upload_public_file_managed(
+        visitor_context,
+        version,
+        field_ref,
+        file,
+    )
 
 
 @_telemetry_router.post(

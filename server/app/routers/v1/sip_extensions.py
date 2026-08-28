@@ -123,7 +123,7 @@ async def get_sip_extension_registration_info(
         require_permission_short_session(EXTENSION_MANAGE)
     ),
 ):
-    """Registration info for the copy action (masked password)."""
+    """Full registration info for the copy action."""
     return await SipExtensionService.get_registration_info_managed(
         principal, extension_id
     )

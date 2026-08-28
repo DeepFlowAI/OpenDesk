@@ -144,6 +144,7 @@ async def test_sip_phone_agent_rings_and_bridges_on_answer(monkeypatch):
     bridges = [a for m, a in telephony.recorded if m == "call.bridge"]
     assert bridges and bridges[0]["call_id"] == "cust-call"
     assert bridges[0]["other_call_id"] == "ext-leg"
+    assert bridges[0]["user_call_id"] == "cust-call"
     assert ctx.variables["sys._bridged_agent_id"] == 42
     assert ctx.variables["sys._bridged_webrtc_call_id"] == "ext-leg"
     # Off-hook on the handset moves the agent's browser to 通话中 (no click).
@@ -236,3 +237,72 @@ async def test_sip_phone_caller_hangup_cancels_ring(monkeypatch):
     assert any(h["call_id"] == "ext-leg" for h in hangups), "handset ring stopped"
     bridges = [m for m, _ in telephony.recorded if m == "call.bridge"]
     assert not bridges  # customer never bridged
+
+
+def test_queue_prompt_resolution():
+    """Missing key → default prompt; non-empty string → as-is; explicit empty
+    string → None (prompt disabled, callee hears silence before the agent)."""
+    assert AssignQueueExecutor._queue_prompt({}) == "正在为您转接，请稍候。"
+    assert AssignQueueExecutor._queue_prompt({"queue_prompt_text": "请稍等"}) == "请稍等"
+    assert AssignQueueExecutor._queue_prompt({"queue_prompt_text": ""}) is None
+
+
+@pytest.mark.asyncio
+async def test_sip_phone_empty_prompt_plays_nothing_and_bridges(monkeypatch):
+    """queue_prompt_text="" (personal auto-outbound transfer): no transfer TTS,
+    no play waiter registered — the callee goes from silence straight to the
+    agent's voice once the handset is off-hook."""
+    telephony = MockTelephonyClient()
+    await telephony.connect()
+    telephony.originate_response = {"call_id": "ext-leg", "status": "originating"}
+    ext = SimpleNamespace(
+        sip_user_id="acme-1001",
+        is_active=True,
+        registration_status="registered",
+        current_occupant_employee_id=42,
+    )
+    _patch_common(monkeypatch, device_type="sip_phone", ext=ext)
+
+    from app.services import call_record_service
+    from app.services.cc_agent_status_service import CcAgentStatusService
+    from app.services.cc_agent_resource_service import CcAgentResourceService
+    from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
+    from app.services.system_settings_service import SystemSettingsService
+
+    monkeypatch.setattr(call_record_service.CallRecordService, "mark_answered", AsyncMock())
+    monkeypatch.setattr(CcAgentStatusService, "set_status", AsyncMock())
+    monkeypatch.setattr(AgentWebRTCSessionService, "set_busy", AsyncMock())
+    monkeypatch.setattr(CcAgentResourceService, "mark_ringing", AsyncMock(return_value=None))
+    monkeypatch.setattr(CcAgentResourceService, "mark_in_call", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        SystemSettingsService, "is_bridge_asr_enabled_managed", AsyncMock(return_value=True),
+    )
+
+    ctx = _ctx(telephony)
+    exe = AssignQueueExecutor()
+
+    orch = get_orchestrator()
+    orch.notify_agent_incoming = AsyncMock()
+    orch.notify_agent_call_answered = AsyncMock()
+
+    async def answer_soon():
+        await asyncio.sleep(0.05)
+        # No play wait to resolve — the prompt was disabled.
+        orch._resolve_leg_wait("ext-leg", {"answered": True})
+
+    answer_task = asyncio.create_task(answer_soon())
+    result = await exe._try_ring_sip_phone_agent(
+        ctx, {"queue_prompt_text": ""}, _node(), {"employee_id": 42},
+        "offer-1", 30.0, MagicMock(), orch, MagicMock(),
+    )
+    await answer_task
+
+    assert result is not _NOT_SIP_PHONE
+    # No transfer prompt played and no waiter registered.
+    assert not [m for m, _ in telephony.recorded if m == "call.say"]
+    assert "sys._prompt_play_waiter" not in ctx.variables
+    # Off-hook still bridges caller ↔ extension normally.
+    bridges = [a for m, a in telephony.recorded if m == "call.bridge"]
+    assert bridges and bridges[0]["call_id"] == "cust-call"
+    assert bridges[0]["other_call_id"] == "ext-leg"
+    assert ctx.variables["sys._bridged_agent_id"] == 42

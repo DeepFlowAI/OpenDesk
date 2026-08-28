@@ -9,6 +9,7 @@ import { t } from '@/utils/i18n'
 import { hasPermission } from '@/utils/permissions'
 import { useCreateEmployee } from '@/service/use-employees'
 import EmployeeForm from '@/app/(main)/employees/form'
+import { readEmployeeErrorMessage } from '@/app/(main)/employees/read-error-message'
 import type { CreateEmployeePayload } from '@/models/employee'
 
 export default function NewEmployeePage() {
@@ -28,9 +29,10 @@ export default function NewEmployeePage() {
         setTimeout(() => {
           router.push(`/employees/${created.id}`)
         }, 800)
-      } catch {
-        setToast({ type: 'error', text: t('emp.saveFailed', locale) })
-        setTimeout(() => setToast(null), 3000)
+      } catch (error) {
+        const message = await readEmployeeErrorMessage(error, t('emp.saveFailed', locale))
+        setToast({ type: 'error', text: message })
+        setTimeout(() => setToast(null), 5000)
       }
     },
     [canCreate, createMutation, locale, router]

@@ -41,6 +41,7 @@ import {
   ActivityTimelineRow,
 } from '@/app/components/features/ticket/activity-timeline-row'
 import { TicketCommentThread } from '@/app/components/features/ticket/ticket-comment-thread'
+import { FormMessageSubmissionCard } from '@/app/components/features/ticket/form-message-submission-card'
 import { richTextToPlainCell } from '@/lib/rich-text-plain'
 import {
   coalescePillOptions,
@@ -273,7 +274,7 @@ export default function TicketDetailPage() {
   const [rightTab, setRightTab] = useState<'comments' | 'changes' | 'all'>('comments')
   const [editingFieldId, setEditingFieldId] = useState<number | null>(null)
   const [selectedSessionRecordId, setSelectedSessionRecordId] = useState<number | null>(null)
-  const [selectedCallRecordId, setSelectedCallRecordId] = useState<number | null>(null)
+  const [selectedCallRecordId, setSelectedCallRecordId] = useState<string | null>(null)
   const shouldLoadChanges = rightTab === 'changes' || rightTab === 'all'
   const changeQueryParams = useMemo(() => ({ page: 1, per_page: 50 }), [])
   const {
@@ -523,12 +524,24 @@ export default function TicketDetailPage() {
                     editingFieldId={editingFieldId}
                     onStartEdit={canEditTicket ? setEditingFieldId : () => undefined}
                     onOpenSessionDrawer={setSelectedSessionRecordId}
-                    onOpenCallDrawer={setSelectedCallRecordId}
+                    onOpenCallDrawer={() => {
+                      if (ticket.call_record_public_id) {
+                        setSelectedCallRecordId(ticket.call_record_public_id)
+                      }
+                    }}
                     conversationPublicId={ticket.conversation_public_id ?? ticket.call_record_call_id ?? undefined}
                     callRecordId={ticket.call_record_id ?? undefined}
                     isZh={isZh}
                   />
                 ))}
+              </div>
+            )}
+            {ticket.form_submission && (
+              <div className={layout ? 'mt-[18px]' : undefined}>
+                <FormMessageSubmissionCard
+                  submission={ticket.form_submission}
+                  isZh={isZh}
+                />
               </div>
             )}
           </div>

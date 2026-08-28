@@ -5,6 +5,7 @@ import {
   useContext,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -16,7 +17,9 @@ import {
   type AppendMessage,
 } from '@assistant-ui/react'
 import { useVisitorChatStore } from '@/context/visitor-chat-store'
+import { dedupeMessagesById } from '@/lib/message-list'
 import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import type {
   Message,
   OpenAgentTextBlock,
@@ -256,7 +259,7 @@ export function getOpenAgentToolBlocks(metadata?: Record<string, unknown>): Open
     return [{
       id,
       toolName,
-      brief: getStringValue(record.brief) || toolName || '工具调用',
+      brief: getStringValue(record.brief) || toolName,
       toolCallId,
       stepId: getNumberValue(record.stepId) ?? getNumberValue(record.step_id),
       isExecuting: record.isExecuting === true || record.is_executing === true,
@@ -308,8 +311,7 @@ function getToolCallId(data: OpenAgentToolCallPayload | OpenAgentToolResultPaylo
 function buildToolBrief(data: OpenAgentToolCallPayload, toolName: string): string {
   const brief = getStringValue(data.brief)
   if (brief) return brief
-  if (toolName) return `调用 ${toolName}`
-  return '调用工具'
+  return toolName
 }
 
 function upsertToolCallBlock(
@@ -352,7 +354,7 @@ function applyToolResultBlock(
       {
         id: `tool_${toolCallId}`,
         toolName,
-        brief: toolName ? `调用 ${toolName}` : '工具调用',
+        brief: toolName,
         toolCallId,
         stepId: null,
         isExecuting: false,
@@ -645,14 +647,12 @@ function resolveHandoffEventType(message: Message): string | null {
 function resolveHandoffBrief(
   payload: HumanHandoffEventPayload,
   fallbackContent: string,
-  locale: string,
+  locale: Locale,
 ): string {
   const brief = payload.handoff?.brief?.trim()
   if (brief) return brief
   if (fallbackContent.trim()) return fallbackContent.trim()
-  return locale === 'zh'
-    ? '这个问题需要人工客服进一步处理。'
-    : 'This issue needs a human support agent to take a closer look.'
+  return t('chat.handoff.needsAgent', locale)
 }
 
 function isFinalBotMessage(message: Message): boolean {
@@ -821,7 +821,8 @@ export function VisitorChatRuntimeProvider({
   onHandoffQueueFull,
   ...chatConfig
 }: ProviderProps) {
-  const messages = useVisitorChatStore((s) => s.messages)
+  const rawMessages = useVisitorChatStore((s) => s.messages)
+  const messages = useMemo(() => dedupeMessagesById(rawMessages), [rawMessages])
   const {
     conversationPublicId,
     offlineMode,
@@ -968,7 +969,7 @@ export function VisitorChatRuntimeProvider({
     submittedNoticeShownRef.current = true
     const noticeId = addSystemNotice(
       messageThreadPublicId,
-      chatConfig.locale === 'zh' ? '留言已提交' : 'Message submitted',
+      t('chat.leaveMessage.submitted', chatConfig.locale),
       { offline_message_submit_success: true },
     )
     submittedNoticeIdRef.current = noticeId
@@ -1196,7 +1197,7 @@ export function VisitorChatRuntimeProvider({
             },
             (response?: { ok?: boolean; message?: string }) => {
               if (response?.ok === false) {
-                window.alert(response.message || (chatConfig.locale === 'zh' ? '撤回失败，请稍后重试' : 'Recall failed. Try again later'))
+                window.alert(response.message || t('chat.recall.failed', chatConfig.locale))
                 resolve(false)
                 return
               }
@@ -1215,7 +1216,7 @@ export function VisitorChatRuntimeProvider({
         useVisitorChatStore.getState().updateMessage(recalled as Message)
         return true
       } catch {
-        window.alert(chatConfig.locale === 'zh' ? '撤回失败，请稍后重试' : 'Recall failed. Try again later')
+        window.alert(t('chat.recall.failed', chatConfig.locale))
         return false
       }
     },
@@ -1488,7 +1489,7 @@ export function VisitorChatRuntimeProvider({
       setBotRunning(true)
       let assistantTempId: number | null = addBotStreamingMessage(
         conversationPublicId,
-        chatConfig.config.open_agent_agent_name || '智能助手',
+        chatConfig.config.open_agent_agent_name || t('chat.quote.sender.bot', chatConfig.locale),
       )
       let assistantHasContent = false
       let assistantHasTextContent = false
@@ -1564,7 +1565,7 @@ export function VisitorChatRuntimeProvider({
         if (assistantTempId === null) {
           assistantTempId = addBotStreamingMessage(
             conversationPublicId,
-            chatConfig.config.open_agent_agent_name || '智能助手',
+            chatConfig.config.open_agent_agent_name || t('chat.quote.sender.bot', chatConfig.locale),
           )
         }
         return assistantTempId
@@ -1637,12 +1638,8 @@ export function VisitorChatRuntimeProvider({
         addSystemNotice(
           conversationPublicId,
           message || (attachment
-            ? chatConfig.locale === 'zh'
-              ? '附件发送失败，请点击重试'
-              : 'Failed to send the attachment. Click retry.'
-            : chatConfig.locale === 'zh'
-              ? '智能助手暂时没有响应，请稍后重试或转人工'
-              : 'The assistant is not responding. Please retry or contact support.'),
+            ? t('chat.attachment.failed', chatConfig.locale)
+            : t('chat.bot.noResponse', chatConfig.locale)),
           { event_type: 'open_agent_stream_error' },
         )
       }

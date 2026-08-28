@@ -84,6 +84,7 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
                 "call.incoming",
                 "call.dtmf",
                 "call.play_end",
+                "call.speech_start",
                 "call.speech_end",
                 "call.speech_partial",
                 "call.user_text",
@@ -305,8 +306,22 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
             call_id, "call_say", call_id, text, voice=voice, barge_in=barge_in
         )
 
-    async def call_listen(self, call_id: str, *, timeout_ms: int | None = None) -> None:
-        await self._call_on_kernel(call_id, "call_listen", call_id, timeout_ms=timeout_ms)
+    async def call_listen(
+        self,
+        call_id: str,
+        *,
+        timeout_ms: int | None = None,
+        adaptive_barge_in: bool | None = None,
+        performance: dict | None = None,
+    ) -> None:
+        await self._call_on_kernel(
+            call_id,
+            "call_listen",
+            call_id,
+            timeout_ms=timeout_ms,
+            adaptive_barge_in=adaptive_barge_in,
+            performance=performance,
+        )
 
     async def call_stop(self, call_id: str, *, target: str = "all") -> None:
         await self._call_on_kernel(call_id, "call_stop", call_id, target=target)
@@ -348,6 +363,7 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
         transcribe: bool = True,
         *,
         keepalive_on_peer_hangup: bool = False,
+        user_call_id: str | None = None,
     ) -> None:
         await self._call_on_kernel(
             call_id,
@@ -356,6 +372,7 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
             other_call_id,
             transcribe=transcribe,
             keepalive_on_peer_hangup=keepalive_on_peer_hangup,
+            user_call_id=user_call_id,
         )
         # Both legs live on the same kernel.
         idx = await self._lookup_kernel(call_id)
@@ -447,6 +464,7 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
         trunk_id: str | None = None,
         timeout_ms: int | None = None,
         headers: dict[str, str] | None = None,
+        request_id: str | None = None,
     ) -> dict:
         preferred = self._primary()
         # Prefer the active-color primary, but fall through to any other ready
@@ -466,6 +484,7 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
                     trunk_id=trunk_id,
                     timeout_ms=timeout_ms,
                     headers=headers,
+                    request_id=request_id,
                 )
             except TelephonyRPCError as exc:
                 last_exc = exc
@@ -523,6 +542,12 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
     async def registrar_info(self) -> dict | None:
         return await self._primary().registrar_info()
 
+    async def originate_capacity(self) -> dict | None:
+        client = self._primary()
+        if not client.is_ready:
+            return None
+        return await client.originate_capacity()
+
     async def call_list(self) -> list[dict]:
         merged: list[dict] = []
         for idx, client in enumerate(self._clients):
@@ -541,6 +566,32 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
                     await self._remember_kernel(str(cid), idx)
                 merged.append(call)
         return merged
+
+    async def call_alive(self, call_id: str) -> bool | None:
+        """Three-state alive probe that respects blue/green ownership.
+
+        Known ownership asks only that kernel (never falls back to primary).
+        Unknown ownership requires every kernel to answer before returning
+        False — a down sibling must not look like "call gone".
+        """
+
+        idx = await self._lookup_kernel(call_id)
+        if idx is not None:
+            client = self._clients[idx]
+            if not client.is_ready:
+                return None
+            return await client.call_alive(call_id)
+
+        any_alive = False
+        for client in self._clients:
+            if not client.is_ready:
+                return None
+            result = await client.call_alive(call_id)
+            if result is None:
+                return None
+            if result:
+                any_alive = True
+        return any_alive
 
     async def webrtc_offer(self, sdp: str, call_id: str | None = None) -> dict:
         if call_id:

@@ -5,7 +5,7 @@ import type { Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 
 const BLINK_INTERVAL_MS = 1500
-const DEFAULT_TITLE = 'OpenDesk'
+const DEFAULT_TITLE = '工作台-OpenDesk'
 
 type UseWorkspaceTitleBlinkOptions = {
   enabled: boolean

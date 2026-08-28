@@ -12,6 +12,7 @@ import pytest
 
 import app.services.audio_asset_service as audio_mod
 import app.services.sip_extension_service as sip_mod
+from app.core.secret_store import encrypt_secret
 from app.libs.telephony.base import TelephonyError
 from app.repositories.audio_asset_repository import AudioAssetRepository
 from app.schemas.permission import EffectivePrincipal
@@ -73,6 +74,7 @@ def _sip_record(**overrides):
         sip_user_id="acme-1001",
         auth_account="acme-1001",
         auth_password_masked="abcd********",
+        auth_password_ciphertext=encrypt_secret("plain-secret"),
         registration_status="unregistered",
     )
     base.update(overrides)
@@ -214,6 +216,9 @@ async def test_managed_create_closes_db_while_registrar_rpc(monkeypatch):
         "app.libs.telephony.get_telephony_client",
         lambda: _Tel(),
     )
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_HOST", "")
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_PORT", None)
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_TRANSPORT", "")
 
     result = await SipExtensionService.create_managed(
         _principal(),
@@ -229,7 +234,7 @@ async def test_managed_create_closes_db_while_registrar_rpc(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_managed_create_succeeds_when_registrar_raises(monkeypatch):
-    """Telephony failure must not abort create — falls back to settings."""
+    """Complete SIP_REGISTRAR_* skips the kernel; create still succeeds."""
     _reset_tracker()
     rpc_active: list[bool] = []
 
@@ -257,7 +262,7 @@ async def test_managed_create_succeeds_when_registrar_raises(monkeypatch):
         SipExtensionCreate(name="Desk", extension_number="1001"),
     )
 
-    assert rpc_active == [False]
+    assert rpc_active == []
     info = result["registration_info"]
     assert info.registration_server == "fallback.host"
     assert info.registration_port == 5070
@@ -287,6 +292,9 @@ async def test_managed_reset_password_closes_db_while_registrar_rpc(monkeypatch)
         "app.libs.telephony.get_telephony_client",
         lambda: _Tel(),
     )
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_HOST", "")
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_PORT", None)
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_TRANSPORT", "")
 
     result = await SipExtensionService.reset_password_managed(_principal(), 5)
 
@@ -316,6 +324,8 @@ async def test_managed_reset_password_succeeds_when_registrar_raises(monkeypatch
         lambda: _Tel(),
     )
     monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_HOST", "fallback.host")
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_PORT", None)
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_TRANSPORT", "")
 
     result = await SipExtensionService.reset_password_managed(_principal(), 5)
 
@@ -345,11 +355,14 @@ async def test_managed_registration_info_closes_db_while_registrar_rpc(monkeypat
         "app.libs.telephony.get_telephony_client",
         lambda: _Tel(),
     )
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_HOST", "")
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_PORT", None)
+    monkeypatch.setattr(sip_mod.settings, "SIP_REGISTRAR_TRANSPORT", "")
 
     info = await SipExtensionService.get_registration_info_managed(_principal(), 5)
 
     assert rpc_active == [False]
     assert info.registration_server == "sip.example.com"
-    assert info.auth_password is None
+    assert info.auth_password == "plain-secret"
     assert info.auth_password_masked == "abcd********"
     assert SessionTracker.opens == SessionTracker.closes == 1

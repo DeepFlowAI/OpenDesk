@@ -30,6 +30,7 @@ from app.schemas.conversation_read_status import (
 from app.schemas.conversation_agent_display_setting import (
     ConversationAgentDisplaySettingPayload,
     ConversationAgentDisplaySettingResponse,
+    ConversationAgentDisplayTargetResponse,
 )
 from app.schemas.conversation_announcement_rule import (
     ConversationAnnouncementRuleCreate,
@@ -73,6 +74,14 @@ from app.schemas.satisfaction_survey_config import (
     SatisfactionSurveyVersionDetail,
     SatisfactionSurveyVersionListResponse,
 )
+from app.schemas.embedded_page import (
+    EmbeddedPageCreate,
+    EmbeddedPageListResponse,
+    EmbeddedPageLocation,
+    EmbeddedPageResponse,
+    EmbeddedPageUpdate,
+    EmbeddedPageWorkspaceResponse,
+)
 from app.services.queue_no_show_setting_service import QueueNoShowSettingService
 from app.services.knowledge_input_suggestion_setting_service import KnowledgeInputSuggestionSettingService
 from app.services.satisfaction_survey_config_service import SatisfactionSurveyConfigService
@@ -84,6 +93,7 @@ from app.services.conversation_user_stat_service import ConversationUserStatServ
 from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 from app.services.welcome_message_rule_service import WelcomeMessageRuleService
 from app.services.robot_qa_service import RobotQaService
+from app.services.embedded_page_service import EmbeddedPageService
 
 router = APIRouter(prefix="/conversation-settings", tags=["ConversationSettings"])
 EMOJI_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
@@ -95,6 +105,28 @@ ANNOUNCEMENT_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 READ_STATUS_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 AGENT_DISPLAY_NAME_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
 ROBOT_QA_ADMIN_PERMISSIONS = ["admin.access", "chat.admin.settings.manage"]
+EMBEDDED_PAGE_ADMIN_PERMISSIONS_BY_LOCATION: dict[str, list[str]] = {
+    "chat_auxiliary": ["admin.access", "chat.admin.settings.manage"],
+    "call_screen_pop": ["admin.access", "call.admin.settings.manage"],
+}
+EMBEDDED_PAGE_WORKSPACE_PERMISSION_BY_LOCATION: dict[str, str] = {
+    "chat_auxiliary": "chat.workspace.use",
+    "call_screen_pop": "call.workspace.use",
+}
+
+
+def require_embedded_page_admin(principal: EffectivePrincipal, location: str) -> None:
+    """Authorize embedded-page admin operations against the page's location."""
+    permissions = EMBEDDED_PAGE_ADMIN_PERMISSIONS_BY_LOCATION.get(location)
+    if not permissions or not principal.has_all_permissions(permissions):
+        raise ForbiddenError("Permission denied")
+
+
+def require_embedded_page_workspace(principal: EffectivePrincipal, location: str) -> None:
+    """Authorize workspace embedded-page reads against the target location."""
+    permission = EMBEDDED_PAGE_WORKSPACE_PERMISSION_BY_LOCATION.get(location)
+    if not permission or not principal.has_permission(permission):
+        raise ForbiddenError("Permission denied")
 
 
 async def require_robot_qa_admin_short_session(
@@ -285,6 +317,23 @@ async def get_agent_display_name_settings(
 ):
     """Get agent display-name settings."""
     return await ConversationAgentDisplaySettingService.get_current(db, current_user["tenant_id"])
+
+
+@router.get(
+    "/agent-display-name/agent",
+    response_model=ConversationAgentDisplayTargetResponse,
+    dependencies=[Depends(require_permission("chat.workspace.use"))],
+)
+async def get_agent_display_name_target(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the current workspace agent's configured sender name."""
+    return await ConversationAgentDisplaySettingService.get_agent_target(
+        db,
+        current_user["tenant_id"],
+        current_user["user_id"],
+    )
 
 
 @router.put(
@@ -630,4 +679,96 @@ async def delete_conversation_announcement(
 ):
     """Delete an announcement rule."""
     await ConversationAnnouncementRuleService.delete(db, rule_id, current_user["tenant_id"])
+    return {"message": "Deleted successfully"}
+
+
+@router.get(
+    "/embedded-pages/workspace",
+    response_model=EmbeddedPageWorkspaceResponse,
+)
+async def list_workspace_embedded_pages(
+    location: EmbeddedPageLocation = "chat_auxiliary",
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """List enabled embedded pages for the agent workspace, with the agent summary."""
+    require_embedded_page_workspace(principal, location)
+    return await EmbeddedPageService.list_workspace_pages(
+        db, principal.tenant_id, principal.user_id, location
+    )
+
+
+@router.get(
+    "/embedded-pages",
+    response_model=EmbeddedPageListResponse,
+)
+async def list_embedded_pages(
+    location: EmbeddedPageLocation = "chat_auxiliary",
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """List embedded pages for one location ordered by sort order."""
+    require_embedded_page_admin(principal, location)
+    return await EmbeddedPageService.list_pages(db, principal.tenant_id, location)
+
+
+@router.post(
+    "/embedded-pages",
+    response_model=EmbeddedPageResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_embedded_page(
+    body: EmbeddedPageCreate,
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create an embedded page."""
+    require_embedded_page_admin(principal, body.location)
+    return await EmbeddedPageService.create(db, principal.tenant_id, body)
+
+
+@router.get(
+    "/embedded-pages/{page_id}",
+    response_model=EmbeddedPageResponse,
+)
+async def get_embedded_page(
+    page_id: int,
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get an embedded page by ID."""
+    page = await EmbeddedPageService.get_by_id(db, page_id, principal.tenant_id)
+    require_embedded_page_admin(principal, page["location"])
+    return page
+
+
+@router.put(
+    "/embedded-pages/{page_id}",
+    response_model=EmbeddedPageResponse,
+)
+async def update_embedded_page(
+    page_id: int,
+    body: EmbeddedPageUpdate,
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update an embedded page."""
+    page = await EmbeddedPageService.get_by_id(db, page_id, principal.tenant_id)
+    require_embedded_page_admin(principal, page["location"])
+    return await EmbeddedPageService.update(db, page_id, principal.tenant_id, body)
+
+
+@router.delete(
+    "/embedded-pages/{page_id}",
+    status_code=status.HTTP_200_OK,
+)
+async def delete_embedded_page(
+    page_id: int,
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an embedded page."""
+    page = await EmbeddedPageService.get_by_id(db, page_id, principal.tenant_id)
+    require_embedded_page_admin(principal, page["location"])
+    await EmbeddedPageService.delete(db, page_id, principal.tenant_id)
     return {"message": "Deleted successfully"}

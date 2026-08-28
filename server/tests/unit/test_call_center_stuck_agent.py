@@ -14,13 +14,15 @@ an agent, then the CALLER hangs up. Three races used to leave the agent stuck on
       the agent's own WebRTC leg must still be torn down and status reset, with
       no exception, so the agent can always hang up.
 """
+from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import fakeredis.aioredis
 import pytest
 
 from app.libs import realtime as realtime_module
-from app.libs.telephony.base import TelephonyRPCError
+from app.libs.telephony.base import CallEvent, TelephonyRPCError
 from app.libs.telephony.providers.mock.client import MockTelephonyClient
 from app.services.agent_webrtc_session_service import AgentWebRTCSessionService
 from app.services.call_center import orchestrator as orch_module
@@ -240,9 +242,17 @@ async def test_agent_hangup_when_customer_gone_resets_status(monkeypatch):
     tel.hangup_errors["sip-customer"] = TelephonyRPCError(-32002, "call not found: sip-customer")
 
     orch = CallCenterOrchestrator(telephony=tel)
+    orch._workflows["sip-customer"] = SimpleNamespace()
+    await orch._claim_call("sip-customer")
     result = await orch.hangup_agent_current_call(tenant_id=7, employee_id=42)
 
     assert result == {"ok": True, "note": "already_ended", "call_id": "sip-customer"}
+
+    # No kernel call.hangup will arrive for a leg the kernel has forgotten, so
+    # the orchestrator must drop its own state here. Leaving it behind pins the
+    # workflow for the life of the process and stalls blue/green drain.
+    assert "sip-customer" not in orch._workflows
+    assert await fake_redis.exists(orch._call_owner_key("sip-customer")) == 0
 
     methods = [(m, p.get("call_id")) for m, p in tel.recorded]
     # Agent's own webrtc leg is torn down (so the browser can hang up)...
@@ -321,3 +331,213 @@ async def test_agent_hangup_internal_participant_tears_down_leg(monkeypatch):
     assert any(event == "cc.call_hangup" for event, _data, _room in transport.emits)
     snapshot = await CcAgentResourceService.get_snapshot(fake_redis, 7, 42)
     assert snapshot is None or snapshot["resource_state"] != "in_call"
+
+
+@pytest.mark.asyncio
+async def test_finalize_agent_call_keeps_live_satisfaction_workflow(monkeypatch):
+    """Satisfaction handoff ends the agent's participation but leaves the
+    customer on the survey. Discarding that workflow would freeze the survey
+    after the first prompt (no play_end / DTMF / hangup delivery)."""
+
+    from app.services.call_center.satisfaction_workflow import SatisfactionWorkflow
+
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    transport = _FakeTransport()
+    monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _FakeSession(None))
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake_redis)
+    monkeypatch.setattr(orch_module, "get_realtime_transport", lambda: transport)
+    monkeypatch.setattr(realtime_module, "get_realtime_transport", lambda: transport)
+    monkeypatch.setattr(CcAgentStatusService, "sync_pg_status", AsyncMock(return_value={}))
+    monkeypatch.setattr(AgentWebRTCSessionService, "set_busy", AsyncMock(return_value=None))
+
+    await CcAgentResourceService.set_visible_status(fake_redis, 7, 42, "ready")
+    await CcAgentResourceService.reserve_inbound(
+        fake_redis, 7, 42, call_id="cust-1", offer_id="o1", queue_id=9, ttl_seconds=30,
+    )
+    await CcAgentResourceService.mark_in_call(
+        fake_redis, 7, 42, call_id="cust-1", direction="inbound", offer_id="o1",
+    )
+
+    orch = CallCenterOrchestrator(telephony=MockTelephonyClient())
+    survey = SatisfactionWorkflow.__new__(SatisfactionWorkflow)
+    survey.done = __import__("asyncio").Event()
+    survey.execution_id = 81
+    orch._workflows["cust-1"] = survey
+    await orch._claim_call("cust-1")
+
+    await orch.finalize_agent_call(
+        tenant_id=7,
+        employee_id=42,
+        call_id="cust-1",
+        reason="satisfaction_started",
+        mark_cdr_completed=False,
+    )
+
+    assert orch._workflows.get("cust-1") is survey
+    assert await fake_redis.exists(orch._call_owner_key("cust-1")) == 1
+    snap = await CcAgentResourceService.get_snapshot(fake_redis, 7, 42)
+    assert snap["visible_status"] == "after_call_work"
+
+
+@pytest.mark.asyncio
+async def test_hangup_without_workflow_settles_agent_from_cdr(monkeypatch):
+    """Auto-outbound bridged the agent, then its reception popped the workflow
+    (or the process restarted mid-call). The customer-leg hangup finds no
+    workflow and no outbound originator, so it must fall back to the CDR's
+    last_serving_agent_id to move the agent busy → after_call_work."""
+    tenant_id, employee_id, call_id = 1, 42, "call-1"
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    await CcAgentResourceService.set_visible_status(redis, tenant_id, employee_id, "ready")
+    await CcAgentResourceService.reserve_inbound(
+        redis, tenant_id, employee_id, call_id=call_id, offer_id="o1", queue_id=9,
+        ttl_seconds=30,
+    )
+    await CcAgentResourceService.mark_in_call(
+        redis, tenant_id, employee_id, call_id=call_id, direction="outbound"
+    )
+
+    row = SimpleNamespace(
+        call_id=call_id,
+        root_call_id=call_id,
+        tenant_id=tenant_id,
+        lifecycle_status="answered",
+        customer_connected_at=datetime.now(timezone.utc),
+        last_serving_agent_id=employee_id,
+    )
+
+    class _Result:
+        def scalar_one_or_none(self):
+            return row
+
+    class _FakeDb:
+        async def execute(self, _q):
+            return _Result()
+
+        async def scalar(self, _q):
+            return None  # no auto-outbound task wrap-up override
+
+    class _Session:
+        async def __aenter__(self):
+            return _FakeDb()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _Session())
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: redis)
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordService.mark_completed",
+        AsyncMock(),
+    )
+    set_busy = AsyncMock()
+    monkeypatch.setattr(AgentWebRTCSessionService, "set_busy", set_busy)
+    sync_pg = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.cc_agent_status_service.CcAgentStatusService.sync_pg_status",
+        sync_pg,
+    )
+    monkeypatch.setattr(
+        "app.services.system_settings_service.SystemSettingsService.get_settings",
+        AsyncMock(return_value=SimpleNamespace(call_wrapup_seconds=60)),
+    )
+    transport = _FakeTransport()
+    monkeypatch.setattr(realtime_module, "get_realtime_transport", lambda: transport)
+
+    orch = CallCenterOrchestrator(telephony=MockTelephonyClient())
+    monkeypatch.setattr(orch, "_maybe_release_sip_occupancy", AsyncMock())
+
+    async def _noop_cleanup(_call_id):
+        return None
+
+    monkeypatch.setattr(orch, "_delayed_trace_cleanup", _noop_cleanup)
+
+    await orch._on_hangup(
+        CallEvent(method="call.hangup", data={"call_id": call_id, "reason": "bye"})
+    )
+
+    snapshot = await CcAgentResourceService.get_snapshot(redis, tenant_id, employee_id)
+    assert snapshot["resource_state"] == "after_call_work"
+    assert snapshot["visible_status"] == "after_call_work"
+    set_busy.assert_awaited_once()
+    assert set_busy.await_args.kwargs["busy"] is False
+    sync_pg.assert_awaited_once()
+    assert sync_pg.await_args.args[3] == "after_call_work"
+    methods = [m for m, _, _ in transport.emits]
+    assert "cc.call_hangup" in methods
+
+
+@pytest.mark.asyncio
+async def test_hangup_fallback_skips_agent_who_moved_on(monkeypatch):
+    """The CDR fallback must not touch an agent whose resource already left
+    this call (e.g. they took a new call after a stale workflow cleanup)."""
+    tenant_id, employee_id, call_id = 1, 42, "call-1"
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    await CcAgentResourceService.set_visible_status(redis, tenant_id, employee_id, "ready")
+    await CcAgentResourceService.reserve_inbound(
+        redis, tenant_id, employee_id, call_id="call-2", offer_id="o2", queue_id=9,
+        ttl_seconds=30,
+    )
+    await CcAgentResourceService.mark_in_call(
+        redis, tenant_id, employee_id, call_id="call-2", direction="outbound"
+    )
+
+    row = SimpleNamespace(
+        call_id=call_id,
+        root_call_id=call_id,
+        tenant_id=tenant_id,
+        lifecycle_status="answered",
+        customer_connected_at=datetime.now(timezone.utc),
+        last_serving_agent_id=employee_id,
+    )
+
+    class _Result:
+        def scalar_one_or_none(self):
+            return row
+
+    class _FakeDb:
+        async def execute(self, _q):
+            return _Result()
+
+        async def scalar(self, _q):
+            return None
+
+    class _Session:
+        async def __aenter__(self):
+            return _FakeDb()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _Session())
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: redis)
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordService.mark_completed",
+        AsyncMock(),
+    )
+    set_busy = AsyncMock()
+    monkeypatch.setattr(AgentWebRTCSessionService, "set_busy", set_busy)
+    sync_pg = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.cc_agent_status_service.CcAgentStatusService.sync_pg_status",
+        sync_pg,
+    )
+    transport = _FakeTransport()
+    monkeypatch.setattr(realtime_module, "get_realtime_transport", lambda: transport)
+
+    orch = CallCenterOrchestrator(telephony=MockTelephonyClient())
+    monkeypatch.setattr(orch, "_maybe_release_sip_occupancy", AsyncMock())
+
+    async def _noop_cleanup(_call_id):
+        return None
+
+    monkeypatch.setattr(orch, "_delayed_trace_cleanup", _noop_cleanup)
+
+    await orch._on_hangup(
+        CallEvent(method="call.hangup", data={"call_id": call_id, "reason": "bye"})
+    )
+
+    snapshot = await CcAgentResourceService.get_snapshot(redis, tenant_id, employee_id)
+    assert snapshot["resource_state"] == "in_call"
+    assert snapshot["current_call_id"] == "call-2"
+    set_busy.assert_not_awaited()
+    sync_pg.assert_not_awaited()

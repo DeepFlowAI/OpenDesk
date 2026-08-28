@@ -7,7 +7,9 @@ out of the box.
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.fd_form_layout_repository import FdFormLayoutRepository
+from app.repositories.system_settings_repository import SystemSettingsRepository
 from app.services.role_service import RoleService
+from app.services.scheduling_service import seed_preset_shifts
 
 
 # ── Default form layout definitions ──
@@ -88,9 +90,16 @@ DEFAULT_LAYOUTS = [_new_ticket_layout, _ticket_detail_layout]
 async def init_tenant_data(db: AsyncSession, tenant_pk: int) -> None:
     """Seed all default data for a newly created tenant.
 
-    Called from TenantService.create() after the tenant and admin
-    employee have been persisted (but before the final commit).
+    Called from TenantService.create() after the tenant and admin employee
+    have been persisted. Layout create commits on its own; this function
+    commits remaining seed rows (system roles, preset shifts) before return.
     """
     for layout_fn in DEFAULT_LAYOUTS:
         await FdFormLayoutRepository.create(db, tenant_pk, layout_fn())
     await RoleService.ensure_system_roles(db, tenant_pk)
+    await RoleService.backfill_employee_roles(db, tenant_pk)
+
+    settings_row = await SystemSettingsRepository.get_by_tenant_id(db, tenant_pk)
+    lang = settings_row.default_language if settings_row else "zh"
+    await seed_preset_shifts(db, tenant_pk, lang)
+    await db.commit()

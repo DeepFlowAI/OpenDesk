@@ -2,7 +2,9 @@ ARG NODE_BASE_IMAGE=node:22-alpine
 FROM ${NODE_BASE_IMAGE} AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --legacy-peer-deps
+# http loglevel prints each registry fetch URL so cold installs are diagnosable
+# in CI (default npm progress bars are invisible in non-TTY deploy logs).
+RUN npm ci --legacy-peer-deps --no-fund --no-audit --loglevel=http
 
 FROM ${NODE_BASE_IMAGE} AS builder
 WORKDIR /app

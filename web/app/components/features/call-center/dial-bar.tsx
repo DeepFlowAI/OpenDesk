@@ -1,11 +1,16 @@
 'use client'
 
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { IconDialpad, IconPhone } from '@tabler/icons-react'
 import { toast } from 'sonner'
 
 import { DialPad } from '@/app/components/features/call-center/dial-pad'
-import { OutboundNumberSelect } from '@/app/components/features/call-center/outbound-number-select'
+import {
+  OutboundNumberSelect,
+  type OutboundNumberChangeSource,
+} from '@/app/components/features/call-center/outbound-number-select'
+import { controlErrorMessage } from '@/app/components/features/call-center/use-call-control'
+import { useWorkspaceCallOutboundPreference } from '@/hooks/use-workspace-call-outbound-preference'
 import { dialOutbound } from '@/service/use-call-center'
 
 const DIAL_INPUT_PATTERN = /^[\d+\-*#\s]*$/
@@ -13,6 +18,10 @@ const DIAL_INPUT_PATTERN = /^[\d+\-*#\s]*$/
 type DialBarProps = {
   disabled?: boolean
   statusHint?: string
+  /** Optional extra action rendered next to the dial button (e.g. send SMS). */
+  smsButton?: React.ReactNode
+  /** Controlled dial number. When omitted, DialBar keeps its own draft. */
+  value?: string
   onDialNumberChange?: (number: string) => void
   onOutboundNumberChange?: (id: string, phoneNumber: string) => void
   onDialStarted?: (info: { callId: string; destination: string; outboundNumber: string }) => void
@@ -21,25 +30,29 @@ type DialBarProps = {
 export function DialBar({
   disabled,
   statusHint,
+  smsButton,
+  value,
   onDialNumberChange,
   onOutboundNumberChange,
   onDialStarted,
 }: DialBarProps) {
-  const [dialNumber, setDialNumber] = useState('')
+  const { preferredId, savePreferredId } = useWorkspaceCallOutboundPreference()
+  const [internalNumber, setInternalNumber] = useState('')
   const [outboundId, setOutboundId] = useState('')
   const [outboundNumber, setOutboundNumber] = useState('')
   const [keypadOpen, setKeypadOpen] = useState(false)
   const [dialing, setDialing] = useState(false)
+  const dialNumber = value !== undefined ? value : internalNumber
   const trimmedDialNumber = dialNumber.trim()
   const canDial = !disabled && !dialing && trimmedDialNumber.length > 0 && !!outboundId
 
   const updateDialNumber = (next: string) => {
     if (!DIAL_INPUT_PATTERN.test(next)) return
-    setDialNumber(next)
+    if (value === undefined) setInternalNumber(next)
     onDialNumberChange?.(next)
   }
 
-  const appendDigit = (key: string) => {
+  const handleKeyPress = (key: string) => {
     updateDialNumber(dialNumber + key)
   }
 
@@ -47,11 +60,15 @@ export function DialBar({
     updateDialNumber(dialNumber.slice(0, -1))
   }
 
-  const handleOutboundChange = (id: string, phoneNumber: string) => {
-    setOutboundId(id)
-    setOutboundNumber(phoneNumber)
-    onOutboundNumberChange?.(id, phoneNumber)
-  }
+  const handleOutboundChange = useCallback(
+    (id: string, phoneNumber: string, source: OutboundNumberChangeSource) => {
+      setOutboundId(id)
+      setOutboundNumber(phoneNumber)
+      onOutboundNumberChange?.(id, phoneNumber)
+      if (source === 'user') savePreferredId(id)
+    },
+    [onOutboundNumberChange, savePreferredId],
+  )
 
   const handleDialClick = async () => {
     if (!canDial) return
@@ -67,9 +84,7 @@ export function DialBar({
         outboundNumber,
       })
     } catch (err) {
-      // Backend ValidationError → 422 with a JSON body carrying detail
-      const message = err instanceof Error ? err.message : '外呼失败'
-      toast.error(message)
+      toast.error(await controlErrorMessage(err, '外呼失败'))
     } finally {
       setDialing(false)
     }
@@ -91,7 +106,7 @@ export function DialBar({
           <DialPad
             open={keypadOpen}
             onOpenChange={setKeypadOpen}
-            onKeyPress={appendDigit}
+            onKeyPress={handleKeyPress}
             onBackspace={handleBackspace}
             disabled={disabled}
             trigger={<IconDialpad size={18} />}
@@ -101,9 +116,12 @@ export function DialBar({
 
       <OutboundNumberSelect
         value={outboundId}
+        preferredId={preferredId}
         onChange={handleOutboundChange}
         disabled={disabled}
       />
+
+      {smsButton}
 
       <button
         type="button"
@@ -114,9 +132,9 @@ export function DialBar({
             ? '正在拨号...'
             : canDial
               ? '发起外呼'
-              : '请输入号码并选择外呼号码'
+              : statusHint || '请输入号码并选择外呼号码'
         }
-        className="rounded-full bg-green-500 p-2.5 text-white disabled:cursor-not-allowed disabled:opacity-40"
+        className="rounded-full bg-green-500 p-2.5 text-white transition-colors hover:bg-green-600 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-green-500"
       >
         <IconPhone size={18} />
       </button>

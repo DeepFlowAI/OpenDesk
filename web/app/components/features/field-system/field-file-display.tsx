@@ -6,6 +6,7 @@ import { ImagePreviewLightbox } from '@/app/components/ui/image-preview-lightbox
 import { IconDownload, IconEye, IconFile, IconLoader2, IconX } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import type { FieldFileAttachment } from '@/app/components/features/field-system/field-file-editor'
+import { attachmentPreviewKind, fileExtension } from '@/app/components/features/file-preview/preview-kind'
 
 const PDFViewer = dynamic(
   () => import('@embedpdf/react-pdf-viewer').then((mod) => mod.PDFViewer),
@@ -19,8 +20,6 @@ const PDFViewer = dynamic(
   },
 )
 
-type PreviewKind = 'image' | 'pdf' | 'document'
-
 type FieldFileDisplayProps = {
   value: unknown
   className?: string
@@ -33,33 +32,6 @@ function normalizeFileValue(value: unknown): FieldFileAttachment[] {
     (item): item is FieldFileAttachment =>
       !!item && typeof item === 'object' && typeof (item as FieldFileAttachment).url === 'string',
   )
-}
-
-function fileExtension(filename: string): string {
-  const cleanName = filename.split('?')[0]?.split('#')[0] ?? filename
-  return cleanName.includes('.') ? cleanName.split('.').pop()?.toLowerCase() ?? '' : ''
-}
-
-function previewKind(contentType: string | null | undefined, filename: string): PreviewKind | null {
-  const mime = contentType?.toLowerCase() ?? ''
-  const ext = fileExtension(filename)
-
-  if (mime.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif'].includes(ext)) {
-    return 'image'
-  }
-  if (mime === 'application/pdf' || ext === 'pdf') return 'pdf'
-  if (
-    mime.includes('word') ||
-    mime.includes('excel') ||
-    mime.includes('spreadsheet') ||
-    mime.includes('powerpoint') ||
-    mime.includes('presentation') ||
-    ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv', 'md', 'json', 'xml', 'html', 'htm'].includes(ext)
-  ) {
-    return 'document'
-  }
-
-  return null
 }
 
 function fileIconSrc(contentType: string | null | undefined, filename: string): string | null {
@@ -147,7 +119,8 @@ export function FieldFileDisplay({ value, className }: FieldFileDisplayProps) {
   const files = useMemo(() => normalizeFileValue(value), [value])
   const [previewFile, setPreviewFile] = useState<FieldFileAttachment | null>(null)
   const previewName = previewFile?.name || '附件'
-  const currentPreviewKind = previewFile ? previewKind(previewFile.content_type, previewName) : null
+  const currentPreviewKind = previewFile ? attachmentPreviewKind(previewFile.content_type, previewName) : null
+  const currentDocumentPreview = currentPreviewKind === 'pdf' || currentPreviewKind === 'document'
 
   if (files.length === 0) return <span className={cn('text-muted-foreground', className)}>—</span>
 
@@ -157,7 +130,8 @@ export function FieldFileDisplay({ value, className }: FieldFileDisplayProps) {
         {files.map((file, i) => {
           const name = file.name || `文件 ${i + 1}`
           const icon = fileIconSrc(file.content_type, name)
-          const canPreview = previewKind(file.content_type, name) !== null
+          const kind = attachmentPreviewKind(file.content_type, name)
+          const canPreview = kind === 'image' || kind === 'pdf' || kind === 'document'
           const sizeLabel = formatBytes(file.size)
 
           return (
@@ -209,7 +183,7 @@ export function FieldFileDisplay({ value, className }: FieldFileDisplayProps) {
         />
       )}
 
-      {previewFile && currentPreviewKind && currentPreviewKind !== 'image' && (
+      {previewFile && currentDocumentPreview && (
         <div
           className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/70 p-4"
           onClick={() => setPreviewFile(null)}

@@ -36,3 +36,13 @@ class BaseStorageClient(ABC):
     ) -> str:
         """Return a temporary URL for reading an object."""
         ...
+
+    @abstractmethod
+    async def get_presigned_upload_url(
+        self,
+        key: str,
+        content_type: str = "application/octet-stream",
+        expires_seconds: int = 900,
+    ) -> str:
+        """Return a temporary signed URL that lets a client PUT one object directly."""
+        ...

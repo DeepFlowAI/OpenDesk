@@ -230,3 +230,19 @@ export const useDeleteFieldTreeNode = () => {
     },
   })
 }
+
+export const useFieldReferenceEmployees = () => useQuery({
+  queryKey: [NS, 'reference-options', 'employees'],
+  queryFn: () => get<PaginatedResponse<{ id: number; name: string; username: string }>>(
+    'v1/field-definitions/reference-options/employees',
+    { searchParams: { page: 1, per_page: 100 } },
+  ),
+})
+
+export const useFieldReferenceEmployeeGroups = () => useQuery({
+  queryKey: [NS, 'reference-options', 'employee-groups'],
+  queryFn: () => get<PaginatedResponse<{ id: number; name: string }>>(
+    'v1/field-definitions/reference-options/employee-groups',
+    { searchParams: { page: 1, per_page: 100 } },
+  ),
+})

@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 
 class EffectivePrincipal(BaseModel):
-    user_id: int
+    user_id: int | None
     tenant_id: int
     is_super_admin: bool = False
     role_ids: list[int] = Field(default_factory=list)

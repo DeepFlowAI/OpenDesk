@@ -14,13 +14,36 @@ import {
   formatCallDuration,
   useCallCenterRuntime,
 } from '@/context/call-center-runtime'
-import { useLocaleStore } from '@/context/locale-store'
+import { useLocaleStore, type Locale } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
 import { cn } from '@/lib/utils'
+import { isAutoOutboundIncoming, isPersonalAutoOutboundIncoming } from '@/lib/auto-outbound-incoming'
+import { callWorkspaceHref } from '@/lib/call-workspace-view'
 import { AgentCallBar } from './agent-call-bar'
 
 type GlobalCallBarProps = {
   hidden?: boolean
+}
+
+function BackToWorkspaceLink({
+  source,
+  locale,
+}: {
+  source?: string | null
+  locale: Locale
+}) {
+  const href = isPersonalAutoOutboundIncoming({ source })
+    ? callWorkspaceHref('personal-auto-outbound')
+    : callWorkspaceHref('screen-pop')
+  return (
+    <Link
+      href={href}
+      className="flex h-8 shrink-0 items-center gap-1 rounded-md px-2 text-xs font-medium text-foreground/70 transition-colors hover:bg-muted"
+    >
+      <IconArrowBackUp size={14} />
+      <span className="hidden sm:inline">{t('ws.callbar.backToWorkspace', locale)}</span>
+    </Link>
+  )
 }
 
 export function GlobalCallBar({ hidden = false }: GlobalCallBarProps) {
@@ -29,6 +52,7 @@ export function GlobalCallBar({ hidden = false }: GlobalCallBarProps) {
     incoming,
     callStart,
     now,
+    wrapUpRemainingMs,
     leg,
     accept,
     reject,
@@ -42,34 +66,33 @@ export function GlobalCallBar({ hidden = false }: GlobalCallBarProps) {
   }
   if (!incoming && phase !== 'wrap_up') return null
 
-  // Active call: reuse the universal call bar shell (compact main row + inline
-  // downward extension) with a "back to call workspace" link. The extension is
-  // the bar's own inline area — it pushes page content down, not an overlay.
+  // Active call: compact universal call bar, with "back to workspace" in the
+  // main-row trailing slot so it stays attached to the mini control strip.
   if (phase === 'on_call' && incoming) {
     return (
       <div className="w-full max-w-[min(760px,calc(100vw-8rem))]">
         <AgentCallBar
           compact
-          trailing={
-            <Link
-              href="/workspace/call"
-              className="ml-1 flex h-8 items-center gap-1 rounded-md px-2 text-xs font-medium text-foreground/70 transition-colors hover:bg-background/60"
-            >
-              <IconArrowBackUp size={14} />
-              <span className="hidden sm:inline">{t('ws.callbar.backToWorkspace', locale)}</span>
-            </Link>
-          }
+          trailing={<BackToWorkspaceLink source={incoming.source} locale={locale} />}
         />
       </div>
     )
   }
 
-  const duration = formatCallDuration(callStart ? now - callStart : 0)
+  // Wrap-up shows remaining time (countdown), never the live call duration.
+  const duration =
+    phase === 'wrap_up'
+      ? wrapUpRemainingMs != null
+        ? formatCallDuration(wrapUpRemainingMs)
+        : null
+      : formatCallDuration(callStart ? now - callStart : 0)
   const isIncoming = phase === 'incoming'
   const isOutbound = incoming?.direction === 'outbound'
   const number = isOutbound ? incoming?.to : incoming?.from
   const label =
-    phase === 'incoming'
+    incoming?.source === 'personal_auto_outbound'
+      ? t(incoming.personal_assignment_type === 'fallback' ? 'personalAuto.callTypeFallback' : 'personalAuto.callTypePrimary', locale)
+      : phase === 'incoming'
       ? '来电'
       : phase === 'outbound_ringing'
         ? '外呼中'
@@ -111,12 +134,19 @@ export function GlobalCallBar({ hidden = false }: GlobalCallBarProps) {
           {number || '未知号码'}
         </span>
       )}
-      <span className="shrink-0 font-mono tabular-nums text-foreground/70">
-        {duration}
-      </span>
+      {duration != null && (
+        <span className="shrink-0 font-mono tabular-nums text-foreground/70">
+          {duration}
+        </span>
+      )}
       <div className="ml-1 flex shrink-0 items-center gap-1">
         {isIncoming ? (
-          incoming?.device_type === 'sip_phone' ? (
+          isAutoOutboundIncoming(incoming) && incoming?.device_type !== 'sip_phone' ? (
+            // Auto-outbound Web phone: runtime auto-accepts; no manual answer.
+            <span className="shrink-0 whitespace-nowrap text-[11px] text-foreground/70">
+              {leg.state === 'connecting' ? '正在接通...' : '自动接听中'}
+            </span>
+          ) : incoming?.device_type === 'sip_phone' ? (
             // SIP phone: the handset rings and is answered physically — no
             // browser "接听". Show a ringing hint; reject is still available.
             <>

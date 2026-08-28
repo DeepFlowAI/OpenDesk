@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.core.exceptions import NotFoundError
 from app.libs.telephony.providers.mock.client import MockTelephonyClient
 from app.services.call_center import call_control_service as ccs_mod
 from app.services.call_center.call_control_service import (
@@ -20,7 +21,18 @@ from app.services.call_center.call_control_service import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_incall():
+def _clear_incall(monkeypatch):
+    from app.repositories.call_satisfaction_execution_repository import (
+        CallSatisfactionExecutionRepository,
+    )
+
+    # Fake CDR sessions in this file answer every execute(); without this stub
+    # media_reconnect's survey guard would treat that CDR row as an execution.
+    monkeypatch.setattr(
+        CallSatisfactionExecutionRepository,
+        "get_by_call_record_id",
+        AsyncMock(return_value=None),
+    )
     _in_call_state.clear()
     for task in list(_consult_target_grace_tasks.values()):
         task.cancel()
@@ -71,6 +83,51 @@ async def test_resolve_current_call_prefers_bound_media_leg(monkeypatch):
     call = await CallControlService._resolve_current_call(1, 7)
     assert call.customer_call_id == "cust-1"
     assert call.webrtc_call_id == "live-leg"
+
+
+@pytest.mark.asyncio
+async def test_resolve_current_call_rejects_cdr_owned_by_previous_call(monkeypatch):
+    """A new ringing offer must not reconnect media to an old active CDR."""
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(id=9, root_call_id=None, call_id="stale-outbound")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_a, **_k):
+            return _FakeResult()
+
+    fake_redis = object()
+    monkeypatch.setattr(ccs_mod, "AsyncSessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "get_active",
+        staticmethod(AsyncMock(return_value={"webrtc_call_id": "stale-leg"})),
+    )
+    from app.services.call_center import orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "_get_redis_client", lambda: fake_redis)
+    monkeypatch.setattr(
+        ccs_mod.CcAgentResourceService,
+        "get_snapshot",
+        classmethod(
+            AsyncMock(
+                return_value={
+                    "resource_state": "ringing",
+                    "current_call_id": "new-inbound",
+                }
+            )
+        ),
+    )
+
+    with pytest.raises(NotFoundError, match="状态已变化"):
+        await CallControlService._resolve_current_call(1, 7)
 
 
 @pytest.mark.asyncio
@@ -208,6 +265,7 @@ async def test_media_reconnect_bridges_customer_and_binds_leg(monkeypatch):
     tel = MockTelephonyClient()
     await tel.connect()
     tel.webrtc_offer_response = {"call_id": "new-leg", "sdp": "v=0-answer"}
+    tel.call_list_response = [{"call_id": "cust-1"}]
 
     class _FakeResult:
         def scalar_one_or_none(self):
@@ -250,9 +308,125 @@ async def test_media_reconnect_bridges_customer_and_binds_leg(monkeypatch):
     assert result.get("consult_active") is False
     assert (
         "call.bridge",
-        {"call_id": "cust-1", "other_call_id": "new-leg", "transcribe": True},
+        {
+            "call_id": "cust-1",
+            "other_call_id": "new-leg",
+            "transcribe": True,
+            "keepalive_on_peer_hangup": True,
+        },
     ) in tel.recorded
     assert _in_call_state[(7, 42)].agent_media_call_id == "new-leg"
+
+
+@pytest.mark.asyncio
+async def test_media_reconnect_rejoins_existing_room_after_refresh(monkeypatch):
+    """Refreshing an agent under whisper/barge must rejoin the room, not bridge
+    an already-roomed customer a second time (bridged -> bridged)."""
+    tel = MockTelephonyClient()
+    await tel.connect()
+    tel.webrtc_offer_response = {"call_id": "new-leg", "sdp": "v=0-answer"}
+    tel.call_list_response = [{"call_id": "cust-1"}]
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(id=1, root_call_id=None, call_id="cust-1")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_a, **_k):
+            return _FakeResult()
+
+    monkeypatch.setattr(ccs_mod, "AsyncSessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "get_active",
+        staticmethod(AsyncMock(return_value={"webrtc_call_id": "old-leg"})),
+    )
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "upsert_with_real_call_id",
+        staticmethod(AsyncMock()),
+    )
+    monkeypatch.setattr(
+        CallControlService,
+        "_stop_tone",
+        staticmethod(AsyncMock()),
+    )
+    _in_call_state[(7, 42)] = InCallLegs(
+        agent_media_call_id="old-leg",
+        room_id="room-1",
+        room_legs=["cust-1", "old-leg", "supervisor-leg"],
+    )
+
+    result = await CallControlService.media_reconnect(
+        tel, tenant_id=7, employee_id=42, sdp="v=0-offer",
+    )
+
+    assert result["call_id"] == "new-leg"
+    assert (
+        "room.replace_leg",
+        {"room_id": "room-1", "old_call_id": "old-leg", "new_call_id": "new-leg"},
+    ) in tel.recorded
+    assert not any(method == "call.bridge" for method, _params in tel.recorded)
+    legs = _in_call_state[(7, 42)]
+    assert legs.agent_media_call_id == "new-leg"
+    assert legs.room_legs == ["cust-1", "new-leg", "supervisor-leg"]
+
+
+@pytest.mark.asyncio
+async def test_media_reconnect_adds_leg_when_room_already_detached_old_leg(monkeypatch):
+    """FlowKit removes a media_eof leg from its room before HTTP reconnect."""
+    tel = MockTelephonyClient()
+    await tel.connect()
+    tel.webrtc_offer_response = {"call_id": "new-leg", "sdp": "v=0-answer"}
+    tel.call_list_response = [{"call_id": "cust-1"}]
+    tel.room_replace_leg = AsyncMock(side_effect=RuntimeError("room: leg not found"))
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(id=1, root_call_id=None, call_id="cust-1")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_a, **_k):
+            return _FakeResult()
+
+    monkeypatch.setattr(ccs_mod, "AsyncSessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "get_active",
+        staticmethod(AsyncMock(return_value={"webrtc_call_id": "old-leg"})),
+    )
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "upsert_with_real_call_id",
+        staticmethod(AsyncMock()),
+    )
+    _in_call_state[(7, 42)] = InCallLegs(
+        agent_media_call_id="old-leg",
+        room_id="room-1",
+        room_legs=["cust-1", "old-leg", "supervisor-leg"],
+    )
+
+    await CallControlService.media_reconnect(
+        tel, tenant_id=7, employee_id=42, sdp="v=0-offer",
+    )
+
+    assert (
+        "room.add_leg",
+        {"room_id": "room-1", "call_id": "new-leg"},
+    ) in tel.recorded
+    assert not any(method == "call.bridge" for method, _params in tel.recorded)
 
 
 @pytest.mark.asyncio
@@ -261,6 +435,7 @@ async def test_media_reconnect_preserves_active_consult(monkeypatch):
     tel = MockTelephonyClient()
     await tel.connect()
     tel.webrtc_offer_response = {"call_id": "new-leg", "sdp": "v=0-answer"}
+    tel.call_list_response = [{"call_id": "cust-1"}]
 
     class _FakeResult:
         def scalar_one_or_none(self):
@@ -678,3 +853,264 @@ async def test_consult_host_media_departed_notifies_target(monkeypatch):
     ended.assert_awaited_once()
     assert ended.await_args.args[:3] == (7, 13, "b-leg")
     assert (7, 1) not in _in_call_state or _in_call_state[(7, 1)].consult_call_id is None
+
+
+@pytest.mark.asyncio
+async def test_media_reconnect_rejects_while_satisfaction_survey_runs(monkeypatch):
+    from app.core.exceptions import ConflictError
+    from app.repositories.call_satisfaction_execution_repository import (
+        CallSatisfactionExecutionRepository,
+    )
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+    tel.webrtc_offer_response = {"call_id": "new-leg", "sdp": "v=0-answer"}
+    tel.call_list_response = [{"call_id": "cust-1"}]
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(id=1, root_call_id=None, call_id="cust-1")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, _query):
+            return _FakeResult()
+
+    monkeypatch.setattr(ccs_mod, "AsyncSessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "get_active",
+        staticmethod(AsyncMock(return_value={"webrtc_call_id": "dead-leg"})),
+    )
+    monkeypatch.setattr(
+        CallSatisfactionExecutionRepository,
+        "get_by_call_record_id",
+        AsyncMock(return_value=SimpleNamespace(id=4, status="in_progress")),
+    )
+    _in_call_state[(7, 42)] = InCallLegs(agent_media_call_id="dead-leg")
+
+    with pytest.raises(ConflictError, match="满意度调查"):
+        await CallControlService.media_reconnect(
+            tel, tenant_id=7, employee_id=42, sdp="v=0-offer",
+        )
+    assert not any(method == "call.bridge" for method, _ in tel.recorded)
+
+
+@pytest.mark.asyncio
+async def test_media_reconnect_skips_when_customer_leg_gone(monkeypatch):
+    tel = MockTelephonyClient()
+    await tel.connect()
+    tel.webrtc_offer_response = {"call_id": "new-leg", "sdp": "v=0-answer"}
+    tel.call_list_response = [{"call_id": "other-leg"}]
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(id=1, root_call_id=None, call_id="cust-1")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_a, **_k):
+            return _FakeResult()
+
+    monkeypatch.setattr(ccs_mod, "AsyncSessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "get_active",
+        staticmethod(AsyncMock(return_value={"webrtc_call_id": "dead-leg"})),
+    )
+    _in_call_state[(7, 42)] = InCallLegs(agent_media_call_id="dead-leg")
+
+    finalize = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_center.orchestrator.get_orchestrator",
+        lambda: SimpleNamespace(finalize_agent_call=finalize),
+    )
+
+    with pytest.raises(NotFoundError, match="客户通话已结束"):
+        await CallControlService.media_reconnect(
+            tel, tenant_id=7, employee_id=42, sdp="v=0-offer",
+        )
+
+    assert not any(method == "webrtc.offer" for method, _ in tel.recorded)
+    finalize.assert_awaited_once()
+    assert finalize.await_args.kwargs["call_id"] == "cust-1"
+    assert finalize.await_args.kwargs["reason"] == "media_timeout"
+    assert (7, 42) not in _in_call_state
+
+
+@pytest.mark.asyncio
+async def test_media_reconnect_fail_open_when_call_list_errors(monkeypatch):
+    tel = MockTelephonyClient()
+    await tel.connect()
+    tel.webrtc_offer_response = {"call_id": "new-leg", "sdp": "v=0-answer"}
+    tel.call_list_response = [{"call_id": "cust-1"}]
+
+    async def _boom():
+        raise RuntimeError("kernel down")
+
+    tel.call_list = _boom  # type: ignore[method-assign]
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(id=1, root_call_id=None, call_id="cust-1")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_a, **_k):
+            return _FakeResult()
+
+    monkeypatch.setattr(ccs_mod, "AsyncSessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "get_active",
+        staticmethod(AsyncMock(return_value={"webrtc_call_id": "dead-leg"})),
+    )
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "upsert_with_real_call_id",
+        staticmethod(AsyncMock()),
+    )
+    monkeypatch.setattr(
+        CallControlService,
+        "_stop_tone",
+        staticmethod(AsyncMock()),
+    )
+    _in_call_state[(7, 42)] = InCallLegs(agent_media_call_id="dead-leg")
+
+    result = await CallControlService.media_reconnect(
+        tel, tenant_id=7, employee_id=42, sdp="v=0-offer",
+    )
+
+    assert result["call_id"] == "new-leg"
+    assert any(method == "webrtc.offer" for method, _ in tel.recorded)
+
+
+@pytest.mark.asyncio
+async def test_media_reconnect_empty_list_is_authoritative_gone(monkeypatch):
+    """Single-kernel empty call.list means the customer leg is gone."""
+    tel = MockTelephonyClient()
+    await tel.connect()
+    tel.webrtc_offer_response = {"call_id": "new-leg", "sdp": "v=0-answer"}
+    tel.call_list_response = []
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(id=1, root_call_id=None, call_id="cust-1")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_a, **_k):
+            return _FakeResult()
+
+    monkeypatch.setattr(ccs_mod, "AsyncSessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "get_active",
+        staticmethod(AsyncMock(return_value={"webrtc_call_id": "dead-leg"})),
+    )
+    _in_call_state[(7, 42)] = InCallLegs(agent_media_call_id="dead-leg")
+    finalize = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_center.orchestrator.get_orchestrator",
+        lambda: SimpleNamespace(finalize_agent_call=finalize),
+    )
+
+    with pytest.raises(NotFoundError, match="客户通话已结束"):
+        await CallControlService.media_reconnect(
+            tel, tenant_id=7, employee_id=42, sdp="v=0-offer",
+        )
+    assert not any(method == "webrtc.offer" for method, _ in tel.recorded)
+    finalize.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_media_reconnect_fail_open_when_owner_kernel_not_ready(monkeypatch):
+    """Blue/green: owner kernel down must not look like customer gone."""
+    from app.libs.telephony.providers.flowkit.multi_client import (
+        MultiKernelTelephonyClient,
+    )
+
+    multi = MultiKernelTelephonyClient(
+        ws_urls=["ws://k0/ws", "ws://k1/ws"],
+        sdk_name="test",
+        sdk_version="0",
+    )
+    k0 = MockTelephonyClient()
+    k1 = MockTelephonyClient()
+    multi._clients = [k0, k1]  # type: ignore[assignment]
+    multi._wired = True
+    await k0.connect()
+    await k1.connect()
+    await k0.disconnect()  # owner down
+    multi._call_kernel["cust-1"] = 0
+    monkeypatch.setattr(
+        "app.libs.telephony.providers.flowkit.multi_client._get_redis",
+        lambda: None,
+    )
+
+    class _FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(id=1, root_call_id=None, call_id="cust-1")
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, *_a, **_k):
+            return _FakeResult()
+
+    monkeypatch.setattr(ccs_mod, "AsyncSessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "get_active",
+        staticmethod(AsyncMock(return_value={"webrtc_call_id": "dead-leg"})),
+    )
+    monkeypatch.setattr(
+        ccs_mod.AgentWebRTCSessionService,
+        "upsert_with_real_call_id",
+        staticmethod(AsyncMock()),
+    )
+    monkeypatch.setattr(
+        CallControlService,
+        "_stop_tone",
+        staticmethod(AsyncMock()),
+    )
+    _in_call_state[(7, 42)] = InCallLegs(agent_media_call_id="dead-leg")
+
+    assert await multi.call_alive("cust-1") is None
+
+    async def _offer(sdp, call_id=None):
+        return {"call_id": "new-leg", "sdp": "v=0-answer"}
+
+    multi.webrtc_offer = _offer  # type: ignore[method-assign]
+    multi.call_answer = AsyncMock()  # type: ignore[method-assign]
+    multi.call_bridge = AsyncMock()  # type: ignore[method-assign]
+    multi.call_hangup = AsyncMock()  # type: ignore[method-assign]
+
+    result = await CallControlService.media_reconnect(
+        multi, tenant_id=7, employee_id=42, sdp="v=0-offer",
+    )
+    assert result["call_id"] == "new-leg"

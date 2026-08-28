@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useComposerRuntime } from '@assistant-ui/react'
 import { IconMoodSmile } from '@tabler/icons-react'
 import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import type { EmojiItem, EmojiTargetConfig } from '@/models/emoji-setting'
 import { getEmojiAlias, getEmojiName } from '@/lib/emoji-catalog'
 
@@ -25,8 +26,8 @@ export function EmojiPicker({ config, locale, disabled = false, onEmojiPick }: E
   const buttonRef = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)
   const emojis = config?.enabled ? config.emojis : []
-  const label = locale === 'zh' ? '插入表情' : 'Insert emoji'
-  const panelTitle = locale === 'zh' ? '选择表情' : 'Choose emoji'
+  const label = t('chat.emoji.insert', locale)
+  const panelTitle = t('chat.emoji.choose', locale)
 
   const grouped = useMemo(() => emojis.slice(0, 48), [emojis])
 

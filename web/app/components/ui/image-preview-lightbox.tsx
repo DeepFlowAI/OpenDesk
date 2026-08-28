@@ -1,6 +1,14 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react'
 import Lightbox, {
   type LightboxExternalProps,
   type Plugin,
@@ -23,6 +31,10 @@ type ImagePreviewLightboxProps = LightboxExternalProps
 type WindowedPreviewPosition = {
   x: number
   y: number
+}
+
+function stopContextMenuPropagation(event: ReactMouseEvent<HTMLElement>) {
+  event.stopPropagation()
 }
 
 function getWindowedPreviewSize() {
@@ -240,6 +252,7 @@ function WindowedImagePreview({
   return (
     <div
       className="fixed z-[9999] overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-2xl"
+      onContextMenu={stopContextMenuPropagation}
       style={{
         left: position.x,
         top: position.y,
@@ -332,6 +345,7 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
     thumbnails: userThumbnails,
     styles: userStyles,
     on: userOn,
+    portal: userPortal,
     open,
     close,
     slides = [],
@@ -451,6 +465,16 @@ export function ImagePreviewLightbox(props: ImagePreviewLightboxProps) {
         ...userZoom,
       }}
       thumbnails={{ showToggle: true, ...userThumbnails }}
+      portal={{
+        ...userPortal,
+        container: {
+          ...userPortal?.container,
+          onContextMenu: (event) => {
+            stopContextMenuPropagation(event)
+            userPortal?.container?.onContextMenu?.(event)
+          },
+        },
+      }}
       render={render}
       toolbar={toolbar}
       styles={styles}

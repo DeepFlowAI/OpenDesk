@@ -2,6 +2,7 @@
 Telephony catalog schemas — aligned with Tenant Platform API contract.
 """
 import ipaddress
+import re
 from datetime import datetime
 from typing import List
 
@@ -15,6 +16,18 @@ CALL_TYPE_VALUES = ("inbound", "outbound")
 CALL_TYPE_SET = set(CALL_TYPE_VALUES)
 MAX_OUTBOUND_TIME_SLOTS = 10
 MAX_CONCURRENCY = 1000
+OPTIONAL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def _normalize_optional_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if not OPTIONAL_ID_RE.fullmatch(stripped):
+        raise ValueError("Invalid id")
+    return stripped
 
 
 class OutboundTimeSlot(BaseModel):
@@ -126,7 +139,12 @@ class SipTrunkBase(BaseModel):
 
 
 class SipTrunkCreate(SipTrunkBase):
-    pass
+    id: str | None = Field(default=None, max_length=32)
+
+    @field_validator("id")
+    @classmethod
+    def _optional_id(cls, v: str | None) -> str | None:
+        return _normalize_optional_id(v)
 
 
 class SipTrunkUpdate(SipTrunkBase):
@@ -168,6 +186,7 @@ def _validate_call_types(value: list[str]) -> list[str]:
 
 
 class PhoneNumberCreate(BaseModel):
+    id: str | None = Field(default=None, max_length=32)
     phone_number: str = Field(..., min_length=1, max_length=64)
     call_types: list[str] = Field(..., min_length=1)
     trunk_id: str | None = Field(default=None)
@@ -177,6 +196,11 @@ class PhoneNumberCreate(BaseModel):
     concurrency: int | None = Field(default=None, ge=1, le=MAX_CONCURRENCY)
     called_number_prefix: str | None = Field(default=None, max_length=32)
     outbound_time_slots: list[OutboundTimeSlot] = Field(default_factory=list)
+
+    @field_validator("id")
+    @classmethod
+    def _optional_id(cls, v: str | None) -> str | None:
+        return _normalize_optional_id(v)
 
     @field_validator("phone_number")
     @classmethod

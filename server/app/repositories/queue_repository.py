@@ -523,25 +523,25 @@ class QueueReturningAgentRepository:
         if current.user_id is not None:
             conditions.append(CallRecord.user_id == current.user_id)
         else:
-            from_number = (current.from_number or "").strip()
-            if not from_number:
+            customer_number = (current.customer_number or "").strip()
+            if not customer_number:
                 return None
-            conditions.append(CallRecord.from_number == from_number)
+            conditions.append(CallRecord.customer_number == customer_number)
 
         history_at = func.coalesce(
             CallRecord.ended_at,
-            CallRecord.answered_at,
+            CallRecord.first_agent_connected_at,
             CallRecord.started_at,
             CallRecord.created_at,
         )
         result = await db.execute(
-            select(CallRecord.agent_id)
+            select(CallRecord.last_serving_agent_id)
             .where(
                 CallRecord.tenant_id == tenant_id,
                 CallRecord.call_id != current.call_id,
                 CallRecord.direction == "inbound",
-                CallRecord.agent_id.is_not(None),
-                CallRecord.answered_at.is_not(None),
+                CallRecord.last_serving_agent_id.is_not(None),
+                CallRecord.first_agent_connected_at.is_not(None),
                 history_at >= cutoff,
                 *conditions,
             )
