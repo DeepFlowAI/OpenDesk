@@ -19,6 +19,7 @@ DEFAULTS = SystemSettingsResponse(
     organization_enabled=False,
     bridge_asr_enabled=False,
     call_wrapup_seconds=30,
+    call_short_abandon_threshold_seconds=5,
     lingomaster_enabled=False,
     lingomaster_visitor_prompt=DEFAULT_VISITOR_TRANSLATION_PROMPT,
     lingomaster_agent_prompt=DEFAULT_AGENT_TRANSLATION_PROMPT,
@@ -108,3 +109,18 @@ class SystemSettingsService:
         async with AsyncSessionLocal() as db:
             settings = await SystemSettingsService.get_settings(db, tenant_id)
         return settings.call_wrapup_seconds
+
+    @staticmethod
+    async def update_call_short_abandon_threshold(
+        db: AsyncSession, tenant_id: int, seconds: int
+    ) -> SystemSettingsResponse:
+        """Save the tenant-level customer short-abandon threshold."""
+        changes = {"call_short_abandon_threshold_seconds": seconds}
+        item = await SystemSettingsRepository.get_by_tenant_id(db, tenant_id)
+        if item:
+            item = await SystemSettingsRepository.update(db, item, changes)
+        else:
+            defaults = DEFAULTS.model_dump()
+            defaults.update(changes)
+            item = await SystemSettingsRepository.create(db, tenant_id, defaults)
+        return SystemSettingsResponse.model_validate(item)

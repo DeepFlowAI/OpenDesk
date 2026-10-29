@@ -128,6 +128,11 @@ export function mapOutboundFailure(
   if (reason === 'agent_cancel' || reason === 'agent_hangup') {
     return { message: null, level: 'info', isFallback: false }
   }
+  // satisfaction_*: the customer leg ends after the post-call survey, long
+  // after the agent hung up — a normal end, never an outbound failure.
+  if (reason.startsWith('satisfaction_')) {
+    return { message: null, level: 'info', isFallback: false }
+  }
   if (reason === 'remote_bye') {
     return { message: '对方已挂断', level: 'info', isFallback: false }
   }

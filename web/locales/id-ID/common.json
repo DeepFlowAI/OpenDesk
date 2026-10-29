@@ -1201,6 +1201,7 @@
   "chat.handoff.needsAgent": "Masalah ini memerlukan peninjauan lebih lanjut oleh agen dukungan manusia.",
   "chat.attachment.upload": "Unggah lampiran",
   "chat.attachment.failed": "Gagal mengirim lampiran. Klik untuk mencoba lagi.",
+  "chat.attachment.empty": "Gambar belum siap. Silakan coba lagi.",
   "chat.bot.noResponse": "Asisten tidak merespons. Silakan coba lagi atau hubungi dukungan.",
   "chat.recall.mine": "Anda menarik kembali sebuah pesan",
   "chat.recall.named": "{name} menarik kembali sebuah pesan",

@@ -137,4 +137,7 @@ class AutoOutboundCallRecord(Base, TimestampMixin):
     reception_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
     agent_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
     reception_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Snapshot of variables preset to the voice bot for this call:
+    # {"status": "passed" | "failed", "items": [{"name", "value", "truncated"}]}.
+    call_variables: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     fail_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

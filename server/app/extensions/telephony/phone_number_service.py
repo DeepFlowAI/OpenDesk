@@ -9,6 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError, NotFoundError, ValidationError
 from app.models.phone_number import PhoneNumber
+from app.repositories.personal_auto_outbound_repository import (
+    ACTIVE_SESSION_STATUSES,
+    PersonalAutoOutboundRepository,
+)
 from app.repositories.phone_number_repository import PhoneNumberRepository
 from app.repositories.tenant_phone_number_repository import TenantPhoneNumberRepository
 from app.repositories.tenant_repository import TenantRepository
@@ -309,6 +313,29 @@ class PhoneNumberService:
         row = await PhoneNumberRepository.get_by_id(db, phone_id)
         if not row:
             raise NotFoundError("Phone number not found")
+        active_sessions = await PersonalAutoOutboundRepository.count_by_outbound_phone_number_id(
+            db,
+            phone_id,
+            statuses=ACTIVE_SESSION_STATUSES,
+        )
+        if active_sessions > 0:
+            raise BusinessError(
+                "Phone number is used by an active personal auto-outbound session; "
+                "end the session first",
+                status_code=409,
+                code="PHONE_IN_ACTIVE_PERSONAL_AUTO_OUTBOUND",
+            )
+        session_refs = await PersonalAutoOutboundRepository.count_by_outbound_phone_number_id(
+            db,
+            phone_id,
+        )
+        if session_refs > 0:
+            raise BusinessError(
+                "Phone number is referenced by past personal auto-outbound sessions; "
+                "ask an administrator to clear that history before deleting",
+                status_code=409,
+                code="PHONE_IN_PERSONAL_AUTO_OUTBOUND_HISTORY",
+            )
         await PhoneNumberRepository.delete(db, row)
 
     @staticmethod

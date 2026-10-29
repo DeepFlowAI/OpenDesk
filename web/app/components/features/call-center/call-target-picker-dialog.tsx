@@ -200,7 +200,7 @@ export function CallTargetPickerDialog({
 
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next && !busy) onClose() }}>
-      <DialogContent className="gap-3 pb-3 sm:max-w-[480px]">
+      <DialogContent className="grid-cols-[minmax(0,1fr)] gap-3 pb-3 sm:max-w-[480px]">
         <DialogHeader>
           <DialogTitle>{t(TITLE_KEY[mode], locale)}</DialogTitle>
           <DialogDescription>{t(DESC_KEY[mode], locale)}</DialogDescription>

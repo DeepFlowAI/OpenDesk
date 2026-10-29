@@ -9,6 +9,7 @@ from app.core.trace import set_request_id, set_trace_id
 from app.libs.observability import init_observability, shutdown_observability
 from app.routers import register_routers
 from app.core.exceptions import register_exception_handlers
+from app.core.tenant_platform_auth import tenant_api_key_configured
 from app.db.session import AsyncSessionLocal, engine
 from app.db.migration import run_migrations
 from app.db.seed import seed_system_defaults
@@ -124,6 +125,40 @@ async def _event_delivery_worker() -> None:
         await asyncio.sleep(interval)
 
 
+async def _platform_llm_worker() -> None:
+    from app.services.platform_llm_queue_service import PlatformLLMQueueService
+
+    logger = logging.getLogger(__name__)
+    interval = settings.PLATFORM_LLM_SCAN_INTERVAL_SECONDS
+    while True:
+        try:
+            processed = await PlatformLLMQueueService.run_tick()
+            if processed:
+                continue
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Platform LLM dispatch failed")
+        await asyncio.sleep(interval)
+
+
+async def _quality_continuous_worker() -> None:
+    from app.services.quality_continuous_plan_service import QualityContinuousPlanService
+
+    logger = logging.getLogger(__name__)
+    interval = settings.QUALITY_CONTINUOUS_SCAN_INTERVAL_SECONDS
+    while True:
+        try:
+            stats = await QualityContinuousPlanService.run_tick()
+            if any(stats.values()):
+                logger.info("quality_continuous_tick %s", stats)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Continuous quality plan scan failed")
+        await asyncio.sleep(interval)
+
+
 async def _call_wrapup_timeout_worker() -> None:
     from app.services.call_wrapup_timeout_service import CallWrapupTimeoutService
 
@@ -145,6 +180,25 @@ async def _call_wrapup_timeout_worker() -> None:
         await asyncio.sleep(interval)
 
 
+async def _call_finalization_retry_worker() -> None:
+    from app.services.call_finalization_retry_service import (
+        CallFinalizationRetryService,
+    )
+
+    logger = logging.getLogger(__name__)
+    interval = settings.CALL_FINALIZATION_RETRY_SCAN_INTERVAL_SECONDS
+    while True:
+        try:
+            stats = await CallFinalizationRetryService.run_tick()
+            if stats["checked"]:
+                logger.info("call_finalization_retry_tick %s", stats)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("Call finalization retry scan failed")
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     assert_safe_production_config()
@@ -155,6 +209,10 @@ async def lifespan(app: FastAPI):
     if settings.REDIS_URL:
         from app.db.redis import redis_client
         await redis_client.initialize()
+
+    from app.services.export_task_worker import ExportTaskWorker
+
+    export_task_worker = asyncio.create_task(ExportTaskWorker.run(), name="export-task-worker")
 
     visitor_timeout_task = None
     if settings.VISITOR_TIMEOUT_CLOSE_WORKER_ENABLED:
@@ -180,11 +238,29 @@ async def lifespan(app: FastAPI):
             _event_delivery_worker(),
             name="event-delivery-worker",
         )
+    platform_llm_task = None
+    if settings.PLATFORM_LLM_WORKER_ENABLED:
+        platform_llm_task = asyncio.create_task(
+            _platform_llm_worker(),
+            name="platform-llm-worker",
+        )
+    quality_continuous_task = None
+    if settings.QUALITY_CONTINUOUS_WORKER_ENABLED:
+        quality_continuous_task = asyncio.create_task(
+            _quality_continuous_worker(),
+            name="quality-continuous-worker",
+        )
     wrapup_timeout_task = None
     if settings.CALL_WRAPUP_TIMEOUT_WORKER_ENABLED and settings.REDIS_URL:
         wrapup_timeout_task = asyncio.create_task(
             _call_wrapup_timeout_worker(),
             name="call-wrapup-timeout-worker",
+        )
+    call_finalization_retry_task = None
+    if settings.CALL_FINALIZATION_RETRY_WORKER_ENABLED:
+        call_finalization_retry_task = asyncio.create_task(
+            _call_finalization_retry_worker(),
+            name="call-finalization-retry-worker",
         )
 
     auto_outbound_engine = None
@@ -232,6 +308,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    export_task_worker.cancel()
+    with suppress(asyncio.CancelledError):
+        await export_task_worker
     if visitor_timeout_task is not None:
         visitor_timeout_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -248,10 +327,22 @@ async def lifespan(app: FastAPI):
         event_delivery_task.cancel()
         with suppress(asyncio.CancelledError):
             await event_delivery_task
+    if platform_llm_task is not None:
+        platform_llm_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await platform_llm_task
+    if quality_continuous_task is not None:
+        quality_continuous_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await quality_continuous_task
     if wrapup_timeout_task is not None:
         wrapup_timeout_task.cancel()
         with suppress(asyncio.CancelledError):
             await wrapup_timeout_task
+    if call_finalization_retry_task is not None:
+        call_finalization_retry_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await call_finalization_retry_task
     if auto_outbound_engine is not None:
         try:
             await auto_outbound_engine.stop()
@@ -326,6 +417,11 @@ def create_app() -> FastAPI:
     register_exception_handlers(app)
     register_routers(app)
     load_extensions(app)
+    if not tenant_api_key_configured():
+        logging.getLogger(__name__).warning(
+            "TENANT_API_KEY is empty or a placeholder: Tenant Platform APIs "
+            "(tenants, telephony, SMS platform, verify files) answer 503"
+        )
     return app
 
 

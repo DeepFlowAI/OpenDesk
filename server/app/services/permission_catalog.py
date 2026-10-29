@@ -97,6 +97,20 @@ PERMISSION_TREE: list[dict] = [
                 ],
             },
             {
+                "key": "quality",
+                "name": "质检",
+                "name_en": "Quality Review",
+                "permissions": [
+                    {"key": "quality.online.access", "name": "使用在线质检", "name_en": "Use online quality review", "type": "menu", "requires": "chat.workspace.use"},
+                    {"key": "quality.online.plan.view", "name": "查看质检方案", "name_en": "View quality plans", "type": "switch", "requires": "quality.online.access", "data_scope_resource": "session_record"},
+                    {"key": "quality.online.plan.manage", "name": "管理质检方案", "name_en": "Manage quality plans", "type": "manage", "requires": "quality.online.plan.view", "data_scope_resource": "session_record"},
+                    {"key": "quality.online.review.perform", "name": "执行人工质检", "name_en": "Perform quality reviews", "type": "action", "requires": "quality.online.plan.view", "data_scope_resource": "session_record"},
+                    {"key": "quality.online.record.view", "name": "查看质检记录", "name_en": "View quality records", "type": "switch", "requires": "quality.online.plan.view", "data_scope_resource": "session_record"},
+                    {"key": "quality.online.scorecard.view", "name": "查看质检表", "name_en": "View quality scorecards", "type": "switch", "requires": "quality.online.access"},
+                    {"key": "quality.online.scorecard.manage", "name": "管理质检表", "name_en": "Manage quality scorecards", "type": "manage", "requires": "quality.online.scorecard.view"},
+                ],
+            },
+            {
                 "key": "learning",
                 "name": "学习中心",
                 "name_en": "Learning Center",
@@ -216,6 +230,7 @@ PERMISSION_TREE: list[dict] = [
                     {"key": "call.admin.extension.manage", "name": "管理 SIP 分机", "name_en": "Manage SIP extensions", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.settings.manage", "name": "管理呼叫中心设置", "name_en": "Manage call center settings", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.embed.manage", "name": "管理嵌入式通话", "name_en": "Manage embedded calling", "type": "manage", "requires": "admin.access"},
+                    {"key": "call.admin.event_subscription.manage", "name": "管理通话事件订阅", "name_en": "Manage call event subscriptions", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.summary_config.manage", "name": "管理通话纪要配置", "name_en": "Manage call summaries", "type": "manage", "requires": "admin.access"},
                     {"key": "call.admin.sms.manage", "name": "管理短信", "name_en": "Manage SMS", "type": "manage", "requires": "admin.access"},
                 ],

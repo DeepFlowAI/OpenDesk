@@ -10,6 +10,8 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
+import { HTTPError } from 'ky'
+import { readApiErrorCode } from '@/utils/session-replacement'
 import { useAuthStore } from '@/context/auth-store'
 import { useSocketStore } from '@/context/socket-store'
 import { useChatStore } from '@/context/chat-store'
@@ -1381,9 +1383,18 @@ export default function ChatPage() {
             : t('ws.chat.newConversationStarted', locale),
         )
         return conversation
-      } catch {
-        window.alert(t('ws.chat.startNewConversationFailed', locale))
-        throw new Error('Failed to start conversation')
+      } catch (error) {
+        const code = error instanceof HTTPError ? await readApiErrorCode(error.response) : ''
+        const messageKey = code === 'BOT_VISITOR_ONLINE'
+          ? 'ws.chat.startNewBotOnline'
+          : code === 'VISITOR_STATUS_UNAVAILABLE'
+            ? 'ws.chat.startNewVisitorStatusUnavailable'
+            : code === 'ACTIVE_CONVERSATION_EXISTS'
+              ? 'ws.chat.startNewActiveConflict'
+              : 'ws.chat.startNewConversationFailed'
+        const message = t(messageKey, locale)
+        window.alert(message)
+        throw new Error(message)
       }
     },
     [

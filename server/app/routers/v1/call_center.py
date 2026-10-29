@@ -46,6 +46,7 @@ from app.schemas.call_center import (
     CallRecordDetail,
     CallRecordFilterOptionsResponse,
     CallRecordUserLinkRequest,
+    BotTranscriptResponse,
     CallTranscriptResponse,
     CallUserAssociationResponse,
     CallRecordListResponse,
@@ -72,6 +73,7 @@ from app.services.call_center.outbound_webrtc_service import OutboundWebRTCServi
 from app.repositories.call_record_repository import CallRecordRepository
 from app.services.call_record_service import CallRecordService
 from app.services.call_trajectory_service import CallTrajectoryService
+from app.services.bot_transcript_service import BotTranscriptService
 from app.services.call_transcript_service import CallTranscriptService
 from app.services.call_user_association_service import CallUserAssociationService
 from app.services.cc_agent_resource_service import CcAgentResourceService
@@ -696,6 +698,34 @@ async def get_call_record_transcript(
     return await CallTranscriptService.get_for_record(
         db, public_id, principal.tenant_id, principal
     )
+
+
+@router.get(
+    "/calls/{call_id}/bot-transcript",
+    response_model=BotTranscriptResponse,
+)
+async def get_workspace_bot_transcript(
+    call_id: str,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.workspace.use")
+    ),
+):
+    """Robot-stage transcript for the ringing / live workspace. Never holds a
+    DB session while VoiceSpeed is in flight."""
+    return await BotTranscriptService.get_for_workspace_managed(principal, call_id)
+
+
+@router.get(
+    "/call-records/{public_id}/bot-transcript",
+    response_model=BotTranscriptResponse,
+)
+async def get_record_bot_transcript(
+    public_id: UUID,
+    principal: EffectivePrincipal = Depends(
+        require_permission_short_session("call.record.view")
+    ),
+):
+    return await BotTranscriptService.get_for_record_managed(principal, public_id)
 
 
 @router.post(

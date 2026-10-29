@@ -7,6 +7,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from app.constants.call_center import CallSource
 from app.db.session import AsyncSessionLocal
 from app.enums import QueueType
 from app.libs.telephony import BaseTelephonyClient, CallEvent
@@ -317,7 +318,7 @@ class PersonalAutoOutboundRuntime:
                     from_number=caller_id,
                     to_number=call.phone_number,
                     agent_id=None,
-                    call_source="personal_auto_outbound",
+                    call_source=CallSource.PERSONAL_AUTO_OUTBOUND.value,
                 )
                 cdr_id = detail.get("id")
                 for attempt in range(4):

@@ -15,7 +15,6 @@ from app.core.exceptions import BusinessError, ForbiddenError, NotFoundError, Va
 from app.db.session import AsyncSessionLocal
 from app.enums import ConversationStatus, MessageContentType, MessageSenderType, QueueType
 from app.libs.realtime import get_realtime_transport
-from app.libs.conversation_metrics import compute_duration_seconds
 from app.libs.storage import create_storage_client
 from app.models.conversation import Conversation
 from app.models.message import Message
@@ -39,7 +38,7 @@ from app.services.conversation_file_service import (
 from app.services.conversation_service import ConversationService
 from app.services.data_scope_service import DataScopeService, RESOURCE_OFFLINE_MESSAGE
 from app.services.offline_message_realtime_service import OfflineMessageRealtimeService
-from app.services.visitor_web_status_service import VisitorWebStatusService
+from app.services.offline_bot_conversation_service import OfflineBotConversationService
 from app.services.routing_service import RoutingService
 
 logger = logging.getLogger(__name__)
@@ -49,6 +48,7 @@ QUEUE_LEAVE_MESSAGE_SOURCES = {
     QUEUE_FULL_LEAVE_MESSAGE_SOURCE,
     QUEUE_WAITING_LEAVE_MESSAGE_SOURCE,
 }
+LEAVE_MESSAGE_HOURS_OPEN_CODE = "LEAVE_MESSAGE_HOURS_OPEN"
 
 _AVATAR_COLORS = [
     "#F87171", "#FB923C", "#FBBF24", "#34D399",
@@ -233,71 +233,24 @@ class OfflineMessageService:
         r: aioredis.Redis,
         conversation: Conversation,
     ) -> bool:
-        if conversation.status != ConversationStatus.BOT.value:
-            return False
-        active_count = await ConversationRepository.count_active_visitor_conversations(
-            db,
-            tenant_id=conversation.tenant_id,
-            visitor_id=conversation.visitor_id,
-            channel_id=conversation.channel_id,
-        )
-        if active_count != 1 or not VisitorWebStatusService.can_display(conversation):
-            return False
-        try:
-            status = await VisitorWebStatusService.get_status(
-                r,
-                conversation.tenant_id,
-                int(conversation.channel_id),
-                conversation.visitor.external_id,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to read visitor Web status before offline-message assignment "
-                "conversation_id=%s",
-                conversation.id,
-            )
-            return False
-        return status == "offline"
+        return await OfflineBotConversationService.check(
+            db, r, conversation, source="offline_message",
+        ) == "eligible"
 
     @staticmethod
     async def _close_bot_conversation_for_offline_message_assignment(
-        db: AsyncSession,
-        conversation: Conversation,
+        db: AsyncSession, conversation: Conversation,
     ) -> None:
-        ended_at = datetime.now(timezone.utc)
-        conversation.status = ConversationStatus.CLOSED.value
-        conversation.ended_at = ended_at
-        conversation.ended_by = OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY
-        conversation.duration_seconds = compute_duration_seconds(conversation.started_at, ended_at)
-        await db.flush()
-        await ConversationRepository.recompute_message_counts(db, conversation.id)
-        await ConversationRepository.recompute_first_human_response_seconds(db, conversation.id)
-        await ConversationRepository.recompute_agent_response_metrics(db, conversation.id)
+        await OfflineBotConversationService.close(
+            db, conversation, ended_by=OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY,
+        )
 
     @staticmethod
     async def _emit_bot_conversation_closed_for_offline_message_assignment(
         conversation: Conversation,
     ) -> None:
-        try:
-            rt = get_realtime_transport()
-        except RuntimeError:
-            return
-
-        payload = {
-            "conversation_id": conversation.id,
-            "conversation_public_id": conversation.public_id,
-            "ended_by": OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY,
-        }
-        conv_room = f"conv:{conversation.id}"
-        await rt.emit("conversation_ended", payload, room=conv_room, namespace="/chat")
-        await rt.emit("conversation_ended", payload, room=conv_room, namespace="/visitor")
-        from app.services.conversation_realtime_service import ConversationRealtimeService
-
-        await ConversationRealtimeService.emit_conversation_list_updated(
-            conversation.tenant_id,
-            action="ended",
-            conversation_id=conversation.id,
-            rt=rt,
+        await OfflineBotConversationService.emit_closed(
+            conversation, ended_by=OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY,
         )
 
     @staticmethod
@@ -425,7 +378,10 @@ class OfflineMessageService:
         gate = await ChannelService.check_human_service_gate(db, channel, config)
         if gate["can_start_conversation"] or gate["reason"] != "outside_service_hours":
             if source not in QUEUE_LEAVE_MESSAGE_SOURCES:
-                raise BusinessError("Leave message is only available outside service hours")
+                raise BusinessError(
+                    "Leave message is only available outside service hours",
+                    code=LEAVE_MESSAGE_HOURS_OPEN_CODE,
+                )
             group_id = await OfflineMessageService._resolve_queue_leave_message_group_id(
                 db,
                 r,
@@ -1271,11 +1227,15 @@ class OfflineMessageService:
             if not row.visitor_id:
                 raise ValidationError("Offline message visitor is missing")
 
+            await ConversationRepository.lock_visitor_conversations(
+                db, tenant_id=row.tenant_id, visitor_id=row.visitor_id, channel_id=row.channel_id,
+            )
             existing = await ConversationRepository.get_active_visitor_conversation(
                 db,
                 tenant_id=row.tenant_id,
                 visitor_id=row.visitor_id,
                 channel_id=row.channel_id,
+                for_update=True,
             )
             if existing and await OfflineMessageService._should_close_single_offline_bot_conversation(
                 db,

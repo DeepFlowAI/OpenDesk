@@ -34,6 +34,23 @@ class VoiceSpeedAgentListResult:
 
 
 @dataclass(frozen=True)
+class VoiceSpeedCallTranscriptMessage:
+    role: str
+    content: str
+    interrupted: bool = False
+    heard_content: str | None = None
+
+
+@dataclass(frozen=True)
+class VoiceSpeedCallTranscript:
+    call_id: str
+    agent_id: str
+    agent_name: str
+    handoff_at: str | None
+    messages: list[VoiceSpeedCallTranscriptMessage]
+
+
+@dataclass(frozen=True)
 class VoiceSpeedRealtimeSession:
     """Short-lived realtime session minted for one phone call.
 
@@ -117,3 +134,51 @@ class BaseVoiceSpeedClient(ABC):
         Default no-op so mock/test clients need not implement it.
         """
         return {}
+
+    async def preset_call_variables(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+        call_id: str,
+        variables: dict[str, str],
+    ) -> None:
+        """Store `{{name}}` values for one call before its first dialog turn.
+
+        Raises VoiceSpeedClientError on any failure. Clients that cannot preset
+        variables inherit this default, which always fails.
+        """
+        raise VoiceSpeedClientError("Call variable preset is not supported")
+
+    async def get_call_opening(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+        *,
+        session_id: str,
+        fallback_greeting: str,
+        user_identifier: str | None = None,
+    ) -> dict:
+        """Resolve how the agent opens this call: ``{"greeting", "opening"}``
+        plus an optional ``voice_spk_id``, passed as-is to converse. ``fallback_greeting`` is used when the agent
+        has no opening configured. ``user_identifier`` (the customer's number)
+        is shown on the agent's session record.
+
+        Default returns the fallback so mock/test clients need not implement it.
+        """
+        return {"greeting": fallback_greeting, "opening": ""}
+
+    async def get_call_transcript(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+        call_id: str,
+    ) -> VoiceSpeedCallTranscript:
+        """Read the robot-stage transcript for one VoiceSpeed call.
+
+        Raises VoiceSpeedClientError on any failure, including 404. Default
+        always fails so mock clients that do not implement it stay explicit.
+        """
+        raise VoiceSpeedClientError("Call transcript is not supported")

@@ -45,6 +45,14 @@ import {
   uploadVisitorConversationFile,
   uploadVisitorOfflineMessageFile,
 } from '@/service/use-conversation-files'
+import {
+  isRecoverableVisitorSessionError,
+} from '@/lib/visitor-session-recoverable-error'
+import {
+  describeFileSendError,
+  isEmptyUploadFile,
+  readBusinessErrorCode,
+} from '@/utils/file-send-error'
 import type { SatisfactionSurveyRecord } from '@/models/satisfaction-survey'
 import type { Socket } from 'socket.io-client'
 import {
@@ -74,6 +82,27 @@ import {
 } from '@/lib/handoff-route-unavailable'
 import { quoteFromMessage } from '@/lib/message-quote'
 import { createPendingAttachmentContent } from '@/lib/pending-attachment'
+
+const LEAVE_MESSAGE_HOURS_OPEN_CODE = 'LEAVE_MESSAGE_HOURS_OPEN'
+const LEAVE_MESSAGE_HOURS_OPEN_PENDING_TTL_MS = 10 * 60 * 1000
+
+type PendingLeaveMessageHoursOpen =
+  | {
+      kind: 'text'
+      text: string
+      stage: 'await_conversation' | 'await_leave_message'
+      createdAt: number
+      // Resubmitting as a leave message is only valid once the page has left
+      // the leave-message mode that was just rejected.
+      exitedLeaveMessage: boolean
+    }
+  | {
+      kind: 'file'
+      file: File
+      stage: 'await_conversation' | 'await_leave_message'
+      createdAt: number
+      exitedLeaveMessage: boolean
+    }
 
 // ─── Config context ──────────────────────────────────────────────
 
@@ -709,7 +738,9 @@ type ProviderProps = Omit<
   onCurrentQueueCountChange?: (count: number | null) => void
   onOfflineMessageCreated: (offlineMessagePublicId: string) => void
   onHandoffLeaveMessage?: (prompt?: string) => void
+  onLeaveMessageHoursOpen?: () => Promise<void> | void
   onHandoffQueueFull?: (payload: HandoffRouteUnavailablePayload, inline?: boolean) => void
+  onRecoverVisitorSession?: () => Promise<string | null>
   children: ReactNode
 }
 
@@ -818,7 +849,9 @@ export function VisitorChatRuntimeProvider({
   onCurrentQueueCountChange,
   onOfflineMessageCreated,
   onHandoffLeaveMessage,
+  onLeaveMessageHoursOpen,
   onHandoffQueueFull,
+  onRecoverVisitorSession,
   ...chatConfig
 }: ProviderProps) {
   const rawMessages = useVisitorChatStore((s) => s.messages)
@@ -844,6 +877,10 @@ export function VisitorChatRuntimeProvider({
   const pendingOfflineFilesRef = useRef(new Map<number, { file: File; localUrl: string }>())
   const retryingOfflineMessageIdsRef = useRef(new Set<number>())
   const runOpenAgentTurnRef = useRef<((options: RunOpenAgentTurnOptions) => Promise<void>) | null>(null)
+  const pendingLeaveMessageHoursOpenRef = useRef<PendingLeaveMessageHoursOpen | null>(null)
+  const leaveMessageHoursOpenRedirectedRef = useRef(false)
+  const leaveMessageHoursOpenResumeInFlightRef = useRef(false)
+  const [leaveMessageHoursOpenResumeNonce, setLeaveMessageHoursOpenResumeNonce] = useState(0)
 
   const convertMessage = useCallback(
     (msg: Message, idx: number): ThreadMessageLike => {
@@ -1059,6 +1096,25 @@ export function VisitorChatRuntimeProvider({
       },
     })
   }, [chatConfig.botMode, chatConfig.channel.channel_key, conversationPublicId, offlineMode])
+
+  const beginLeaveMessageHoursOpenRedirect = useCallback(
+    async (content: { kind: 'text'; text: string } | { kind: 'file'; file: File }) => {
+      if (leaveMessageHoursOpenRedirectedRef.current) return false
+      leaveMessageHoursOpenRedirectedRef.current = true
+      pendingLeaveMessageHoursOpenRef.current = {
+        ...content,
+        stage: 'await_conversation',
+        createdAt: Date.now(),
+        exitedLeaveMessage: false,
+      }
+      trackEvent('leave_message_hours_open_redirect', {
+        props: { content_kind: content.kind },
+      })
+      await onLeaveMessageHoursOpen?.()
+      return true
+    },
+    [onLeaveMessageHoursOpen, trackEvent],
+  )
 
   const requestHumanHandoff = useCallback(
     async (payload?: HumanHandoffEventPayload | null) => {
@@ -1290,6 +1346,87 @@ export function VisitorChatRuntimeProvider({
     visitorSessionToken,
   ])
 
+  const deliverConversationFileViaSocket = useCallback(
+    async (
+      file: File,
+      options?: { quotedMessage?: Message | null; startedAt?: number },
+    ) => {
+      if (!socket || !conversationPublicId || !visitorExternalId) return
+      const startedAt = options?.startedAt ?? Date.now()
+      const quoted = options?.quotedMessage ?? null
+      try {
+        const uploaded = await uploadVisitorConversationFile({
+          conversationPublicId,
+          visitorSessionToken,
+          file,
+        })
+        const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
+        const content = JSON.stringify({
+          schema_version: uploaded.schema_version,
+          file_id: uploaded.file_id,
+          name: uploaded.name,
+          size: uploaded.size,
+          mime_type: uploaded.mime_type,
+        })
+        const quoteMetadata = quoted
+          ? { quote: quoteFromMessage(quoted, chatConfig.locale) }
+          : undefined
+        const tempId = addOptimistic(conversationPublicId, content, contentType, quoteMetadata)
+
+        socket.emit('send_message', {
+          conversation_public_id: conversationPublicId,
+          content,
+          content_type: contentType,
+          ...(quoted ? { quoted_message_id: quoted.id } : {}),
+        }, (res: { ok?: boolean; message?: Message | string; error?: string }) => {
+          if (res?.ok && res.message) {
+            confirmOptimistic(tempId, res.message as Message)
+            if (quoted) setQuotedMessage(null)
+            trackEvent('file_send_succeeded', {
+              props: { target: 'conversation' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            return
+          }
+          removeMessage(tempId)
+          const errorMessage = typeof res?.message === 'string' ? res.message : res?.error
+          if (errorMessage) window.alert(errorMessage)
+          trackEvent('file_send_failed', {
+            level: 'warn',
+            props: {
+              target: 'conversation',
+              stage: 'socket_ack',
+              error_message: errorMessage || 'socket_ack_failed',
+            },
+            metrics: { duration_ms: Date.now() - startedAt },
+          })
+        })
+      } catch (error) {
+        trackEvent('file_send_failed', {
+          level: 'error',
+          props: {
+            target: 'conversation',
+            stage: 'upload_or_send',
+            error_message: await describeFileSendError(error),
+          },
+          metrics: { duration_ms: Date.now() - startedAt },
+        })
+        throw new Error('Failed to send conversation file')
+      }
+    },
+    [
+      addOptimistic,
+      chatConfig.locale,
+      confirmOptimistic,
+      conversationPublicId,
+      removeMessage,
+      socket,
+      trackEvent,
+      visitorExternalId,
+      visitorSessionToken,
+    ],
+  )
+
   const onFileSend = useCallback(
     async (file: File) => {
       const startedAt = Date.now()
@@ -1301,6 +1438,20 @@ export function VisitorChatRuntimeProvider({
         metrics: { size_bytes: file.size },
       })
 
+      if (isEmptyUploadFile(file)) {
+        trackEvent('file_send_failed', {
+          level: 'warn',
+          props: {
+            target: offlineMode ? 'offline_message' : 'conversation',
+            stage: 'empty_file',
+            error_message: 'File is empty',
+            mime_type: file.type || 'unknown',
+          },
+          metrics: { duration_ms: Date.now() - startedAt, size_bytes: 0 },
+        })
+        throw new Error('File is empty')
+      }
+
       if (offlineMode) {
         const tempId = addPendingOfflineFile(file)
         try {
@@ -1310,10 +1461,22 @@ export function VisitorChatRuntimeProvider({
             metrics: { duration_ms: Date.now() - startedAt },
           })
           return
-        } catch {
+        } catch (error) {
+          if (
+            (await readBusinessErrorCode(error)) === LEAVE_MESSAGE_HOURS_OPEN_CODE
+            && await beginLeaveMessageHoursOpenRedirect({ kind: 'file', file })
+          ) {
+            releasePendingOfflineFile(tempId)
+            removeMessage(tempId)
+            return
+          }
           trackEvent('file_send_failed', {
             level: 'error',
-            props: { target: 'offline_message', stage: 'upload_or_send' },
+            props: {
+              target: 'offline_message',
+              stage: 'upload_or_send',
+              error_message: await describeFileSendError(error),
+            },
             metrics: { duration_ms: Date.now() - startedAt },
           })
           markMessageFailed(tempId)
@@ -1365,73 +1528,22 @@ export function VisitorChatRuntimeProvider({
         return
       }
 
-      if (!socket || !conversationPublicId || !visitorExternalId) return
-
-      try {
-        const uploaded = await uploadVisitorConversationFile({
-          conversationPublicId,
-          visitorSessionToken,
-          file,
-        })
-        const contentType = uploaded.mime_type.startsWith('image/') ? 'image' : 'file'
-        const content = JSON.stringify({
-          schema_version: uploaded.schema_version,
-          file_id: uploaded.file_id,
-          name: uploaded.name,
-          size: uploaded.size,
-          mime_type: uploaded.mime_type,
-        })
-        const quoteMetadata = quotedMessage ? { quote: quoteFromMessage(quotedMessage, chatConfig.locale) } : undefined
-        const tempId = addOptimistic(conversationPublicId, content, contentType, quoteMetadata)
-
-        socket.emit('send_message', {
-          conversation_public_id: conversationPublicId,
-          content,
-          content_type: contentType,
-          ...(quotedMessage ? { quoted_message_id: quotedMessage.id } : {}),
-        }, (res: { ok?: boolean; message?: Message | string; error?: string }) => {
-          if (res?.ok && res.message) {
-            confirmOptimistic(tempId, res.message as Message)
-            if (quotedMessage) setQuotedMessage(null)
-            trackEvent('file_send_succeeded', {
-              props: { target: 'conversation' },
-              metrics: { duration_ms: Date.now() - startedAt },
-            })
-            return
-          }
-          removeMessage(tempId)
-          const errorMessage = typeof res?.message === 'string' ? res.message : res?.error
-          if (errorMessage) window.alert(errorMessage)
-          trackEvent('file_send_failed', {
-            level: 'warn',
-            props: { target: 'conversation', stage: 'socket_ack' },
-            metrics: { duration_ms: Date.now() - startedAt },
-          })
-        })
-      } catch {
-        trackEvent('file_send_failed', {
-          level: 'error',
-          props: { target: 'conversation', stage: 'upload_or_send' },
-          metrics: { duration_ms: Date.now() - startedAt },
-        })
-        throw new Error('Failed to send conversation file')
-      }
+      await deliverConversationFileViaSocket(file, { quotedMessage, startedAt })
     },
     [
-      socket,
       chatConfig.botMode,
       chatConfig.config.open_agent_attachment_upload_enabled,
-      chatConfig.locale,
       botRunning,
       conversationPublicId,
       offlineMode,
-      visitorExternalId,
       visitorSessionToken,
       addPendingOfflineFile,
       addOptimistic,
-      confirmOptimistic,
+      beginLeaveMessageHoursOpenRedirect,
+      deliverConversationFileViaSocket,
       markMessageFailed,
       markOptimisticDelivered,
+      releasePendingOfflineFile,
       removeMessage,
       sendPendingOfflineFile,
       trackEvent,
@@ -1654,6 +1766,7 @@ export function VisitorChatRuntimeProvider({
         clientMessageId,
         lastEventId,
         resume,
+        recoverVisitorSession: onRecoverVisitorSession,
         handlers: {
           onLlmStepCreated: (data) => {
             streamMetrics.recordChunk()
@@ -1930,7 +2043,22 @@ export function VisitorChatRuntimeProvider({
             })
             persistControllerSnapshot()
           },
-          onError: (message) => {
+          onRecoveredAuth: (message) => {
+            trackEvent('open_agent_turn_recovered', {
+              level: 'warn',
+              request_id: requestId,
+              client_message_id: clientMessageId,
+              props: {
+                error_excerpt: message.slice(0, 200),
+                resume,
+                recoverable: true,
+              },
+            })
+            persistControllerSnapshot()
+          },
+          onError: (message, details) => {
+            const recoverable = details?.authRecoverable === true
+              || isRecoverableVisitorSessionError(message, { context: 'http' })
             trackEvent('open_agent_turn_failed', {
               level: 'error',
               request_id: requestId,
@@ -1938,6 +2066,8 @@ export function VisitorChatRuntimeProvider({
               props: {
                 error_excerpt: message.slice(0, 200),
                 resume,
+                recoverable,
+                ...(recoverable ? { recovery_exhausted: true } : {}),
               },
               metrics: {
                 ...streamMetrics.finish(),
@@ -1955,13 +2085,17 @@ export function VisitorChatRuntimeProvider({
         await controller.completion
       } catch (error) {
         if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          const excerpt = error instanceof Error ? error.message.slice(0, 200) : 'unknown'
+          const recoverable = isRecoverableVisitorSessionError(error, { context: 'http' })
           trackEvent('open_agent_turn_failed', {
             level: 'error',
             request_id: requestId,
             client_message_id: clientMessageId,
             props: {
-              error_excerpt: error instanceof Error ? error.message.slice(0, 200) : 'unknown',
+              error_excerpt: excerpt,
               resume,
+              recoverable,
+              ...(recoverable ? { recovery_exhausted: true } : {}),
             },
             metrics: {
               ...streamMetrics.finish(),
@@ -2012,6 +2146,7 @@ export function VisitorChatRuntimeProvider({
       applyQueueConversationState,
       trackEvent,
       quotedMessage,
+      onRecoverVisitorSession,
     ],
   )
 
@@ -2051,6 +2186,64 @@ export function VisitorChatRuntimeProvider({
       markMessageFailed(message.id)
     }
   }, [botRunning, chatConfig.botMode, markMessageFailed, runOpenAgentTurn, updateMessage])
+
+  const deliverConversationTextViaSocket = useCallback(
+    async (
+      text: string,
+      options?: { quotedMessage?: Message | null; startedAt?: number },
+    ): Promise<boolean> => {
+      if (!socket || !conversationPublicId) return false
+      const startedAt = options?.startedAt ?? Date.now()
+      const quoted = options?.quotedMessage ?? null
+
+      trackEvent('message_send_started', {
+        props: { target: 'conversation', content_type: 'text' },
+        metrics: { content_length: text.length },
+      })
+      const quoteMetadata = quoted
+        ? { quote: quoteFromMessage(quoted, chatConfig.locale) }
+        : undefined
+      const tempId = addOptimistic(conversationPublicId, text, 'text', quoteMetadata)
+
+      return await new Promise<boolean>((resolve) => {
+        socket.emit('send_message', {
+          conversation_public_id: conversationPublicId,
+          content: text,
+          content_type: 'text',
+          ...(quoted ? { quoted_message_id: quoted.id } : {}),
+        }, (res: { ok?: boolean; message?: Message | string; error?: string }) => {
+          if (res?.ok && res.message) {
+            confirmOptimistic(tempId, res.message as Message)
+            if (quoted) setQuotedMessage(null)
+            trackEvent('message_send_succeeded', {
+              props: { target: 'conversation' },
+              metrics: { duration_ms: Date.now() - startedAt },
+            })
+            resolve(true)
+            return
+          }
+          trackEvent('message_send_failed', {
+            level: 'warn',
+            props: { target: 'conversation', reason: 'socket_ack' },
+            metrics: { duration_ms: Date.now() - startedAt },
+          })
+          const errorMessage = typeof res?.message === 'string' ? res.message : res?.error
+          if (errorMessage) window.alert(errorMessage)
+          removeMessage(tempId)
+          resolve(false)
+        })
+      })
+    },
+    [
+      addOptimistic,
+      chatConfig.locale,
+      confirmOptimistic,
+      conversationPublicId,
+      removeMessage,
+      socket,
+      trackEvent,
+    ],
+  )
 
   const sendTextMessage = useCallback(
     async (text: string) => {
@@ -2109,10 +2302,20 @@ export function VisitorChatRuntimeProvider({
             })
             return true
           }
-        } catch {
+        } catch (error) {
+          if (
+            (await readBusinessErrorCode(error)) === LEAVE_MESSAGE_HOURS_OPEN_CODE
+            && await beginLeaveMessageHoursOpenRedirect({ kind: 'text', text: trimmed })
+          ) {
+            removeMessage(tempId)
+            return false
+          }
           trackEvent('message_send_failed', {
             level: 'error',
-            props: { target: 'offline_message' },
+            props: {
+              target: 'offline_message',
+              error_message: await describeFileSendError(error),
+            },
             metrics: { duration_ms: Date.now() - startedAt },
           })
           markMessageFailed(tempId)
@@ -2145,46 +2348,9 @@ export function VisitorChatRuntimeProvider({
         return true
       }
 
-      if (!socket) return false
-
-      trackEvent('message_send_started', {
-        props: { target: 'conversation', content_type: 'text' },
-        metrics: { content_length: trimmed.length },
-      })
-      const quoteMetadata = quotedMessage ? { quote: quoteFromMessage(quotedMessage, chatConfig.locale) } : undefined
-      const tempId = addOptimistic(conversationPublicId, trimmed, 'text', quoteMetadata)
-
-      return await new Promise<boolean>((resolve) => {
-        socket.emit('send_message', {
-          conversation_public_id: conversationPublicId,
-          content: trimmed,
-          content_type: 'text',
-          ...(quotedMessage ? { quoted_message_id: quotedMessage.id } : {}),
-        }, (res: { ok?: boolean; message?: Message | string; error?: string }) => {
-          if (res?.ok && res.message) {
-            confirmOptimistic(tempId, res.message as Message)
-            if (quotedMessage) setQuotedMessage(null)
-            trackEvent('message_send_succeeded', {
-              props: { target: 'conversation' },
-              metrics: { duration_ms: Date.now() - startedAt },
-            })
-            resolve(true)
-            return
-          }
-          trackEvent('message_send_failed', {
-            level: 'warn',
-            props: { target: 'conversation', reason: 'socket_ack' },
-            metrics: { duration_ms: Date.now() - startedAt },
-          })
-          const errorMessage = typeof res?.message === 'string' ? res.message : res?.error
-          if (errorMessage) window.alert(errorMessage)
-          removeMessage(tempId)
-          resolve(false)
-        })
-      })
+      return await deliverConversationTextViaSocket(trimmed, { quotedMessage, startedAt })
     },
     [
-      socket,
       conversationPublicId,
       offlineMode,
       offlineMessagePublicId,
@@ -2199,15 +2365,15 @@ export function VisitorChatRuntimeProvider({
       botRunning,
       runOpenAgentTurn,
       addOptimistic,
+      beginLeaveMessageHoursOpenRedirect,
       confirmOptimistic,
+      deliverConversationTextViaSocket,
       addMessage,
       removeMessage,
       trackEvent,
       quotedMessage,
-      chatConfig.locale,
       markMessageFailed,
       showSubmittedNotice,
-      updateMessage,
     ],
   )
 
@@ -2251,12 +2417,30 @@ export function VisitorChatRuntimeProvider({
       if (!offlineMessagePublicId && res.offline_message_public_id) {
         showSubmittedNotice(res.offline_message_public_id)
       }
-    } catch {
+    } catch (error) {
+      const hoursOpen =
+        (await readBusinessErrorCode(error)) === LEAVE_MESSAGE_HOURS_OPEN_CODE
+      if (hoursOpen && !leaveMessageHoursOpenRedirectedRef.current) {
+        const pendingFile = pendingOfflineFilesRef.current.get(message.id)?.file
+        if (pendingFile) {
+          releasePendingOfflineFile(message.id)
+          removeMessage(message.id)
+          if (await beginLeaveMessageHoursOpenRedirect({ kind: 'file', file: pendingFile })) {
+            return
+          }
+        } else if (message.content_type === 'text') {
+          removeMessage(message.id)
+          if (await beginLeaveMessageHoursOpenRedirect({ kind: 'text', text: message.content })) {
+            return
+          }
+        }
+      }
       markMessageFailed(message.id)
     } finally {
       retryingOfflineMessageIdsRef.current.delete(message.id)
     }
   }, [
+    beginLeaveMessageHoursOpenRedirect,
     confirmOptimistic,
     addMessage,
     offlineMessagePublicId,
@@ -2264,6 +2448,7 @@ export function VisitorChatRuntimeProvider({
     offlineMessageSource,
     offlineMode,
     onOfflineMessageCreated,
+    releasePendingOfflineFile,
     removeMessage,
     markMessageFailed,
     sendPendingOfflineFile,
@@ -2271,6 +2456,105 @@ export function VisitorChatRuntimeProvider({
     updateMessage,
     visitorEnvironment,
     visitorSessionToken,
+  ])
+
+  useEffect(() => {
+    const pending = pendingLeaveMessageHoursOpenRef.current
+    if (!pending) return
+
+    if (Date.now() - pending.createdAt > LEAVE_MESSAGE_HOURS_OPEN_PENDING_TTL_MS) {
+      pendingLeaveMessageHoursOpenRef.current = null
+      leaveMessageHoursOpenRedirectedRef.current = false
+      trackEvent('leave_message_hours_open_pending_expired', {
+        level: 'warn',
+        props: { content_kind: pending.kind },
+      })
+      return
+    }
+
+    if (!offlineMode && !pending.exitedLeaveMessage) {
+      pending.exitedLeaveMessage = true
+    }
+
+    if (leaveMessageHoursOpenResumeInFlightRef.current) return
+
+    const resumeOfflineSubmit = async (item: PendingLeaveMessageHoursOpen) => {
+      leaveMessageHoursOpenResumeInFlightRef.current = true
+      pendingLeaveMessageHoursOpenRef.current = null
+      try {
+        if (item.kind === 'text') {
+          await sendTextMessage(item.text)
+          return
+        }
+        const tempId = addPendingOfflineFile(item.file)
+        try {
+          await sendPendingOfflineFile(tempId, item.file)
+        } catch (error) {
+          trackEvent('file_send_failed', {
+            level: 'error',
+            props: {
+              target: 'offline_message',
+              stage: 'hours_open_resume',
+              error_message: await describeFileSendError(error),
+            },
+          })
+          markMessageFailed(tempId)
+        }
+      } finally {
+        leaveMessageHoursOpenRedirectedRef.current = false
+        leaveMessageHoursOpenResumeInFlightRef.current = false
+      }
+    }
+
+    const resumeConversationDeliver = async () => {
+      leaveMessageHoursOpenResumeInFlightRef.current = true
+      try {
+        if (chatConfig.botMode && !(await requestHumanHandoff())) {
+          // The handoff-unavailable handlers switch the page to queue-full or
+          // leave-message; the content is resubmitted once leave-message mode is on.
+          pending.stage = 'await_leave_message'
+          return
+        }
+        pendingLeaveMessageHoursOpenRef.current = null
+        leaveMessageHoursOpenRedirectedRef.current = false
+        if (pending.kind === 'text') {
+          await deliverConversationTextViaSocket(pending.text)
+        } else {
+          await deliverConversationFileViaSocket(pending.file).catch(() => undefined)
+        }
+      } finally {
+        leaveMessageHoursOpenResumeInFlightRef.current = false
+        setLeaveMessageHoursOpenResumeNonce((n) => n + 1)
+      }
+    }
+
+    if (offlineMode && pending.exitedLeaveMessage) {
+      void resumeOfflineSubmit(pending)
+      return
+    }
+
+    if (
+      pending.stage === 'await_conversation'
+      && conversationPublicId
+      && !offlineMode
+      && socket?.connected
+    ) {
+      void resumeConversationDeliver()
+    }
+  }, [
+    addPendingOfflineFile,
+    chatConfig.botMode,
+    conversationPublicId,
+    deliverConversationFileViaSocket,
+    deliverConversationTextViaSocket,
+    leaveMessageHoursOpenResumeNonce,
+    markMessageFailed,
+    offlineMode,
+    requestHumanHandoff,
+    sendPendingOfflineFile,
+    sendTextMessage,
+    socket,
+    trackEvent,
   ])
 
   const onNew = useCallback(

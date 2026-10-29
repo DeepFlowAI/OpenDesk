@@ -41,6 +41,8 @@ const KNOWN_CALL_RESULTS = new Set([
   'customer_no_answer',
   'customer_busy',
   'customer_unreachable',
+  'provider_answer_unconfirmed',
+  'provider_temporarily_unavailable',
   'invalid_number',
   'ivr_customer_hangup',
   'bot_customer_hangup',

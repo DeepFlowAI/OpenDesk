@@ -1,7 +1,7 @@
 """
 HTTP VoiceSpeed client provider.
 """
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -9,6 +9,8 @@ from app.libs.voice_speed.base import (
     BaseVoiceSpeedClient,
     VoiceSpeedAgentListResult,
     VoiceSpeedAgentSummary,
+    VoiceSpeedCallTranscript,
+    VoiceSpeedCallTranscriptMessage,
     VoiceSpeedClientError,
     VoiceSpeedConnectionResult,
     VoiceSpeedRealtimeSession,
@@ -121,6 +123,137 @@ class HTTPVoiceSpeedClient(BaseVoiceSpeedClient):
             return {}
         return {k: v for k, v in payload.items() if v is not None}
 
+    async def preset_call_variables(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+        call_id: str,
+        variables: dict[str, str],
+    ) -> None:
+        """PUT the call's variable values; VoiceSpeed reads them on the first turn."""
+        url = self._build_call_variables_url(base_url, agent_id, call_id)
+        headers = {"Authorization": f"Bearer {api_key}"}
+        try:
+            async with httpx.AsyncClient(timeout=self.list_timeout_seconds) as client:
+                response = await client.put(url, headers=headers, json={"variables": variables})
+        except httpx.RequestError as exc:
+            raise VoiceSpeedClientError("无法连接 VoiceSpeed，请检查服务地址和网络") from exc
+
+        if not 200 <= response.status_code < 300:
+            raise VoiceSpeedClientError(
+                self._extract_error_message(response) or "VoiceSpeed 通话变量传入失败",
+                status_code=response.status_code,
+            )
+
+    async def get_call_opening(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+        *,
+        session_id: str,
+        fallback_greeting: str,
+        user_identifier: str | None = None,
+    ) -> dict:
+        """POST call-opening; any failure (including a VoiceSpeed without this
+        endpoint) falls back to speaking ``fallback_greeting``."""
+        fallback = {"greeting": fallback_greeting, "opening": ""}
+        url = self._build_call_opening_url(base_url, agent_id)
+        headers = {"Authorization": f"Bearer {api_key}"}
+        body = {"session_id": session_id, "fallback_greeting": fallback_greeting}
+        if user_identifier:
+            body["user_identifier"] = user_identifier
+        try:
+            async with httpx.AsyncClient(timeout=self.list_timeout_seconds) as client:
+                response = await client.post(url, headers=headers, json=body)
+        except httpx.RequestError:
+            return fallback
+        if not 200 <= response.status_code < 300:
+            return fallback
+        try:
+            payload = response.json()
+        except ValueError:
+            return fallback
+        if not isinstance(payload, dict):
+            return fallback
+        return {
+            "greeting": str(payload.get("greeting") or ""),
+            "opening": str(payload.get("opening") or ""),
+            "voice_spk_id": str(payload.get("voice_spk_id") or ""),
+        }
+
+    async def get_call_transcript(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+        call_id: str,
+    ) -> VoiceSpeedCallTranscript:
+        """GET the robot-stage transcript. 3s timeout so a slow VoiceSpeed
+        never blocks the ringing screen-pop."""
+        url = self._build_call_transcript_url(base_url, agent_id, call_id)
+        headers = {"Authorization": f"Bearer {api_key}"}
+        try:
+            async with httpx.AsyncClient(timeout=self.list_timeout_seconds) as client:
+                response = await client.get(url, headers=headers)
+        except httpx.RequestError as exc:
+            raise VoiceSpeedClientError("无法连接 VoiceSpeed，请检查服务地址和网络") from exc
+
+        if not 200 <= response.status_code < 300:
+            message = self._extract_error_message(response)
+            raise VoiceSpeedClientError(
+                self._map_error_message(response.status_code, message),
+                status_code=response.status_code,
+            )
+        return self._parse_call_transcript(response, call_id)
+
+    @staticmethod
+    def _parse_call_transcript(
+        response: httpx.Response, fallback_call_id: str
+    ) -> VoiceSpeedCallTranscript:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise VoiceSpeedClientError("VoiceSpeed 返回了无法解析的响应") from exc
+        if not isinstance(payload, dict):
+            raise VoiceSpeedClientError("VoiceSpeed 返回了无法解析的响应")
+
+        agent = payload.get("agent") if isinstance(payload.get("agent"), dict) else {}
+        handoff = payload.get("handoff") if isinstance(payload.get("handoff"), dict) else None
+        handoff_at = None
+        if handoff:
+            raw = handoff.get("handoff_at")
+            handoff_at = str(raw) if raw else None
+
+        messages: list[VoiceSpeedCallTranscriptMessage] = []
+        raw_messages = payload.get("messages")
+        if isinstance(raw_messages, list):
+            for raw in raw_messages:
+                if not isinstance(raw, dict):
+                    continue
+                role = str(raw.get("role") or "")
+                content = raw.get("content")
+                if role not in {"user", "assistant"} or not isinstance(content, str):
+                    continue
+                heard = raw.get("heard_content")
+                messages.append(
+                    VoiceSpeedCallTranscriptMessage(
+                        role=role,
+                        content=content,
+                        interrupted=bool(raw.get("interrupted")),
+                        heard_content=heard if isinstance(heard, str) else None,
+                    )
+                )
+
+        return VoiceSpeedCallTranscript(
+            call_id=str(payload.get("call_id") or fallback_call_id),
+            agent_id=str(agent.get("id") or ""),
+            agent_name=str(agent.get("name") or ""),
+            handoff_at=handoff_at,
+            messages=messages,
+        )
+
     @staticmethod
     def _parse_realtime_session(response: httpx.Response) -> VoiceSpeedRealtimeSession:
         try:
@@ -206,6 +339,44 @@ class HTTPVoiceSpeedClient(BaseVoiceSpeedClient):
         base = base_url.rstrip("/")
         path = parsed.path.rstrip("/")
         suffix = f"agents/{agent_id}/performance-settings"
+        if path.endswith("/api/v1/openapi"):
+            return f"{base}/{suffix}"
+        if path.endswith("/api/v1"):
+            return f"{base}/openapi/{suffix}"
+        return f"{base}/api/v1/openapi/{suffix}"
+
+    @staticmethod
+    def _build_call_variables_url(base_url: str, agent_id: str, call_id: str) -> str:
+        parsed = urlparse(base_url)
+        base = base_url.rstrip("/")
+        path = parsed.path.rstrip("/")
+        suffix = f"agents/{quote(agent_id, safe='')}/calls/{quote(call_id, safe='')}/variables"
+        if path.endswith("/api/v1/openapi"):
+            return f"{base}/{suffix}"
+        if path.endswith("/api/v1"):
+            return f"{base}/openapi/{suffix}"
+        return f"{base}/api/v1/openapi/{suffix}"
+
+    @staticmethod
+    def _build_call_opening_url(base_url: str, agent_id: str) -> str:
+        parsed = urlparse(base_url)
+        base = base_url.rstrip("/")
+        path = parsed.path.rstrip("/")
+        suffix = f"agents/{quote(agent_id, safe='')}/call-opening"
+        if path.endswith("/api/v1/openapi"):
+            return f"{base}/{suffix}"
+        if path.endswith("/api/v1"):
+            return f"{base}/openapi/{suffix}"
+        return f"{base}/api/v1/openapi/{suffix}"
+
+    @staticmethod
+    def _build_call_transcript_url(base_url: str, agent_id: str, call_id: str) -> str:
+        parsed = urlparse(base_url)
+        base = base_url.rstrip("/")
+        path = parsed.path.rstrip("/")
+        suffix = (
+            f"agents/{quote(agent_id, safe='')}/calls/{quote(call_id, safe='')}/transcript"
+        )
         if path.endswith("/api/v1/openapi"):
             return f"{base}/{suffix}"
         if path.endswith("/api/v1"):

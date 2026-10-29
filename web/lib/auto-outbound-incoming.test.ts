@@ -9,6 +9,7 @@ import {
   resolveAutoOutboundRecordId,
   restoredAutoOutboundContext,
   shouldAutoAcceptAutoOutbound,
+  shouldKeepAutoAnswerChime,
   shouldShowAutoOutboundBusinessTab,
 } from '@/lib/auto-outbound-incoming'
 
@@ -83,6 +84,20 @@ describe('autoOutboundIncomingForCallRecord', () => {
         record_id: null,
       }),
     ).toBeNull()
+  })
+})
+
+describe('shouldKeepAutoAnswerChime', () => {
+  it('keeps playing while the offer is ringing or connected', () => {
+    expect(shouldKeepAutoAnswerChime('incoming')).toBe(true)
+    expect(shouldKeepAutoAnswerChime('on_call')).toBe(true)
+  })
+
+  it('stops once the offer is gone', () => {
+    expect(shouldKeepAutoAnswerChime('idle')).toBe(false)
+    expect(shouldKeepAutoAnswerChime('wrap_up')).toBe(false)
+    expect(shouldKeepAutoAnswerChime('outbound_ringing')).toBe(false)
+    expect(shouldKeepAutoAnswerChime('mic_denied')).toBe(false)
   })
 })
 

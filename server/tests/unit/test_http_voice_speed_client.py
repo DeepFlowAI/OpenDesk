@@ -1,6 +1,9 @@
-import httpx
+import json
 
-from app.libs.voice_speed.base import BaseVoiceSpeedClient
+import httpx
+import pytest
+
+from app.libs.voice_speed.base import BaseVoiceSpeedClient, VoiceSpeedClientError
 from app.libs.voice_speed.providers.http import HTTPVoiceSpeedClient
 
 
@@ -144,3 +147,144 @@ def test_parse_realtime_session_rejects_missing_token():
     response = httpx.Response(200, json={"ws_url": "wss://x"})
     with pytest.raises(VoiceSpeedClientError):
         HTTPVoiceSpeedClient._parse_realtime_session(response)
+
+
+def test_build_call_variables_url_respects_base_paths():
+    for base in (
+        "https://voicespeed.example.com",
+        "https://voicespeed.example.com/api/v1",
+        "https://voicespeed.example.com/api/v1/openapi",
+    ):
+        assert (
+            HTTPVoiceSpeedClient._build_call_variables_url(base, "7", "call-1")
+            == "https://voicespeed.example.com/api/v1/openapi/agents/7/calls/call-1/variables"
+        )
+
+
+def _patch_async_client(monkeypatch, handler):
+    real_client = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+
+
+@pytest.mark.asyncio
+async def test_preset_call_variables_puts_variables(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("Authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"call_id": "call-1", "expires_at": "2026-10-19T00:00:00Z"})
+
+    _patch_async_client(monkeypatch, handler)
+    await HTTPVoiceSpeedClient().preset_call_variables(
+        "https://vs.example.com", "key", "7", "call-1", {"customer_name": "张三"}
+    )
+    assert seen == {
+        "method": "PUT",
+        "url": "https://vs.example.com/api/v1/openapi/agents/7/calls/call-1/variables",
+        "auth": "Bearer key",
+        "body": {"variables": {"customer_name": "张三"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_preset_call_variables_raises_on_rejection(monkeypatch):
+    _patch_async_client(
+        monkeypatch,
+        lambda _request: httpx.Response(409, json={"message": "Call already started"}),
+    )
+    with pytest.raises(VoiceSpeedClientError) as exc_info:
+        await HTTPVoiceSpeedClient().preset_call_variables(
+            "https://vs.example.com", "key", "7", "call-1", {"a": "b"}
+        )
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_get_call_opening_posts_session_and_fallback(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("Authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"greeting": "", "opening": "model", "voice_spk_id": "general"})
+
+    _patch_async_client(monkeypatch, handler)
+    opening = await HTTPVoiceSpeedClient().get_call_opening(
+        "https://vs.example.com", "key", "3", session_id="call-1", fallback_greeting="您好"
+    )
+
+    assert opening == {"greeting": "", "opening": "model", "voice_spk_id": "general"}
+    assert seen["url"] == "https://vs.example.com/api/v1/openapi/agents/3/call-opening"
+    assert seen["auth"] == "Bearer key"
+    assert seen["body"] == {"session_id": "call-1", "fallback_greeting": "您好"}
+
+    await HTTPVoiceSpeedClient().get_call_opening(
+        "https://vs.example.com", "key", "3", session_id="call-1", fallback_greeting="您好",
+        user_identifier="13800000000",
+    )
+    assert seen["body"]["user_identifier"] == "13800000000"
+
+
+@pytest.mark.asyncio
+async def test_get_call_opening_falls_back_when_endpoint_missing(monkeypatch):
+    _patch_async_client(monkeypatch, lambda _req: httpx.Response(404, json={"detail": "Not Found"}))
+    opening = await HTTPVoiceSpeedClient().get_call_opening(
+        "https://vs.example.com", "key", "3", session_id="call-1", fallback_greeting="您好"
+    )
+    assert opening == {"greeting": "您好", "opening": ""}
+
+
+@pytest.mark.asyncio
+async def test_get_call_transcript_parses_handoff_and_interrupt(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("Authorization")
+        return httpx.Response(
+            200,
+            json={
+                "call_id": "call-1",
+                "agent": {"id": 3, "name": "移动客服"},
+                "handoff": {"handoff_at": "2026-10-22T03:01:10Z"},
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "您好，我是移动客服",
+                        "interrupted": True,
+                        "heard_content": "您好，",
+                    },
+                    {"role": "user", "content": "转人工", "interrupted": False},
+                ],
+            },
+        )
+
+    _patch_async_client(monkeypatch, handler)
+    transcript = await HTTPVoiceSpeedClient().get_call_transcript(
+        "https://vs.example.com", "key", "3", "call-1"
+    )
+    assert seen["url"] == "https://vs.example.com/api/v1/openapi/agents/3/calls/call-1/transcript"
+    assert seen["auth"] == "Bearer key"
+    assert transcript.agent_name == "移动客服"
+    assert transcript.handoff_at == "2026-10-22T03:01:10Z"
+    assert transcript.messages[0].heard_content == "您好，"
+    assert transcript.messages[1].role == "user"
+
+
+@pytest.mark.asyncio
+async def test_get_call_transcript_raises_on_404(monkeypatch):
+    _patch_async_client(monkeypatch, lambda _req: httpx.Response(404, json={"detail": "not found"}))
+    with pytest.raises(VoiceSpeedClientError) as exc_info:
+        await HTTPVoiceSpeedClient().get_call_transcript(
+            "https://vs.example.com", "key", "3", "missing"
+        )
+    assert exc_info.value.status_code == 404

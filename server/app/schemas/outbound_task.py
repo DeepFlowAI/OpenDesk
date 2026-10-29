@@ -189,6 +189,21 @@ class OutboundTaskField(BaseModel):
         return value
 
 
+def normalize_field_name(name: str) -> str:
+    """Compare field names the same way spreadsheet import matches headers."""
+    return name.strip().lower().replace(" ", "").replace("_", "")
+
+
+def ensure_unique_field_names(fields: list[OutboundTaskField] | None) -> None:
+    """Reject field lists where two fields (enabled or not) share a name."""
+    seen: dict[str, str] = {}
+    for field in fields or []:
+        normalized = normalize_field_name(field.name)
+        if normalized in seen:
+            raise ValueError(f'Field name "{field.name}" duplicates "{seen[normalized]}"')
+        seen[normalized] = field.name
+
+
 class OutboundTemplateBase(BaseModel):
     name: str
     description: str | None = None
@@ -214,11 +229,19 @@ class OutboundTemplateBase(BaseModel):
 
 
 class OutboundTemplateCreate(OutboundTemplateBase):
-    pass
+    @model_validator(mode="after")
+    def validate_field_names(self) -> "OutboundTemplateCreate":
+        ensure_unique_field_names(self.fields)
+        return self
 
 
 class OutboundTemplateUpdate(OutboundTemplateBase):
     expected_updated_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_field_names(self) -> "OutboundTemplateUpdate":
+        ensure_unique_field_names(self.fields)
+        return self
 
 
 class OutboundTemplateScriptUpdate(BaseModel):
@@ -302,9 +325,19 @@ class OutboundTaskCreate(OutboundTaskBase):
     template_id: int
     publish: bool = False
 
+    @model_validator(mode="after")
+    def validate_field_names(self) -> "OutboundTaskCreate":
+        ensure_unique_field_names(self.fields)
+        return self
+
 
 class OutboundTaskUpdate(OutboundTaskBase):
     name: str | None = None
+
+    @model_validator(mode="after")
+    def validate_field_names(self) -> "OutboundTaskUpdate":
+        ensure_unique_field_names(self.fields)
+        return self
 
 
 class OutboundTaskStats(BaseModel):

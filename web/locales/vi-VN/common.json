@@ -1201,6 +1201,7 @@
   "chat.handoff.needsAgent": "Vấn đề này cần nhân viên hỗ trợ xem xét kỹ hơn.",
   "chat.attachment.upload": "Tải lên tệp đính kèm",
   "chat.attachment.failed": "Gửi tệp đính kèm thất bại. Nhấn để thử lại.",
+  "chat.attachment.empty": "Ảnh chưa tải xong. Vui lòng thử lại.",
   "chat.bot.noResponse": "Trợ lý thông minh không phản hồi. Vui lòng thử lại hoặc liên hệ hỗ trợ.",
   "chat.recall.mine": "Bạn đã thu hồi một tin nhắn",
   "chat.recall.named": "{name} đã thu hồi một tin nhắn",

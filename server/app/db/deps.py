@@ -48,6 +48,8 @@ _EMBEDDED_CALL_ALLOWED_METHODS_BY_PATH: dict[str, frozenset[str]] = {
     "/api/v1/call-center/agents/me/current-call/media-reconnect": frozenset({"POST"}),
     "/api/v1/call-center/agents/me/current-call/accept": frozenset({"POST"}),
     "/api/v1/call-center/agents/me/current-call/reject": frozenset({"POST"}),
+    "/api/v1/call-center/sms/workspace/templates": frozenset({"GET"}),
+    "/api/v1/call-center/sms/send": frozenset({"POST"}),
 }
 _EMBEDDED_CALL_COMMAND_PATH_PREFIX = "/api/v1/call-center/embed/commands/"
 

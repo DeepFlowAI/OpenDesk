@@ -6,14 +6,15 @@ import { EmployeeAvatar } from '@/app/components/features/session-reports/employ
 import { useLocaleStore } from '@/context/locale-store'
 import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
-import type { CallEmployeeBrief } from '@/models/call-report'
+import type { CallAgentBrief } from '@/models/call-agent-report'
 
 type Props = {
-  employee: CallEmployeeBrief
+  employee: CallAgentBrief
   carriedSearch: string
+  groupNames: string[]
 }
 
-export function CallEmployeeDetailHeader({ employee, carriedSearch }: Props) {
+export function CallEmployeeDetailHeader({ employee, carriedSearch, groupNames }: Props) {
   const { locale } = useLocaleStore()
   const tail = carriedSearch ? `?${carriedSearch.replace(/^\?/, '')}` : ''
 
@@ -28,22 +29,23 @@ export function CallEmployeeDetailHeader({ employee, carriedSearch }: Props) {
       </Link>
       <div className="flex items-center gap-3">
         <EmployeeAvatar employee={employee} size={40} />
-        <div className="flex min-w-0 items-center gap-3">
-          <span className="truncate text-lg font-semibold text-foreground">
-            {employee.display_name ?? employee.name}
-          </span>
-          <span
+        <div className="min-w-0">
+          <div className="flex min-w-0 items-center gap-3"><span className="truncate text-lg font-semibold text-foreground">
+            {employee.display_name ?? employee.name}</span><span
             className={cn(
               'inline-flex shrink-0 items-center rounded-md px-2 py-0.5 text-xs',
-              employee.is_active
+              employee.status === 'active'
                 ? 'bg-success/10 text-success'
                 : 'bg-muted text-muted-foreground'
             )}
           >
-            {employee.is_active
-              ? t('ws.records.callReports.employees.statusActive', locale)
-              : t('ws.records.callReports.employees.statusInactive', locale)}
-          </span>
+            {t(`ws.records.callReports.employees.status${employee.status[0].toUpperCase()}${employee.status.slice(1)}`, locale)}
+          </span></div>
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            {employee.status === 'deleted' || groupNames.length === 0 ? '—' : groupNames.length <= 2
+              ? groupNames.join(' · ')
+              : `${groupNames.slice(0, 2).join(' · ')} +${groupNames.length - 2}`}
+          </p>
         </div>
       </div>
     </div>

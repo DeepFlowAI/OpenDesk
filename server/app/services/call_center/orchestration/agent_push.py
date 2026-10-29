@@ -98,7 +98,7 @@ class AgentPushMixin:
                         db, tenant_id, employee_id
                     )
                     if active is None or active.first_agent_connected_at is None:
-                        logger.info(
+                        logger.debug(
                             "republish call UI: skip agent=%s/%s "
                             "state=%s call_id=%s (no live in_progress CDR)",
                             tenant_id, employee_id, state, call_id,
@@ -165,6 +165,28 @@ class AgentPushMixin:
                         db, call_id, tenant_id
                     )
                     if record is None or record.lifecycle_status != "active":
+                        # A colleague's transfer / consult / conference ring is
+                        # keyed on an internal id with no CDR. While its ring
+                        # payload is still stored the ring is live, not a ghost:
+                        # show it again instead of releasing the target.
+                        if state == "ringing":
+                            from app.services.call_center.internal_consult_service import (
+                                load_internal_offer_payload,
+                            )
+
+                            ring = await load_internal_offer_payload(r, offer_id)
+                            if ring is not None:
+                                await self.notify_agent_incoming(
+                                    tenant_id=tenant_id,
+                                    employee_id=employee_id,
+                                    payload=ring,
+                                )
+                                logger.info(
+                                    "republish call UI: re-ring internal offer "
+                                    "agent=%s/%s call_id=%s offer_id=%s",
+                                    tenant_id, employee_id, call_id, offer_id,
+                                )
+                                return
                         # Consult targets are keyed on their WebRTC leg and have
                         # no CDR — keep the UI if a host still lists them.
                         from app.services.call_center.call_control_service import (

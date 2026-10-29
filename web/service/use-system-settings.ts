@@ -5,6 +5,7 @@ import type {
   UpdateSystemSettingsPayload,
   UpdateOrganizationSettingsPayload,
   UpdateCallTranscriptionPayload,
+  UpdateCallShortAbandonPayload,
   UpdateCallWrapupPayload,
 } from '@/models/system-settings'
 
@@ -61,6 +62,18 @@ export const useUpdateCallWrapup = () => {
   return useMutation({
     mutationFn: (data: UpdateCallWrapupPayload) =>
       put<SystemSettings>('v1/system-settings/call-wrapup', { json: data }),
+    onSuccess: (data) => {
+      qc.setQueryData(systemSettingsKeys.detail(), data)
+      qc.invalidateQueries({ queryKey: systemSettingsKeys.detail() })
+    },
+  })
+}
+
+export const useUpdateCallShortAbandon = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: UpdateCallShortAbandonPayload) =>
+      put<SystemSettings>('v1/system-settings/call-short-abandon', { json: data }),
     onSuccess: (data) => {
       qc.setQueryData(systemSettingsKeys.detail(), data)
       qc.invalidateQueries({ queryKey: systemSettingsKeys.detail() })

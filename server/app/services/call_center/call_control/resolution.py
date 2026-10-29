@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 
 from sqlalchemy import desc, or_, select
 
@@ -11,7 +12,7 @@ from app.constants.call_center import (
     ConsultState,
 )
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
-from app.libs.telephony.base import BaseTelephonyClient
+from app.libs.telephony.base import BaseTelephonyClient, TelephonyRPCError
 from app.models.call_record import CallRecord
 from app.services.call_center import consult_session
 
@@ -302,14 +303,29 @@ class ResolutionMixin:
                         legs.room_id, stale, new_leg,
                     )
             if not replaced:
-                await telephony.room_add_leg(legs.room_id, new_leg)
-            legs.room_legs = [
-                new_leg if leg == stale else leg
-                for leg in legs.room_legs
-                if leg != new_leg
-            ]
-            if new_leg not in legs.room_legs:
-                legs.room_legs.append(new_leg)
+                try:
+                    await telephony.room_add_leg(legs.room_id, new_leg)
+                except TelephonyRPCError as exc:
+                    if exc.code != -32002:
+                        raise
+                    # The kernel drops a room once fewer than two legs remain
+                    # (a conference collapsed to 1:1 and the old browser leg
+                    # then left), leaving the customer unroomed. Bridge the new
+                    # leg to the customer directly instead.
+                    logger.info(
+                        "media reconnect: room gone; bridging customer directly "
+                        "room=%s customer=%s new=%s",
+                        legs.room_id, customer_call_id, new_leg,
+                    )
+                    room_active = False
+            if room_active:
+                legs.room_legs = [
+                    new_leg if leg == stale else leg
+                    for leg in legs.room_legs
+                    if leg != new_leg
+                ]
+                if new_leg not in legs.room_legs:
+                    legs.room_legs.append(new_leg)
 
         if stale and stale != new_leg:
             try:
@@ -344,6 +360,7 @@ class ResolutionMixin:
                 await telephony.call_bridge(
                     customer_call_id,
                     new_leg,
+                    user_call_id=customer_call_id,
                     keepalive_on_peer_hangup=True,
                 )
                 consult_call_id = None
@@ -353,6 +370,7 @@ class ResolutionMixin:
             await telephony.call_bridge(
                 customer_call_id,
                 new_leg,
+                user_call_id=customer_call_id,
                 keepalive_on_peer_hangup=True,
             )
 
@@ -386,12 +404,37 @@ class ResolutionMixin:
     ) -> dict | None:
         """Return host agent + legs when ``target`` is their active consult peer."""
 
+        return await _ccs.CallControlService._find_host_for_colleague(
+            tenant_id, target_employee_id, _consult_leg_of
+        )
+
+    @staticmethod
+    async def _find_colleague_leg(
+        tenant_id: int, employee_id: int
+    ) -> tuple[dict, str] | None:
+        """Host + this agent's own leg when they joined a colleague's call as a
+        consult target or conference participant (they own no call record)."""
+
+        host = await _ccs.CallControlService._find_host_for_colleague(
+            tenant_id, employee_id, _colleague_leg_of
+        )
+        if host is None:
+            return None
+        return host, _colleague_leg_of(host["legs"], employee_id)
+
+    @staticmethod
+    async def _find_host_for_colleague(
+        tenant_id: int,
+        target_employee_id: int,
+        leg_of: Callable[[_ccs.InCallLegs, int], str | None],
+    ) -> dict | None:
+        """First host agent whose in-call legs give ``target`` a leg via ``leg_of``."""
+
+        def matches(legs: _ccs.InCallLegs) -> bool:
+            return bool(leg_of(legs, target_employee_id))
+
         for (tid, eid), legs in list(_ccs._in_call_state.items()):
-            if (
-                tid == tenant_id
-                and legs.consult_target_employee_id == target_employee_id
-                and legs.consult_call_id
-            ):
+            if tid == tenant_id and matches(legs):
                 return {"tenant_id": tid, "employee_id": eid, "legs": legs}
 
         from app.services.call_center.orchestrator import _get_redis_client
@@ -420,9 +463,8 @@ class ResolutionMixin:
                 data = json.loads(raw)
             except (TypeError, ValueError):
                 continue
-            if data.get("consult_target_employee_id") != target_employee_id:
-                continue
-            if not data.get("consult_call_id"):
+            legs = _ccs.InCallLegs.from_dict(data)
+            if not matches(legs):
                 continue
             parts = str(key).split(":")
             if len(parts) < 5:
@@ -431,7 +473,6 @@ class ResolutionMixin:
                 host_id = int(parts[-1])
             except (TypeError, ValueError):
                 continue
-            legs = _ccs.InCallLegs.from_dict(data)
             _ccs._in_call_state[(tenant_id, host_id)] = legs
             return {"tenant_id": tenant_id, "employee_id": host_id, "legs": legs}
         return None
@@ -643,6 +684,22 @@ class ResolutionMixin:
 
         strategy = await resolve_agent_strategy(tenant_id, employee_id)
         return strategy.is_sip_phone
+
+def _consult_leg_of(legs, employee_id: int) -> str | None:
+    if legs.consult_target_employee_id == employee_id:
+        return legs.consult_call_id
+    return None
+
+
+def _conference_leg_of(legs, employee_id: int) -> str | None:
+    if legs.conference_target_employee_id == employee_id:
+        return legs.conference_participant_call_id
+    return None
+
+
+def _colleague_leg_of(legs, employee_id: int) -> str | None:
+    return _consult_leg_of(legs, employee_id) or _conference_leg_of(legs, employee_id)
+
 
 # Imported after the mixin class so this module can be imported directly
 # without a circular-import error (call_control_service imports the mixins).

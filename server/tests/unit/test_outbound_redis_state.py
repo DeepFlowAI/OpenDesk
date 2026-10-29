@@ -303,6 +303,55 @@ async def test_late_outbound_cdr_is_immediately_finalized(monkeypatch):
     db.commit.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_outbound_auto_bridge_treats_missing_call_as_skip(monkeypatch):
+    """Remote BYE before call.bridge must not raise an ERROR-level failure."""
+    from app.libs.telephony.base import TelephonyRPCError
+
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    orch, telephony = await _ready_outbound_orchestrator(monkeypatch, fake)
+    telephony.bridge_error = TelephonyRPCError(-32002, "call not found: out-1")
+
+    await orch.pair_outbound_webrtc(
+        outbound_call_id="out-1", webrtc_call_id="rtc-1"
+    )
+    event = CallEvent(method="call.answered", data={"call_id": "out-1"})
+    await orch._on_outbound_answered(event)
+
+    assert _bridge_calls(telephony) == [
+        {
+            "call_id": "out-1",
+            "other_call_id": "rtc-1",
+            "transcribe": False,
+            "keepalive_on_peer_hangup": True,
+            "user_call_id": "out-1",
+        }
+    ]
+    # Claim released so a later pairing/event can retry if the SIP is still up.
+    assert await fake.get(orch._outbound_bridged_key("out-1")) is None
+
+
+@pytest.mark.asyncio
+async def test_outbound_auto_bridge_binds_agent_media_leg(monkeypatch):
+    """After outbound auto-bridge, mute/transfer must see the live WebRTC leg."""
+    from app.services.call_center.call_control_service import _in_call_state
+
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    orch, telephony = await _ready_outbound_orchestrator(monkeypatch, fake)
+    _in_call_state.clear()
+
+    await orch.pair_outbound_webrtc(
+        outbound_call_id="out-1", webrtc_call_id="rtc-1"
+    )
+    event = CallEvent(method="call.answered", data={"call_id": "out-1"})
+    await orch._on_outbound_answered(event)
+
+    assert len(_bridge_calls(telephony)) == 1
+    legs = _in_call_state[(9, 42)]
+    assert legs.agent_media_call_id == "rtc-1"
+    _in_call_state.clear()
+
+
 def test_outbound_early_fail_covers_flowkit_reasons_and_final_sip() -> None:
     from app.services.call_center.orchestration.outbound import OutboundMixin
 
@@ -313,3 +362,20 @@ def test_outbound_early_fail_covers_flowkit_reasons_and_final_sip() -> None:
     assert OutboundMixin._is_outbound_early_fail("unknown_bucket", 486)
     assert OutboundMixin._is_outbound_early_fail("remote_bye") is False
     assert OutboundMixin._is_outbound_early_fail("remote_bye", 183) is False
+
+
+@pytest.mark.asyncio
+async def test_reassign_outbound_originator_moves_call_to_new_agent(monkeypatch):
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: fake)
+    orch = CallCenterOrchestrator(telephony=MockTelephonyClient())
+    await orch.register_outbound_call(
+        call_id="out-1", tenant_id=9, employee_id=42, outbound_did="9000001"
+    )
+
+    await orch.reassign_outbound_originator("out-1", 77)
+    await orch.reassign_outbound_originator("not-outbound", 77)
+
+    other_node = CallCenterOrchestrator(telephony=MockTelephonyClient())
+    assert await other_node._peek_outbound_originator("out-1") == (9, 77, "9000001")
+    assert await other_node._peek_outbound_originator("not-outbound") is None

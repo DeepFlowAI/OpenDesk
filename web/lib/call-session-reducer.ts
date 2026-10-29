@@ -204,8 +204,18 @@ export function callSessionReducer(
       }
       const toOnCall =
         !!event.restore || !!event.alreadyAnswered || state.phase === 'on_call'
+      // A restore re-key (e.g. after accepting a transfer) carries the
+      // customer's original answer time; keep when this desk got the call so
+      // a pre-transfer idle status snapshot cannot end it.
+      const liveStartedAt =
+        state.phase === 'incoming' || state.phase === 'on_call'
+          ? state.incoming?.startedAt
+          : undefined
       return bump(state, {
-        incoming: event.incoming,
+        incoming:
+          liveStartedAt != null && liveStartedAt > event.incoming.startedAt
+            ? { ...event.incoming, startedAt: liveStartedAt }
+            : event.incoming,
         callStart: event.callStart != null
           ? minCallStart(state.callStart, event.callStart) ?? event.callStart
           : state.callStart ?? event.incoming.startedAt,
@@ -246,15 +256,20 @@ export function callSessionReducer(
 
     case 'SOCKET_OUTBOUND_HANGUP': {
       const ended = collectEndedCallIds(state, event.callId)
+      const sameCall =
+        !state.incoming ||
+        state.incoming.call_id === event.callId ||
+        state.incoming.source_call_id === event.callId
+      // A late hangup for an earlier call (e.g. its satisfaction survey just
+      // ended) must not end the call this desk is on now.
+      if (!sameCall && (state.phase === 'outbound_ringing' || state.phase === 'on_call')) {
+        return state
+      }
       if (
         state.phase === 'outbound_ringing' ||
         state.phase === 'idle' ||
         state.phase === 'mic_check'
       ) {
-        const sameCall =
-          !state.incoming ||
-          state.incoming.call_id === event.callId ||
-          state.incoming.source_call_id === event.callId
         return bump(state, {
           phase: 'idle',
           incoming: sameCall ? null : state.incoming,
@@ -354,6 +369,23 @@ export function isRecentlyEndedCall(
   return candidates.some((id) => Boolean(id) && endedIds.includes(id as string))
 }
 
+/**
+ * Whether a cc.call_incoming push replays a call this desk just ended.
+ * A fresh offer carries its own new call id even when it is for the same
+ * customer call (e.g. a second conference invite), so the customer call id
+ * only identifies a replay on restore pushes.
+ */
+export function isRecentlyEndedIncoming(
+  endedIds: string[],
+  incoming: { call_id: string; source_call_id?: string; restore?: boolean },
+): boolean {
+  return isRecentlyEndedCall(
+    endedIds,
+    incoming.call_id,
+    incoming.restore ? incoming.source_call_id : undefined,
+  )
+}
+
 export function shouldPollHydrateOnCall(
   resourceState: string | null | undefined,
   ringingButAnswered: boolean,
@@ -394,15 +426,43 @@ export function shouldLeaveOutboundRingingFromPoll(opts: {
   currentCallId?: string | null
   resourceState?: string | null
   resourceUpdatedAtMs?: number | null
+  statusFetchedAtMs?: number | null
 }): boolean {
   if (opts.phase !== 'outbound_ringing') return false
   if (!opts.ringingCallId) return false
   if (opts.currentCallId === opts.ringingCallId) return false
-  if (opts.resourceUpdatedAtMs == null || opts.callStart == null) return false
-  if (opts.resourceUpdatedAtMs < opts.callStart) return false
+  if (!isSnapshotAfterCallStart(opts)) return false
   const rs = opts.resourceState
   if (rs === 'reserved' || rs === 'ringing' || rs === 'in_call') return false
   return true
+}
+
+/**
+ * Whether a status snapshot can speak for the call that started at
+ * `callStart` (browser clock). `resourceUpdatedAtMs` is server time, so on a
+ * browser whose clock runs behind it a snapshot fetched before the call looks
+ * newer than the call; the browser-side fetch time rules that out.
+ *
+ * A transferred call inherits the customer's original answer time as
+ * `callStart` (so the timer keeps running), which predates this agent's ring.
+ * `sessionStartedAt` (when this desk got the call) keeps the anchor from
+ * sliding back and letting this agent's pre-transfer idle snapshot through.
+ */
+function isSnapshotAfterCallStart(opts: {
+  callStart?: number | null
+  sessionStartedAt?: number | null
+  resourceUpdatedAtMs?: number | null
+  statusFetchedAtMs?: number | null
+}): boolean {
+  const { resourceUpdatedAtMs, statusFetchedAtMs } = opts
+  const anchor =
+    opts.callStart == null
+      ? null
+      : Math.max(opts.callStart, opts.sessionStartedAt ?? opts.callStart)
+  if (anchor == null || resourceUpdatedAtMs == null || statusFetchedAtMs == null) {
+    return false
+  }
+  return resourceUpdatedAtMs >= anchor && statusFetchedAtMs >= anchor
 }
 
 /**
@@ -414,12 +474,13 @@ export function shouldLeaveOutboundRingingFromPoll(opts: {
 export function shouldLeaveOnCallFromPoll(opts: {
   phase: CallCenterPhase
   callStart?: number | null
+  sessionStartedAt?: number | null
   resourceState?: string | null
   resourceUpdatedAtMs?: number | null
+  statusFetchedAtMs?: number | null
 }): boolean {
   if (opts.phase !== 'on_call') return false
-  if (opts.resourceUpdatedAtMs == null || opts.callStart == null) return false
-  if (opts.resourceUpdatedAtMs < opts.callStart) return false
+  if (!isSnapshotAfterCallStart(opts)) return false
   const rs = opts.resourceState
   return rs === 'idle' || rs === 'after_call_work'
 }

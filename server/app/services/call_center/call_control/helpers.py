@@ -147,6 +147,7 @@ class HelpersMixin:
                 await telephony.call_bridge(
                     call.customer_call_id,
                     call.webrtc_call_id,
+                    user_call_id=call.customer_call_id,
                     keepalive_on_peer_hangup=True,
                 )
         except Exception:  # noqa: BLE001
@@ -362,6 +363,7 @@ class HelpersMixin:
                     await telephony.call_bridge(
                         call.customer_call_id,
                         host_media,
+                        user_call_id=call.customer_call_id,
                         keepalive_on_peer_hangup=True,
                     )
                     resumed = True
@@ -891,6 +893,17 @@ class HelpersMixin:
         except Exception:  # noqa: BLE001
             logger.warning(
                 "transfer: call-record reassign failed call=%s agent=%s",
+                customer_call_id, new_agent_id, exc_info=True,
+            )
+        try:
+            from app.services.call_center.orchestrator import get_orchestrator
+
+            await get_orchestrator().reassign_outbound_originator(
+                customer_call_id, new_agent_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "transfer: outbound originator reassign failed call=%s agent=%s",
                 customer_call_id, new_agent_id, exc_info=True,
             )
 

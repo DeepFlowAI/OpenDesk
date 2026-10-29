@@ -219,7 +219,10 @@ async def test_agent_hangup_when_customer_gone_resets_status(monkeypatch):
         set_busy_calls.append((tenant_id, employee_id, busy))
         return None
 
+    mark_completed_calls: list[str] = []
+
     async def _mark_completed(_db, _tenant_id, _call_id, *, hangup_reason=None, end_state="completed"):
+        mark_completed_calls.append(_call_id)
         return None
 
     monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _get_active)
@@ -267,6 +270,8 @@ async def test_agent_hangup_when_customer_gone_resets_status(monkeypatch):
     assert snapshot is not None
     assert snapshot["visible_status"] == "after_call_work"
     assert any(event == "cc.call_hangup" for event, _data, _room in transport.emits)
+    # CDR finalization belongs to the in-flight call.hangup event, not this path.
+    assert mark_completed_calls == []
 
 
 @pytest.mark.asyncio

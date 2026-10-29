@@ -1201,6 +1201,7 @@
   "chat.handoff.needsAgent": "Bu sorun bir insan destek temsilcisinin incelemesini gerektiriyor.",
   "chat.attachment.upload": "Ek yükle",
   "chat.attachment.failed": "Ek gönderilemedi. Yeniden denemek için tıklayın.",
+  "chat.attachment.empty": "Görsel henüz hazır değil. Lütfen tekrar deneyin.",
   "chat.bot.noResponse": "Asistan yanıt vermiyor. Lütfen tekrar deneyin veya desteğe başvurun.",
   "chat.recall.mine": "Bir mesajı geri çektiniz",
   "chat.recall.named": "{name} bir mesajı geri çekti",

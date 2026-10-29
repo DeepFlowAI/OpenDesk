@@ -8,6 +8,7 @@ import secrets
 
 import redis.asyncio as aioredis
 
+from app.constants.call_center import CallSource
 from app.core.exceptions import BusinessError, ForbiddenError, NotFoundError
 from app.libs.telephony import get_telephony_client
 from app.schemas.embedded_call import (
@@ -176,7 +177,7 @@ class EmbeddedCallDialService:
                 outbound_phone_number_id=data.outbound_number_id,
                 destination=data.number,
                 r=redis,
-                call_source="embedded_call",
+                call_source=CallSource.EMBEDDED_CALL.value,
                 custom_business_info=data.custom_business_info,
                 external_context=context,
             )

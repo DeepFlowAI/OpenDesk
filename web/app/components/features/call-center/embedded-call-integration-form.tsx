@@ -7,6 +7,7 @@ import { toast } from 'sonner'
 
 import { EmbeddedCallOriginFields } from '@/app/components/features/call-center/embedded-call-origin-fields'
 import { EmbeddedCallSecretDialog } from '@/app/components/features/call-center/embedded-call-secret-dialog'
+import { CallIntegrationTabs } from '@/app/components/features/call-center/call-integration-tabs'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Switch } from '@/components/ui/switch'
 import { useLocaleStore } from '@/context/locale-store'
@@ -155,29 +156,34 @@ export function EmbeddedCallIntegrationForm({ integrationId }: { integrationId: 
 
   return (
     <div className="-m-8 flex flex-col">
-      <div className="sticky -top-8 z-20 flex h-14 shrink-0 items-center justify-between border-b border-border bg-white px-6">
-        <button
-          type="button"
-          className="flex items-center gap-2 transition-colors hover:opacity-80"
-          onClick={() => router.push(listPath)}
-        >
-          <IconArrowLeft size={20} className="text-muted-foreground" />
-          <span className="text-base font-semibold text-foreground">
-            {integrationId
-              ? name || (isZh ? '编辑集成' : 'Edit integration')
-              : isZh
-                ? '新建集成'
-                : 'New integration'}
-          </span>
-        </button>
-        <button
-          type="button"
-          disabled={pending}
-          onClick={save}
-          className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
-        >
-          {pending ? (isZh ? '保存中…' : 'Saving…') : (isZh ? '保存' : 'Save')}
-        </button>
+      <div className="sticky -top-8 z-20 bg-white">
+        <div className="px-6 pt-6">
+          <CallIntegrationTabs />
+        </div>
+        <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-6">
+          <button
+            type="button"
+            className="flex items-center gap-2 transition-colors hover:opacity-80"
+            onClick={() => router.push(listPath)}
+          >
+            <IconArrowLeft size={20} className="text-muted-foreground" />
+            <span className="text-base font-semibold text-foreground">
+              {integrationId
+                ? name || (isZh ? '编辑集成' : 'Edit integration')
+                : isZh
+                  ? '新建集成'
+                  : 'New integration'}
+            </span>
+          </button>
+          <button
+            type="button"
+            disabled={pending}
+            onClick={save}
+            className="flex h-9 items-center rounded-lg bg-primary px-5 text-sm font-medium text-white transition-colors hover:bg-primary/80 disabled:opacity-50"
+          >
+            {pending ? (isZh ? '保存中…' : 'Saving…') : (isZh ? '保存' : 'Save')}
+          </button>
+        </div>
       </div>
 
       <div className="flex w-[720px] max-w-full flex-col gap-6 p-8">

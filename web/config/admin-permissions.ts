@@ -36,6 +36,8 @@ export type AdminNavItem = {
   href: string
   iconKey: AdminNavIconKey
   permission: string
+  /** Visible when the user holds any of these permissions (overrides `permission`). */
+  anyPermissions?: string[]
   superAdminOnly?: boolean
 }
 
@@ -47,8 +49,15 @@ export type AdminNavGroup = {
 export type AdminRouteRule = {
   prefix: string
   permissions: string[]
+  /** Grant access when any listed permission is held instead of all of them. */
+  matchAny?: boolean
+  /** Show the 403 page on denial instead of redirecting to the default admin page. */
+  forbidOnDeny?: boolean
   superAdminOnly?: boolean
 }
+
+export const CALL_EMBED_MANAGE_PERMISSION = 'call.admin.embed.manage'
+export const CALL_EVENT_SUBSCRIPTION_MANAGE_PERMISSION = 'call.admin.event_subscription.manage'
 
 export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
   {
@@ -69,7 +78,13 @@ export const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
       { labelKey: 'nav.callSummary', href: '/call-summary', iconKey: 'callSummary', permission: 'call.admin.summary_config.manage' },
       { labelKey: 'nav.smsTemplates', href: '/call-center/sms', iconKey: 'sms', permission: 'call.admin.sms.manage' },
       { labelKey: 'nav.callSettings', href: '/call-center/settings', iconKey: 'callSettings', permission: 'call.admin.settings.manage' },
-      { labelKey: 'nav.callIntegrations', href: '/call-center/integrations', iconKey: 'callIntegrations', permission: 'call.admin.embed.manage' },
+      {
+        labelKey: 'nav.callIntegrations',
+        href: '/call-center/integrations',
+        iconKey: 'callIntegrations',
+        permission: CALL_EMBED_MANAGE_PERMISSION,
+        anyPermissions: [CALL_EMBED_MANAGE_PERMISSION, CALL_EVENT_SUBSCRIPTION_MANAGE_PERMISSION],
+      },
     ],
   },
   {
@@ -130,7 +145,14 @@ export const ADMIN_ROUTE_RULES: AdminRouteRule[] = [
   { prefix: '/call-center/extensions', permissions: ['call.admin.extension.manage'] },
   { prefix: '/call-center/sms', permissions: ['call.admin.sms.manage'] },
   { prefix: '/call-center/settings', permissions: ['call.admin.settings.manage'] },
-  { prefix: '/call-center/integrations', permissions: ['call.admin.embed.manage'] },
+  { prefix: '/call-center/integrations/embedded-call', permissions: [CALL_EMBED_MANAGE_PERMISSION], forbidOnDeny: true },
+  { prefix: '/call-center/integrations/event-subscriptions', permissions: [CALL_EVENT_SUBSCRIPTION_MANAGE_PERMISSION], forbidOnDeny: true },
+  {
+    prefix: '/call-center/integrations',
+    permissions: [CALL_EMBED_MANAGE_PERMISSION, CALL_EVENT_SUBSCRIPTION_MANAGE_PERMISSION],
+    matchAny: true,
+    forbidOnDeny: true,
+  },
   { prefix: '/call-summary', permissions: ['call.admin.summary_config.manage'] },
   { prefix: '/online-service/conversation-settings', permissions: ['chat.admin.settings.manage'] },
   { prefix: '/channels', permissions: ['chat.admin.channel.manage'] },

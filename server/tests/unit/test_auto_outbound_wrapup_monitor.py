@@ -167,6 +167,72 @@ async def test_wrapup_rejects_wrong_agent(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_wrapup_allows_bot_record_transferred_to_agent(monkeypatch):
+    record = _record(
+        reception_type="bot",
+        agent_id=77,
+        reception_result={"handoff": True, "transferred": True},
+    )
+    target = SimpleNamespace(id=10, field_values={})
+    monkeypatch.setattr(
+        "app.services.auto_outbound_task_service.AutoOutboundRepository.get_task",
+        AsyncMock(return_value=_task(execution_mode="bot")),
+    )
+    monkeypatch.setattr(
+        "app.services.auto_outbound_task_service.AutoOutboundRepository.get_record_for_task",
+        AsyncMock(return_value=record),
+    )
+
+    async def update_record(db, item, data, **_kwargs):
+        for k, v in data.items():
+            setattr(item, k, v)
+        return item
+
+    monkeypatch.setattr(
+        "app.services.auto_outbound_task_service.AutoOutboundRepository.update_record",
+        update_record,
+    )
+    monkeypatch.setattr(
+        "app.services.auto_outbound_task_service.AutoOutboundRepository.get_target",
+        AsyncMock(return_value=target),
+    )
+    monkeypatch.setattr(
+        "app.services.auto_outbound_task_service.AutoOutboundRepository.update_target",
+        AsyncMock(return_value=target),
+    )
+
+    result = await AutoOutboundTaskService.submit_wrapup(
+        AsyncMock(),
+        _principal(77),
+        1,
+        100,
+        AutoOutboundWrapupRequest(field_values={"note": "办理"}),
+    )
+    assert result.reception_result["field_values"]["note"] == "办理"
+    assert result.reception_result["transferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_wrapup_rejects_bot_record_without_agent(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.auto_outbound_task_service.AutoOutboundRepository.get_task",
+        AsyncMock(return_value=_task(execution_mode="bot")),
+    )
+    monkeypatch.setattr(
+        "app.services.auto_outbound_task_service.AutoOutboundRepository.get_record_for_task",
+        AsyncMock(return_value=_record(reception_type="bot", agent_id=None)),
+    )
+    with pytest.raises(ValidationError):
+        await AutoOutboundTaskService.submit_wrapup(
+            MagicMock(),
+            _principal(77),
+            1,
+            100,
+            AutoOutboundWrapupRequest(field_values={"note": "x"}),
+        )
+
+
+@pytest.mark.asyncio
 async def test_wrapup_allows_repeated_submit_and_emits_updated(monkeypatch):
     record = _record(
         reception_result={

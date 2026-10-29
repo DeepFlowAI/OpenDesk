@@ -23,6 +23,12 @@ from app.models.call_record import CallRecord  # noqa: F401
 from app.models.call_record_access_scope import CallRecordAccessScope  # noqa: F401
 from app.models.call_recording import CallRecording  # noqa: F401
 from app.models.call_event import CallEvent  # noqa: F401
+from app.models.call_queue_fact import CallQueueOffer, CallQueueVisit  # noqa: F401
+from app.models.call_agent_fact import (  # noqa: F401
+    CallAgentAfterCallWork,
+    CallAgentOperation,
+    CallAgentReceptionSegment,
+)
 from app.models.call_satisfaction import CallSatisfactionAnswer, CallSatisfactionExecution  # noqa: F401
 from app.models.call_transcript_segment import CallTranscriptSegment  # noqa: F401
 from app.models.agent_webrtc_session import AgentWebRTCSession  # noqa: F401
@@ -107,6 +113,11 @@ from app.models.auto_outbound_event_subscription import (  # noqa: F401
     AutoOutboundEventSubscription,
     AutoOutboundEventSubscriptionAudit,
 )
+from app.models.call_event_subscription import (  # noqa: F401
+    CallEventSubscriptionRule,
+    CallEventSubscriptionRuleAudit,
+)
+from app.models.call_recording_link_audit import CallRecordingLinkAudit  # noqa: F401
 from app.models.outbound_prescreen import OutboundPrescreenIntent, OutboundPrescreenIntentExample  # noqa: F401
 from app.models.personal_auto_outbound import PersonalAutoOutboundCall, PersonalAutoOutboundSession, PersonalOutboundRecording  # noqa: F401
 from app.models.embedded_call_integration import EmbeddedCallIntegration  # noqa: F401
@@ -116,3 +127,20 @@ from app.models.scheduling import (  # noqa: F401
     ScheduleShift,
 )
 from app.models.scheduling_rule import ScheduleRuleSet  # noqa: F401
+from app.models.platform_llm_call import PlatformLLMCall  # noqa: F401
+from app.models.quality import (  # noqa: F401
+    QualityScorecard,
+    QualityScorecardCriterion,
+    QualityScorecardOption,
+    QualityScorecardSection,
+    QualityScorecardVersion,
+    QualityPlan,
+    QualityPlanCandidate,
+    QualityReview,
+    QualityReviewItem,
+    QualityHumanReviewDraft,
+    QualityHumanReviewItem,
+    QualityReviewAudit,
+)
+
+from app.models.export_task import ExportTask

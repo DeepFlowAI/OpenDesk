@@ -156,6 +156,8 @@ async def test_finalized_disconnect_resets_desired_status_to_offline(fake_redis,
         return 0
 
     monkeypatch.setattr(fake_redis, "eval", fake_eval)
+    sync_db = AsyncMock()
+    monkeypatch.setattr(AgentStatusService, "_sync_cc_db_status_best_effort", sync_db)
 
     await AgentStatusService.finalize_disconnect_if_stale(
         fake_redis,
@@ -168,6 +170,214 @@ async def test_finalized_disconnect_resets_desired_status_to_offline(fake_redis,
     assert status["status"] == AgentOnlineStatus.OFFLINE.value
     assert await fake_redis.hget(key, "desired_status") == AgentOnlineStatus.OFFLINE.value
     assert status["current_count"] == 3
+    sync_db.assert_awaited_once_with(
+        7, 42, AgentOnlineStatus.OFFLINE.value, reason="disconnect_finalize"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_disconnect_syncs_cc_db_offline(fake_redis, monkeypatch):
+    key = "agent:status:7:42"
+    await fake_redis.hset(
+        key,
+        mapping={
+            "connection_sid": "sid-online",
+            "pending_offline_until": "1",
+            "status": AgentOnlineStatus.ONLINE.value,
+            "desired_status": AgentOnlineStatus.ONLINE.value,
+        },
+    )
+
+    async def fake_eval(
+        _script,
+        _numkeys,
+        key_arg,
+        connection_sid_field,
+        sid,
+        pending_offline_field,
+        offline_status,
+        desired_status_field,
+    ):
+        if (
+            await fake_redis.hget(key_arg, connection_sid_field) == sid
+            and await fake_redis.hexists(key_arg, pending_offline_field)
+        ):
+            await fake_redis.hdel(key_arg, connection_sid_field, pending_offline_field)
+            await fake_redis.hset(key_arg, "status", offline_status)
+            await fake_redis.hset(key_arg, desired_status_field, offline_status)
+            return 1
+        return 0
+
+    monkeypatch.setattr(fake_redis, "eval", fake_eval)
+    upsert = AsyncMock()
+    monkeypatch.setattr(
+        "app.repositories.agent_status_repository.AgentStatusRepository.upsert",
+        upsert,
+    )
+
+    class _SessionCM:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(
+        "app.db.session.AsyncSessionLocal",
+        lambda: _SessionCM(),
+    )
+
+    changed = await AgentStatusService.finalize_disconnect_if_stale(
+        fake_redis, tenant_id=7, user_id=42, sid="sid-online"
+    )
+
+    assert changed is True
+    upsert.assert_awaited_once()
+    args = upsert.await_args.args
+    assert args[1:] == (7, 42, "offline", "disconnect_finalize")
+
+
+@pytest.mark.asyncio
+async def test_finalize_stale_disconnect_does_not_touch_cc_db(fake_redis, monkeypatch):
+    # Newer connection already replaced the sid — Lua returns 0.
+    await fake_redis.hset(
+        "agent:status:7:42",
+        mapping={
+            "connection_sid": "sid-newer",
+            "pending_offline_until": "1",
+            "status": AgentOnlineStatus.ONLINE.value,
+            "desired_status": AgentOnlineStatus.ONLINE.value,
+        },
+    )
+
+    async def fake_eval(*_args):
+        return 0
+
+    monkeypatch.setattr(fake_redis, "eval", fake_eval)
+    sync_db = AsyncMock()
+    monkeypatch.setattr(AgentStatusService, "_sync_cc_db_status_best_effort", sync_db)
+
+    changed = await AgentStatusService.finalize_disconnect_if_stale(
+        fake_redis, tenant_id=7, user_id=42, sid="sid-old"
+    )
+
+    assert changed is False
+    sync_db.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mark_connected_restores_cc_db_from_resource_visible_status(
+    fake_redis, monkeypatch
+):
+    """Within-grace reconnect: chat desired_status restores Redis; PG follows
+    call-center resource visible_status (ready/busy/...), not chat enums."""
+    await AgentStatusService.set_status(
+        fake_redis,
+        tenant_id=7,
+        user_id=42,
+        status=AgentOnlineStatus.BUSY.value,
+    )
+    await fake_redis.hset(
+        "agent:status:7:42",
+        mapping={
+            "status": AgentOnlineStatus.OFFLINE.value,
+            "desired_status": AgentOnlineStatus.BUSY.value,
+        },
+    )
+
+    monkeypatch.setattr(
+        "app.services.cc_agent_resource_service.CcAgentResourceService.get_snapshot",
+        AsyncMock(
+            return_value={
+                "visible_status": "ready",
+                "resource_state": "idle",
+            }
+        ),
+    )
+    sync_db = AsyncMock()
+    monkeypatch.setattr(AgentStatusService, "_sync_cc_db_status_best_effort", sync_db)
+
+    await AgentStatusService.mark_connected(fake_redis, tenant_id=7, user_id=42, sid="sid-2")
+
+    status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
+    assert status["status"] == AgentOnlineStatus.BUSY.value
+    sync_db.assert_awaited_once_with(7, 42, "ready", reason="reconnect_restore")
+
+
+@pytest.mark.asyncio
+async def test_mark_connected_offline_desired_does_not_restore_cc_db(
+    fake_redis, monkeypatch
+):
+    await fake_redis.hset(
+        "agent:status:7:42",
+        mapping={
+            "status": AgentOnlineStatus.OFFLINE.value,
+            "desired_status": AgentOnlineStatus.OFFLINE.value,
+        },
+    )
+    sync_db = AsyncMock()
+    monkeypatch.setattr(AgentStatusService, "_sync_cc_db_status_best_effort", sync_db)
+    monkeypatch.setattr(
+        "app.services.cc_agent_resource_service.CcAgentResourceService.get_snapshot",
+        AsyncMock(return_value={"visible_status": "ready", "resource_state": "idle"}),
+    )
+
+    await AgentStatusService.mark_connected(
+        fake_redis, tenant_id=7, user_id=42, sid="sid-offline"
+    )
+
+    sync_db.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_finalize_db_sync_failure_does_not_raise(fake_redis, monkeypatch):
+    key = "agent:status:7:42"
+    await fake_redis.hset(
+        key,
+        mapping={
+            "connection_sid": "sid-online",
+            "pending_offline_until": "1",
+            "status": AgentOnlineStatus.ONLINE.value,
+            "desired_status": AgentOnlineStatus.ONLINE.value,
+        },
+    )
+
+    async def fake_eval(
+        _script,
+        _numkeys,
+        key_arg,
+        connection_sid_field,
+        sid,
+        pending_offline_field,
+        offline_status,
+        desired_status_field,
+    ):
+        await fake_redis.hdel(key_arg, connection_sid_field, pending_offline_field)
+        await fake_redis.hset(key_arg, "status", offline_status)
+        await fake_redis.hset(key_arg, desired_status_field, offline_status)
+        return 1
+
+    monkeypatch.setattr(fake_redis, "eval", fake_eval)
+    monkeypatch.setattr(
+        "app.repositories.agent_status_repository.AgentStatusRepository.upsert",
+        AsyncMock(side_effect=RuntimeError("db down")),
+    )
+
+    class _SessionCM:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr("app.db.session.AsyncSessionLocal", lambda: _SessionCM())
+
+    changed = await AgentStatusService.finalize_disconnect_if_stale(
+        fake_redis, tenant_id=7, user_id=42, sid="sid-online"
+    )
+    assert changed is True
+    status = await AgentStatusService.get_status(fake_redis, tenant_id=7, user_id=42)
+    assert status["status"] == AgentOnlineStatus.OFFLINE.value
 
 
 @pytest.mark.asyncio

@@ -40,17 +40,64 @@ def test_unresolvable_destination_statuses_are_grouped() -> None:
         assert result.party == "carrier"
 
 
+def test_satisfaction_survey_endings_count_as_agent_hangup() -> None:
+    for status in ("completed", "partial", "unanswered", "failed"):
+        result = classify_hangup(
+            HangupSignal(reason=f"satisfaction_{status}", sip_status=None)
+        )
+        assert result.code == "agent_hangup"
+        assert result.party == "agent"
+        assert result.strategy == "internal_reason"
+
+
 def test_standard_busy_and_no_answer_are_preserved() -> None:
     busy = classify_hangup(HangupSignal(reason="busy", sip_status=486))
-    no_answer = classify_hangup(HangupSignal(reason="no_answer", sip_status=480))
+    no_answer = classify_hangup(HangupSignal(reason="no_answer", sip_status=180))
+    no_signal = classify_hangup(HangupSignal(reason="no_answer", sip_status=None))
 
     assert busy.code == "customer_busy"
     assert no_answer.code == "customer_no_answer"
+    assert no_signal.code == "customer_no_answer"
 
 
-def test_provider_decline_is_not_reported_as_unknown() -> None:
+def test_ring_timeout_after_early_media_is_not_a_customer_no_answer() -> None:
+    result = classify_hangup(
+        HangupSignal(reason="no_answer", sip_status=183, sip_reason="Session Progress")
+    )
+
+    assert result.code == "provider_answer_unconfirmed"
+    assert result.party == "carrier"
+    assert result.strategy == "internal_reason_sip_status"
+
+
+def test_carrier_480_is_reported_as_temporarily_unavailable() -> None:
+    unanswered = classify_hangup(
+        HangupSignal(reason="no_answer", sip_status=480, sip_reason="Temporarily Unavailable")
+    )
+    rejected = classify_hangup(HangupSignal(reason="rejected", sip_status=480))
+
+    assert unanswered.code == "provider_temporarily_unavailable"
+    assert rejected.code == "provider_temporarily_unavailable"
+    assert unanswered.party == rejected.party == "carrier"
+
+
+def test_callee_decline_is_reported_as_customer_busy() -> None:
     result = classify_hangup(
         HangupSignal(reason="rejected", sip_status=603, sip_reason="Decline")
+    )
+
+    assert result.code == "customer_busy"
+    assert result.strategy == "sip_status"
+
+
+def test_carrier_block_wording_on_603_stays_provider_rejected() -> None:
+    result = classify_hangup(
+        HangupSignal(
+            reason="rejected",
+            sip_status=603,
+            sip_reason="Decline",
+            sip_reason_hdr='Q.850;cause=21;text="Call rejected"',
+        )
     )
 
     assert result.code == "provider_rejected"

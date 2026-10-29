@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
 
 type Props = {
-  active: 'overall' | 'employees'
+  active: 'overall' | 'employees' | 'queues'
   search?: string
 }
 
@@ -14,7 +14,7 @@ export function CallReportTabs({ active, search = '' }: Props) {
   const { locale } = useLocaleStore()
   const tail = search ? `?${search.replace(/^\?/, '')}` : ''
 
-  const items: { key: 'overall' | 'employees'; href: string; labelKey: string }[] = [
+  const items: { key: 'overall' | 'employees' | 'queues'; href: string; labelKey: string }[] = [
     {
       key: 'overall',
       href: `/workspace/records/call-reports${tail}`,
@@ -24,6 +24,11 @@ export function CallReportTabs({ active, search = '' }: Props) {
       key: 'employees',
       href: `/workspace/records/call-reports/employees${tail}`,
       labelKey: 'ws.records.callReports.tabs.employees',
+    },
+    {
+      key: 'queues',
+      href: `/workspace/records/call-reports/queues${tail}`,
+      labelKey: 'ws.records.callReports.tabs.queues',
     },
   ]
 

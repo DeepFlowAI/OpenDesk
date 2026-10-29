@@ -53,6 +53,10 @@ async def test_create_outbound_normalizes_root_identity_and_adds_initiator_scope
         "app.services.call_record_service.CallRecordRepository.create", create
     )
     monkeypatch.setattr(
+        "app.services.call_record_service._employee_name_snapshots",
+        AsyncMock(return_value={12: "Ada"}),
+    )
+    monkeypatch.setattr(
         "app.services.call_record_service.CallTrajectoryService.append_event", append
     )
     monkeypatch.setattr(
@@ -86,6 +90,8 @@ async def test_create_outbound_normalizes_root_identity_and_adds_initiator_scope
     assert data["customer_number"] == "+8613800138000"
     assert data["service_number"] == "4001681715"
     assert data["initiator_agent_id"] == 12
+    assert data["initiator_agent_ref_id"] == 12
+    assert data["initiator_agent_name_snapshot"] == "Ada"
     assert data["call_source"] == "embedded_call"
     assert data["custom_business_info"] == "Order 88\nRenewal requested"
     assert data["external_context"] == {"record_type": "order", "record_id": "88"}
@@ -94,6 +100,83 @@ async def test_create_outbound_normalizes_root_identity_and_adds_initiator_scope
     assert add_scope.await_args.kwargs["subject_id"] == 12
     db.commit.assert_awaited_once()
     identify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("linked_user_id", [501, None])
+async def test_create_outbound_tells_desk_to_reload_once_user_is_linked(
+    monkeypatch, linked_user_id
+) -> None:
+    row = SimpleNamespace(
+        id=91,
+        public_id=uuid4(),
+        tenant_id=3,
+        call_id="call-91",
+        conversation_id=None,
+        root_call_id="call-91",
+        direction="outbound",
+        call_source="agent_dial",
+        customer_number="13800138000",
+        service_number="0210000",
+        started_at=NOW,
+        user_id=None,
+    )
+
+    async def identify(_db, _tenant_id, record, *, actor_id):
+        record.user_id = linked_user_id
+
+    emit = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.get_by_call_id",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.create",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service._employee_name_snapshots",
+        AsyncMock(return_value={12: "Ada"}),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallTrajectoryService.append_event",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordAccessScopeRepository.add",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service._best_effort_identify_user", identify
+    )
+    monkeypatch.setattr(
+        "app.services.call_center.agent_notify.emit_to_agent", emit
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service._to_detail",
+        lambda value, _name: {"id": value.id},
+    )
+
+    await CallRecordService.create_for_outbound(
+        AsyncMock(),
+        3,
+        call_id="call-91",
+        conversation_id=None,
+        root_call_id=None,
+        from_number="0210000",
+        to_number="13800138000",
+        agent_id=12,
+    )
+
+    if linked_user_id is None:
+        emit.assert_not_awaited()
+    else:
+        emit.assert_awaited_once_with(
+            tenant_id=3,
+            employee_id=12,
+            method="cc.call_record_updated",
+            payload={"call_id": "call-91"},
+        )
 
 
 @pytest.mark.asyncio
@@ -226,8 +309,11 @@ async def test_mark_completed_synchronizes_target_summary(monkeypatch, caplog) -
     caplog.set_level(logging.INFO, logger="app.services.call_record_service")
     row = SimpleNamespace(
         id=5,
+        tenant_id=3,
         lifecycle_status="active",
+        finalization_status="pending",
         ended_event_id=None,
+        ended_at=NOW,
         call_id="call-5",
     )
     settlement = {
@@ -260,6 +346,23 @@ async def test_mark_completed_synchronizes_target_summary(monkeypatch, caplog) -
         "app.services.call_record_service.CallRecordRepository.update", update
     )
     monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.lock_by_id",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallEventRepository.list_for_call",
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    event_type="call_ending",
+                    occurred_at=NOW,
+                    reason_detail="agent_hangup",
+                    details={"hangup_party": "agent", "end_state": "completed"},
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
         "app.services.call_record_service.CallTrajectoryService.append_event",
         AsyncMock(),
     )
@@ -285,12 +388,19 @@ async def test_mark_completed_synchronizes_target_summary(monkeypatch, caplog) -
         hangup_party="agent",
     )
 
-    patch = update.await_args.args[2]
+    pending_patch = update.await_args_list[0].args[2]
+    assert pending_patch == {
+        "lifecycle_status": "ended",
+        "ended_at": NOW,
+        "finalization_status": "pending",
+        "finalized_at": None,
+    }
+    patch = update.await_args_list[1].args[2]
     assert patch["lifecycle_status"] == "ended"
     assert patch["finalization_status"] == "completed"
     assert patch["call_result"] == "agent_answered"
     assert patch["customer_agent_talk_duration_ms"] == 40_000
-    assert db.commit.await_count == 1
+    assert db.commit.await_count == 2
     classified = next(
         record
         for record in caplog.records
@@ -299,6 +409,192 @@ async def test_mark_completed_synchronizes_target_summary(monkeypatch, caplog) -
     assert classified.hangup_call_id == "call-5"
     assert classified.hangup_reason_code == "agent_hangup"
     assert classified.hangup_match_strategy == "internal_reason"
+
+
+@pytest.mark.asyncio
+async def test_mark_completed_keeps_pending_fact_when_settlement_fails(
+    monkeypatch,
+) -> None:
+    row = SimpleNamespace(
+        id=6,
+        tenant_id=3,
+        lifecycle_status="active",
+        finalization_status="pending",
+        ended_event_id=None,
+        ended_at=NOW,
+        call_id="call-6",
+    )
+    update = AsyncMock(return_value=row)
+    db = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.get_by_call_id",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.lock_by_id",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.get_by_id_unscoped",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.update",
+        update,
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallEventRepository.list_for_call",
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    event_type="call_ending",
+                    occurred_at=NOW,
+                    reason_detail="normal_clearing",
+                    details={"hangup_party": "customer", "end_state": "completed"},
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallTrajectoryService.append_event",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallTrajectoryService.reconcile_open_intervals",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallTrajectoryService.build_settlement_details",
+        AsyncMock(side_effect=RuntimeError("projection failed")),
+    )
+
+    await CallRecordService.mark_completed(
+        db,
+        3,
+        "call-6",
+        hangup_reason="normal_clearing",
+        hangup_party="customer",
+    )
+
+    assert update.await_args_list[0].args[2]["finalization_status"] == "pending"
+    failed_patch = update.await_args_list[-1].args[2]
+    assert failed_patch["lifecycle_status"] == "ended"
+    assert failed_patch["finalization_status"] == "failed"
+    assert failed_patch["finalized_at"] is None
+    db.commit.assert_awaited_once()
+    db.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_mark_completed_is_idempotent_after_success(monkeypatch) -> None:
+    row = SimpleNamespace(
+        id=7,
+        lifecycle_status="ended",
+        finalization_status="completed",
+        ended_event_id="opendesk:call-ended:7",
+        call_id="call-7",
+    )
+    append = AsyncMock()
+    update = AsyncMock()
+    project = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.get_by_call_id",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.update",
+        update,
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallTrajectoryService.append_event",
+        append,
+    )
+    monkeypatch.setattr(
+        "app.services.call_satisfaction_projection_service."
+        "CallSatisfactionProjectionService.project",
+        project,
+    )
+
+    await CallRecordService.mark_completed(AsyncMock(), 3, "call-7")
+
+    append.assert_not_awaited()
+    update.assert_not_awaited()
+    project.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_repeated_end_callback_retries_incomplete_record(monkeypatch) -> None:
+    row = SimpleNamespace(
+        id=8,
+        lifecycle_status="ended",
+        finalization_status="incomplete",
+        ended_event_id="opendesk:call-ended:8",
+        ended_at=NOW,
+        call_id="call-8",
+    )
+    append = AsyncMock()
+    update = AsyncMock(return_value=row)
+    finalize = AsyncMock(return_value=True)
+    db = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.get_by_call_id",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.update",
+        update,
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallTrajectoryService.append_event",
+        append,
+    )
+    monkeypatch.setattr(CallRecordService, "_finalize_pending", finalize)
+
+    await CallRecordService.mark_completed(db, 3, "call-8")
+
+    assert append.await_args.kwargs["payload"].event_id == "opendesk:call-ending:8"
+    assert update.await_args.args[2]["finalization_status"] == "pending"
+    db.commit.assert_awaited_once()
+    finalize.assert_awaited_once_with(db, call_record_id=8)
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_finalization_reenters_pending_before_work(monkeypatch) -> None:
+    row = SimpleNamespace(
+        id=9,
+        lifecycle_status="ended",
+        finalization_status="failed",
+        updated_at=NOW,
+        ended_at=NOW,
+        started_at=NOW,
+    )
+    update = AsyncMock(return_value=row)
+    finalize = AsyncMock(return_value=True)
+    db = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.lock_by_id",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.update",
+        update,
+    )
+    monkeypatch.setattr(CallRecordService, "_finalize_pending", finalize)
+
+    result = await CallRecordService.retry_finalization(
+        db,
+        call_record_id=9,
+        pending_before=NOW,
+        failed_before=NOW,
+    )
+
+    assert result is True
+    assert update.await_args.args[2] == {
+        "finalization_status": "pending",
+        "finalized_at": None,
+    }
+    db.commit.assert_awaited_once()
+    finalize.assert_awaited_once_with(db, call_record_id=9)
 
 
 @pytest.mark.asyncio
@@ -318,6 +614,10 @@ async def test_save_recording_upserts_artifact_and_refreshes_summary(monkeypatch
     db = AsyncMock()
     monkeypatch.setattr(
         "app.services.call_record_service.CallRecordRepository.find_by_media_call_id",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "app.services.call_record_service.CallRecordRepository.lock_by_id",
         AsyncMock(return_value=row),
     )
     monkeypatch.setattr(

@@ -31,6 +31,7 @@ from app.services.entity_change_service import EntityChangeService
 from app.services.fd_field_definition_service import coerce_slot_value
 
 USER_EXPORT_MAX_ROWS = 5000
+USER_EXPORT_ROW_BATCH_SIZE = 250
 USER_LEVEL_NORMAL = "normal"
 USER_LEVEL_VIP = "vip"
 USER_LEVEL_VALUES = {USER_LEVEL_NORMAL, USER_LEVEL_VIP}
@@ -578,7 +579,7 @@ class UserService:
                     group_field_col = slot_map.get(view.group_field_id)
 
         temp_conds = [c.model_dump() for c in req.temp_conditions] if req.temp_conditions else []
-        items, total = await UserRepository.query_paginated(
+        ids, _ = await UserRepository.query_paginated(
             db,
             tenant_id,
             search=req.search,
@@ -593,10 +594,13 @@ class UserService:
             sort_order=req.sort_order,
             page=1,
             per_page=USER_EXPORT_MAX_ROWS + 1,
+            ids_only=True,
+            include_count=False,
         )
-        if total > USER_EXPORT_MAX_ROWS:
+        if len(ids) > USER_EXPORT_MAX_ROWS:
             raise ValidationError("Too many records to export")
 
+        items = await UserService._load_export_rows(db, tenant_id, ids)
         columns = UserService._normalize_export_columns(req.columns)
         organization_names = await UserService._get_export_organization_names(db, tenant_id, items)
         employee_names = await UserService._get_export_employee_names(db, tenant_id, items)
@@ -623,6 +627,25 @@ class UserService:
         workbook = build_xlsx(headers, rows, sheet_name="Users")
         filename = f"users-export-{datetime.now().strftime('%Y%m%d-%H%M')}.xlsx"
         return workbook, filename
+
+    @staticmethod
+    async def _load_export_rows(
+        db: AsyncSession,
+        tenant_id: int,
+        ids: list[int],
+    ) -> list[User]:
+        """Load export rows in id order, batched to avoid a 5000-element IN list.
+
+        Batch size is 250 to match ticket export, keeping per-batch memory
+        and IN list size bounded.
+        """
+        items: list[User] = []
+        for start in range(0, len(ids), USER_EXPORT_ROW_BATCH_SIZE):
+            batch_ids = ids[start:start + USER_EXPORT_ROW_BATCH_SIZE]
+            rows = await UserRepository.list_by_ids(db, tenant_id, batch_ids)
+            by_id = {row.id: row for row in rows}
+            items.extend(by_id[row_id] for row_id in batch_ids if row_id in by_id)
+        return items
 
     @staticmethod
     def _normalize_export_columns(columns: list[UserExportColumn]) -> list[UserExportColumn]:

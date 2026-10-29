@@ -22,6 +22,7 @@ from fastapi.encoders import jsonable_encoder
 from socketio.exceptions import ConnectionRefusedError
 
 from app.db.redis import redis_client
+from app.db.retry import run_db_op_with_deadlock_retry
 from app.db.session import AsyncSessionLocal
 from app.core.exceptions import BusinessError, UnauthorizedError
 from app.core.security import decode_visitor_session_token
@@ -209,6 +210,15 @@ async def _visitor_start_lock(r, tenant_id: int, channel_id: int, visitor_extern
                 current = current.decode()
             if current == token:
                 await r.delete(key)
+
+
+async def _visitor_db_call(log_label: str, op):
+    """Open a short session, retrying once or twice if PostgreSQL deadlocks."""
+    async def _run():
+        async with AsyncSessionLocal() as db:
+            return await op(db)
+
+    return await run_db_op_with_deadlock_retry(_run, log_label=log_label)
 
 
 def _open_desk_messages_from_sse_events(events: list[bytes]) -> list[dict]:
@@ -412,8 +422,8 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
         context_token = payload.get("contextToken") or payload.get("context_token")
         try:
             async with _visitor_start_lock(r, int(tenant_id), int(channel_id), visitor_external_id):
-                async with AsyncSessionLocal() as db:
-                    result = await ConversationService.create_from_visitor(
+                async def _create(db):
+                    return await ConversationService.create_from_visitor(
                         db,
                         r,
                         tenant_id=tenant_id,
@@ -427,6 +437,8 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                         visitor_browser=payload.get("browser") or payload.get("visitor_browser"),
                         visitor_ip=session.get("visitor_ip"),
                     )
+
+                result = await _visitor_db_call("visitor_start_conversation", _create)
         except Exception:
             logger.exception(
                 "start_conversation failed for visitor=%s channel=%s",
@@ -631,7 +643,7 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
             return {"ok": False, "error": "Invalid quoted_message_id"}
 
         try:
-            async with AsyncSessionLocal() as db:
+            async def _send(db):
                 msg_payload, _agent_id, conv = await ConversationService.send_visitor_message_for_session(
                     db,
                     conversation_public_id=conversation_public_id,
@@ -646,8 +658,19 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
                     conversation_public_id=str(conversation_public_id),
                     before_message_id=msg_payload["id"],
                 )
+                return msg_payload, conv, read_result
+
+            msg_payload, conv, read_result = await _visitor_db_call("visitor_send_message", _send)
         except BusinessError as exc:
             return {"ok": False, "error": exc.code, "message": exc.message}
+        except Exception:
+            logger.exception(
+                "visitor_send_message_failed sid=%s tenant_id=%s conversation_public_id=%s",
+                sid,
+                tenant_id,
+                conversation_public_id,
+            )
+            return {"ok": False, "error": "INTERNAL"}
 
         conv_room = f"conv:{conv.id}"
         await rt.emit("new_message", msg_payload, room=conv_room, namespace=NAMESPACE)
@@ -802,12 +825,25 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
         if not conversation_public_id:
             return {"error": "conversation_public_id required"}
 
-        async with AsyncSessionLocal() as db:
-            result = await ConversationService.mark_agent_messages_visitor_read_for_session(
-                db,
-                visitor_context=session,
-                conversation_public_id=str(conversation_public_id),
+        try:
+            result = await _visitor_db_call(
+                "visitor_mark_read",
+                lambda db: ConversationService.mark_agent_messages_visitor_read_for_session(
+                    db,
+                    visitor_context=session,
+                    conversation_public_id=str(conversation_public_id),
+                ),
             )
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
+        except Exception:
+            logger.exception(
+                "visitor_mark_read_failed sid=%s tenant_id=%s conversation_public_id=%s",
+                sid,
+                session.get("tenant_id"),
+                conversation_public_id,
+            )
+            return {"ok": False, "error": "INTERNAL"}
         logger.info(
             "visitor_mark_read_socket tenant_id=%s channel_id=%s conversation_id=%s "
             "conversation_public_id=%s read_message_count=%s recipient_count=%s",
@@ -854,13 +890,26 @@ def register_visitor_handlers(rt: BaseRealtimeTransport) -> None:
         if len(message_ids) > 500:
             return {"ok": False, "error": "Too many message_ids"}
 
-        async with AsyncSessionLocal() as db:
-            result = await ConversationService.mark_agent_messages_visitor_delivered_for_session(
-                db,
-                visitor_context=session,
-                conversation_public_id=str(conversation_public_id),
-                message_ids=message_ids,
+        try:
+            result = await _visitor_db_call(
+                "visitor_messages_delivered",
+                lambda db: ConversationService.mark_agent_messages_visitor_delivered_for_session(
+                    db,
+                    visitor_context=session,
+                    conversation_public_id=str(conversation_public_id),
+                    message_ids=message_ids,
+                ),
             )
+        except BusinessError as exc:
+            return {"ok": False, "error": exc.code, "message": exc.message}
+        except Exception:
+            logger.exception(
+                "visitor_messages_delivered_failed sid=%s tenant_id=%s conversation_public_id=%s",
+                sid,
+                session.get("tenant_id"),
+                conversation_public_id,
+            )
+            return {"ok": False, "error": "INTERNAL"}
 
         delivered_payload = {
             "conversation_id": result["conversation_id"],

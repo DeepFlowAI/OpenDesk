@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 
 import redis.asyncio as aioredis
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.constants.call_center import CcSocketEvent
@@ -62,7 +62,11 @@ async def resolve_effective_wrapup_seconds(
                 )
                 .where(
                     AutoOutboundCallRecord.tenant_id == tenant_id,
-                    AutoOutboundCallRecord.reception_type == "agent",
+                    or_(
+                        AutoOutboundCallRecord.reception_type == "agent",
+                        # Bot/IVR receptions handed to an agent keep their type.
+                        AutoOutboundCallRecord.agent_id.is_not(None),
+                    ),
                     CallRecord.call_id == call_id,
                 )
                 .order_by(AutoOutboundCallRecord.id.desc())
@@ -89,6 +93,28 @@ async def resolve_effective_wrapup_seconds(
             exc_info=True,
         )
         return FALLBACK_WRAPUP_SECONDS
+
+
+async def _wrap_up_still_active(
+    redis: aioredis.Redis | None, tenant_id: int, employee_id: int
+) -> bool:
+    """Whether the agent is still in after-call work in Redis.
+
+    The agent can finish wrap-up (and set ready) between the Redis transition
+    and the PG write; writing after_call_work then would pin the displayed
+    status on 整理中 while the agent is actually ready.
+    """
+    if redis is None:
+        return True
+    try:
+        snapshot = await CcAgentResourceService.get_snapshot(redis, tenant_id, employee_id)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "wrap-up PG sync: snapshot unreadable tenant=%s employee=%s",
+            tenant_id, employee_id, exc_info=True,
+        )
+        return True
+    return snapshot is None or snapshot.get("resource_state") == "after_call_work"
 
 
 async def apply_post_call_agent_status(
@@ -125,9 +151,38 @@ async def apply_post_call_agent_status(
                     },
                 )
         if db is not None:
-            await CcAgentStatusService.sync_pg_status(
-                db, tenant_id, employee_id, "after_call_work", reason=reason
-            )
+            from app.services.call_agent_fact_service import CallAgentFactService
+
+            try:
+                await CallAgentFactService.start_after_call_work(
+                    db,
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    agent_id=employee_id,
+                )
+            except Exception:
+                logger.exception(
+                    "after-call work fact start failed tenant=%s employee=%s call=%s",
+                    tenant_id,
+                    employee_id,
+                    call_id,
+                )
+                rollback = getattr(db, "rollback", None)
+                if rollback is not None:
+                    try:
+                        await rollback()
+                    except Exception:
+                        logger.warning(
+                            "after-call work fact rollback failed tenant=%s employee=%s call=%s",
+                            tenant_id,
+                            employee_id,
+                            call_id,
+                            exc_info=True,
+                        )
+            if await _wrap_up_still_active(redis, tenant_id, employee_id):
+                await CcAgentStatusService.sync_pg_status(
+                    db, tenant_id, employee_id, "after_call_work", reason=reason
+                )
         return "after_call_work"
 
     if redis is not None:

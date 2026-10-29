@@ -1,11 +1,12 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { IconCopy, IconPencil, IconPhoneCall, IconPlus, IconSearch, IconTrash } from '@tabler/icons-react'
+import { IconCopy, IconExternalLink, IconPencil, IconPhoneCall, IconPlus, IconSearch, IconTrash } from '@tabler/icons-react'
 import { HTTPError } from 'ky'
 import { useRouter } from 'next/navigation'
 import { toast } from 'sonner'
 
+import { CallIntegrationTabs } from '@/app/components/features/call-center/call-integration-tabs'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Switch } from '@/components/ui/switch'
 import { useLocaleStore } from '@/context/locale-store'
@@ -106,6 +107,7 @@ export function EmbeddedCallIntegrationsList() {
 
   return (
     <div className="flex flex-col gap-6">
+      <CallIntegrationTabs />
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold text-foreground">
@@ -115,6 +117,15 @@ export function EmbeddedCallIntegrationsList() {
             {isZh
               ? '把 OpenDesk 软电话安全嵌入第三方 Web 系统。'
               : 'Securely embed the OpenDesk softphone in third-party web apps.'}
+            <a
+              href="/call-center/integrations/embedded-call/tester"
+              target="_blank"
+              rel="noopener"
+              className="ml-2 inline-flex items-center gap-1 font-medium text-primary hover:underline"
+            >
+              {isZh ? '集成测试台' : 'Integration tester'}
+              <IconExternalLink size={14} />
+            </a>
           </p>
         </div>
         <button

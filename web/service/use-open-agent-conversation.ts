@@ -1,3 +1,4 @@
+import { isRecoverableVisitorSessionError } from '@/lib/visitor-session-recoverable-error'
 import type { Message } from '@/models/conversation'
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_URL ?? '').replace(/\/$/, '')
@@ -85,7 +86,8 @@ type OpenAgentSseHandlers = {
   onDone?: (data: Record<string, unknown>) => void
   onAssistantReset?: (data: Record<string, unknown>) => void
   onRetry?: (attempt: number, maxAttempts: number) => void
-  onError?: (message: string) => void
+  onRecoveredAuth?: (message: string) => void
+  onError?: (message: string, details?: { authRecoverable?: boolean }) => void
 }
 
 type RetryOptions = {
@@ -113,6 +115,7 @@ type StreamOpenAgentConversationParams = {
   resume?: boolean
   signal?: AbortSignal
   retry?: RetryOptions
+  recoverVisitorSession?: () => Promise<string | null>
   handlers?: OpenAgentSseHandlers
 }
 
@@ -467,6 +470,7 @@ async function fetchSSEWithRetry(
   controller: AbortController,
   state: RetryState,
   retryOpts?: RetryOptions,
+  recoverVisitorSession?: () => Promise<string | null>,
 ): Promise<void> {
   const maxRetries = retryOpts?.maxRetries ?? DEFAULT_RETRY.maxRetries
   const baseDelayMs = retryOpts?.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs
@@ -552,6 +556,25 @@ async function fetchSSEWithRetry(
       if (result.completed || result.nonRetryable) return
       if (controller.signal.aborted) return
 
+      if (result.authRecoverable) {
+        const errorMessage = result.errorMessage || 'Invalid or expired visitor session'
+        attempt += 1
+        if (attempt > maxRetries) {
+          handlers?.onError?.(errorMessage, { authRecoverable: true })
+          return
+        }
+        const token = recoverVisitorSession ? await recoverVisitorSession() : null
+        if (!token || controller.signal.aborted) {
+          handlers?.onError?.(errorMessage, { authRecoverable: true })
+          return
+        }
+        // Pre-flight 401 never created this turn. Retry is a fresh attempt
+        // with a new token — skip backoff and emit a single recovered warn.
+        handlers?.onRecoveredAuth?.(errorMessage)
+        if (controller.signal.aborted) return
+        continue
+      }
+
       attempt += 1
       if (attempt > maxRetries) {
         handlers?.onError?.('OpenAgent stream failed after retries')
@@ -582,6 +605,8 @@ async function doFetchSSE(
 ): Promise<{
   completed: boolean
   nonRetryable: boolean
+  authRecoverable?: boolean
+  errorMessage?: string
   retryAfterMs?: number | null
   abortedByUserSignal?: boolean
 }> {
@@ -604,13 +629,28 @@ async function doFetchSSE(
     const response = await fetch(url, mergedInit)
     if (!response.ok) {
       const text = await response.text()
+      const errorMessage = text || `HTTP ${response.status}`
+      const authRecoverable = isRecoverableVisitorSessionError(errorMessage, {
+        context: 'http',
+        status: response.status,
+      })
+      if (authRecoverable) {
+        return {
+          completed: false,
+          nonRetryable: false,
+          authRecoverable: true,
+          errorMessage,
+          retryAfterMs: parseRetryAfter(response.headers.get('Retry-After')),
+        }
+      }
       const retryable = response.status >= 500 || response.status === 408 || response.status === 429
       if (!retryable) {
-        handlers?.onError?.(text || `HTTP ${response.status}`)
+        handlers?.onError?.(errorMessage)
       }
       return {
         completed: false,
         nonRetryable: !retryable,
+        errorMessage,
         retryAfterMs: parseRetryAfter(response.headers.get('Retry-After')),
       }
     }
@@ -737,6 +777,7 @@ export function streamOpenAgentConversation({
   resume = false,
   signal,
   retry,
+  recoverVisitorSession,
   handlers,
 }: StreamOpenAgentConversationParams): OpenAgentStreamController {
   const state: RetryState = {
@@ -763,6 +804,15 @@ export function streamOpenAgentConversation({
     }
   }
 
+  let sessionToken = visitorSessionToken
+  const recoverAndRefreshToken = recoverVisitorSession
+    ? async () => {
+      const token = await recoverVisitorSession()
+      if (token) sessionToken = token
+      return token
+    }
+    : undefined
+
   const buildInit = (): RequestInit => {
     const body = buildOpenAgentChatRequestBody({
       message,
@@ -777,7 +827,7 @@ export function streamOpenAgentConversation({
     return {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${visitorSessionToken}`,
+        Authorization: `Bearer ${sessionToken}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
@@ -791,6 +841,7 @@ export function streamOpenAgentConversation({
     controller,
     state,
     retry,
+    recoverAndRefreshToken,
   ).finally(() => {
     if (signal && forwardAbort) {
       signal.removeEventListener('abort', forwardAbort)

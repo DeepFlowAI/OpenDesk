@@ -112,6 +112,23 @@ class PersonalAutoOutboundRepository:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def count_by_outbound_phone_number_id(
+        db: AsyncSession,
+        phone_number_id: str,
+        *,
+        statuses: tuple[str, ...] | None = None,
+    ) -> int:
+        query = (
+            select(func.count())
+            .select_from(PersonalAutoOutboundSession)
+            .where(PersonalAutoOutboundSession.outbound_phone_number_id == phone_number_id)
+        )
+        if statuses is not None:
+            query = query.where(PersonalAutoOutboundSession.status.in_(statuses))
+        result = await db.execute(query)
+        return int(result.scalar_one())
+
+    @staticmethod
     async def create_session(db: AsyncSession, data: dict) -> PersonalAutoOutboundSession:
         row = PersonalAutoOutboundSession(**data)
         db.add(row)

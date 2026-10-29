@@ -43,7 +43,9 @@ async def test_identify_links_single_normalized_phone_match(monkeypatch):
     row = _record()
     user = _user(22, phone="186 0112 3206")
 
-    async def fake_list_with_phone(_db, _tenant_id):
+    async def fake_list_by_phone_match_keys(_db, _tenant_id, _keys):
+        assert _tenant_id == 1
+        assert _keys == phone_match_keys(row.customer_number)
         return [user]
 
     async def fake_update(_db, record, patch, *, commit=True):
@@ -52,7 +54,7 @@ async def test_identify_links_single_normalized_phone_match(monkeypatch):
             setattr(record, key, value)
         return record
 
-    monkeypatch.setattr(UserRepository, "list_with_phone", fake_list_with_phone)
+    monkeypatch.setattr(UserRepository, "list_by_phone_match_keys", fake_list_by_phone_match_keys)
     monkeypatch.setattr(CallRecordRepository, "update", fake_update)
     monkeypatch.setattr(
         "app.services.call_user_association_service.CallTrajectoryService.append_event",
@@ -71,7 +73,7 @@ async def test_identify_returns_candidates_for_multiple_matches(monkeypatch):
     row = _record(customer_number="18800001111")
     users = [_user(1, name="First", phone="18800001111"), _user(2, name="Second", phone="188-0000-1111")]
 
-    async def fake_list_with_phone(_db, _tenant_id):
+    async def fake_list_by_phone_match_keys(_db, _tenant_id, _keys):
         return users
 
     async def fake_update(_db, record, patch, *, commit=True):
@@ -80,7 +82,7 @@ async def test_identify_returns_candidates_for_multiple_matches(monkeypatch):
             setattr(record, key, value)
         return record
 
-    monkeypatch.setattr(UserRepository, "list_with_phone", fake_list_with_phone)
+    monkeypatch.setattr(UserRepository, "list_by_phone_match_keys", fake_list_by_phone_match_keys)
     monkeypatch.setattr(CallRecordRepository, "update", fake_update)
 
     result = await CallUserAssociationService.identify_for_record(AsyncMock(), 1, row)
@@ -95,7 +97,7 @@ async def test_identify_creates_user_when_no_match(monkeypatch):
     row = _record(customer_number="15500008888")
     created_user = _user(33, name="15500008888", phone="15500008888")
 
-    async def fake_list_with_phone(_db, _tenant_id):
+    async def fake_list_by_phone_match_keys(_db, _tenant_id, _keys):
         return []
 
     async def fake_create_user(_db, tenant_id, data, actor_id=None):
@@ -114,7 +116,7 @@ async def test_identify_creates_user_when_no_match(monkeypatch):
             setattr(record, key, value)
         return record
 
-    monkeypatch.setattr(UserRepository, "list_with_phone", fake_list_with_phone)
+    monkeypatch.setattr(UserRepository, "list_by_phone_match_keys", fake_list_by_phone_match_keys)
     monkeypatch.setattr(UserService, "create_user", fake_create_user)
     monkeypatch.setattr(UserRepository, "get_by_id", fake_get_by_id)
     monkeypatch.setattr(CallRecordRepository, "update", fake_update)

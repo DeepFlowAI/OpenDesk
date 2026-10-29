@@ -11,6 +11,7 @@ import {
   IconDialpad,
   IconDots,
   IconHeadset,
+  IconMessage,
   IconMicrophone,
   IconMicrophoneOff,
   IconMinus,
@@ -22,6 +23,7 @@ import {
   IconPlayerPause,
   IconPlayerPlay,
   IconSparkles,
+  IconStar,
   IconSwitchHorizontal,
   IconUsers,
   IconUsersGroup,
@@ -33,6 +35,9 @@ import {
   type CallTargetPickerMode,
   type PickedTarget,
 } from '@/app/components/features/call-center/call-target-picker-dialog'
+import { CallConfirmDialog } from '@/app/components/features/call-center/call-confirm-dialog'
+import { SendSmsDialog } from '@/app/components/features/call-center/send-sms-dialog'
+import { controlErrorMessage } from '@/app/components/features/call-center/use-call-control'
 import {
   CALL_STATUS_OPTIONS,
   formatCallDuration,
@@ -47,7 +52,11 @@ import {
   useMyCurrentCallDevice,
   useSetMyCurrentCallDevice,
 } from '@/service/use-agent-devices'
+import { inviteCurrentCallSatisfaction, useCurrentCallSatisfaction } from '@/service/use-call-center'
 import { useEmbeddedOutboundNumbers } from '@/service/use-embedded-call'
+import { useSmsWorkspaceTemplates } from '@/service/use-sms'
+import { t } from '@/utils/i18n'
+import { isCnMobileNumber } from '@/utils/validators'
 
 
 type EmbeddedCallPanelProps = {
@@ -286,6 +295,7 @@ export function EmbeddedCallPanel({
             {!isOwner ? (
               <ObserverBody
                 isZh={isZh}
+                hasCall={phase === 'incoming' || phase === 'outbound_ringing' || phase === 'on_call'}
                 customerName={customerName}
                 duration={duration}
                 pending={takeoverPending}
@@ -637,23 +647,37 @@ function OnCallBody({
   onToggleMore: () => void
   onHangup: () => void
 }) {
-  const { callControl } = useCallCenterRuntime()
+  const { callControl, incoming } = useCallCenterRuntime()
+  const locale = isZh ? 'zh' : 'en'
   const [picker, setPicker] = useState<CallTargetPickerMode | null>(null)
+  const [confirmTransfer, setConfirmTransfer] = useState<PickedTarget | null>(null)
+  const [confirmSatisfaction, setConfirmSatisfaction] = useState(false)
+  const [satisfactionPending, setSatisfactionPending] = useState(false)
+  const [smsOpen, setSmsOpen] = useState(false)
   const canTransfer = permissions.includes('call.operation.transfer')
   const canConsult = permissions.includes('call.operation.consult')
   const canConference = permissions.includes('call.operation.conference')
+  const canInviteSatisfaction = permissions.includes('call.operation.satisfaction_invite')
+  const canSendSms = permissions.includes('call.workspace.sms.send')
+  const { data: satisfaction } = useCurrentCallSatisfaction(
+    callControl.mode === 'single' && canInviteSatisfaction,
+  )
+  const showSatisfactionInvite =
+    callControl.mode === 'single' &&
+    canInviteSatisfaction &&
+    satisfaction?.agent_invite.available === true
+  const { data: smsTemplates } = useSmsWorkspaceTemplates({ enabled: canSendSms })
+  const showSms = canSendSms && (smsTemplates?.items.length ?? 0) > 0
+  const smsDisabled = !isCnMobileNumber(number)
   const inConsult = callControl.mode === 'consult_ringing' || callControl.mode === 'consult_active'
   const inConference = callControl.mode === 'conference' || callControl.mode === 'conference_ringing'
   const hasMore = canConference || inConsult || inConference
 
   const submit = (target: PickedTarget) => {
     if (picker === 'transfer') {
-      if (!window.confirm(isZh ? `确认转接给 ${target.target_name}？` : `Transfer to ${target.target_name}?`)) return
-      void callControl.submitTransfer({
-        target_type: target.target_type,
-        target_id: target.target_id,
-        number: target.number,
-      })
+      // The picker latches its submit button on click; close it and confirm in
+      // a separate dialog so cancelling never leaves the picker stuck.
+      setConfirmTransfer(target)
     } else if (picker === 'consult') {
       void callControl.beginConsult({
         target_type: target.target_type === 'external' ? 'external' : 'employee',
@@ -748,6 +772,23 @@ function OnCallBody({
                 onClick={() => setPicker('consult')}
               />
             ) : null}
+            {showSatisfactionInvite ? (
+              <CallAction
+                icon={<IconStar />}
+                label={isZh ? '评价' : 'Rate'}
+                disabled={satisfactionPending}
+                onClick={() => setConfirmSatisfaction(true)}
+              />
+            ) : null}
+            {showSms ? (
+              <CallAction
+                icon={<IconMessage />}
+                label={isZh ? '短信' : 'SMS'}
+                disabled={smsDisabled}
+                title={smsDisabled ? t('sms.send.disabledNoCallNumber', locale) : undefined}
+                onClick={() => setSmsOpen(true)}
+              />
+            ) : null}
             {hasMore ? (
               <div className="relative flex flex-col items-center">
                 <CallAction
@@ -814,6 +855,72 @@ function OnCallBody({
         onClose={() => setPicker(null)}
         onSubmit={submit}
       />
+
+      <CallConfirmDialog
+        open={confirmTransfer !== null}
+        title={t('ws.callbar.confirmTransferTitle', locale)}
+        body={t('ws.callbar.confirmTransferBody', locale)}
+        lines={confirmTransfer ? [
+          { label: t('ws.callbar.transfer', locale), value: confirmTransfer.target_name },
+          ...(confirmTransfer.target_status
+            ? [{ label: t('ws.callbar.confirmTransferStatus', locale), value: confirmTransfer.target_status }]
+            : []),
+        ] : undefined}
+        warning={
+          confirmTransfer?.target_type === 'queue' && confirmTransfer.queue_available_count === 0
+            ? t('ws.callbar.confirmTransferQueueEmptyWarning', locale)
+            : undefined
+        }
+        confirmLabel={t('ws.callbar.confirmTransferConfirm', locale)}
+        submitting={callControl.pending === 'transfer'}
+        onClose={() => setConfirmTransfer(null)}
+        onConfirm={() => {
+          if (!confirmTransfer) return
+          void callControl.submitTransfer({
+            target_type: confirmTransfer.target_type,
+            target_id: confirmTransfer.target_id,
+            number: confirmTransfer.number,
+          })
+          setConfirmTransfer(null)
+        }}
+      />
+
+      <CallConfirmDialog
+        open={confirmSatisfaction}
+        title={t('ws.callbar.confirmSatisfactionTitle', locale)}
+        body={t('ws.callbar.confirmSatisfactionBody', locale)}
+        lines={satisfaction?.flow ? [
+          { label: t('ws.callbar.satisfactionFlow', locale), value: satisfaction.flow.name },
+          { label: t('ws.callbar.satisfactionVersion', locale), value: `V${satisfaction.flow.version_no}` },
+        ] : undefined}
+        confirmLabel={t('ws.callbar.confirmSatisfactionConfirm', locale)}
+        submitting={satisfactionPending}
+        onClose={() => setConfirmSatisfaction(false)}
+        onConfirm={() => {
+          if (satisfactionPending) return
+          setSatisfactionPending(true)
+          void inviteCurrentCallSatisfaction()
+            .then(() => {
+              setConfirmSatisfaction(false)
+              toast.success(t('ws.callbar.satisfactionStarted', locale))
+            })
+            .catch(async (error) => {
+              toast.error(
+                await controlErrorMessage(error, t('ws.callbar.satisfactionFailed', locale)),
+              )
+            })
+            .finally(() => setSatisfactionPending(false))
+        }}
+      />
+
+      <SendSmsDialog
+        open={smsOpen}
+        onOpenChange={setSmsOpen}
+        defaultPhone={number ?? ''}
+        phoneReadonly
+        callId={incoming?.call_id ?? null}
+        templates={smsTemplates?.items ?? []}
+      />
     </div>
   )
 }
@@ -872,6 +979,7 @@ function WrapUpBody({
 
 function ObserverBody({
   isZh,
+  hasCall,
   customerName,
   duration,
   pending,
@@ -879,6 +987,7 @@ function ObserverBody({
   onTakeover,
 }: {
   isZh: boolean
+  hasCall: boolean
   customerName: string
   duration: string
   pending: boolean
@@ -892,7 +1001,9 @@ function ObserverBody({
           <IconDeviceDesktop size={28} />
         </span>
         <h2 className="mt-4 text-lg font-semibold">
-          {isZh ? '通话正在另一窗口处理' : 'Call is handled in another window'}
+          {hasCall
+            ? (isZh ? '通话正在另一窗口处理' : 'Call is handled in another window')
+            : (isZh ? '通话控制在另一窗口' : 'Calls are controlled in another window')}
         </h2>
         <p className="mx-auto mt-2 max-w-[260px] text-xs leading-5 text-muted-foreground">
           {isZh
@@ -901,18 +1012,20 @@ function ObserverBody({
         </p>
       </div>
       <div className="mt-6 rounded-xl border border-border p-4">
-        <div className="flex items-center gap-3">
-          <span className="grid h-9 w-9 place-items-center rounded-full bg-muted">
-            <IconPhoneIncoming size={17} />
-          </span>
-          <div>
-            <p className="text-sm font-medium">{customerName || (isZh ? '当前通话' : 'Current call')}</p>
-            <p className="mt-0.5 font-mono text-xs text-muted-foreground">
-              {isZh ? '通话中' : 'On call'} · {duration}
-            </p>
+        {hasCall ? (
+          <div className="mb-4 flex items-center gap-3 border-b border-border pb-3">
+            <span className="grid h-9 w-9 place-items-center rounded-full bg-muted">
+              <IconPhoneIncoming size={17} />
+            </span>
+            <div>
+              <p className="text-sm font-medium">{customerName || (isZh ? '当前通话' : 'Current call')}</p>
+              <p className="mt-0.5 font-mono text-xs text-muted-foreground">
+                {isZh ? '通话中' : 'On call'} · {duration}
+              </p>
+            </div>
           </div>
-        </div>
-        <div className="mt-4 flex items-center justify-between border-t border-border pt-3 text-xs">
+        ) : null}
+        <div className="flex items-center justify-between text-xs">
           <span className="text-muted-foreground">{isZh ? '当前控制窗口' : 'Controlling window'}</span>
           <span className="font-medium">
             {ownerInstanceId ? `${ownerInstanceId.slice(0, 12)}…` : (isZh ? '其他窗口' : 'Another window')}
@@ -1112,15 +1225,25 @@ function CallAction({
   icon,
   label,
   active = false,
+  disabled = false,
+  title,
   onClick,
 }: {
   icon: ReactNode
   label: string
   active?: boolean
+  disabled?: boolean
+  title?: string
   onClick: () => void
 }) {
   return (
-    <button type="button" onClick={onClick} className="flex flex-col items-center gap-2 text-xs">
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className="flex flex-col items-center gap-2 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+    >
       <span className={cn(
         'grid h-11 w-11 place-items-center rounded-full border bg-background text-foreground [&_svg]:h-[18px] [&_svg]:w-[18px]',
         active ? 'border-primary bg-muted' : 'border-border',

@@ -1,4 +1,5 @@
 """Unit tests for call trajectory storage and query orchestration."""
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -37,6 +38,8 @@ def _event(
     operation_id: str | None = None,
     result: str | None = None,
     duration_ms: int | None = None,
+    sequence_no: int = 1,
+    source: str = "opendesk",
 ):
     return SimpleNamespace(
         id=1,
@@ -46,6 +49,8 @@ def _event(
         operation_id=operation_id,
         result=result,
         duration_ms=duration_ms,
+        sequence_no=sequence_no,
+        source=source,
         created_at=occurred_at,
     )
 
@@ -73,6 +78,320 @@ async def test_append_event_resolves_call_and_removes_sensitive_details(monkeypa
     written = append.await_args.kwargs["data"]
     assert written["details"] == {"digit_count": 4, "nested": {}}
     assert append.await_args.kwargs["call_record"] is call_record
+
+
+@pytest.mark.asyncio
+async def test_append_event_serializes_datetime_details(monkeypatch):
+    """Settlement details carry real datetimes, and the column they land in is
+    JSON — storing them unconverted fails the whole insert."""
+    occurred_at = datetime(2026, 8, 9, 2, 0, tzinfo=timezone.utc)
+    append = AsyncMock(return_value=(SimpleNamespace(id=21), True))
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.get_by_id_unscoped",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                id=9, tenant_id=3, call_id="call-9", root_call_id=None
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallEventRepository.append",
+        append,
+    )
+
+    await CallTrajectoryService.append_event(
+        AsyncMock(),
+        call_record_id=9,
+        payload=_payload(
+            details={
+                "first_agent_wait_started_at": occurred_at,
+                "nested": [{"bot_handoff_requested_at": occurred_at}],
+            }
+        ),
+    )
+
+    written = append.await_args.kwargs["data"]["details"]
+    assert written == {
+        "first_agent_wait_started_at": "2026-08-09T02:00:00+00:00",
+        "nested": [{"bot_handoff_requested_at": "2026-08-09T02:00:00+00:00"}],
+    }
+    json.dumps(written)
+
+
+@pytest.mark.asyncio
+async def test_queue_event_projects_first_wait_and_freezes_threshold(monkeypatch):
+    occurred_at = datetime(2026, 8, 9, 2, 0, tzinfo=timezone.utc)
+    call_record = SimpleNamespace(
+        id=9,
+        tenant_id=3,
+        first_agent_wait_started_at=None,
+        human_service_requested_at=None,
+        short_abandon_threshold_ms=None,
+    )
+    update = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.get_by_id_unscoped",
+        AsyncMock(return_value=call_record),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallEventRepository.append",
+        AsyncMock(return_value=(SimpleNamespace(id=21), True)),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.update",
+        update,
+    )
+    monkeypatch.setattr(
+        "app.services.system_settings_service.SystemSettingsService.get_settings",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                call_short_abandon_threshold_seconds=7
+            )
+        ),
+    )
+
+    await CallTrajectoryService.append_event(
+        AsyncMock(),
+        call_record_id=9,
+        payload=_payload(
+            event_type="queue_entered",
+            event_category="queue",
+            actor_type="system",
+            occurred_at=occurred_at,
+            details={},
+        ),
+    )
+
+    assert update.await_args.args[2] == {
+        "first_agent_wait_started_at": occurred_at,
+        "human_service_requested_at": occurred_at,
+        "short_abandon_threshold_ms": 7_000,
+    }
+
+
+@pytest.mark.asyncio
+async def test_queue_event_does_not_move_first_values_or_threshold_later(monkeypatch):
+    existing = datetime(2026, 8, 9, 2, 0, tzinfo=timezone.utc)
+    call_record = SimpleNamespace(
+        id=9,
+        tenant_id=3,
+        first_agent_wait_started_at=existing,
+        human_service_requested_at=existing,
+        short_abandon_threshold_ms=9_000,
+    )
+    update = AsyncMock()
+    threshold_read = AsyncMock(return_value=2)
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.get_by_id_unscoped",
+        AsyncMock(return_value=call_record),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallEventRepository.append",
+        AsyncMock(return_value=(SimpleNamespace(id=21), True)),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.update",
+        update,
+    )
+    monkeypatch.setattr(
+        "app.services.system_settings_service.SystemSettingsService.get_settings",
+        threshold_read,
+    )
+
+    await CallTrajectoryService.append_event(
+        AsyncMock(),
+        call_record_id=9,
+        payload=_payload(
+            event_type="queue_entered",
+            event_category="queue",
+            actor_type="system",
+            occurred_at=existing + timedelta(seconds=1),
+            details={},
+        ),
+    )
+
+    update.assert_not_awaited()
+    threshold_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_late_fact_reopens_incomplete_finalization(monkeypatch):
+    occurred_at = datetime(2026, 8, 9, 2, 0, tzinfo=timezone.utc)
+    call_record = SimpleNamespace(
+        id=9,
+        tenant_id=3,
+        lifecycle_status="ended",
+        finalization_status="incomplete",
+        first_agent_offer_started_at=None,
+        human_service_requested_at=None,
+    )
+    update = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.get_by_id_unscoped",
+        AsyncMock(return_value=call_record),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallEventRepository.append",
+        AsyncMock(return_value=(SimpleNamespace(id=21), True)),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.update",
+        update,
+    )
+
+    await CallTrajectoryService.append_event(
+        AsyncMock(),
+        call_record_id=9,
+        payload=_payload(
+            event_type="agent_offer_started",
+            event_category="queue",
+            actor_type="system",
+            occurred_at=occurred_at,
+            details={},
+        ),
+    )
+
+    assert update.await_args.args[2] == {
+        "first_agent_offer_started_at": occurred_at,
+        "human_service_requested_at": occurred_at,
+        "finalization_status": "pending",
+        "finalized_at": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_late_recording_event_does_not_reopen_finalization(monkeypatch):
+    call_record = SimpleNamespace(
+        id=9,
+        tenant_id=3,
+        lifecycle_status="ended",
+        finalization_status="incomplete",
+    )
+    update = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.get_by_id_unscoped",
+        AsyncMock(return_value=call_record),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallEventRepository.append",
+        AsyncMock(return_value=(SimpleNamespace(id=21), True)),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.update",
+        update,
+    )
+
+    await CallTrajectoryService.append_event(
+        AsyncMock(),
+        call_record_id=9,
+        payload=_payload(
+            event_type="recording_available",
+            event_category="media",
+            actor_type="system",
+            occurred_at=datetime(2026, 8, 9, 2, 0, tzinfo=timezone.utc),
+            details={},
+        ),
+    )
+
+    update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queue_event_uses_default_threshold_when_settings_read_fails(monkeypatch):
+    call_record = SimpleNamespace(
+        id=9,
+        tenant_id=3,
+        first_agent_wait_started_at=None,
+        human_service_requested_at=None,
+        short_abandon_threshold_ms=None,
+    )
+    update = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.get_by_id_unscoped",
+        AsyncMock(return_value=call_record),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallEventRepository.append",
+        AsyncMock(return_value=(SimpleNamespace(id=21), True)),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.update",
+        update,
+    )
+    monkeypatch.setattr(
+        "app.services.system_settings_service.SystemSettingsService.get_settings",
+        AsyncMock(side_effect=RuntimeError("settings unavailable")),
+    )
+
+    await CallTrajectoryService.append_event(
+        AsyncMock(),
+        call_record_id=9,
+        payload=_payload(
+            event_type="queue_entered",
+            event_category="queue",
+            actor_type="system",
+            details={},
+        ),
+    )
+
+    assert update.await_args.args[2]["short_abandon_threshold_ms"] == 5_000
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected_fields"),
+    [
+        (
+            "agent_offer_started",
+            {"first_agent_offer_started_at", "human_service_requested_at"},
+        ),
+        (
+            "bot_handoff_requested",
+            {"bot_handoff_requested_at", "human_service_requested_at"},
+        ),
+        ("bot_handoff_succeeded", {"bot_handoff_succeeded_at"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_business_events_project_first_timestamps(
+    monkeypatch, event_type, expected_fields
+):
+    occurred_at = datetime(2026, 8, 9, 2, 0, tzinfo=timezone.utc)
+    call_record = SimpleNamespace(
+        id=9,
+        tenant_id=3,
+        first_agent_offer_started_at=None,
+        human_service_requested_at=None,
+        bot_handoff_requested_at=None,
+        bot_handoff_succeeded_at=None,
+    )
+    update = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.get_by_id_unscoped",
+        AsyncMock(return_value=call_record),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallEventRepository.append",
+        AsyncMock(return_value=(SimpleNamespace(id=21), True)),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.update",
+        update,
+    )
+
+    await CallTrajectoryService.append_event(
+        AsyncMock(),
+        call_record_id=9,
+        payload=_payload(
+            event_type=event_type,
+            event_category="bot" if event_type.startswith("bot_") else "queue",
+            actor_type="system",
+            occurred_at=occurred_at,
+            details={},
+        ),
+    )
+
+    assert set(update.await_args.args[2]) == expected_fields
+    assert all(value == occurred_at for value in update.await_args.args[2].values())
 
 
 @pytest.mark.asyncio
@@ -198,6 +517,66 @@ async def test_get_trajectory_returns_latest_settlement_and_gap_warning(monkeypa
     assert result["warnings"] == [
         {"code": "trajectory_gap", "message": "Part of the call trajectory may be incomplete"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_trajectory_clears_gap_after_post_settlement_fact(monkeypatch):
+    started = datetime(2026, 8, 9, 2, 0, tzinfo=timezone.utc)
+    events = [
+        _event("created", "call_created", started, sequence_no=1),
+        _event(
+            "late-queue-exit",
+            "queue_exited",
+            started + timedelta(seconds=30),
+            sequence_no=5,
+        ),
+        _event(
+            "gap",
+            "trajectory_gap_detected",
+            started + timedelta(seconds=59),
+            sequence_no=3,
+        ),
+        _event(
+            "ended",
+            "call_ended",
+            started + timedelta(minutes=1),
+            sequence_no=4,
+        ),
+    ]
+    public_id = uuid4()
+    record = SimpleNamespace(
+        id=8,
+        public_id=public_id,
+        call_id="call-8",
+        lifecycle_status="ended",
+        finalization_status="completed",
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallRecordRepository.get_by_public_id",
+        AsyncMock(return_value=record),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.DataScopeService.assert_call_record_in_scope",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service.CallEventRepository.list_for_call",
+        AsyncMock(return_value=events),
+    )
+    monkeypatch.setattr(
+        "app.services.call_trajectory_service._event_response_data",
+        lambda event: {"event_id": event.event_id},
+    )
+
+    result = await CallTrajectoryService.get_trajectory(
+        AsyncMock(),
+        public_id=public_id,
+        tenant_id=3,
+        principal=SimpleNamespace(group_ids=[]),
+    )
+
+    assert result["is_complete"] is True
+    assert result["warnings"] == []
 
 
 def test_reconciliation_event_id_stays_within_limit_for_long_start_ids():

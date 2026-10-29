@@ -1,7 +1,9 @@
 """
 Agent status service — manages agent online status via Redis.
 
-Status is stored in Redis (not DB) for high-frequency reads/writes.
+Chat presence (online/busy/offline) is stored in Redis for high-frequency
+reads/writes. Call-center chosen status lives in PG ``agent_status`` and is
+synced on disconnect finalize / within-grace reconnect (see below).
 
 Disconnect grace window:
     A Socket.IO disconnect does not immediately flip the agent to offline.
@@ -13,6 +15,8 @@ Disconnect grace window:
     so the state self-heals if the scheduled task is lost (e.g. worker restart).
     Once the grace window is finalized, the desired status is also reset to
     offline so a later login does not implicitly put the agent back online.
+    Finalize also best-effort writes PG ``agent_status.status=offline`` so
+    queue / auto-outbound candidates stop selecting disconnected agents.
 """
 import logging
 import time
@@ -196,6 +200,15 @@ class AgentStatusService:
             sid,
             desired_status,
         )
+        # Chat Redis ``desired_status`` is online/busy/offline; call-center PG
+        # uses ready/busy/break/.... On a within-grace reconnect, restore PG
+        # from the call-center resource's visible_status (the agent's last
+        # chosen CC status) so a brief flap does not leave them stuck offline
+        # after a concurrent finalize wrote PG offline.
+        if desired_status != AgentOnlineStatus.OFFLINE.value:
+            await AgentStatusService._restore_cc_db_status_best_effort(
+                r, tenant_id, user_id
+            )
 
     @staticmethod
     async def get_connection_sid(r: aioredis.Redis, tenant_id: int, user_id: int) -> str | None:
@@ -308,6 +321,15 @@ class AgentStatusService:
         )
         if changed:
             logger.info("Agent %d finalized offline sid=%s", user_id, sid)
+            # Redis is already offline; PG sync is best-effort so a DB error
+            # must not roll Redis back to ready (that would revive the
+            # disconnected-but-ready probe loop in auto-outbound / queue pick).
+            await AgentStatusService._sync_cc_db_status_best_effort(
+                tenant_id,
+                user_id,
+                AgentOnlineStatus.OFFLINE.value,
+                reason="disconnect_finalize",
+            )
         else:
             logger.info(
                 "Skipped offline finalize for agent %d sid=%s (reconnected or already cleared)",
@@ -315,6 +337,60 @@ class AgentStatusService:
                 sid,
             )
         return bool(changed)
+
+    @staticmethod
+    async def _sync_cc_db_status_best_effort(
+        tenant_id: int,
+        user_id: int,
+        status: str,
+        *,
+        reason: str | None,
+    ) -> None:
+        """Write call-center ``agent_status`` in a short-lived session."""
+        try:
+            from app.db.session import AsyncSessionLocal
+            from app.repositories.agent_status_repository import AgentStatusRepository
+
+            async with AsyncSessionLocal() as db:
+                await AgentStatusRepository.upsert(
+                    db, tenant_id, user_id, status, reason
+                )
+        except Exception:
+            logger.exception(
+                "Failed to sync agent_status DB status=%s agent=%s/%s reason=%s",
+                status,
+                tenant_id,
+                user_id,
+                reason,
+            )
+
+    @staticmethod
+    async def _restore_cc_db_status_best_effort(
+        r: aioredis.Redis, tenant_id: int, user_id: int
+    ) -> None:
+        """Restore PG call-center status from Redis resource visible_status."""
+        try:
+            from app.constants.call_center import VISIBLE_STATUSES
+            from app.services.cc_agent_resource_service import CcAgentResourceService
+
+            snapshot = await CcAgentResourceService.get_snapshot(
+                r, tenant_id, user_id
+            )
+            cc_status = (snapshot or {}).get("visible_status")
+            if not cc_status or cc_status == "offline" or cc_status not in VISIBLE_STATUSES:
+                return
+            await AgentStatusService._sync_cc_db_status_best_effort(
+                tenant_id,
+                user_id,
+                str(cc_status),
+                reason="reconnect_restore",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to restore agent_status DB after reconnect agent=%s/%s",
+                tenant_id,
+                user_id,
+            )
 
     @staticmethod
     async def _notify_stats_changed(

@@ -188,8 +188,15 @@ class CallRecordListItem(BaseModel):
     started_at: datetime
     customer_connected_at: datetime | None = None
     first_agent_connected_at: datetime | None = None
+    human_service_requested_at: datetime | None = None
+    first_agent_wait_started_at: datetime | None = None
+    first_agent_offer_started_at: datetime | None = None
+    bot_handoff_requested_at: datetime | None = None
+    bot_handoff_succeeded_at: datetime | None = None
     ended_at: datetime | None = None
     human_service_ended_at: datetime | None = None
+    hangup_stage: str | None = None
+    short_abandon_threshold_ms: int | None = None
     total_duration_ms: int | None = None
     customer_ring_duration_ms: int | None = None
     agent_wait_duration_ms: int | None = None
@@ -261,8 +268,15 @@ class CallRecordDetail(BaseModel):
     started_at: datetime
     customer_connected_at: datetime | None = None
     first_agent_connected_at: datetime | None = None
+    human_service_requested_at: datetime | None = None
+    first_agent_wait_started_at: datetime | None = None
+    first_agent_offer_started_at: datetime | None = None
+    bot_handoff_requested_at: datetime | None = None
+    bot_handoff_succeeded_at: datetime | None = None
     ended_at: datetime | None = None
     human_service_ended_at: datetime | None = None
+    hangup_stage: str | None = None
+    short_abandon_threshold_ms: int | None = None
     total_duration_ms: int | None = None
     customer_ring_duration_ms: int | None = None
     agent_wait_duration_ms: int | None = None
@@ -293,6 +307,21 @@ class CallTranscriptSegmentSchema(BaseModel):
 class CallTranscriptResponse(BaseModel):
     call_id: str | None = None
     segments: list[CallTranscriptSegmentSchema] = Field(default_factory=list)
+
+
+class BotTranscriptMessage(BaseModel):
+    role: Literal["user", "bot"]
+    text: str
+    interrupted: bool = False
+
+
+class BotTranscriptResponse(BaseModel):
+    available: bool
+    status: Literal["ok", "empty", "error"] = "empty"
+    agent_name: str | None = None
+    handoff_at: datetime | None = None
+    entered_human: bool = False
+    messages: list[BotTranscriptMessage] = Field(default_factory=list)
 
 
 class CallUserAssociationResponse(BaseModel):

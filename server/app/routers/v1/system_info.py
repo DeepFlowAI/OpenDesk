@@ -1,13 +1,10 @@
 """Public system info — UX hints for the frontend.
 
 This endpoint is intentionally **not** an authorisation gate. It tells the
-frontend whether to render multi-tenant UI (login form's tenant field, tenant
-admin pages, etc.). The actual authority over multi-tenant features comes
-from whether an optional ``tenants`` extension is loaded — controlled by
-file-system presence of the extension package, not by any config flag.
-
-Single-tenant deployments do not load this extension, so ``single_tenant_mode``
-is always ``true`` for them.
+frontend whether to render multi-tenant UI and whether reports are available.
+Those flags follow which extension packages actually loaded, not a config
+switch. The tenants and reports packages ship with the application, so a
+normal deployment reports multi-tenant mode and reports as enabled.
 """
 from fastapi import APIRouter, Request
 

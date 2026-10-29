@@ -563,3 +563,77 @@ async def test_republish_skips_in_call_when_customer_leg_gone(monkeypatch):
     orch.finalize_agent_call.assert_awaited_once()
     assert orch.finalize_agent_call.await_args.kwargs["call_id"] == "cust-gone"
     assert orch.finalize_agent_call.await_args.kwargs["reason"] == "media_timeout"
+
+@pytest.mark.asyncio
+async def test_republish_re_rings_live_internal_transfer_offer(monkeypatch):
+    """A colleague's transfer ring has no CDR; reconnect must re-ring, not release."""
+    from app.services.call_center import internal_consult_service
+
+    orch = CallCenterOrchestrator.__new__(CallCenterOrchestrator)
+    orch._pending_offers = {}
+    orch.notify_agent_incoming = AsyncMock(return_value=True)
+    release = AsyncMock(return_value=None)
+    ring = {
+        "offer_id": "off-1",
+        "call_id": "internal:off-1",
+        "call_type": "internal_transfer",
+        "from": "A",
+        "from_employee_id": 13,
+    }
+
+    _patch_deps(
+        monkeypatch,
+        snapshot={
+            "resource_state": "ringing",
+            "current_call_id": "internal:off-1",
+            "offer_id": "off-1",
+            "queue_id": None,
+            "direction": "inbound",
+        },
+        record=None,
+        force_release=release,
+    )
+    monkeypatch.setattr(
+        internal_consult_service,
+        "load_internal_offer_payload",
+        AsyncMock(return_value=ring),
+    )
+
+    await orch.republish_agent_call_ui(tenant_id=1, employee_id=1)
+
+    release.assert_not_awaited()
+    orch.notify_agent_incoming.assert_awaited_once()
+    assert orch.notify_agent_incoming.await_args.kwargs["payload"] == ring
+
+
+@pytest.mark.asyncio
+async def test_republish_releases_internal_ring_whose_offer_ended(monkeypatch):
+    from app.services.call_center import internal_consult_service
+
+    orch = CallCenterOrchestrator.__new__(CallCenterOrchestrator)
+    orch._pending_offers = {}
+    orch.notify_agent_incoming = AsyncMock(return_value=True)
+    release = AsyncMock(return_value=None)
+
+    _patch_deps(
+        monkeypatch,
+        snapshot={
+            "resource_state": "ringing",
+            "current_call_id": "internal:off-gone",
+            "offer_id": "off-gone",
+            "queue_id": None,
+            "direction": "inbound",
+        },
+        record=None,
+        force_release=release,
+    )
+    monkeypatch.setattr(
+        internal_consult_service,
+        "load_internal_offer_payload",
+        AsyncMock(return_value=None),
+    )
+
+    await orch.republish_agent_call_ui(tenant_id=1, employee_id=1)
+
+    release.assert_awaited_once()
+    orch.notify_agent_incoming.assert_not_awaited()

@@ -3,13 +3,10 @@ SMS platform routers — signature/template/grant APIs for the Tenant Platform.
 
 Authenticated via X-API-Key (same key as /api/v1/tenants and /api/v1/sip-trunks).
 """
-import hmac
-
-from fastapi import APIRouter, Depends, Header, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.configs.settings import settings
-from app.core.exceptions import UnauthorizedError
+from app.core.tenant_platform_auth import verify_tenant_api_key
 from app.db.deps import get_db
 from app.schemas.sms import (
     SmsGrantedTemplateListResponse,
@@ -32,29 +29,22 @@ from app.services.sms_platform_service import (
 )
 
 
-async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
-    expected = settings.TENANT_API_KEY or ""
-    if not hmac.compare_digest(x_api_key.strip(), expected):
-        raise UnauthorizedError("Invalid or missing API Key")
-    return x_api_key
-
-
 sms_signatures_router = APIRouter(
     prefix="/sms-signatures",
     tags=["SMS Signatures"],
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_tenant_api_key)],
 )
 
 sms_templates_router = APIRouter(
     prefix="/sms-templates",
     tags=["SMS Templates"],
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_tenant_api_key)],
 )
 
 sms_template_grants_router = APIRouter(
     prefix="/sms-template-grants",
     tags=["SMS Template Grants"],
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_tenant_api_key)],
 )
 
 

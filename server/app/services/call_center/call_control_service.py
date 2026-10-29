@@ -152,6 +152,10 @@ class InCallLegs:
     # call-center resource is occupied for the conference, so it must be freed
     # when the conference ends.
     conference_target_employee_id: int | None = None
+    # A Web-phone colleague still being rung to join the conference. Kept so
+    # the invite can be withdrawn if the host's call ends before they answer.
+    conference_invite_offer_id: str | None = None
+    conference_invite_employee_id: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -166,6 +170,8 @@ class InCallLegs:
             "consult_offer_id": self.consult_offer_id,
             "consult_state": self.consult_state,
             "conference_target_employee_id": self.conference_target_employee_id,
+            "conference_invite_offer_id": self.conference_invite_offer_id,
+            "conference_invite_employee_id": self.conference_invite_employee_id,
         }
 
     @classmethod
@@ -182,6 +188,8 @@ class InCallLegs:
             consult_offer_id=d.get("consult_offer_id"),
             consult_state=d.get("consult_state"),
             conference_target_employee_id=d.get("conference_target_employee_id"),
+            conference_invite_offer_id=d.get("conference_invite_offer_id"),
+            conference_invite_employee_id=d.get("conference_invite_employee_id"),
         )
 
 

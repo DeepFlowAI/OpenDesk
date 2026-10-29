@@ -98,6 +98,8 @@ class CallRecord(Base, TimestampMixin):
     initiator_agent_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True
     )
+    initiator_agent_ref_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    initiator_agent_name_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_serving_agent_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True
     )
@@ -116,6 +118,21 @@ class CallRecord(Base, TimestampMixin):
     first_agent_connected_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    human_service_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_agent_wait_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    first_agent_offer_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    bot_handoff_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    bot_handoff_succeeded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     human_service_ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -129,6 +146,10 @@ class CallRecord(Base, TimestampMixin):
     call_result: Mapped[str | None] = mapped_column(String(32), nullable=True)
     hangup_party: Mapped[str | None] = mapped_column(String(16), nullable=True)
     hangup_reason_code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    hangup_stage: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    short_abandon_threshold_ms: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
 
     total_duration_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     customer_ring_duration_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

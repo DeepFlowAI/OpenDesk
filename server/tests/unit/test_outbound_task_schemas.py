@@ -2,8 +2,19 @@
 
 from typing import Any
 
+import pytest
+from pydantic import ValidationError
+
 from app.models.outbound_task import OutboundTask, OutboundTaskTarget
-from app.schemas.outbound_task import OutboundTargetResponse, OutboundTargetWithTaskResponse
+from app.schemas.outbound_task import (
+    OutboundTargetResponse,
+    OutboundTargetWithTaskResponse,
+    OutboundTaskCreate,
+    OutboundTaskUpdate,
+    OutboundTemplateCreate,
+    OutboundTemplateResponse,
+    OutboundTemplateUpdate,
+)
 
 
 class TargetWithUnloadedTask:
@@ -68,3 +79,60 @@ def test_outbound_target_with_task_response_keeps_task_details():
 
     assert response.task.id == 1
     assert response.task.name == "回访任务"
+
+
+class TestOutboundFieldNameUniqueness:
+    @staticmethod
+    def _field(key: str, name: str, *, enabled: bool = True) -> dict[str, Any]:
+        return {"key": key, "name": name, "field_type": "single_line_text", "enabled": enabled}
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ("customer_name", "CustomerName"),
+            ("备注", "备 注"),
+            ("customer_name", " customer name "),
+        ],
+    )
+    def test_template_create_rejects_normalized_duplicates(self, first: str, second: str):
+        with pytest.raises(ValidationError, match="duplicates"):
+            OutboundTemplateCreate(
+                name="模板",
+                fields=[self._field("field_1", first), self._field("field_2", second)],
+            )
+
+    def test_template_update_counts_disabled_fields(self):
+        with pytest.raises(ValidationError, match="duplicates"):
+            OutboundTemplateUpdate(
+                name="模板",
+                fields=[
+                    self._field("field_1", "customer_name"),
+                    self._field("field_2", "customer_name", enabled=False),
+                ],
+            )
+
+    def test_template_create_accepts_distinct_names(self):
+        data = OutboundTemplateCreate(
+            name="模板",
+            fields=[self._field("field_1", "customer_name"), self._field("field_2", "备注")],
+        )
+        assert [field.name for field in data.fields] == ["customer_name", "备注"]
+
+    def test_template_response_keeps_legacy_duplicates_readable(self):
+        response = OutboundTemplateResponse(
+            id=1,
+            tenant_id=1,
+            name="模板",
+            fields=[self._field("field_1", "备注"), self._field("field_2", "备注")],
+        )
+        assert len(response.fields) == 2
+
+    def test_manual_task_with_duplicate_fields_rejected(self):
+        with pytest.raises(ValidationError, match="duplicates"):
+            OutboundTaskCreate(
+                name="任务",
+                template_id=1,
+                fields=[self._field("field_1", "a"), self._field("field_2", "A")],
+            )
+        with pytest.raises(ValidationError, match="duplicates"):
+            OutboundTaskUpdate(fields=[self._field("field_1", "a"), self._field("field_2", "A")])

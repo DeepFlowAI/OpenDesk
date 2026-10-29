@@ -137,7 +137,11 @@ def _fake_orchestrator(monkeypatch):
             self.control_results: list[tuple] = []
             self.ended: list[tuple] = []
             self.republished: list[tuple] = []
+            self.originator_reassigned: list[tuple] = []
             self._workflows: dict = {}
+
+        async def reassign_outbound_originator(self, call_id, employee_id):
+            self.originator_reassigned.append((call_id, employee_id))
 
         def register_leg_wait(self, call_id):
             fut = asyncio.get_event_loop().create_future()
@@ -484,6 +488,50 @@ async def test_transfer_webrtc_employee_rekeys_exactly_once(monkeypatch):
         await asyncio.sleep(0)
 
     assert rekeyed == [(7, 99, "sip-customer")]
+
+
+@pytest.mark.asyncio
+async def test_transfer_webrtc_employee_binds_target_leg_and_originator(monkeypatch):
+    """The colleague's controls use the transfer leg, and an agent-dialed call
+    settles the colleague (not the initiator) on the customer's hangup."""
+
+    _install_session(monkeypatch, _active_row(), SessionTracker())
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _webrtc_active)
+    _bypass_tone(monkeypatch)
+    _route_employee_webrtc(monkeypatch, True)
+    _stub_internal_consult(
+        monkeypatch,
+        result={"target_webrtc_call_id": "target-web-2", "offer_id": "offer-1"},
+    )
+    orch = _fake_orchestrator(monkeypatch)
+    _seed_bridged_workflow(orch, call_id="sip-customer", employee_id=42)
+    _track_wrapup(monkeypatch)
+    # Leftover media leg from the colleague's previous call.
+    ccs_module._in_call_state[(7, 99)] = ccs_module.InCallLegs(
+        agent_media_call_id="stale-leg",
+    )
+
+    async def _rekey_current_call(_r, tenant_id, employee_id, *, call_id):
+        return {"resource_state": "in_call", "current_call_id": call_id}
+
+    monkeypatch.setattr(
+        ccs_module.CcAgentResourceService,
+        "rekey_current_call",
+        staticmethod(_rekey_current_call),
+    )
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+
+    await CallControlService.transfer(
+        tel, tenant_id=7, employee_id=42,
+        target_type="employee", target_id=99, number=None,
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert ccs_module._in_call_state[(7, 99)].agent_media_call_id == "target-web-2"
+    assert orch.originator_reassigned == [("sip-customer", 99)]
 
 
 # ───────────────────────── Fix: wrap-up busy + legs ─────────────────────────

@@ -30,8 +30,11 @@ class FakeRedis:
     async def get(self, key: str) -> str | None:
         return self.values.get(key)
 
-    async def getdel(self, key: str) -> str | None:
-        return self.values.pop(key, None)
+    # No getdel: production Redis predates GETDEL, so consuming a signature
+    # must go through the get-and-delete script instead.
+    async def eval(self, script: str, numkeys: int, *keys: str) -> str | None:
+        assert "GET" in script and "DEL" in script and numkeys == 1
+        return self.values.pop(keys[0], None)
 
 
 def integration(secret: str) -> SimpleNamespace:

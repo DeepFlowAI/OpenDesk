@@ -4,15 +4,13 @@ Telephony catalog routers — SIP Trunk and phone number APIs for Tenant Platfor
 Authenticated via X-API-Key (same key as /api/v1/tenants).
 """
 import csv
-import hmac
 import io
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.configs.settings import settings
-from app.core.exceptions import UnauthorizedError
+from app.core.tenant_platform_auth import verify_tenant_api_key
 from app.db.deps import get_db
 
 from .phone_number_service import PhoneNumberService
@@ -32,23 +30,16 @@ from .schemas import (
 from .sip_trunk_service import SipTrunkService
 
 
-async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
-    expected = settings.TENANT_API_KEY or ""
-    if not hmac.compare_digest(x_api_key.strip(), expected):
-        raise UnauthorizedError("Invalid or missing API Key")
-    return x_api_key
-
-
 sip_trunks_router = APIRouter(
     prefix="/sip-trunks",
     tags=["SIP Trunks"],
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_tenant_api_key)],
 )
 
 phone_numbers_router = APIRouter(
     prefix="/phone-numbers",
     tags=["Phone Numbers"],
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[Depends(verify_tenant_api_key)],
 )
 
 

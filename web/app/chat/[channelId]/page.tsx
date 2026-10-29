@@ -54,6 +54,28 @@ import {
 import { emitTestEvent, initTestEventChannel } from '@/lib/e2e-test-events'
 import { buildMessageDeliveryBatches } from '@/lib/message-delivery'
 import {
+  isRecoverableVisitorSessionError,
+  visitorRecoveryTelemetryLevel,
+} from '@/lib/visitor-session-recoverable-error'
+import {
+  canAttemptSessionRecoveryForToken,
+  claimSessionRecoveryReconnect,
+  decideJoinNotFoundReplace,
+  emptySessionRecoveryBudget,
+  followSessionRecoveryToken,
+  isSessionRecoveryFlightCurrent,
+  recordSessionRecoveryAttempt,
+  requestSessionRecoveryReconnect,
+  resolveSessionRecoveryReconnectIntent,
+  sessionRecoveryFailureTelemetryLevel,
+  shouldReportSessionRecoveryExhausted,
+  VISITOR_SESSION_RECOVERY_EXHAUSTED_EVENT,
+  withVisitorSessionRecovery,
+  type RecoverVisitorSessionOptions,
+  type SessionRecoveryFlightState,
+  type VisitorSessionRecoveryFailure,
+} from '@/lib/visitor-session-recovery'
+import {
   getVisitorPayloadKey,
   mergeEmbedInitPayload,
   resolveVisitorIdentitySource,
@@ -123,6 +145,10 @@ type JoinConversationAck = {
   message?: string
   conversation_id?: number
   conversation_public_id?: string
+}
+
+type SessionRecoveryFlight = SessionRecoveryFlightState & {
+  promise: Promise<string | null>
 }
 
 type NavigatorWithUserAgentData = Navigator & {
@@ -321,9 +347,6 @@ function detectVisitorEnvironment(): VisitorEnvironment {
 function visitorCredentialStorageKey(channelKey: string): string {
   return `opendesk_visitor_${channelKey}`
 }
-
-// Max automatic re-mint attempts before giving up and surfacing the auth error.
-const MAX_SESSION_RECOVERIES = 3
 
 // Max retries for a transient (non-auth) context-sync failure before giving up.
 const MAX_CONTEXT_SYNC_RETRIES = 3
@@ -644,9 +667,23 @@ export default function VisitorChatPage() {
   const [leaveMessagePrompt, setLeaveMessagePrompt] = useState('')
   const [queueLeaveMessageLoading, setQueueLeaveMessageLoading] = useState(false)
   const lastSyncedContextTokenRef = useRef<string | null>(null)
-  // Bounds automatic re-mint attempts after a visitor session auth failure, so a
-  // token the server keeps rejecting (e.g. a disabled channel) can't loop.
-  const sessionRecoveryRef = useRef(0)
+  // Remint budget follows the failing token so a remint chain cannot reset
+  // itself via join/connect success. The count decays after the idle window.
+  const sessionRecoveryBudgetRef = useRef(emptySessionRecoveryBudget())
+  const sessionRecoveryInFlightRef = useRef<SessionRecoveryFlight | null>(null)
+  const sessionRecoveryFailureRef = useRef<VisitorSessionRecoveryFailure | null>(null)
+  const sessionRecoveryExhaustedReportedRef = useRef<string | null | undefined>(undefined)
+  const sessionRecoveryGenerationRef = useRef(0)
+  const visitorSessionTokenRef = useRef(visitorSessionToken)
+  visitorSessionTokenRef.current = visitorSessionToken
+  const visitorExternalIdRef = useRef(visitorExternalId)
+  visitorExternalIdRef.current = visitorExternalId
+  const joinNotFoundDiscardedIdRef = useRef<string | null>(null)
+  const joinNotFoundReplaceCountRef = useRef<{ epoch: number; count: number }>({
+    epoch: -1,
+    count: 0,
+  })
+  const joinSessionRequiredRetryRef = useRef<{ conversationId: string; token: string } | null>(null)
   // Tracks transient context-sync failures per token to cap backoff retries.
   const contextSyncFailureRef = useRef<{ token: string | null; failures: number }>({
     token: null,
@@ -670,6 +707,8 @@ export default function VisitorChatPage() {
     satisfactionInvitation,
     pendingHumanHandoff,
     connect,
+    applySessionToken,
+    reconnectWithSession,
     clearAuthFailed,
     setConversationPublicId,
     setMessages,
@@ -838,6 +877,172 @@ export default function VisitorChatPage() {
     postEmbedMessage(embedInstanceId, { type: 'close' })
   }, [embedInstanceId, trackEvent])
 
+  // Same remint path as the socket authFailed self-heal. Shared so HTTP 401
+  // and join_conversation identity mismatches can recover without a reload.
+  // Socket reconnect is opt-in: a healthy websocket must not be torn down
+  // for a pure HTTP 401.
+  const reportSessionRecoveryExhausted = useCallback((
+    reason: VisitorSessionRecoveryFailure,
+    activeToken: string | null,
+  ) => {
+    if (!shouldReportSessionRecoveryExhausted(
+      sessionRecoveryExhaustedReportedRef.current,
+      activeToken,
+    )) {
+      return
+    }
+    sessionRecoveryExhaustedReportedRef.current = activeToken
+    const attempts = sessionRecoveryBudgetRef.current.attempts
+    trackEvent(VISITOR_SESSION_RECOVERY_EXHAUSTED_EVENT, {
+      level: sessionRecoveryFailureTelemetryLevel(reason, attempts),
+      props: {
+        reason,
+        attempts,
+      },
+    })
+  }, [trackEvent])
+
+  const recoverVisitorSession = useCallback(async (
+    options?: RecoverVisitorSessionOptions,
+  ): Promise<string | null> => {
+    const existing = sessionRecoveryInFlightRef.current
+    if (
+      existing
+      && isSessionRecoveryFlightCurrent(existing.generation, sessionRecoveryGenerationRef.current)
+    ) {
+      if (options?.reconnectSocket) requestSessionRecoveryReconnect(existing)
+      const token = await existing.promise
+      if (!isSessionRecoveryFlightCurrent(existing.generation, sessionRecoveryGenerationRef.current)) {
+        return null
+      }
+      const reconnectVisitorId = token ? claimSessionRecoveryReconnect(existing) : null
+      if (token && reconnectVisitorId) {
+        reconnectWithSession(token, reconnectVisitorId)
+      }
+      return token
+    }
+    const activeToken = visitorSessionTokenRef.current
+    if (!channelKey) {
+      sessionRecoveryFailureRef.current = 'mint_failed'
+      reportSessionRecoveryExhausted('mint_failed', activeToken)
+      return null
+    }
+    if (!canAttemptSessionRecoveryForToken(sessionRecoveryBudgetRef.current, activeToken)) {
+      sessionRecoveryFailureRef.current = 'budget_exhausted'
+      reportSessionRecoveryExhausted('budget_exhausted', activeToken)
+      return null
+    }
+
+    sessionRecoveryFailureRef.current = null
+    const generation = sessionRecoveryGenerationRef.current
+    const previousVisitorExternalId = visitorExternalIdRef.current
+    const flight: SessionRecoveryFlight = {
+      promise: Promise.resolve(null),
+      wantReconnect: Boolean(options?.reconnectSocket),
+      didReconnect: false,
+      visitorExternalId: null,
+      generation,
+    }
+
+    const run = (async () => {
+      sessionRecoveryBudgetRef.current = recordSessionRecoveryAttempt(
+        sessionRecoveryBudgetRef.current,
+        visitorSessionTokenRef.current,
+      )
+      const embedPayload = embedInitPayload ?? EMPTY_EMBED_INIT_PAYLOAD
+      if (embedPayload.contextToken === null) {
+        clearVisitorCredential(channelKey)
+      }
+      const storedForRenewal = selectStoredVisitorCredential(
+        readVisitorCredential(channelKey),
+        embedPayload,
+      )
+      try {
+        const session = await createVisitorSession({
+          channelKey,
+          visitorExternalId: storedForRenewal?.visitorExternalId,
+          visitorSecret: storedForRenewal?.visitorSecret,
+          visitorName: embedPayload.visitor?.name,
+          metadata: embedPayload.visitor?.metadata,
+          contextToken: embedPayload.contextToken || null,
+        })
+        if (!isSessionRecoveryFlightCurrent(flight.generation, sessionRecoveryGenerationRef.current)) {
+          return null
+        }
+        const visitorSecret = session.visitor_secret || storedForRenewal?.visitorSecret
+        if (visitorSecret) {
+          writeVisitorCredential(channelKey, {
+            visitorExternalId: session.visitor_external_id,
+            visitorSecret,
+            visitorSessionToken: session.visitor_session_token,
+            visitorSessionExpiresAt: Date.now() + session.expires_in * 1000,
+            visitorPayloadKey: getVisitorPayloadKey(embedPayload),
+          })
+        }
+        sessionRecoveryBudgetRef.current = followSessionRecoveryToken(
+          sessionRecoveryBudgetRef.current,
+          session.visitor_session_token,
+        )
+        sessionRecoveryFailureRef.current = null
+        sessionRecoveryExhaustedReportedRef.current = undefined
+        setVisitorExternalId(session.visitor_external_id)
+        setVisitorSessionToken(session.visitor_session_token)
+        visitorSessionTokenRef.current = session.visitor_session_token
+        visitorExternalIdRef.current = session.visitor_external_id
+        const reconnectVisitorId = resolveSessionRecoveryReconnectIntent(
+          flight,
+          previousVisitorExternalId,
+          session.visitor_external_id,
+        )
+        if (reconnectVisitorId) {
+          reconnectWithSession(session.visitor_session_token, reconnectVisitorId)
+        } else {
+          applySessionToken(session.visitor_session_token, session.visitor_external_id)
+        }
+        clearAuthFailed()
+        return session.visitor_session_token
+      } catch {
+        sessionRecoveryFailureRef.current = 'mint_failed'
+        reportSessionRecoveryExhausted('mint_failed', visitorSessionTokenRef.current)
+        return null
+      }
+    })()
+
+    flight.promise = run
+    sessionRecoveryInFlightRef.current = flight
+    try {
+      return await run
+    } finally {
+      if (sessionRecoveryInFlightRef.current === flight) {
+        sessionRecoveryInFlightRef.current = null
+      }
+    }
+  }, [
+    applySessionToken,
+    channelKey,
+    clearAuthFailed,
+    embedInitPayload,
+    reconnectWithSession,
+    reportSessionRecoveryExhausted,
+  ])
+
+  const fetchPublicMessagesRecovering = useCallback(
+    (params: {
+      conversationPublicId: string
+      visitorSessionToken: string
+      beforeId?: number | null
+      limit?: number
+    }) =>
+      withVisitorSessionRecovery(
+        (token) => fetchPublicMessages({ ...params, visitorSessionToken: token }),
+        {
+          visitorSessionToken: params.visitorSessionToken,
+          recoverVisitorSession,
+        },
+      ),
+    [recoverVisitorSession],
+  )
+
   useEffect(() => {
     if (!hasUrlContextTokenParam(searchParams)) return
     stripUrlContextTokenParams()
@@ -957,8 +1162,12 @@ export default function VisitorChatPage() {
     const currentContextToken = embedPayload.contextToken || null
     const visitorPayloadKey = getVisitorPayloadKey(embedPayload)
 
+    sessionRecoveryGenerationRef.current += 1
+    sessionRecoveryInFlightRef.current = null
     setVisitorExternalId(null)
     setVisitorSessionToken(null)
+    visitorSessionTokenRef.current = null
+    visitorExternalIdRef.current = null
     setConversationPublicId(null)
     setOfflineMessagePublicId(null)
     setOfflineMessageSource(null)
@@ -1237,7 +1446,7 @@ export default function VisitorChatPage() {
             setEnded(res.conversation.status === 'closed')
             try {
               const fetchStartedAt = Date.now()
-              const data = await fetchPublicMessages({
+              const data = await fetchPublicMessagesRecovering({
                 conversationPublicId: res.conversation.conversation_public_id,
                 visitorSessionToken,
                 limit: 50,
@@ -1369,7 +1578,7 @@ export default function VisitorChatPage() {
                 setLeaveMessageMode(false)
                 setConversationPublicId(data.conversation_public_id)
                 setConversationStatus('active')
-                const current = await fetchPublicMessages({
+                const current = await fetchPublicMessagesRecovering({
                   conversationPublicId: data.conversation_public_id,
                   visitorSessionToken,
                   limit: 50,
@@ -1486,6 +1695,7 @@ export default function VisitorChatPage() {
     visitorEnvironment.browser,
     visitorEnvironment.system,
     visitorSessionToken,
+    fetchPublicMessagesRecovering,
     trackEvent,
   ])
 
@@ -1835,9 +2045,11 @@ export default function VisitorChatPage() {
         // 401/403 means the context token itself is invalid/expired. Retrying the
         // same token always fails, so don't — wait for the host to push a fresh
         // one via updateContext (a new token value re-triggers this effect).
+        // Only the host integration can fix that, so report it at warn; other
+        // statuses point at a real backend/network fault and stay at error.
         const isAuthError = status === 401 || status === 403
         trackEvent('conversation_context_sync_failed', {
-          level: 'error',
+          level: isAuthError ? 'warn' : 'error',
           conversation_external_id: conversationPublicId,
           props: { auth_error: isAuthError, ...(typeof status === 'number' ? { status } : {}) },
         })
@@ -2036,6 +2248,17 @@ export default function VisitorChatPage() {
     setPendingHumanHandoff,
   ])
 
+  const handleLeaveMessageHoursOpen = useCallback(async () => {
+    setLeaveMessageMode(false)
+    setOfflineMessagePublicId(null)
+    setOfflineMessageSource(null)
+    setOfflineMessageQueueTarget(null)
+    setLeaveMessagePrompt('')
+    setSocketOfflineTitle('')
+    setSocketOfflineMessage('')
+    await startConversation()
+  }, [startConversation])
+
   const handleContinueBotFromForm = useCallback(() => {
     setLeaveMessageMode(false)
     setOfflineMessageSource(null)
@@ -2109,65 +2332,15 @@ export default function VisitorChatPage() {
 
   // ── Auth-failure self-heal ──
   // An expired visitor session token makes the socket reject every reconnect.
-  // Rather than leaving the chat dead until a manual page reload, mint a fresh
-  // token for the same stored visitor identity and let the connect effect retry.
-  // Bounded by MAX_SESSION_RECOVERIES so a token the server keeps rejecting
-  // (e.g. a disabled channel, where minting itself fails) can't loop.
+  // Remint through recoverVisitorSession (same helper as HTTP 401 / join
+  // recovery) so a later expiry still self-heals without a page reload.
   useEffect(() => {
     if (!authFailed || !embedActivated || !channelKey) return
-    if (sessionRecoveryRef.current >= MAX_SESSION_RECOVERIES) return
-    sessionRecoveryRef.current += 1
-
-    let cancelled = false
-    const embedPayload = embedInitPayload ?? EMPTY_EMBED_INIT_PAYLOAD
-    if (embedPayload.contextToken === null) {
-      clearVisitorCredential(channelKey)
-    }
-    const storedForRenewal = selectStoredVisitorCredential(
-      readVisitorCredential(channelKey),
-      embedPayload,
-    )
-
-    createVisitorSession({
-      channelKey,
-      visitorExternalId: storedForRenewal?.visitorExternalId,
-      visitorSecret: storedForRenewal?.visitorSecret,
-      visitorName: embedPayload.visitor?.name,
-      metadata: embedPayload.visitor?.metadata,
-      contextToken: embedPayload.contextToken || null,
-    })
-      .then((session) => {
-        if (cancelled) return
-        const visitorSecret = session.visitor_secret || storedForRenewal?.visitorSecret
-        if (visitorSecret) {
-          writeVisitorCredential(channelKey, {
-            visitorExternalId: session.visitor_external_id,
-            visitorSecret,
-            visitorSessionToken: session.visitor_session_token,
-            visitorSessionExpiresAt: Date.now() + session.expires_in * 1000,
-            visitorPayloadKey: getVisitorPayloadKey(embedPayload),
-          })
-        }
-        setVisitorExternalId(session.visitor_external_id)
-        setVisitorSessionToken(session.visitor_session_token)
-        // Re-enable the connect effect now that a fresh token is in place.
-        clearAuthFailed()
-      })
-      .catch(() => {
-        // Minting failed (e.g. the channel was disabled). Leave authFailed set so
-        // the page surfaces the error instead of silently retrying forever.
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [authFailed, embedActivated, channelKey, embedInitPayload, clearAuthFailed])
+    void recoverVisitorSession({ reconnectSocket: true })
+  }, [authFailed, embedActivated, channelKey, recoverVisitorSession, visitorSessionToken])
 
   useEffect(() => {
     if (!connected) return
-    // A successful connect means the current token works; reset the recovery
-    // budget so a later expiry gets a fresh set of attempts.
-    sessionRecoveryRef.current = 0
     trackEvent('socket_connected')
   }, [connected, trackEvent])
 
@@ -2214,22 +2387,20 @@ export default function VisitorChatPage() {
   // Room membership belongs to a concrete Socket.IO connection. Re-establish it
   // whenever either the active conversation or the underlying connection changes.
   useEffect(() => {
-    if (!socket || !connected || !conversationPublicId || !visitorSessionToken) {
+    if (!socket || !connected || !conversationPublicId || !visitorSessionToken || !visitorExternalId) {
       setConversationSubscriptionStatus('idle')
       return
     }
 
     let cancelled = false
     let retryTimer: ReturnType<typeof setTimeout> | null = null
-    const permanentErrors = new Set([
-      'NOT_FOUND',
-      'UNAUTHORIZED',
-      'FORBIDDEN',
-      'visitor_session_required',
-    ])
+    // FORBIDDEN is a durable ACL reject. NOT_FOUND means the conversation
+    // public id is no longer valid for this identity — discard it once and
+    // let start_conversation resume or create the visitor's active session.
+    const permanentErrors = new Set(['FORBIDDEN'])
 
     const reconcileMessages = () => {
-      fetchPublicMessages({
+      fetchPublicMessagesRecovering({
         conversationPublicId,
         visitorSessionToken,
         limit: 50,
@@ -2252,6 +2423,40 @@ export default function VisitorChatPage() {
         })
     }
 
+    const failSubscription = (
+      error: string,
+      nextAttempt: number,
+      exhausted: boolean,
+      recoveryReason?: VisitorSessionRecoveryFailure | null,
+      extraProps?: { replace_attempted?: boolean },
+    ) => {
+      const recoverable = isRecoverableVisitorSessionError(error, {
+        context: 'socket_join',
+        code: error,
+      })
+      setConversationSubscriptionStatus('degraded')
+      trackEvent('conversation_subscription_failed', {
+        level: visitorRecoveryTelemetryLevel({
+          recoverable,
+          recoveryExhausted: exhausted,
+        }),
+        conversation_external_id: conversationPublicId,
+        props: {
+          error,
+          attempts: nextAttempt,
+          connection_epoch: connectionEpoch,
+          recoverable,
+          ...(extraProps?.replace_attempted === true ? { replace_attempted: true } : {}),
+          ...(exhausted && recoverable
+            ? {
+              recovery_exhausted: true,
+              recovery_reason: recoveryReason ?? 'budget_exhausted',
+            }
+            : {}),
+        },
+      })
+    }
+
     const join = (attempt: number) => {
       if (cancelled || !socket.connected) return
       setConversationSubscriptionStatus('joining')
@@ -2261,6 +2466,8 @@ export default function VisitorChatPage() {
         (timeoutError: Error | null, response?: JoinConversationAck) => {
           if (cancelled) return
           if (!timeoutError && response?.ok === true) {
+            joinNotFoundDiscardedIdRef.current = null
+            joinSessionRequiredRetryRef.current = null
             setConversationSubscriptionStatus('joined')
             trackEvent('conversation_subscription_succeeded', {
               conversation_external_id: conversationPublicId,
@@ -2272,20 +2479,101 @@ export default function VisitorChatPage() {
 
           const error = response?.error || timeoutError?.message || 'unknown'
           const nextAttempt = attempt + 1
+          if (error === 'NOT_FOUND') {
+            if (joinNotFoundReplaceCountRef.current.epoch !== connectionEpoch) {
+              joinNotFoundReplaceCountRef.current = { epoch: connectionEpoch, count: 0 }
+              joinNotFoundDiscardedIdRef.current = null
+            }
+            const decision = decideJoinNotFoundReplace(
+              joinNotFoundDiscardedIdRef.current,
+              conversationPublicId,
+              {
+                ended,
+                replaceCount: joinNotFoundReplaceCountRef.current.count,
+              },
+            )
+            joinNotFoundDiscardedIdRef.current = decision.discardedId
+            if (decision.action === 'replace') {
+              // Ended conversations must not self-heal into a new queued session.
+              if (ended) {
+                failSubscription(error, nextAttempt, false)
+                return
+              }
+              joinNotFoundReplaceCountRef.current = {
+                epoch: connectionEpoch,
+                count: decision.replaceCount,
+              }
+              startedRef.current = false
+              setConversationPublicId(null)
+              trackEvent(decision.telemetry.name, {
+                level: decision.telemetry.level,
+                conversation_external_id: decision.telemetry.conversation_external_id,
+                props: {
+                  ...decision.telemetry.props,
+                  attempts: nextAttempt,
+                  connection_epoch: connectionEpoch,
+                },
+              })
+              return
+            }
+            failSubscription(
+              error,
+              nextAttempt,
+              false,
+              undefined,
+              decision.replaceAttempted ? { replace_attempted: true } : undefined,
+            )
+            return
+          }
+          if (error === 'visitor_session_required') {
+            const alreadyRetried =
+              joinSessionRequiredRetryRef.current?.conversationId === conversationPublicId
+              && joinSessionRequiredRetryRef.current?.token === visitorSessionToken
+            if (!alreadyRetried) {
+              joinSessionRequiredRetryRef.current = {
+                conversationId: conversationPublicId,
+                token: visitorSessionToken,
+              }
+              reconnectWithSession(visitorSessionToken, visitorExternalId)
+              return
+            }
+            failSubscription(error, nextAttempt, false)
+            return
+          }
+          const recoverable = isRecoverableVisitorSessionError(error, {
+            context: 'socket_join',
+            code: error,
+          })
+          if (recoverable) {
+            void recoverVisitorSession({ reconnectSocket: true }).then((token) => {
+              if (cancelled) return
+              if (!token) {
+                failSubscription(
+                  error,
+                  nextAttempt,
+                  true,
+                  sessionRecoveryFailureRef.current,
+                )
+                return
+              }
+              trackEvent('conversation_subscription_recovered', {
+                level: 'warn',
+                conversation_external_id: conversationPublicId,
+                props: {
+                  error,
+                  attempts: nextAttempt,
+                  connection_epoch: connectionEpoch,
+                  recoverable: true,
+                },
+              })
+            })
+            return
+          }
           if (
             permanentErrors.has(error)
             || nextAttempt >= CONVERSATION_JOIN_RETRY_DELAYS_MS.length
           ) {
-            setConversationSubscriptionStatus('degraded')
-            trackEvent('conversation_subscription_failed', {
-              level: 'error',
-              conversation_external_id: conversationPublicId,
-              props: {
-                error,
-                attempts: nextAttempt,
-                connection_epoch: connectionEpoch,
-              },
-            })
+            failSubscription(error, nextAttempt, false)
             return
           }
 
@@ -2312,10 +2600,16 @@ export default function VisitorChatPage() {
     connectionEpoch,
     conversationPublicId,
     conversationSubscriptionRetryNonce,
+    ended,
+    fetchPublicMessagesRecovering,
     reconcileConversationMessages,
+    reconnectWithSession,
+    recoverVisitorSession,
+    setConversationPublicId,
     setHasMore,
     socket,
     trackEvent,
+    visitorExternalId,
     visitorSessionToken,
   ])
 
@@ -2379,7 +2673,7 @@ export default function VisitorChatPage() {
         conversation_external_id: convertedConversationPublicId,
         props: { status: data.status || 'active' },
       })
-      fetchPublicMessages({
+      fetchPublicMessagesRecovering({
         conversationPublicId: convertedConversationPublicId,
         visitorSessionToken,
         limit: 50,
@@ -2404,6 +2698,7 @@ export default function VisitorChatPage() {
       socket.off('offline_message_conversation_created', handler)
     }
   }, [
+    fetchPublicMessagesRecovering,
     offlineMessagePublicId,
     reconcileConversationMessages,
     setConversationPublicId,
@@ -2457,16 +2752,19 @@ export default function VisitorChatPage() {
     setLoadingMore(true)
     try {
       if (offlineMessagePublicId && !conversationPublicId) {
-        const data = await fetchOfflineMessages({
-          offlineMessagePublicId,
-          visitorSessionToken,
-          beforeId: oldest.id,
-          limit: 50,
-        })
+        const data = await withVisitorSessionRecovery(
+          (token) => fetchOfflineMessages({
+            offlineMessagePublicId,
+            visitorSessionToken: token,
+            beforeId: oldest.id,
+            limit: 50,
+          }),
+          { visitorSessionToken, recoverVisitorSession },
+        )
         prependMessages(data.messages.map(mapPublicMessage))
         setHasMore(data.has_more)
       } else if (conversationPublicId) {
-        const data = await fetchPublicMessages({
+        const data = await fetchPublicMessagesRecovering({
           conversationPublicId,
           visitorSessionToken,
           beforeId: oldest.id,
@@ -2488,6 +2786,8 @@ export default function VisitorChatPage() {
     hasMore,
     messages,
     prependMessages,
+    fetchPublicMessagesRecovering,
+    recoverVisitorSession,
     setHasMore,
   ])
 
@@ -2750,7 +3050,9 @@ export default function VisitorChatPage() {
           onQueueLeaveMessage={handleQueueLeaveMessage}
           onHandoffQueueFullContinueBot={handleHandoffQueueFullContinueBot}
           onHandoffLeaveMessage={handleHandoffLeaveMessage}
+          onLeaveMessageHoursOpen={handleLeaveMessageHoursOpen}
           onHandoffQueueFull={handleHandoffQueueFull}
+          onRecoverVisitorSession={recoverVisitorSession}
           onConversationStatusChange={setConversationStatus}
           onCurrentQueueCountChange={setCurrentQueueCount}
           onOfflineMessageCreated={handleOfflineMessageCreated}
@@ -2838,7 +3140,9 @@ export default function VisitorChatPage() {
             onQueueLeaveMessage={handleQueueLeaveMessage}
             onHandoffQueueFullContinueBot={handleHandoffQueueFullContinueBot}
             onHandoffLeaveMessage={handleHandoffLeaveMessage}
+            onLeaveMessageHoursOpen={handleLeaveMessageHoursOpen}
             onHandoffQueueFull={handleHandoffQueueFull}
+            onRecoverVisitorSession={recoverVisitorSession}
             onConversationStatusChange={setConversationStatus}
             onCurrentQueueCountChange={setCurrentQueueCount}
             onOfflineMessageCreated={handleOfflineMessageCreated}

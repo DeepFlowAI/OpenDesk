@@ -2,15 +2,21 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import and_, desc, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.models.call_record import CallRecord
-from app.models.call_record_access_scope import CallRecordAccessScope
-
 
 class CallRecordRepository:
+    @staticmethod
+    async def lock_creation(db: AsyncSession, tenant_id: int, call_id: str) -> None:
+        """Serialize creation even before a call record exists across workers."""
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"call-record:{tenant_id}:{call_id}"},
+        )
+
     @staticmethod
     async def get_by_id_unscoped(db: AsyncSession, record_id: int) -> CallRecord | None:
         return await db.get(CallRecord, record_id)
@@ -19,6 +25,34 @@ class CallRecordRepository:
     async def lock_by_id(db: AsyncSession, record_id: int) -> CallRecord | None:
         query = select(CallRecord).where(CallRecord.id == record_id).with_for_update()
         return (await db.execute(query)).scalar_one_or_none()
+
+    @staticmethod
+    async def list_finalization_retry_candidate_ids(
+        db: AsyncSession,
+        *,
+        pending_before: datetime,
+        failed_before: datetime,
+        limit: int,
+    ) -> list[int]:
+        query = (
+            select(CallRecord.id)
+            .where(
+                CallRecord.lifecycle_status == "ended",
+                or_(
+                    and_(
+                        CallRecord.finalization_status == "pending",
+                        CallRecord.updated_at <= pending_before,
+                    ),
+                    and_(
+                        CallRecord.finalization_status == "failed",
+                        CallRecord.updated_at <= failed_before,
+                    ),
+                ),
+            )
+            .order_by(CallRecord.updated_at.asc(), CallRecord.id.asc())
+            .limit(limit)
+        )
+        return list((await db.execute(query)).scalars().all())
 
     @staticmethod
     async def get_by_id(
@@ -54,30 +88,32 @@ class CallRecordRepository:
     async def get_latest_active_for_agent(
         db: AsyncSession, tenant_id: int, agent_id: int
     ) -> CallRecord | None:
-        access_exists = (
-            select(CallRecordAccessScope.id)
-            .where(
-                CallRecordAccessScope.call_record_id == CallRecord.id,
-                CallRecordAccessScope.tenant_id == tenant_id,
-                CallRecordAccessScope.subject_type == "employee",
-                CallRecordAccessScope.subject_id == agent_id,
-            )
-            .exists()
-        )
+        # Only the agent currently holding the call. Agents who served it
+        # earlier (e.g. transferred it away) keep record access but must not
+        # be treated as still in the call.
         query = (
             select(CallRecord)
             .where(
                 CallRecord.tenant_id == tenant_id,
                 CallRecord.lifecycle_status == "active",
                 or_(
-                    CallRecord.initiator_agent_id == agent_id,
                     CallRecord.last_serving_agent_id == agent_id,
-                    access_exists,
+                    and_(
+                        CallRecord.last_serving_agent_id.is_(None),
+                        CallRecord.initiator_agent_id == agent_id,
+                    ),
                 ),
             )
             .order_by(desc(CallRecord.started_at))
             .limit(1)
         )
+        return (await db.execute(query)).scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_call_id_unscoped(
+        db: AsyncSession, call_id: str
+    ) -> CallRecord | None:
+        query = select(CallRecord).where(CallRecord.call_id == call_id)
         return (await db.execute(query)).scalar_one_or_none()
 
     @staticmethod

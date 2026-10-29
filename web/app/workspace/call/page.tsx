@@ -20,6 +20,7 @@ import {
   IconArrowLeft,
   IconCheck,
   IconChevronDown,
+  IconChevronRight,
   IconClipboardList,
   IconDownload,
   IconMessage,
@@ -202,6 +203,43 @@ export default function CallWorkspacePage() {
   const { data: currentDevice } = useMyCurrentCallDevice()
   const resetStatus = useResetAgentStatus()
   const [statusDropdownOpen, setStatusDropdownOpen] = useState(false)
+  // Per call, so ending a call or opening its history keeps the fold from the live panel.
+  // A call id with no entry stays folded, which is also how a new call starts.
+  const [factsOpenByCallId, setFactsOpenByCallId] = useState<Record<string, boolean>>({})
+  const [transcriptContentByKey, setTranscriptContentByKey] = useState<
+    Record<string, boolean | null>
+  >({})
+  const reportTranscriptContent = useCallback((key: string, hasContent: boolean | null) => {
+    setTranscriptContentByKey((prev) =>
+      prev[key] === hasContent ? prev : { ...prev, [key]: hasContent },
+    )
+  }, [])
+  const [ringingTranscriptShown, setRingingTranscriptShown] = useState(false)
+  const reportRingingTranscriptShown = useCallback((shown: boolean) => {
+    setRingingTranscriptShown(shown)
+  }, [])
+  useEffect(() => {
+    setRingingTranscriptShown(false)
+  }, [screenPopIncoming?.call_id])
+  // One call can be known by the screen-pop id and the CDR id. Copy a toggle
+  // across those ids so history opened after hangup reads the same fold.
+  useEffect(() => {
+    const ids = [
+      screenPopIncoming?.call_id,
+      screenPopIncoming?.source_call_id,
+      currentRecord?.call_id,
+    ].filter((id): id is string => !!id)
+    if (ids.length < 2) return
+    setFactsOpenByCallId((prev) => {
+      const known = ids.find((id) => Object.prototype.hasOwnProperty.call(prev, id))
+      if (!known) return prev
+      const value = prev[known]
+      if (ids.every((id) => prev[id] === value)) return prev
+      const next = { ...prev }
+      for (const id of ids) next[id] = value
+      return next
+    })
+  }, [screenPopIncoming?.call_id, screenPopIncoming?.source_call_id, currentRecord?.call_id])
   const [callCenterNoticeDismissed, setCallCenterNoticeDismissed] = useState(false)
   const statusDropdownRef = useRef<HTMLDivElement>(null)
   const canCreateTicket = hasPermission(currentUser, 'ticket.workspace.create')
@@ -312,6 +350,17 @@ export default function CallWorkspacePage() {
         selectedRecord.call_id === screenPopIncoming.call_id
       ),
   )
+  // Once the screen-pop call has ended, its facts come from the call record:
+  // the recording and ring duration only exist there.
+  // Consult/conference legs keep the live panel, which hides the bot part of
+  // the customer's call.
+  const endedCallRecord =
+    !isViewingHistory &&
+    (phase === 'wrap_up' || phase === 'idle') &&
+    screenPopIncoming?.call_type !== 'internal_consult' &&
+    screenPopIncoming?.call_type !== 'internal_conference'
+      ? currentRecord
+      : null
   const viewingHistoryDuringLiveCall =
     isViewingHistory &&
     !!screenPopIncoming?.call_id &&
@@ -319,6 +368,68 @@ export default function CallWorkspacePage() {
       phase === 'incoming' ||
       phase === 'wrap_up' ||
       phase === 'outbound_ringing')
+  // Fold the field grid once the conversation column is on screen. Ringing
+  // without a bot transcript keeps the fields open.
+  const liveTranscriptVisible =
+    !isViewingHistory &&
+    !!screenPopIncoming?.call_id &&
+    (phase === 'on_call' ||
+      phase === 'wrap_up' ||
+      phase === 'idle' ||
+      (phase === 'incoming' && ringingTranscriptShown))
+  // History of the call still on the screen pop keeps that call's fold state.
+  const viewingRetainedHistory =
+    isViewingHistory &&
+    screenPopMatchesRecordCall(selectedRecord?.call_id, screenPopIncoming)
+  const liveFactsCallId = screenPopIncoming?.call_id ?? null
+  const historyFactsCallId = selectedRecord?.call_id ?? null
+  // The ended call's transcript keeps feeding the live fold state.
+  const reportEndedCallTranscript = useCallback(
+    (_recordId: string, hasContent: boolean | null) => {
+      if (liveFactsCallId) reportTranscriptContent(liveFactsCallId, hasContent)
+    },
+    [liveFactsCallId, reportTranscriptContent],
+  )
+  // Facts stay open until the call turns out to have conversation lines; an
+  // explicit toggle by the agent always wins.
+  const liveHasTranscript = liveFactsCallId ? transcriptContentByKey[liveFactsCallId] : undefined
+  const historyHasTranscript = selectedRecord
+    ? transcriptContentByKey[selectedRecord.public_id]
+    : undefined
+  const liveFactsOpen = liveFactsCallId
+    ? (factsOpenByCallId[liveFactsCallId] ?? liveHasTranscript !== true)
+    : false
+  const historyFactsStored = historyFactsCallId ? factsOpenByCallId[historyFactsCallId] : undefined
+  const historyFactsOpen =
+    historyFactsStored ?? (viewingRetainedHistory ? liveFactsOpen : historyHasTranscript !== true)
+  const callFactsCollapsed = liveTranscriptVisible && !liveFactsOpen
+  const shownFactsCollapsed = isViewingHistory ? !historyFactsOpen : callFactsCollapsed
+  const factsToggleVisible = isViewingHistory || liveTranscriptVisible
+  const callFactsSummary = formatCallFactsSummary({
+    incoming: screenPopIncoming,
+    duration: screenPopDurationLabel,
+    inboundType: callTypeInboundLabel,
+    inboundNumber: isAutoOutbound
+      ? autoOutboundUserNumber
+      : (screenPopIncoming?.from || '未知号码'),
+  })
+  const shownFactsSummary =
+    isViewingHistory && !viewingRetainedHistory && selectedRecord
+      ? formatEndedCallFactsSummary(selectedRecord)
+      : callFactsSummary
+  const toggleCallFacts = () => {
+    const ids = isViewingHistory && !viewingRetainedHistory
+      ? [historyFactsCallId]
+      : [liveFactsCallId, screenPopIncoming?.source_call_id, currentRecord?.call_id, historyFactsCallId]
+    const nextOpen = !(isViewingHistory ? historyFactsOpen : liveFactsOpen)
+    setFactsOpenByCallId((prev) => {
+      const next = { ...prev }
+      for (const id of ids) {
+        if (id) next[id] = nextOpen
+      }
+      return next
+    })
+  }
 
   const embeddedPagesQuery = useWorkspaceEmbeddedPages('call_screen_pop')
   const embeddedPages = useMemo(() => embeddedPagesQuery.data?.items ?? [], [embeddedPagesQuery.data?.items])
@@ -685,6 +796,7 @@ export default function CallWorkspacePage() {
                       </span>
                     ) : null}
                   </span>
+                  {r.call_source === 'embedded_call' && <EmbeddedCallTag />}
                   <span className="ml-auto shrink-0 text-xs text-muted-foreground">
                     {formatRelative(r.started_at)}
                   </span>
@@ -1101,10 +1213,34 @@ export default function CallWorkspacePage() {
               {/* Full column height; 实时对话 flex-grows to the bottom. */}
               <section className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-white p-5 xl:h-full">
                 <div className="mb-3 flex shrink-0 items-center justify-between gap-2 border-b border-border pb-2">
-                  <h3 className="flex items-center gap-2 text-sm font-semibold">
-                    <IconPhone size={16} className="text-muted-foreground" />
-                    通话信息
-                  </h3>
+                  {factsToggleVisible ? (
+                    <button
+                      type="button"
+                      aria-expanded={!shownFactsCollapsed}
+                      onClick={toggleCallFacts}
+                      className="-mx-1 flex min-w-0 flex-1 items-center justify-between gap-2 rounded-md px-1 text-left hover:bg-muted/60"
+                    >
+                      <h3 className="flex shrink-0 items-center gap-2 text-sm font-semibold">
+                        <IconPhone size={16} className="text-muted-foreground" />
+                        通话信息
+                      </h3>
+                      <span className="flex min-w-0 items-center gap-2">
+                        {shownFactsCollapsed && (
+                          <span className="truncate text-xs text-muted-foreground">{shownFactsSummary}</span>
+                        )}
+                        {shownFactsCollapsed ? (
+                          <IconChevronRight size={16} className="shrink-0 text-muted-foreground" />
+                        ) : (
+                          <IconChevronDown size={16} className="shrink-0 text-muted-foreground" />
+                        )}
+                      </span>
+                    </button>
+                  ) : (
+                    <h3 className="flex items-center gap-2 text-sm font-semibold">
+                      <IconPhone size={16} className="text-muted-foreground" />
+                      通话信息
+                    </h3>
+                  )}
                   {viewingHistoryDuringLiveCall && (
                     <button
                       type="button"
@@ -1117,14 +1253,32 @@ export default function CallWorkspacePage() {
                 </div>
                 {isViewingHistory ? (
                   <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-                    <HistoryDetail recordId={selectedRecord!.public_id} />
+                    <HistoryDetail
+                      recordId={selectedRecord!.public_id}
+                      factsOpen={historyFactsOpen}
+                      onTranscriptContentChange={reportTranscriptContent}
+                    />
+                  </div>
+                ) : endedCallRecord ? (
+                  <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                    <HistoryDetail
+                      recordId={endedCallRecord.public_id}
+                      factsOpen={!callFactsCollapsed}
+                      onTranscriptContentChange={reportEndedCallTranscript}
+                    />
                   </div>
                 ) : (
                   <>
-                    <div className="shrink-0">
+                    {!callFactsCollapsed && <div className="shrink-0">
                       {screenPopIncoming?.direction === 'outbound' ? (
                         <dl className="grid grid-cols-2 gap-y-2 text-sm">
-                          <Dt>通话类型</Dt><Dd>呼出</Dd>
+                          <Dt>通话类型</Dt>
+                          <Dd>
+                            呼出
+                            {(records?.items ?? []).some(
+                              (r) => r.call_id === screenPopIncoming?.call_id && r.call_source === 'embedded_call',
+                            ) && <EmbeddedCallTag className="ml-1.5" />}
+                          </Dd>
                           <Dt>外呼号码</Dt><Dd>{screenPopIncoming?.from || '—'}</Dd>
                           <Dt>被叫号码</Dt><Dd>{screenPopIncoming?.to || '—'}</Dd>
                           <Dt>通话时长</Dt><Dd>{screenPopDurationLabel}</Dd>
@@ -1203,14 +1357,27 @@ export default function CallWorkspacePage() {
                           </Dd>
                         </dl>
                       )}
-                    </div>
+                    </div>}
                     {screenPopIncoming?.call_id &&
-                      (phase === 'on_call' || phase === 'wrap_up' || phase === 'idle') && (
+                      (phase === 'incoming' ||
+                        phase === 'on_call' ||
+                        phase === 'wrap_up' ||
+                        phase === 'idle') && (
                         <CallTranscriptPanel
                           callId={screenPopIncoming.call_id}
                           live={phase === 'on_call'}
+                          ringing={phase === 'incoming'}
+                          hideBot={
+                            screenPopIncoming.call_type === 'internal_consult' ||
+                            screenPopIncoming.call_type === 'internal_conference'
+                          }
                           fallbackRecordId={currentRecord?.public_id}
                           sourceCallId={screenPopIncoming.source_call_id}
+                          flushTop={callFactsCollapsed}
+                          onShownChange={reportRingingTranscriptShown}
+                          onContentChange={(hasContent) =>
+                            reportTranscriptContent(screenPopIncoming.call_id, hasContent)
+                          }
                         />
                       )}
                   </>
@@ -1366,6 +1533,14 @@ export default function CallWorkspacePage() {
   )
 }
 
+function EmbeddedCallTag({ className }: { className?: string }) {
+  return (
+    <span className={cn('shrink-0 rounded bg-info/10 px-1.5 py-0.5 text-[10px] font-medium text-info', className)}>
+      嵌入式
+    </span>
+  )
+}
+
 function Field({
   label, value, strong, color,
 }: {
@@ -1380,6 +1555,66 @@ function Field({
       <p className={`${strong ? 'font-bold' : ''} ${color ?? 'text-foreground'}`}>{value}</p>
     </div>
   )
+}
+
+/** Ended-call history shares the screen pop's fold state when it is the same call. */
+function screenPopMatchesRecordCall(
+  recordCallId: string | null | undefined,
+  incoming: { call_id?: string | null; source_call_id?: string | null } | null | undefined,
+): boolean {
+  if (!recordCallId || !incoming) return false
+  return (
+    recordCallId === incoming.call_id ||
+    (!!incoming.source_call_id && recordCallId === incoming.source_call_id)
+  )
+}
+
+function formatEndedCallFactsSummary(record: {
+  direction: 'inbound' | 'outbound'
+  customer_number: string | null
+  service_number: string | null
+  customer_agent_talk_duration_ms: number | null
+}): string {
+  const kind = record.direction === 'inbound' ? '呼入' : '呼出'
+  const number = callRecordCustomerNumber(record) || '未知号码'
+  return [kind, number, formatDuration(record.customer_agent_talk_duration_ms)].join(' · ')
+}
+
+function formatCallFactsSummary({
+  incoming,
+  duration,
+  inboundType,
+  inboundNumber,
+}: {
+  incoming: {
+    direction?: string | null
+    call_type?: string | null
+    from?: string | null
+    to?: string | null
+    customer_from?: string | null
+  } | null
+  duration: string
+  inboundType: string
+  inboundNumber: string
+}): string {
+  if (!incoming) return duration
+  if (incoming.direction === 'outbound') {
+    return ['呼出', incoming.to || incoming.from || '—', duration].join(' · ')
+  }
+  if (
+    incoming.call_type === 'internal_consult' ||
+    incoming.call_type === 'internal_transfer' ||
+    incoming.call_type === 'internal_conference'
+  ) {
+    const kind =
+      incoming.call_type === 'internal_transfer'
+        ? '转接'
+        : incoming.call_type === 'internal_conference'
+          ? '会议'
+          : '咨询'
+    return [kind, incoming.customer_from || '未知号码', duration].join(' · ')
+  }
+  return [inboundType, inboundNumber, duration].join(' · ')
 }
 
 function Dt({ children }: { children: React.ReactNode }) {
@@ -1422,23 +1657,58 @@ function CallWorkspaceEmptyState() {
   )
 }
 
-function HistoryDetail({ recordId }: { recordId: string }) {
+function HistoryDetail({
+  recordId,
+  factsOpen,
+  onTranscriptContentChange,
+}: {
+  recordId: string
+  factsOpen: boolean
+  onTranscriptContentChange: (recordId: string, hasContent: boolean | null) => void
+}) {
   const { data: record, isLoading, refetch } = useCallRecord(recordId)
+  const reportContent = useCallback(
+    (hasContent: boolean | null) => onTranscriptContentChange(recordId, hasContent),
+    [onTranscriptContentChange, recordId],
+  )
   const playableRecording = selectDisplayRecording(record?.recordings)
 
-  // Recording file may land a few seconds after hangup.
+  // Recording file may land a few seconds after hangup, and a record fetched
+  // right at hangup may not be finalized yet.
+  const hasRecord = Boolean(record)
+  const lifecycleStatus = record?.lifecycle_status
+  const endedAtIso = record?.ended_at
   useEffect(() => {
-    if (!record || playableRecording || record.lifecycle_status !== 'ended') return
-    const endedAt = record.ended_at ? new Date(record.ended_at).getTime() : 0
-    if (!endedAt || Date.now() - endedAt > 60_000) return
+    if (!hasRecord || playableRecording) return
+    const endedAt = endedAtIso ? new Date(endedAtIso).getTime() : 0
+    if (lifecycleStatus === 'ended' && (!endedAt || Date.now() - endedAt > 60_000)) return
+    let polls = 0
     const timer = window.setInterval(() => {
+      polls += 1
+      if (polls > 20) {
+        window.clearInterval(timer)
+        return
+      }
       void refetch()
     }, 3000)
     return () => window.clearInterval(timer)
-  }, [playableRecording, record, refetch])
+  }, [endedAtIso, hasRecord, lifecycleStatus, playableRecording, refetch])
+
+  if (!factsOpen) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        <CallTranscriptHistory recordId={recordId} flushTop onContentChange={reportContent} />
+      </div>
+    )
+  }
 
   if (isLoading || !record) {
-    return <p className="py-4 text-sm text-muted-foreground">加载中...</p>
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        <p className="py-4 text-sm text-muted-foreground">加载中...</p>
+        <CallTranscriptHistory recordId={recordId} onContentChange={reportContent} />
+      </div>
+    )
   }
 
   const started = record.started_at ? new Date(record.started_at) : null
@@ -1446,44 +1716,56 @@ function HistoryDetail({ recordId }: { recordId: string }) {
   const customerNumber = callRecordCustomerNumber(record)
   const serviceNumber = callRecordServiceNumber(record)
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4">
-      <section className="shrink-0">
-        <h4 className="mb-2 text-xs font-semibold text-foreground/70">通话录音</h4>
-        {playableRecording?.access_url ? (
-          <div className="flex items-center gap-2">
-            <audio src={playableRecording.access_url} controls className="min-w-0 flex-1" />
-            <a
-              href={playableRecording.access_url}
-              download
-              className="shrink-0 rounded-md border border-border p-2 hover:bg-muted"
-            >
-              <IconDownload size={16} />
-            </a>
-          </div>
-        ) : (
-          <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
-            <IconMicrophoneOff size={16} />
-            <span>暂无通话录音</span>
-          </div>
-        )}
-      </section>
-      <dl className="grid shrink-0 grid-cols-2 gap-y-2 text-sm">
-        <Dt>通话类型</Dt><Dd>{record.direction === 'inbound' ? '呼入' : '呼出'}</Dd>
-        <Dt>用户号码</Dt><Dd>{customerNumber || '—'}</Dd>
-        <Dt>服务号码</Dt><Dd>{serviceNumber || '—'}</Dd>
-        <Dt>通话时长</Dt><Dd>{formatDuration(record.customer_agent_talk_duration_ms)}</Dd>
-        <Dt>客户响铃时长</Dt>
-        <Dd>{formatDuration(record.customer_ring_duration_ms)}</Dd>
-        <Dt>来电时间</Dt><Dd>{started ? started.toLocaleString() : '—'}</Dd>
-        <Dt>结束时间</Dt><Dd>{ended ? ended.toLocaleString() : '—'}</Dd>
-        <Dt>接听坐席</Dt><Dd>{record.last_serving_agent_name || '—'}</Dd>
-        <Dt>状态</Dt><Dd>{formatCallRecordState(record.lifecycle_status)}</Dd>
-        <Dt>挂断原因</Dt><Dd>{formatHangupReason(record.hangup_reason_code) || '—'}</Dd>
-        <Dt>机器人接待</Dt><Dd>{record.actual_reception_type === 'bot' || record.actual_reception_type === 'bot_agent' ? '是' : '—'}</Dd>
-        <Dt>通话 ID</Dt>
-        <Dd><code className="font-mono text-xs">{record.call_id}</code></Dd>
-      </dl>
-      <CallTranscriptHistory recordId={record.public_id} />
+    <div className="flex min-h-0 flex-1 flex-col">
+      {factsOpen && (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <section>
+            <h4 className="mb-2 text-xs font-semibold text-foreground/70">通话录音</h4>
+            {playableRecording?.access_url ? (
+              <div className="flex items-center gap-2">
+                <audio src={playableRecording.access_url} controls className="min-w-0 flex-1" />
+                <a
+                  href={playableRecording.access_url}
+                  download
+                  className="shrink-0 rounded-md border border-border p-2 hover:bg-muted"
+                >
+                  <IconDownload size={16} />
+                </a>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
+                <IconMicrophoneOff size={16} />
+                <span>暂无通话录音</span>
+              </div>
+            )}
+          </section>
+          <dl className="mt-4 grid grid-cols-2 gap-y-2 text-sm">
+            <Dt>通话类型</Dt>
+            <Dd>
+              {record.direction === 'inbound' ? '呼入' : '呼出'}
+              {record.call_source === 'embedded_call' && <EmbeddedCallTag className="ml-1.5" />}
+            </Dd>
+            <Dt>用户号码</Dt><Dd>{customerNumber || '—'}</Dd>
+            <Dt>服务号码</Dt><Dd>{serviceNumber || '—'}</Dd>
+            <Dt>通话时长</Dt><Dd>{formatDuration(record.customer_agent_talk_duration_ms)}</Dd>
+            <Dt>客户响铃时长</Dt>
+            <Dd>{formatDuration(record.customer_ring_duration_ms)}</Dd>
+            <Dt>来电时间</Dt><Dd>{started ? started.toLocaleString() : '—'}</Dd>
+            <Dt>结束时间</Dt><Dd>{ended ? ended.toLocaleString() : '—'}</Dd>
+            <Dt>接听坐席</Dt><Dd>{record.last_serving_agent_name || '—'}</Dd>
+            <Dt>状态</Dt><Dd>{formatCallRecordState(record.lifecycle_status)}</Dd>
+            <Dt>挂断原因</Dt><Dd>{formatHangupReason(record.hangup_reason_code) || '—'}</Dd>
+            <Dt>机器人接待</Dt><Dd>{record.actual_reception_type === 'bot' || record.actual_reception_type === 'bot_agent' ? '是' : '—'}</Dd>
+            <Dt>通话 ID</Dt>
+            <Dd><code className="font-mono text-xs">{record.call_id}</code></Dd>
+          </dl>
+        </div>
+      )}
+      <CallTranscriptHistory
+        recordId={record.public_id}
+        flushTop={!factsOpen}
+        onContentChange={reportContent}
+      />
     </div>
   )
 }

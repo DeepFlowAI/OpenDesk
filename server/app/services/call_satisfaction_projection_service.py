@@ -75,6 +75,12 @@ class CallSatisfactionProjectionService:
                 "satisfaction_projected_at": now,
             }
         await CallRecordRepository.update(db, record, patch, commit=False)
+        if execution is not None:
+            from app.services.call_event_publisher import CallEventPublisher
+
+            await CallEventPublisher.publish_satisfaction_completed(
+                db, record, execution, first
+            )
         await db.commit()
         return True
 

@@ -1,285 +1,130 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useEffect, useState, type ReactNode } from 'react'
 import { IconArrowDown, IconArrowUp, IconSearch } from '@tabler/icons-react'
+import { useRouter } from 'next/navigation'
 import { EmployeeAvatar } from '@/app/components/features/session-reports/employee-avatar'
+import { useAuthStore } from '@/context/auth-store'
 import { useLocaleStore } from '@/context/locale-store'
 import { cn } from '@/lib/utils'
-import { useCallReportsEmployees } from '@/service/use-call-reports'
-import { formatDuration } from '@/utils/format-duration'
+import type { CallAgentOverviewMetrics, CallAgentOverviewRow, CallAgentSortField } from '@/models/call-agent-report'
+import type { CallEmployeeListExportState } from '@/models/call-report-export'
+import type { SortOrder } from '@/models/call-report'
+import type { CallMetricFormat } from '@/models/call-report-overall'
+import { useCallAgentList } from '@/service/use-call-agent-reports'
+import { useEmployeeGroups } from '@/service/use-employee-groups'
 import { t } from '@/utils/i18n'
-import type {
-  CallEmployeeOverviewRow,
-  CallEmployeeSortField,
-  CallOverviewMetrics,
-  SortOrder,
-} from '@/models/call-report'
-
-type Props = {
-  start: string
-  end: string
-  carriedSearch: string
-  onListStateChange?: (state: {
-    q: string
-    sort: CallEmployeeSortField
-    order: SortOrder
-    loading: boolean
-  }) => void
-}
-
-type MetricColumn = {
-  key: Exclude<CallEmployeeSortField, 'name'>
-  labelKey: string
-  width: string
-  duration?: boolean
-}
+import { getDataScope } from '@/utils/permissions'
+import { CallEmployeeHistoryUnavailable, CallEmployeeReportNotices } from './employees/employee-report-notices'
+import { callMetricLabel, formatCallMetric } from './overall/metric-format'
 
 const PER_PAGE_OPTIONS = [20, 50, 100]
-
-const METRIC_COLUMNS: MetricColumn[] = [
-  { key: 'total_calls', labelKey: 'ws.records.callReports.overview.totalCalls', width: 'w-[70px]' },
-  { key: 'inbound_calls', labelKey: 'ws.records.callReports.overview.inboundCalls', width: 'w-[70px]' },
-  { key: 'answered_inbound_calls', labelKey: 'ws.records.callReports.overview.answeredInboundCalls', width: 'w-[98px]' },
-  { key: 'outbound_calls', labelKey: 'ws.records.callReports.overview.outboundCalls', width: 'w-[70px]' },
-  { key: 'answered_outbound_calls', labelKey: 'ws.records.callReports.overview.answeredOutboundCalls', width: 'w-[98px]' },
-  { key: 'avg_inbound_talk_seconds', labelKey: 'ws.records.callReports.overview.avgInboundTalkTime', width: 'w-[112px]', duration: true },
-  { key: 'avg_outbound_talk_seconds', labelKey: 'ws.records.callReports.overview.avgOutboundTalkTime', width: 'w-[112px]', duration: true },
+const COLUMNS: Array<{ key: CallAgentSortField; format: CallMetricFormat }> = [
+  { key: 'participated_call_count', format: 'integer' }, { key: 'handled_call_count', format: 'integer' },
+  { key: 'reception_segment_count', format: 'integer' }, { key: 'inbound_handled_call_count', format: 'integer' },
+  { key: 'outbound_attempt_count', format: 'integer' }, { key: 'outbound_customer_answered_count', format: 'integer' },
+  { key: 'offer_accept_rate', format: 'percent' }, { key: 'avg_talk_seconds', format: 'duration_seconds' },
+  { key: 'avg_handle_seconds', format: 'duration_seconds' }, { key: 'transfer_completed_count', format: 'integer' },
 ]
 
-export function CallEmployeesTable({ start, end, carriedSearch, onListStateChange }: Props) {
+export function CallEmployeesTable({ start, end, carriedSearch, enabled, onStateChange }: {
+  start: string; end: string; carriedSearch: string; enabled: boolean
+  onStateChange?: (state: { loading: boolean; asOf: string | null; exportParams: CallEmployeeListExportState }) => void
+}) {
   const { locale } = useLocaleStore()
+  const user = useAuthStore((state) => state.user)
   const router = useRouter()
-
+  const scope = getDataScope(user, 'call_record')
   const [search, setSearch] = useState('')
-  const [committedQ, setCommittedQ] = useState('')
-  const [sort, setSort] = useState<CallEmployeeSortField>('total_calls')
+  const [q, setQ] = useState('')
+  const [groupId, setGroupId] = useState(0)
+  const [status, setStatus] = useState('')
+  const [sort, setSort] = useState<CallAgentSortField>('handled_call_count')
   const [order, setOrder] = useState<SortOrder>('desc')
   const [page, setPage] = useState(1)
   const [perPage, setPerPage] = useState(20)
-
-  const { data, isLoading, isFetching } = useCallReportsEmployees({
-    start,
-    end,
-    q: committedQ || undefined,
-    sort,
-    order,
-    page,
-    per_page: perPage,
-  })
+  const groupsQuery = useEmployeeGroups({ per_page: 200, member_id: scope === 'group' ? user?.id : undefined })
+  const query = useCallAgentList({ start, end, q, groupId: groupId || undefined, status: status || undefined,
+    sort, order, page, perPage, enabled })
+  const data = query.data
+  const hasFilters = Boolean(q || groupId || status)
 
   useEffect(() => {
-    onListStateChange?.({
-      q: committedQ,
-      sort,
-      order,
-      loading: isFetching,
+    onStateChange?.({
+      loading: query.isFetching,
+      asOf: data?.as_of ?? null,
+      exportParams: { q: q || undefined, group_id: groupId || undefined, status: status || undefined, sort, order },
     })
-  }, [committedQ, isFetching, onListStateChange, order, sort])
+  }, [data?.as_of, groupId, onStateChange, order, q, query.isFetching, sort, status])
+  useEffect(() => { if (data && page > data.pages) setPage(Math.max(1, data.pages)) }, [data, page])
 
-  const items = data?.items ?? []
-  const total = data?.total ?? 0
-  const pages = data?.pages ?? 1
-  const tail = carriedSearch ? `?${carriedSearch.replace(/^\?/, '')}` : ''
-
-  const commitSearch = () => {
-    setCommittedQ(search.trim())
+  const commitSearch = () => { setQ(search.trim()); setPage(1) }
+  const toggleSort = (next: CallAgentSortField) => {
+    if (sort === next) setOrder((value) => value === 'desc' ? 'asc' : 'desc')
+    else { setSort(next); setOrder(next === 'name' || next === 'status' ? 'asc' : 'desc') }
     setPage(1)
   }
-
-  const toggleSort = (nextSort: CallEmployeeSortField) => {
-    if (nextSort === sort) {
-      setOrder(order === 'desc' ? 'asc' : 'desc')
-    } else {
-      setSort(nextSort)
-      setOrder(nextSort === 'name' ? 'asc' : 'desc')
-    }
-    setPage(1)
-  }
-
-  const goToDetail = (row: CallEmployeeOverviewRow) => {
-    const selectedText = window.getSelection()?.toString()
-    if (selectedText) return
+  const goToDetail = (row: CallAgentOverviewRow) => {
+    if (window.getSelection()?.toString()) return
+    const tail = carriedSearch ? `?${carriedSearch.replace(/^\?/, '')}` : ''
     router.push(`/workspace/records/call-reports/employees/${row.employee.id}${tail}`)
   }
 
-  return (
-    <div className="flex flex-col gap-4">
-      <div className="flex h-9 w-full max-w-80 items-center gap-2 rounded-lg border border-border bg-background px-3">
-        <button
-          type="button"
-          onClick={commitSearch}
-          title={t('ws.records.callReports.employees.searchPlaceholder', locale)}
-          className="flex size-5 items-center justify-center text-muted-foreground hover:text-foreground"
-        >
-          <IconSearch size={16} />
-        </button>
-        <input
-          type="search"
-          value={search}
-          onChange={(event) => {
-            const value = event.target.value
-            setSearch(value)
-            if (!value) {
-              setCommittedQ('')
-              setPage(1)
-            }
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') commitSearch()
-          }}
-          onBlur={commitSearch}
-          placeholder={t('ws.records.callReports.employees.searchPlaceholder', locale)}
-          className="min-w-0 flex-1 border-0 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground"
-        />
+  return <div className="flex flex-col gap-4">
+    {data?.coverage.status !== 'unavailable' ? <CallEmployeeReportNotices coverage={data?.coverage} dataQuality={data?.data_quality} /> : null}
+    {scope !== 'self' ? <div className="flex flex-wrap gap-2">
+      <div className="flex h-9 w-full max-w-72 items-center gap-2 rounded-lg border border-border bg-background px-3">
+        <button type="button" onClick={commitSearch} title={t('ws.records.callReports.employees.searchPlaceholder', locale)} className="text-muted-foreground hover:text-foreground"><IconSearch size={16} /></button>
+        <input type="search" value={search} onChange={(event) => { setSearch(event.target.value); if (!event.target.value) { setQ(''); setPage(1) } }}
+          onKeyDown={(event) => { if (event.key === 'Enter') commitSearch() }} onBlur={commitSearch}
+          placeholder={t('ws.records.callReports.employees.searchPlaceholder', locale)} className="min-w-0 flex-1 bg-transparent text-[13px] outline-none" />
       </div>
-
-      <div className="overflow-hidden rounded-lg border border-border">
-        <div className="overflow-x-auto">
-          <div className="flex h-12 min-w-[960px] items-center gap-2 bg-muted/60 px-4 text-xs font-semibold text-muted-foreground">
-            <button
-              type="button"
-              onClick={() => toggleSort('name')}
-              className="flex w-[180px] items-center gap-1 text-left transition-colors hover:text-foreground"
-            >
-              <span>{t('ws.records.callReports.employees.colEmployee', locale)}</span>
-              {sort === 'name' && (
-                order === 'desc' ? <IconArrowDown size={12} /> : <IconArrowUp size={12} />
-              )}
-            </button>
-            <div className="w-[60px] text-center">
-              {t('ws.records.callReports.employees.colStatus', locale)}
-            </div>
-            {METRIC_COLUMNS.map((column) => (
-              <button
-                type="button"
-                key={column.key}
-                onClick={() => toggleSort(column.key)}
-                className={cn(column.width, 'flex items-center justify-center gap-1 transition-colors hover:text-foreground')}
-              >
-                <span className="min-w-0 whitespace-normal text-center leading-tight">
-                  {t(column.labelKey, locale)}
-                </span>
-                {sort === column.key && (
-                  order === 'desc' ? <IconArrowDown size={12} /> : <IconArrowUp size={12} />
-                )}
-              </button>
-            ))}
-          </div>
-
-          {isLoading ? (
-            <div className="min-w-[960px] px-4 py-16 text-center text-sm text-muted-foreground">
-              {t('ws.records.sessionReports.common.loading', locale)}
-            </div>
-          ) : items.length === 0 ? (
-            <div className="min-w-[960px] px-4 py-16 text-center text-sm text-muted-foreground">
-              {committedQ
-                ? t('ws.records.callReports.employees.emptyByQuery', locale)
-                : t('ws.records.callReports.employees.empty', locale)}
-            </div>
-          ) : (
-            items.map((row, index) => (
-              <div
-                key={row.employee.id}
-                role="button"
-                tabIndex={0}
-                onClick={() => goToDetail(row)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') goToDetail(row)
-                }}
-                className={cn(
-                  'flex h-[56px] min-w-[960px] cursor-pointer select-text items-center gap-2 border-b border-border px-4 text-left text-[13px] text-foreground transition-colors last:border-b-0 hover:bg-muted/35',
-                  index % 2 === 1 ? 'bg-muted/20' : 'bg-background'
-                )}
-              >
-                <div className="flex w-[180px] min-w-0 items-center gap-3">
-                  <EmployeeAvatar employee={row.employee} />
-                  <div className="flex min-w-0 flex-col gap-0.5">
-                    <span className="truncate font-semibold text-foreground">
-                      {row.employee.display_name ?? row.employee.name}
-                    </span>
-                    <span className="truncate text-xs text-muted-foreground">
-                      {row.employee.username ?? row.employee.email ?? '—'}
-                    </span>
-                  </div>
-                </div>
-                <div className="w-[60px] text-center">
-                  <span
-                    className={cn(
-                      'inline-flex items-center rounded-md px-2 py-0.5 text-xs',
-                      row.employee.is_active
-                        ? 'bg-success/10 text-success'
-                        : 'bg-muted text-muted-foreground'
-                    )}
-                  >
-                    {row.employee.is_active
-                      ? t('ws.records.callReports.employees.statusActive', locale)
-                      : t('ws.records.callReports.employees.statusInactive', locale)}
-                  </span>
-                </div>
-                {METRIC_COLUMNS.map((column) => (
-                  <div key={column.key} className={cn(column.width, 'text-center')}>
-                    {renderMetric(row.metrics, column)}
-                  </div>
-                ))}
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-
-      <div className="flex min-h-10 flex-wrap items-center justify-between gap-3 text-[13px]">
-        <span className="text-muted-foreground">
-          {t('ws.records.callReports.employees.total', locale, { total })}
-        </span>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            disabled={page <= 1}
-            onClick={() => setPage((current) => Math.max(1, current - 1))}
-            className="h-8 rounded-lg border border-border bg-background px-3 text-xs hover:bg-muted/50 disabled:opacity-50"
-          >
-            {t('ws.records.sessionReports.common.prev', locale)}
-          </button>
-          <span className="text-muted-foreground">
-            {page} / {pages}
-          </span>
-          <button
-            type="button"
-            disabled={page >= pages}
-            onClick={() => setPage((current) => Math.min(pages, current + 1))}
-            className="h-8 rounded-lg border border-border bg-background px-3 text-xs hover:bg-muted/50 disabled:opacity-50"
-          >
-            {t('ws.records.sessionReports.common.next', locale)}
-          </button>
-        </div>
-        <div className="flex items-center gap-2">
-          {PER_PAGE_OPTIONS.map((option) => (
-            <button
-              type="button"
-              key={option}
-              onClick={() => {
-                setPerPage(option)
-                setPage(1)
-              }}
-              className={cn(
-                'h-8 rounded-lg px-3 text-xs transition-colors',
-                perPage === option
-                  ? 'bg-foreground font-semibold text-background'
-                  : 'border border-border bg-background text-muted-foreground hover:text-foreground'
-              )}
-            >
-              {t('ws.records.sessionReports.common.perPage', locale, { n: option })}
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
+      <FilterSelect value={String(groupId)} onChange={(value) => { setGroupId(Number(value)); setPage(1) }}
+        label={t('ws.records.callReports.employees.groupFilter', locale)} options={[
+          ['0', t('ws.records.callReports.employees.groupAll', locale)],
+          ...(groupsQuery.data?.items ?? []).map((group) => [String(group.id), group.name] as [string, string]),
+        ]} />
+      <FilterSelect value={status} onChange={(value) => { setStatus(value); setPage(1) }}
+        label={t('ws.records.callReports.employees.statusFilter', locale)} options={[
+          ['', t('ws.records.callReports.employees.statusAll', locale)],
+          ['active', t('ws.records.callReports.employees.statusActive', locale)],
+          ['inactive', t('ws.records.callReports.employees.statusInactive', locale)],
+          ['deleted', t('ws.records.callReports.employees.statusDeleted', locale)],
+        ]} />
+    </div> : null}
+    {data?.coverage.status === 'unavailable' ? <CallEmployeeHistoryUnavailable effectiveAt={data.coverage.effective_at} />
+      : query.isError && !data ? <TableState message={t('ws.records.callReports.employees.loadFailed', locale)} onRetry={() => query.refetch()} />
+        : <div className="overflow-x-auto rounded-lg border border-border"><table className="min-w-[1760px] border-collapse text-[13px]">
+          <thead><tr className="h-12 bg-muted/60 text-xs font-semibold text-muted-foreground">
+            <SortHead field="name" sort={sort} order={order} onSort={toggleSort} className="sticky left-0 z-20 min-w-56 bg-muted px-4 text-left">{t('ws.records.callReports.employees.colEmployee', locale)}</SortHead>
+            <SortHead field="status" sort={sort} order={order} onSort={toggleSort}>{t('ws.records.callReports.employees.colStatus', locale)}</SortHead>
+            {COLUMNS.map((column) => <SortHead key={column.key} field={column.key} sort={sort} order={order} onSort={toggleSort}>{callMetricLabel(column.key, locale)}</SortHead>)}
+            <th className="sticky right-0 z-20 min-w-28 bg-muted px-4 text-right">{t('ws.records.callReports.employees.colAction', locale)}</th>
+          </tr></thead>
+          <tbody>{query.isLoading ? <tr><td colSpan={13}><TableState message={t('ws.records.sessionReports.common.loading', locale)} /></td></tr>
+            : !data?.items.length ? <tr><td colSpan={13}><TableState message={t(hasFilters ? 'ws.records.callReports.employees.emptyByQuery' : 'ws.records.callReports.employees.empty', locale)} /></td></tr>
+              : data.items.map((row) => <tr key={row.employee.id} tabIndex={0} onClick={() => goToDetail(row)} onKeyDown={(event) => { if (event.key === 'Enter') goToDetail(row) }}
+                className="h-14 cursor-pointer border-t border-border bg-background text-foreground hover:bg-muted/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+                <td className="sticky left-0 z-10 bg-inherit px-4"><div className="flex min-w-0 items-center gap-3"><EmployeeAvatar employee={row.employee} /><div className="min-w-0"><div className="truncate font-semibold">{row.employee.display_name ?? row.employee.name}</div><div className="truncate text-xs text-muted-foreground">{row.employee.status === 'deleted' ? '—' : row.employee.username ?? row.employee.email ?? '—'}</div></div></div></td>
+                <td className="px-3 text-center"><StatusBadge status={row.employee.status} /></td>
+                {COLUMNS.map((column) => <td key={column.key} className="px-3 text-right font-mono tabular-nums">{formatCallMetric(row.metrics[column.key as keyof CallAgentOverviewMetrics] as number | null, column.format, locale)}</td>)}
+                <td className="sticky right-0 z-10 bg-inherit px-4 text-right"><button type="button" onClick={(event) => { event.stopPropagation(); goToDetail(row) }} className="text-primary hover:underline">{t('ws.records.callReports.employees.viewDetail', locale)}</button></td>
+              </tr>)}</tbody>
+        </table></div>}
+    {data?.coverage.status !== 'unavailable' ? <div className="flex min-h-10 flex-wrap items-center justify-between gap-3 text-[13px]">
+      <span className="text-muted-foreground">{t('ws.records.callReports.employees.total', locale, { total: data?.total ?? 0 })}</span>
+      <div className="flex items-center gap-2"><PageButton disabled={page <= 1} onClick={() => setPage((value) => value - 1)} label={t('ws.records.sessionReports.common.prev', locale)} /><span>{page} / {data?.pages ?? 1}</span><PageButton disabled={page >= (data?.pages ?? 1)} onClick={() => setPage((value) => value + 1)} label={t('ws.records.sessionReports.common.next', locale)} /></div>
+      <div className="flex gap-2">{PER_PAGE_OPTIONS.map((option) => <button key={option} type="button" onClick={() => { setPerPage(option); setPage(1) }} className={cn('h-8 rounded-lg px-3 text-xs', perPage === option ? 'bg-foreground font-semibold text-background' : 'border border-border text-muted-foreground')}>{t('ws.records.sessionReports.common.perPage', locale, { n: option })}</button>)}</div>
+    </div> : null}
+  </div>
 }
 
-function renderMetric(metrics: CallOverviewMetrics, column: MetricColumn): string {
-  const value = metrics[column.key]
-  if (column.duration) return formatDuration(value)
-  return typeof value === 'number' ? value.toLocaleString() : '0'
+function FilterSelect({ value, onChange, label, options }: { value: string; onChange: (value: string) => void; label: string; options: [string, string][] }) {
+  return <label className="flex h-9 items-center gap-2 rounded-lg border border-border bg-background px-3 text-xs text-muted-foreground"><span>{label}</span><select value={value} onChange={(event) => onChange(event.target.value)} className="bg-transparent text-foreground outline-none">{options.map(([key, text]) => <option key={key} value={key}>{text}</option>)}</select></label>
 }
+function SortHead({ field, sort, order, onSort, children, className }: { field: CallAgentSortField; sort: CallAgentSortField; order: SortOrder; onSort: (field: CallAgentSortField) => void; children: ReactNode; className?: string }) {
+  return <th className={cn('min-w-32 px-3 text-right', className)}><button type="button" onClick={() => onSort(field)} className="inline-flex items-center gap-1 hover:text-foreground">{children}{sort === field ? order === 'desc' ? <IconArrowDown size={12} /> : <IconArrowUp size={12} /> : null}</button></th>
+}
+function StatusBadge({ status }: { status: CallAgentOverviewRow['employee']['status'] }) { const { locale } = useLocaleStore(); return <span className={cn('inline-flex rounded-md px-2 py-0.5 text-xs', status === 'active' ? 'bg-success/10 text-success' : 'bg-muted text-muted-foreground')}>{t(`ws.records.callReports.employees.status${status[0].toUpperCase()}${status.slice(1)}`, locale)}</span> }
+function TableState({ message, onRetry }: { message: string; onRetry?: () => void }) { const { locale } = useLocaleStore(); return <div className="flex min-h-52 flex-col items-center justify-center gap-3 text-sm text-muted-foreground"><span>{message}</span>{onRetry ? <button type="button" onClick={onRetry} className="h-9 rounded-md bg-primary px-4 text-primary-foreground">{t('ws.records.callReports.overall.retry', locale)}</button> : null}</div> }
+function PageButton({ disabled, onClick, label }: { disabled: boolean; onClick: () => void; label: string }) { return <button type="button" disabled={disabled} onClick={onClick} className="h-8 rounded-lg border border-border px-3 text-xs disabled:opacity-50">{label}</button> }

@@ -9,11 +9,11 @@ import secrets
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import Date, DateTime, Integer, Numeric, Float, select, func, String as SAString, or_, and_, cast
+from sqlalchemy import Date, DateTime, Integer, Numeric, Float, select, func, String as SAString, or_, and_, cast, literal_column
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import EMPTY_GROUP_VALUE
-from app.models.user import User
+from app.models.user import NORMALIZED_PHONE_SQL, User
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,12 @@ def _coerce_filter_value(col, value):
     return value
 
 
+def _is_null_only_empty_column(col) -> bool:
+    """Number and date columns have no empty-string state; treat empty as NULL."""
+    col_type = getattr(col, "type", None)
+    return isinstance(col_type, (Integer, Numeric, Float, Date, DateTime))
+
+
 def _build_condition_clause(col, operator: str, value):
     """Build a single SQLAlchemy filter clause from operator + value."""
     if col is None:
@@ -126,8 +132,14 @@ def _build_condition_clause(col, operator: str, value):
     if op in ("lte", "<="):
         return col <= coerced_value
     if op in ("is_empty", "is_null"):
+        if _is_null_only_empty_column(col):
+            return col.is_(None)
+        # JSON empty-array (`[]`) is not treated as empty; that would change
+        # saved-view semantics. Non-numeric types stay NULL-or-cast-text.
         return or_(col.is_(None), cast(col, SAString) == "")
     if op in ("is_not_empty", "is_not_null"):
+        if _is_null_only_empty_column(col):
+            return col.isnot(None)
         return and_(col.isnot(None), cast(col, SAString) != "")
     if op in ("in",) and isinstance(coerced_value, list):
         return col.in_(coerced_value)
@@ -165,6 +177,25 @@ class UserRepository:
                 User.tenant_id == tenant_id,
                 User.phone.isnot(None),
                 User.phone != "",
+            )
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def list_by_phone_match_keys(
+        db: AsyncSession, tenant_id: int, target_keys: set[str]
+    ) -> list[User]:
+        if not target_keys:
+            return []
+        # Invert the optional prefixes applied by phone_match_keys; do not
+        # recursively expand them, which would introduce additional matches.
+        numbers = set(target_keys)
+        numbers.update("86" + key for key in target_keys if len(key) == 11)
+        numbers.update("1" + key for key in target_keys if len(key) == 10)
+        result = await db.execute(
+            select(User).where(
+                User.tenant_id == tenant_id,
+                literal_column(NORMALIZED_PHONE_SQL).in_(sorted(numbers)),
             )
         )
         return list(result.scalars().all())
@@ -321,6 +352,8 @@ class UserRepository:
         sort_order: str = "desc",
         page: int = 1,
         per_page: int = 20,
+        ids_only: bool = False,
+        include_count: bool = True,
     ) -> tuple[list[User], int]:
         """
         Query users with combined system-view filters + temp filters.
@@ -359,19 +392,22 @@ class UserRepository:
                 else:
                     base_where.append(col == group_value)
 
-        count_q = select(func.count()).select_from(User).where(*base_where)
-        total = (await db.execute(count_q)).scalar_one()
+        total = 0
+        if include_count:
+            count_q = select(func.count()).select_from(User).where(*base_where)
+            total = (await db.execute(count_q)).scalar_one()
 
         order_col = getattr(User, sort_by, None) if sort_by else User.created_at
         if order_col is None:
             order_col = User.created_at
         order_expr = order_col.desc() if sort_order == "desc" else order_col.asc()
+        id_expr = User.id.desc() if sort_order == "desc" else User.id.asc()
 
         offset = (page - 1) * per_page
         data_q = (
-            select(User)
+            select(User.id if ids_only else User)
             .where(*base_where)
-            .order_by(order_expr)
+            .order_by(order_expr, id_expr)
             .offset(offset)
             .limit(per_page)
         )

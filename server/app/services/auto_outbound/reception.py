@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -20,7 +21,10 @@ from app.db.session import AsyncSessionLocal
 from app.enums import QueueType
 from app.repositories.auto_outbound_repository import AutoOutboundRepository
 from app.services.auto_outbound import frequency as freq
+from app.services.auto_outbound.call_variables import build_call_variables
 from app.services.auto_outbound.engine import DialSessionContext
+from app.services.auto_outbound.tenant_time import resolve_tenant_timezone
+from app.services.call_center.nodes import CALL_VARIABLES_KEY, CALL_VARIABLES_STATUS_KEY
 from app.services.auto_outbound.pacing import (
     record_abandon_for_pacing,
     record_answered_for_pacing,
@@ -29,6 +33,27 @@ from app.services.auto_outbound.pacing import (
 logger = logging.getLogger(__name__)
 
 QUEUE_TYPE_GROUP = QueueType.EMPLOYEE_GROUP.value
+
+# Throttle "no idle agent" INFO logs per (tenant, queue). Signature changes
+# always log immediately; identical signatures re-log at most every 5 minutes.
+_NO_IDLE_LOG_INTERVAL_S = 300.0
+_no_idle_log_state: dict[tuple[int, int], tuple[str, float]] = {}
+
+
+def _should_log_no_idle_agent(
+    tenant_id: int, queue_id: int, blocked_signature: str
+) -> bool:
+    now = time.monotonic()
+    key = (tenant_id, queue_id)
+    prev = _no_idle_log_state.get(key)
+    if (
+        prev is None
+        or prev[0] != blocked_signature
+        or (now - prev[1]) >= _NO_IDLE_LOG_INTERVAL_S
+    ):
+        _no_idle_log_state[key] = (blocked_signature, now)
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -149,6 +174,35 @@ async def _merge_target_field_values(target_id: int, patch: dict[str, Any]) -> N
         values = dict(target.field_values or {})
         values.update(patch)
         await AutoOutboundRepository.update_target(db, target, {"field_values": values})
+
+
+async def _load_call_variables(
+    ctx: DialSessionContext, task: TaskReceptionSnap
+) -> list[dict[str, Any]]:
+    """Build this call's bot variables from the target's current field values."""
+    try:
+        async with AsyncSessionLocal() as db:
+            target = await AutoOutboundRepository.get_target(db, ctx.target_id)
+            if target is None:
+                return []
+            field_values = dict(target.field_values or {})
+            tz = await resolve_tenant_timezone(db, task.tenant_id)
+        return build_call_variables(task.fields, field_values, tz)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "auto_outbound call variables build failed record_id=%s",
+            ctx.record_id,
+            exc_info=True,
+        )
+        return []
+
+
+def _call_variables_update(workflow: Any, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Record update for the preset snapshot; empty when no preset was attempted."""
+    status = workflow.ctx.variables.get(CALL_VARIABLES_STATUS_KEY)
+    if not items or status not in {"passed", "failed"}:
+        return {}
+    return {"call_variables": {"status": status, "items": items}}
 
 
 async def _resolve_call_id(ctx: DialSessionContext) -> str | None:
@@ -352,6 +406,20 @@ class BotReception:
             transfer_target=transfer_target,
         )
 
+        call_variables = await _load_call_variables(ctx, task)
+        initial_variables: dict[str, Any] = {
+            "sys.caller_number": "",
+            "sys.called_number": ctx.phone_number,
+            "sys._auto_outbound_source": "auto_outbound",
+            "sys._auto_outbound_task_id": task.id,
+            "sys._auto_outbound_record_id": ctx.record_id,
+            "sys._direction": "outbound",
+        }
+        if call_variables:
+            initial_variables[CALL_VARIABLES_KEY] = {
+                item["name"]: item["value"] for item in call_variables
+            }
+
         try:
             orch = get_orchestrator()
         except Exception:  # noqa: BLE001
@@ -363,14 +431,7 @@ class BotReception:
             graph=graph,
             telephony=telephony,
             orchestrator=orch,
-            initial_variables={
-                "sys.caller_number": "",
-                "sys.called_number": ctx.phone_number,
-                "sys._auto_outbound_source": "auto_outbound",
-                "sys._auto_outbound_task_id": task.id,
-                "sys._auto_outbound_record_id": ctx.record_id,
-                "sys._direction": "outbound",
-            },
+            initial_variables=initial_variables,
         )
         if orch is not None:
             orch._workflows[call_id] = workflow  # noqa: SLF001
@@ -382,7 +443,10 @@ class BotReception:
             logger.exception("auto_outbound bot workflow failed call_id=%s", call_id)
             await _update_record(
                 ctx.record_id,
-                {"reception_result": {"intent": None, "handoff": False, "error": "workflow_error"}},
+                {
+                    "reception_result": {"intent": None, "handoff": False, "error": "workflow_error"},
+                    **_call_variables_update(workflow, call_variables),
+                },
             )
             return
         finally:
@@ -404,7 +468,10 @@ class BotReception:
             "exit": workflow.ended_reason or "end",
             "transferred": bridged is not None,
         }
-        updates: dict[str, Any] = {"reception_result": result}
+        updates: dict[str, Any] = {
+            "reception_result": result,
+            **_call_variables_update(workflow, call_variables),
+        }
         if bridged is not None:
             updates["agent_id"] = bridged["employee_id"]
         await _update_record(ctx.record_id, updates)
@@ -851,12 +918,14 @@ async def _count_queue_agent_capacity(
             pacing += 1
 
     if idle == 0 and blocked:
-        logger.info(
-            "auto_outbound no idle agent tenant=%s queue=%s blocked=%s",
-            tenant_id,
-            queue_id,
-            ",".join(blocked),
-        )
+        blocked_signature = ",".join(blocked)
+        if _should_log_no_idle_agent(tenant_id, queue_id, blocked_signature):
+            logger.info(
+                "auto_outbound no idle agent tenant=%s queue=%s blocked=%s",
+                tenant_id,
+                queue_id,
+                blocked_signature,
+            )
 
     return idle, pacing
 

@@ -380,6 +380,11 @@ export function WorkspaceMessageBubble({
   const visibleToolBlocks = isBot ? getVisibleOpenAgentToolBlocks(message.metadata) : []
   const hasOpenAgentTrace =
     isBot && (textBlocks.length > 0 || thinkingBlocks.length > 0 || visibleToolBlocks.length > 0)
+  const isOpenAgentTraceStreaming =
+    message.metadata?.streaming === true
+    || thinkingBlocks.some((block) => block.isStreaming)
+    || visibleToolBlocks.some((block) => block.isExecuting)
+    || textBlocks.some((block) => block.isStreaming)
   const hasMessageText = message.content.trim().length > 0
 
   const shortTime = formatMessageTime(message.created_at, locale)
@@ -740,6 +745,8 @@ export function WorkspaceMessageBubble({
                 thinkingBlocks={thinkingBlocks}
                 toolBlocks={visibleToolBlocks}
                 locale={locale}
+                isStreaming={isOpenAgentTraceStreaming}
+                followContentWidth={textBlocks.length === 0 && hasMessageText}
               />
               {textBlocks.length === 0 && <OpenAgentTextBlockView content={message.content} />}
             </div>

@@ -512,6 +512,7 @@ class ConsultMixin:
             await telephony.call_bridge(
                 call.customer_call_id,
                 call.webrtc_call_id,
+                user_call_id=call.customer_call_id,
                 keepalive_on_peer_hangup=True,
             )
         logger.info(

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.schemas.outbound_task import OutboundTaskField
+from app.schemas.outbound_task import OutboundTaskField, ensure_unique_field_names
 
 
 AutoOutboundTaskStatus = Literal["draft", "active", "paused", "completed", "archived"]
@@ -153,6 +153,11 @@ class AutoOutboundTaskCreate(AutoOutboundTaskBase):
     template_id: int
     fields: list[OutboundTaskField] | None = None
 
+    @model_validator(mode="after")
+    def validate_field_names(self) -> "AutoOutboundTaskCreate":
+        ensure_unique_field_names(self.fields)
+        return self
+
 
 class AutoOutboundTaskUpdate(BaseModel):
     name: str | None = None
@@ -213,6 +218,7 @@ class AutoOutboundTaskUpdate(BaseModel):
             raise ValueError("Dial ratio must be between 2 and 5")
         if self.dial_intensity is not None and not (Decimal("1.0") <= self.dial_intensity <= Decimal("3.0")):
             raise ValueError("Dial intensity must be between 1.0 and 3.0")
+        ensure_unique_field_names(self.fields)
         return self
 
 
@@ -333,6 +339,7 @@ class AutoOutboundTargetResponse(BaseModel):
     answered_count: int
     retry_counts: dict[str, Any] = Field(default_factory=dict)
     remaining_retries: int = 0
+    can_delete: bool = False
     last_called_at: datetime | None = None
     last_call_result: str | None = None
     next_call_at: datetime | None = None
@@ -383,6 +390,7 @@ class AutoOutboundRecordResponse(BaseModel):
     agent_id: int | None = None
     agent_name: str | None = None
     reception_result: dict[str, Any] | None = None
+    call_variables: dict[str, Any] | None = None
     fail_reason: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None

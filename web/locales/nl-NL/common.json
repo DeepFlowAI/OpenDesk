@@ -1201,6 +1201,7 @@
   "chat.handoff.needsAgent": "Dit probleem vereist de aandacht van een menselijke supportmedewerker.",
   "chat.attachment.upload": "Bijlage uploaden",
   "chat.attachment.failed": "Bijlage verzenden mislukt. Klik om opnieuw te proberen.",
+  "chat.attachment.empty": "De afbeelding is nog niet gereed. Probeer het opnieuw.",
   "chat.bot.noResponse": "De assistent reageert niet. Probeer het opnieuw of neem contact op met support.",
   "chat.recall.mine": "Je hebt een bericht teruggetrokken",
   "chat.recall.named": "{name} heeft een bericht teruggetrokken",

@@ -14,9 +14,12 @@ import {
 import { FieldTypeConfig, type OptionItem, type TreeNodeItem } from '@/app/components/features/field-system'
 import { OutboundScriptEditor } from '@/app/components/features/engagement/outbound-script-editor'
 import { validateOutboundScript } from '@/app/components/features/engagement/outbound-script-utils'
+import { useLocaleStore } from '@/context/locale-store'
+import { findDuplicateFieldNames } from '@/lib/outbound-field-variables'
 import type { OutboundScript, OutboundTaskField, OutboundTaskTemplate } from '@/models/outbound-task'
 import { FIELD_TYPE_LABELS, FieldType, SELECT_FIELD_TYPES, TREE_FIELD_TYPES } from '@/types/field-enums'
 import { cn } from '@/lib/utils'
+import { t } from '@/utils/i18n'
 
 type TemplateDraft = {
   name: string
@@ -116,6 +119,8 @@ export function OutboundTaskTemplateForm({
   const [activeTab, setActiveTab] = useState<'basic' | 'fields' | 'script'>('basic')
   const [editingKey, setEditingKey] = useState<string | null>(initialDraft.fields[0]?.key ?? null)
   const dirty = JSON.stringify(draft) !== JSON.stringify(savedDraft)
+  const { locale } = useLocaleStore()
+  const duplicateNames = useMemo(() => findDuplicateFieldNames(draft.fields), [draft.fields])
 
   useEffect(() => {
     if (dirty) return
@@ -144,6 +149,13 @@ export function OutboundTaskTemplateForm({
   }
 
   const submit = async () => {
+    const firstDuplicate = draft.fields.find((field) => duplicateNames.has(field.key))
+    if (firstDuplicate) {
+      switchTab('fields')
+      setEditingKey(firstDuplicate.key)
+      toast.error(t('ws.outboundTemplate.field.nameDuplicate', locale, { name: duplicateNames.get(firstDuplicate.key) ?? '' }))
+      return
+    }
     if (draft.script) {
       const issues = validateOutboundScript(draft.script)
       if (issues.length > 0) {
@@ -277,6 +289,10 @@ export function OutboundTaskTemplateForm({
               <div className="overflow-hidden rounded-lg border border-border">
                 {draft.fields.map((field, index) => {
                   const editing = editingKey === field.key
+                  const duplicateOf = duplicateNames.get(field.key)
+                  const duplicateMessage = duplicateOf === undefined
+                    ? null
+                    : t('ws.outboundTemplate.field.nameDuplicate', locale, { name: duplicateOf })
                   return (
                     <div key={field.key} className="border-t border-border first:border-t-0">
                       <div className="flex items-center justify-between gap-3 px-4 py-3">
@@ -293,6 +309,9 @@ export function OutboundTaskTemplateForm({
                             {field.agent_editable ? ' · 客服可编辑' : ''}
                             {!field.enabled ? ' · 已停用' : ''}
                           </span>
+                          {duplicateMessage && (
+                            <span className="ml-3 text-sm text-destructive">{duplicateMessage}</span>
+                          )}
                         </button>
                         <div className="flex shrink-0 items-center gap-1">
                           <IconButton title="上移" disabled={index === 0} onClick={() => moveField(field.key, -1)}>
@@ -309,6 +328,8 @@ export function OutboundTaskTemplateForm({
                       {editing && (
                         <FieldEditor
                           field={field}
+                          nameHint={t('ws.outboundTemplate.field.nameVariableHint', locale)}
+                          nameError={duplicateMessage}
                           onChange={(next) => setField(field.key, () => next)}
                         />
                       )}
@@ -327,9 +348,13 @@ export function OutboundTaskTemplateForm({
 
 function FieldEditor({
   field,
+  nameHint,
+  nameError,
   onChange,
 }: {
   field: OutboundTaskField
+  nameHint: string
+  nameError: string | null
   onChange: (field: OutboundTaskField) => void
 }) {
   const update = <K extends keyof OutboundTaskField>(key: K, value: OutboundTaskField[K]) => {
@@ -346,8 +371,14 @@ function FieldEditor({
           <input
             value={field.name}
             onChange={(e) => update('name', e.target.value)}
-            className="h-10 rounded-md border border-border bg-background px-3 outline-none"
+            aria-invalid={nameError ? true : undefined}
+            className={cn(
+              'h-10 rounded-md border bg-background px-3 outline-none',
+              nameError ? 'border-destructive' : 'border-border',
+            )}
           />
+          {nameError && <span className="text-xs text-destructive">{nameError}</span>}
+          <span className="text-xs text-muted-foreground">{nameHint}</span>
         </label>
         <label className="grid gap-1.5 text-sm">
           <span className="font-medium">字段类型</span>

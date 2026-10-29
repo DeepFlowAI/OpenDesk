@@ -34,6 +34,8 @@ import { useVoiceSpeedAgents } from '@/service/use-open-agent-settings'
 import { useTenantPhoneNumbers } from '@/service/use-tenant-phone-numbers'
 import { useVoiceFlowsSelect } from '@/service/use-voice-flows'
 import { FIELD_TYPE_LABELS, type FieldType } from '@/types/field-enums'
+import { planFieldVariables } from '@/lib/outbound-field-variables'
+import type { OutboundTaskField } from '@/models/outbound-task'
 import { cn } from '@/lib/utils'
 import { t } from '@/utils/i18n'
 import { EmptyState } from '@/app/components/features/engagement/outbound-task-ui'
@@ -93,6 +95,77 @@ export function formatTaskFieldDescription(
 ): string {
   const label = FIELD_TYPE_LABELS[fieldType]?.[locale === 'zh' ? 'zh' : 'en'] ?? fieldType
   return agentEditable ? `${label} · ${t('ws.autoOutbound.field.agentEditable', locale)}` : label
+}
+
+/** Read-only list of which task fields a voice bot call passes as variables. */
+export function CallVariablesPreview({
+  locale,
+  fields,
+  agentChanged,
+}: {
+  locale: Locale
+  fields: OutboundTaskField[]
+  agentChanged: boolean
+}) {
+  const plans = planFieldVariables(fields)
+  const passed = plans.filter((plan) => plan.skipReason === null)
+  const skipped = plans.filter((plan) => plan.skipReason !== null)
+  const overLimit = skipped.some((plan) => plan.skipReason === 'over_limit')
+  const headerClass = 'grid grid-cols-[1fr_200px] gap-3 border-b border-border bg-muted/50 px-3 py-2 text-[11px] font-medium text-muted-foreground'
+  const rowClass = 'grid grid-cols-[1fr_200px] gap-3 border-b border-border px-3 py-2.5 text-sm last:border-b-0'
+
+  return (
+    <section data-testid="auto-outbound-call-variables-preview" className="grid gap-2 text-sm">
+      <span className="font-medium">{t('ws.autoOutbound.callVariables.title', locale)}</span>
+      <p className="text-xs text-muted-foreground">{t('ws.autoOutbound.callVariables.hint', locale)}</p>
+      {overLimit && (
+        <p className="text-xs text-warning">{t('ws.autoOutbound.callVariables.overLimit', locale)}</p>
+      )}
+      {agentChanged && (
+        <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs">
+          {t('ws.autoOutbound.callVariables.agentChanged', locale)}
+        </div>
+      )}
+      {plans.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
+          {t('ws.autoOutbound.callVariables.empty', locale)}
+        </div>
+      ) : (
+        <>
+          {passed.length > 0 && (
+            <div className="overflow-hidden rounded-lg border border-border">
+              <div className={headerClass}>
+                <span>{t('ws.autoOutbound.callVariables.passed', locale)}</span>
+                <span>{t('ws.autoOutbound.callVariables.col.note', locale)}</span>
+              </div>
+              {passed.map((plan) => (
+                <div key={plan.key} className={rowClass}>
+                  <span className="break-all font-mono text-xs leading-5">{plan.name}</span>
+                  <span className="text-muted-foreground">{t('ws.autoOutbound.callVariables.willPass', locale)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {skipped.length > 0 && (
+            <div className="overflow-hidden rounded-lg border border-border">
+              <div className={headerClass}>
+                <span>{t('ws.autoOutbound.callVariables.skipped', locale)}</span>
+                <span>{t('ws.autoOutbound.callVariables.col.reason', locale)}</span>
+              </div>
+              {skipped.map((plan) => (
+                <div key={plan.key} className={rowClass}>
+                  <span className="break-all">{plan.name || '—'}</span>
+                  <span className="text-muted-foreground">
+                    {t(`ws.autoOutbound.callVariables.reason.${plan.skipReason}`, locale)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  )
 }
 
 function buildInitial(task?: AutoOutboundTask | null, ownerId?: number | null): AutoOutboundFormValues {
@@ -173,6 +246,7 @@ export function AutoOutboundTaskForm({
   const [dirty, setDirty] = useState(false)
   const [leaveOpen, setLeaveOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [agentChanged, setAgentChanged] = useState(false)
 
   const { data: templates, isLoading: templatesLoading } = useOutboundTaskTemplates({ page: 1, per_page: 100 })
   const { data: employees } = useEmployees({ page: 1, per_page: 100, status: 'active' })
@@ -189,6 +263,9 @@ export function AutoOutboundTaskForm({
     () => templates?.items.find((item) => item.id === values.template_id) ?? null,
     [templates?.items, values.template_id],
   )
+
+  // Editing previews the task's own copied fields, never the template's current ones.
+  const variablePreviewFields = mode === 'edit' ? initial?.fields ?? [] : selectedTemplate?.fields ?? []
 
   const singleSelectFields = useMemo(
     () => (selectedTemplate?.fields ?? initial?.fields ?? []).filter(
@@ -625,7 +702,11 @@ export function AutoOutboundTaskForm({
                       <select
                         value={values.voicespeed_agent_id ?? ''}
                         disabled={lockExecution}
-                        onChange={(e) => patch({ voicespeed_agent_id: e.target.value || null })}
+                        onChange={(e) => {
+                          const next = e.target.value || null
+                          if (values.voicespeed_agent_id && next !== values.voicespeed_agent_id) setAgentChanged(true)
+                          patch({ voicespeed_agent_id: next })
+                        }}
                         className="h-10 rounded-md border border-border bg-background px-3 disabled:opacity-60"
                       >
                         <option value="">{t('ws.autoOutbound.selectPlaceholder', locale)}</option>
@@ -665,6 +746,11 @@ export function AutoOutboundTaskForm({
                       </select>
                       <span className="text-xs text-muted-foreground">{t('ws.autoOutbound.field.intentFieldHint', locale)}</span>
                     </label>
+                    <CallVariablesPreview
+                      locale={locale}
+                      fields={variablePreviewFields}
+                      agentChanged={agentChanged}
+                    />
                   </>
                 )}
 

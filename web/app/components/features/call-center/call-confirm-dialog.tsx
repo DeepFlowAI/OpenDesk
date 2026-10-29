@@ -46,7 +46,7 @@ export function CallConfirmDialog({
   const { locale } = useLocaleStore()
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next && !submitting) onClose() }}>
-      <DialogContent className="gap-3 sm:max-w-[420px]">
+      <DialogContent className="grid-cols-[minmax(0,1fr)] gap-3 sm:max-w-[420px]">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{body}</DialogDescription>

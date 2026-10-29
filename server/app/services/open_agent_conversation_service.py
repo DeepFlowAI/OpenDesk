@@ -11,6 +11,7 @@ import re
 import uuid
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BusinessError, ValidationError
@@ -380,6 +381,42 @@ class OpenAgentConversationService:
         return OpenAgentConversationService._is_human_handoff_tool_name(
             OpenAgentConversationService._resolve_event_tool_name(data, pending_tool_calls),
         )
+
+    @staticmethod
+    def _is_failed_human_handoff_tool_result(data: dict[str, Any] | None) -> bool:
+        """True when NewAgent already closed this handoff call with an error."""
+        if not isinstance(data, dict):
+            return False
+        status = OpenAgentConversationService._tool_string(data.get("status")).strip().lower()
+        if status == "error":
+            return True
+        result = data.get("result")
+        if isinstance(result, dict):
+            return OpenAgentConversationService._tool_string(result.get("status")).strip().lower() == "error"
+        if not isinstance(result, str):
+            return False
+        compact = result.replace(" ", "").lower()
+        return 'status="error"' in compact or "status='error'" in compact
+
+    @staticmethod
+    def _resolve_pending_handoff_tool_call_id(conversation, requested: str) -> str:
+        """Prefer the latest pending handoff id stored on the conversation."""
+        requested_id = (requested or "").strip()
+        stored = OpenAgentConversationService._extract_handoff_payload_tool_call_id(
+            getattr(conversation, "open_agent_handoff_payload", None) or {},
+        )
+        if stored and requested_id and stored != requested_id:
+            logger.info(
+                "open_agent_handoff_tool_result_retarget tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s requested_tool_call_id=%s pending_tool_call_id=%s",
+                getattr(conversation, "tenant_id", "-"),
+                getattr(conversation, "id", "-"),
+                getattr(conversation, "public_id", "-"),
+                requested_id,
+                stored,
+            )
+            return stored
+        return requested_id or stored or requested
 
     @staticmethod
     def _extract_required_tool_result_action(data: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -812,19 +849,71 @@ class OpenAgentConversationService:
         metadata: dict[str, Any],
     ) -> dict:
         bot_name = conversation.open_agent_agent_name or metadata.get("open_agent_agent_name") or "智能助手"
-        msg = await MessageRepository.create(db, {
-            "tenant_id": conversation.tenant_id,
-            "conversation_id": conversation.id,
-            "sender_type": MessageSenderType.BOT.value,
-            "sender_id": None,
-            "content_type": MessageContentType.TEXT.value,
-            "content": content,
-            "metadata_": {
-                **metadata,
-                "sender_name": bot_name,
-                "open_agent_agent_name": bot_name,
-            },
-        })
+        client_message_id_value = metadata.get("client_message_id")
+        client_message_id = (
+            client_message_id_value
+            if isinstance(client_message_id_value, str) and client_message_id_value
+            else None
+        )
+
+        if client_message_id is not None:
+            existing = await MessageRepository.get_by_client_message_id(
+                db,
+                conversation.tenant_id,
+                conversation.id,
+                client_message_id,
+                sender_type=MessageSenderType.BOT.value,
+                sender_id=None,
+            )
+            if existing is not None:
+                logger.info(
+                    "open_agent_bot_message_deduplicated tenant_id=%s conversation_id=%s "
+                    "client_message_id=%s message_id=%s source=existing",
+                    conversation.tenant_id,
+                    conversation.id,
+                    client_message_id,
+                    existing.id,
+                )
+                return ConversationService._public_message_payload(existing, conversation)
+
+        try:
+            msg = await MessageRepository.create(db, {
+                "tenant_id": conversation.tenant_id,
+                "conversation_id": conversation.id,
+                "sender_type": MessageSenderType.BOT.value,
+                "sender_id": None,
+                "content_type": MessageContentType.TEXT.value,
+                "content": content,
+                "metadata_": {
+                    **metadata,
+                    "sender_name": bot_name,
+                    "open_agent_agent_name": bot_name,
+                },
+                "client_message_id": client_message_id,
+            })
+        except IntegrityError:
+            await db.rollback()
+            if client_message_id is None:
+                raise
+            existing = await MessageRepository.get_by_client_message_id(
+                db,
+                conversation.tenant_id,
+                conversation.id,
+                client_message_id,
+                sender_type=MessageSenderType.BOT.value,
+                sender_id=None,
+            )
+            if existing is None:
+                raise
+            logger.info(
+                "open_agent_bot_message_deduplicated tenant_id=%s conversation_id=%s "
+                "client_message_id=%s message_id=%s source=integrity_conflict",
+                conversation.tenant_id,
+                conversation.id,
+                client_message_id,
+                existing.id,
+            )
+            return ConversationService._public_message_payload(existing, conversation)
         await ConversationRepository.update_last_message(
             db,
             conversation.id,
@@ -882,7 +971,23 @@ class OpenAgentConversationService:
 
         if current_state == "pending" and normalized_tool_call_id:
             if current_tool_call_id and current_tool_call_id != normalized_tool_call_id:
-                return None
+                existing = await MessageRepository.get_handoff_event_by_tool_call_id(
+                    db,
+                    conversation.tenant_id,
+                    conversation.id,
+                    current_tool_call_id,
+                    resolved_event_type,
+                )
+                if existing is not None:
+                    metadata = dict(existing.metadata_ or {})
+                    metadata["tool_call_id"] = normalized_tool_call_id
+                    payload_meta = metadata.get("handoff_payload")
+                    if isinstance(payload_meta, dict):
+                        metadata["handoff_payload"] = {
+                            **payload_meta,
+                            "tool_call_id": normalized_tool_call_id,
+                        }
+                    await MessageRepository.update_metadata(db, existing, metadata)
             conversation = await ConversationRepository.update_open_agent_state(
                 db,
                 conversation,
@@ -976,6 +1081,16 @@ class OpenAgentConversationService:
     ) -> dict | None:
         tool_call_id = OpenAgentConversationService._extract_tool_call_id(data)
         if not tool_call_id:
+            return None
+        if OpenAgentConversationService._is_failed_human_handoff_tool_result(data):
+            logger.info(
+                "open_agent_handoff_tool_result_ignored tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s tool_call_id=%s reason=failed_tool_result",
+                getattr(conversation, "tenant_id", "-"),
+                getattr(conversation, "id", "-"),
+                getattr(conversation, "public_id", "-"),
+                tool_call_id,
+            )
             return None
 
         tool_call_data = pending_tool_calls.get(tool_call_id, {})
@@ -1187,6 +1302,10 @@ class OpenAgentConversationService:
             ]
 
         events: list[bytes] = []
+        tool_call_id = OpenAgentConversationService._resolve_pending_handoff_tool_call_id(
+            conversation,
+            tool_call_id,
+        )
         payload = OpenAgentConversationService._handoff_tool_result_payload(
             tool_call_id,
             status,
@@ -2533,6 +2652,23 @@ class OpenAgentConversationService:
         except OpenAgentClientError as exc:
             yield OpenAgentConversationService._sse_event("error", {"message": str(exc)})
             return
+        except Exception:
+            logger.exception(
+                "open_agent_stream_unexpected_error tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                "accumulated_content_len=%s",
+                conversation.tenant_id,
+                conversation.id,
+                conversation.public_id,
+                request_id,
+                client_message_id,
+                len(accumulated_content),
+            )
+            yield OpenAgentConversationService._sse_event(
+                "error",
+                {"message": "AI assistant temporarily unavailable. Please try again later."},
+            )
+            return
 
         if not final_saved:
             finished_text_blocks = OpenAgentConversationService._finish_text_blocks(text_blocks)
@@ -2636,36 +2772,58 @@ class OpenAgentConversationService:
         open_agent_client: BaseOpenAgentClient | None = None,
         redis=None,
     ) -> AsyncIterator[bytes]:
-        async with AsyncSessionLocal() as db:
-            (
-                conversation,
-                config,
-                base_url,
-                api_key,
-                request_id,
-                client_message_id,
-                resume_last_event_id,
-                payload,
-            ) = await OpenAgentConversationService._load_stream_chat_context(
-                db,
-                conversation_public_id,
-                visitor_context,
-                body,
-            )
-
-        if body.attachments:
-            attachment = body.attachments[0]
-            payload["attachments"] = [
-                await ConversationFileService.build_open_agent_attachment(
-                    tenant_id=conversation.tenant_id,
-                    conversation_id=conversation.id,
-                    file_id=attachment.file_id,
-                    attachment_type=attachment.type,
-                    name=attachment.name,
-                    mime_type=attachment.mime_type,
-                    size=attachment.size,
+        # StreamingResponse sends headers before this generator runs, so setup
+        # failures must surface as SSE error events; raising here would only
+        # produce a truncated stream and an untraceable 500 wrapper.
+        try:
+            async with AsyncSessionLocal() as db:
+                (
+                    conversation,
+                    config,
+                    base_url,
+                    api_key,
+                    request_id,
+                    client_message_id,
+                    resume_last_event_id,
+                    payload,
+                ) = await OpenAgentConversationService._load_stream_chat_context(
+                    db,
+                    conversation_public_id,
+                    visitor_context,
+                    body,
                 )
-            ]
+
+            if body.attachments:
+                attachment = body.attachments[0]
+                payload["attachments"] = [
+                    await ConversationFileService.build_open_agent_attachment(
+                        tenant_id=conversation.tenant_id,
+                        conversation_id=conversation.id,
+                        file_id=attachment.file_id,
+                        attachment_type=attachment.type,
+                        name=attachment.name,
+                        mime_type=attachment.mime_type,
+                        size=attachment.size,
+                    )
+                ]
+        except BusinessError as exc:
+            logger.info(
+                "open_agent_stream_rejected conversation_public_id=%s reason=%s",
+                conversation_public_id,
+                exc.message,
+            )
+            yield OpenAgentConversationService._sse_event("error", {"message": exc.message})
+            return
+        except Exception:
+            logger.exception(
+                "open_agent_stream_setup_error conversation_public_id=%s",
+                conversation_public_id,
+            )
+            yield OpenAgentConversationService._sse_event(
+                "error",
+                {"message": "AI assistant temporarily unavailable. Please try again later."},
+            )
+            return
 
         logger.info(
             "open_agent_stream_started tenant_id=%s conversation_id=%s conversation_public_id=%s "
@@ -3164,6 +3322,23 @@ class OpenAgentConversationService:
                     yield local_event
         except OpenAgentClientError as exc:
             yield OpenAgentConversationService._sse_event("error", {"message": str(exc)})
+            return
+        except Exception:
+            logger.exception(
+                "open_agent_stream_unexpected_error tenant_id=%s conversation_id=%s "
+                "conversation_public_id=%s request_id=%s client_message_id=%s "
+                "accumulated_content_len=%s",
+                conversation.tenant_id,
+                conversation.id,
+                conversation.public_id,
+                request_id,
+                client_message_id,
+                len(accumulated_content),
+            )
+            yield OpenAgentConversationService._sse_event(
+                "error",
+                {"message": "AI assistant temporarily unavailable. Please try again later."},
+            )
             return
 
         if not final_saved:

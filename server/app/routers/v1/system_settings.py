@@ -10,6 +10,7 @@ from app.schemas.system_settings import (
     SystemSettingsUpdate,
     OrganizationSettingsUpdate,
     CallTranscriptionSettingsUpdate,
+    CallShortAbandonSettingsUpdate,
     CallWrapupSettingsUpdate,
     SystemSettingsResponse,
 )
@@ -76,6 +77,20 @@ async def update_call_wrapup_settings(
 ):
     """Save the tenant-level after-call work duration (0-60 seconds)."""
     return await SystemSettingsService.update_call_wrapup(db, principal.tenant_id, body.seconds)
+
+
+@router.put("/call-short-abandon", response_model=SystemSettingsResponse)
+async def update_call_short_abandon_settings(
+    body: CallShortAbandonSettingsUpdate,
+    principal: EffectivePrincipal = Depends(require_permission(CALL_SETTINGS_PERMISSION)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save the tenant-level customer short-abandon threshold (1-60 seconds)."""
+    return await SystemSettingsService.update_call_short_abandon_threshold(
+        db,
+        principal.tenant_id,
+        body.seconds,
+    )
 
 
 @router.get("/call-prompt-tones", response_model=CallPromptToneSettingsResponse)

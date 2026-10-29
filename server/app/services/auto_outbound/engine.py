@@ -902,9 +902,14 @@ class AutoOutboundDialEngine:
                         tenant_id=ctx.tenant_id,
                         call_id=str(call_id),
                     )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception(
-                "auto_outbound CallRecord create skipped call_id=%s", call_id
+                "auto_outbound CallRecord create skipped "
+                "tenant_id=%s record_id=%s call_id=%s error=%s",
+                ctx.tenant_id,
+                ctx.record_id,
+                call_id,
+                exc,
             )
             return
         self._spawn_user_identify(ctx.tenant_id, str(call_id))

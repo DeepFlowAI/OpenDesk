@@ -6,7 +6,9 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { DateToolbar } from '@/app/components/features/session-reports/date-toolbar'
 import { CallEmployeesTable } from '@/app/components/features/call-reports/employees-table'
 import { CallReportTabs } from '@/app/components/features/call-reports/report-tabs'
-import { useCallReportsEmployees } from '@/service/use-call-reports'
+import { CallReportExportButton } from '@/app/components/features/call-reports/export-button'
+import { callAgentKeys } from '@/service/use-call-agent-reports'
+import type { CallEmployeeListExportState } from '@/models/call-report-export'
 
 function todayIsoDate(): string {
   const date = new Date()
@@ -22,6 +24,11 @@ export default function CallReportsEmployeesPage() {
   const queryClient = useQueryClient()
   const [dateRangeValid, setDateRangeValid] = useState(true)
   const [listLoading, setListLoading] = useState(false)
+  const [asOf, setAsOf] = useState<string | null>(null)
+  const [exportParams, setExportParams] = useState<CallEmployeeListExportState>({
+    sort: 'handled_call_count',
+    order: 'desc',
+  })
 
   const today = todayIsoDate()
   const start = searchParams.get('start') || today
@@ -37,11 +44,15 @@ export default function CallReportsEmployeesPage() {
     [router, searchParams]
   )
 
-  const { data, isFetching } = useCallReportsEmployees({ start, end })
-
   const handleRefresh = useCallback(() => {
-    void queryClient.invalidateQueries({ queryKey: ['call-reports'] })
+    void queryClient.invalidateQueries({ queryKey: callAgentKeys.all })
   }, [queryClient])
+
+  const handleListState = useCallback((state: { loading: boolean; asOf: string | null; exportParams: CallEmployeeListExportState }) => {
+    setListLoading(state.loading)
+    setAsOf(state.asOf)
+    setExportParams(state.exportParams)
+  }, [])
 
   const carriedSearch = useMemo(() => searchParams.toString(), [searchParams])
 
@@ -52,17 +63,22 @@ export default function CallReportsEmployeesPage() {
         <DateToolbar
           start={start}
           end={end}
-          asOf={data?.as_of ?? null}
-          loading={isFetching || listLoading || !dateRangeValid}
+          asOf={asOf}
+          loading={listLoading || !dateRangeValid}
           onChange={(range) => updateParams(range)}
           onRefresh={handleRefresh}
           onValidityChange={setDateRangeValid}
+          exportAction={<CallReportExportButton
+            params={{ kind: 'employee-list', start, end, ...exportParams }}
+            disabled={!dateRangeValid || listLoading || !asOf}
+          />}
         />
         <CallEmployeesTable
           start={start}
           end={end}
           carriedSearch={carriedSearch}
-          onListStateChange={(state) => setListLoading(state.loading)}
+          enabled={dateRangeValid}
+          onStateChange={handleListState}
         />
       </div>
     </div>

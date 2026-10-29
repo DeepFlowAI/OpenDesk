@@ -45,14 +45,19 @@ def test_normalize_export_columns_filters_internal_id():
 @pytest.mark.asyncio
 async def test_export_users_builds_xlsx(monkeypatch):
     db = SimpleNamespace(get=AsyncMock(return_value=None))
-    user = SimpleNamespace(organization_id=None)
+    user = SimpleNamespace(id=11, organization_id=None)
 
     monkeypatch.setattr(UserService, "_get_slot_map", AsyncMock(return_value={}))
     monkeypatch.setattr(UserService, "_get_field_key_slot_map", AsyncMock(return_value={}))
     monkeypatch.setattr(
         UserRepository,
         "query_paginated",
-        AsyncMock(return_value=([user], 1)),
+        AsyncMock(return_value=([11], 0)),
+    )
+    monkeypatch.setattr(
+        UserRepository,
+        "list_by_ids",
+        AsyncMock(return_value=[user]),
     )
     monkeypatch.setattr(
         UserService,
@@ -101,7 +106,7 @@ async def test_export_users_rejects_too_many_records(monkeypatch):
     monkeypatch.setattr(
         UserRepository,
         "query_paginated",
-        AsyncMock(return_value=([], 5001)),
+        AsyncMock(return_value=(list(range(5001)), 0)),
     )
 
     with pytest.raises(ValidationError):

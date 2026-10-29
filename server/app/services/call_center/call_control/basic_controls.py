@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 
 from app.core.exceptions import NotFoundError, ValidationError
-from app.libs.telephony.base import BaseTelephonyClient
+from app.libs.telephony.base import BaseTelephonyClient, TelephonyRPCError
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,7 @@ class BasicControlsMixin:
                 await telephony.call_bridge(
                     call.customer_call_id,
                     call.webrtc_call_id,
+                    user_call_id=call.customer_call_id,
                     keepalive_on_peer_hangup=True,
                 )
             except Exception:  # noqa: BLE001
@@ -219,6 +220,7 @@ class BasicControlsMixin:
             await telephony.call_bridge(
                 call.customer_call_id,
                 call.webrtc_call_id,
+                user_call_id=call.customer_call_id,
                 keepalive_on_peer_hangup=True,
             )
         legs = await _ccs._legs(tenant_id, employee_id)
@@ -299,33 +301,64 @@ class BasicControlsMixin:
         while they stayed audible.
         """
 
-        call = await _ccs.CallControlService._resolve_current_call(tenant_id, employee_id)
-        if not call.webrtc_call_id:
-            raise ValidationError("当前通话还没有坐席通道，无法静音")
-        if muted:
-            await telephony.call_mute(call.webrtc_call_id)
+        # A colleague brought in for a consult or a three-way call owns no call
+        # record; their leg is kept on the host agent's call state.
+        colleague = await _ccs.CallControlService._find_colleague_leg(tenant_id, employee_id)
+        if colleague is not None:
+            host, agent_leg = colleague
+            participant_role = (
+                "consult_target"
+                if host["legs"].consult_call_id == agent_leg
+                else "conference_participant"
+            )
+            try:
+                host_call = await _ccs.CallControlService._resolve_current_call(
+                    tenant_id, host["employee_id"]
+                )
+                customer_call_id = host_call.customer_call_id
+            except NotFoundError:
+                customer_call_id = None
         else:
-            await telephony.call_unmute(call.webrtc_call_id)
+            call = await _ccs.CallControlService._resolve_current_call(tenant_id, employee_id)
+            agent_leg = call.webrtc_call_id
+            customer_call_id = call.customer_call_id
+            participant_role = "serving_agent"
+        if not agent_leg:
+            raise ValidationError("当前通话还没有坐席通道，无法静音")
+        try:
+            if muted:
+                await telephony.call_mute(agent_leg)
+            else:
+                await telephony.call_unmute(agent_leg)
+        except TelephonyRPCError as exc:
+            logger.warning(
+                "mute: kernel rejected agent=%s call=%s agent_leg=%s muted=%s code=%s",
+                employee_id, customer_call_id, agent_leg, muted, exc.code,
+            )
+            if exc.code != -32002:
+                raise
+            raise ValidationError("当前通话已结束，无法静音") from exc
         from app.services.call_trajectory_service import CallTrajectoryService
 
-        await CallTrajectoryService.append_for_call_id_best_effort(
-            tenant_id=tenant_id,
-            call_id=call.customer_call_id,
-            event_type="mute_started" if muted else "mute_ended",
-            event_category="control",
-            actor_type="agent",
-            actor_id=str(employee_id),
-            source="opendesk",
-            call_leg_id=call.webrtc_call_id,
-            participant_role="serving_agent",
-            result="succeeded" if not muted else None,
-            reason_code="normal" if not muted else None,
-        )
+        if customer_call_id:
+            await CallTrajectoryService.append_for_call_id_best_effort(
+                tenant_id=tenant_id,
+                call_id=customer_call_id,
+                event_type="mute_started" if muted else "mute_ended",
+                event_category="control",
+                actor_type="agent",
+                actor_id=str(employee_id),
+                source="opendesk",
+                call_leg_id=agent_leg,
+                participant_role=participant_role,
+                result="succeeded" if not muted else None,
+                reason_code="normal" if not muted else None,
+            )
         logger.info(
             "mute: agent=%s call=%s agent_leg=%s muted=%s",
-            employee_id, call.customer_call_id, call.webrtc_call_id, muted,
+            employee_id, customer_call_id, agent_leg, muted,
         )
-        return {"ok": True, "call_id": call.customer_call_id}
+        return {"ok": True, "call_id": customer_call_id or agent_leg}
 
 # Imported after the mixin class so this module can be imported directly
 # without a circular-import error (call_control_service imports the mixins).

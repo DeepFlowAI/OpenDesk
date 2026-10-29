@@ -376,6 +376,13 @@ class OutboundMixin:
                     "outbound: stopping ringback failed leg=%s", webrtc_call_id,
                     exc_info=True,
                 )
+            if await self.outbound_ended_reason(call_id) is not None:
+                await self._release_outbound_bridge_claim(call_id)
+                logger.info(
+                    "outbound auto-bridge skipped; SIP already ended sip=%s webrtc=%s",
+                    call_id, webrtc_call_id,
+                )
+                return False
             await self.telephony.call_bridge(
                 call_id,
                 webrtc_call_id,
@@ -388,11 +395,30 @@ class OutboundMixin:
                     db, tenant_id, call_id,
                     agent_id=employee_id, agent_leg_id=webrtc_call_id,
                 )
+            try:
+                from app.services.call_center.call_control_service import CallControlService
+
+                await CallControlService.bind_agent_media_leg(
+                    tenant_id, employee_id, webrtc_call_id,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "outbound auto-bridge: bind media leg failed agent=%s/%s leg=%s",
+                    tenant_id, employee_id, webrtc_call_id, exc_info=True,
+                )
             await self._pop_outbound_webrtc(call_id)
             logger.info("outbound auto-bridge: sip=%s webrtc=%s", call_id, webrtc_call_id)
             return True
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             await self._release_outbound_bridge_claim(call_id)
+            from app.libs.telephony.base import TelephonyRPCError
+
+            if isinstance(exc, TelephonyRPCError) and exc.code == -32002:
+                logger.warning(
+                    "outbound auto-bridge skipped; call already gone sip=%s webrtc=%s",
+                    call_id, webrtc_call_id,
+                )
+                return False
             logger.exception("outbound auto-bridge failed sip=%s webrtc=%s", call_id, webrtc_call_id)
             return False
 
@@ -754,6 +780,27 @@ class OutboundMixin:
             return value
         return local
 
+    async def reassign_outbound_originator(
+        self, call_id: str, employee_id: int
+    ) -> None:
+        """Hand an agent-dialed call to the agent it was transferred to.
+
+        The customer's eventual ``call.hangup`` settles whoever is recorded as
+        the originator; left on the transferring agent, the new owner never
+        reaches after-call work and stays in-call.
+        """
+
+        info = await self._peek_outbound_originator(call_id)
+        if info is None or info[1] == employee_id:
+            return
+        tenant_id, _old_employee_id, outbound_did = info
+        await self.register_outbound_call(
+            call_id=call_id,
+            tenant_id=tenant_id,
+            employee_id=employee_id,
+            outbound_did=outbound_did,
+        )
+
     async def _pop_outbound_originator(
         self, call_id: str
     ) -> tuple[int, int, str] | None:
@@ -820,6 +867,8 @@ class OutboundMixin:
 
     async def _on_outbound_answered(self, event: CallEvent) -> None:
         call_id = event.data.get("call_id") or ""
+        if call_id:
+            await _orch.CallRecordService.record_outbound_customer_connected(call_id)
         # Auto-outbound (agentless) dial engine — Redis session mapping wins
         # over agent-originator state so system dials never enter the
         # WebRTC bridge / agent busy path.

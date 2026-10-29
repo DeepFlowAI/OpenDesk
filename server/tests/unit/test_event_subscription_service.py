@@ -210,6 +210,10 @@ async def test_delete_disabled_subscription_writes_safe_audit(monkeypatch) -> No
         "app.repositories.auto_outbound_event_repository.AutoOutboundEventRepository.count_bindings_for_subscription",
         AsyncMock(return_value=0),
     )
+    monkeypatch.setattr(
+        "app.repositories.call_event_subscription_repository.CallEventSubscriptionRepository.count_for_subscription",
+        AsyncMock(return_value=0),
+    )
 
     await EventSubscriptionService.delete(object(), _principal(), item.public_id)
 
@@ -218,3 +222,40 @@ async def test_delete_disabled_subscription_writes_safe_audit(monkeypatch) -> No
         "name": "CRM Webhook",
         "endpoint_host": "hooks.example.com",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_count", "rule_count", "fragment"),
+    [
+        (2, 1, "2 auto outbound tasks and 1 call event subscription rules"),
+        (0, 1, "1 call event subscription rules"),
+        (3, 0, "3 auto outbound tasks"),
+    ],
+)
+async def test_delete_blocks_on_auto_outbound_and_call_rule_references(
+    monkeypatch, task_count: int, rule_count: int, fragment: str
+) -> None:
+    item = _subscription(is_active=False)
+    delete_with_audit = AsyncMock()
+    monkeypatch.setattr(EventSubscriptionService, "get_scoped", AsyncMock(return_value=item))
+    monkeypatch.setattr(EventSubscriptionRepository, "delete_with_audit", delete_with_audit)
+    monkeypatch.setattr(
+        "app.repositories.auto_outbound_event_repository.AutoOutboundEventRepository.count_bindings_for_subscription",
+        AsyncMock(return_value=task_count),
+    )
+    monkeypatch.setattr(
+        "app.repositories.call_event_subscription_repository.CallEventSubscriptionRepository.count_for_subscription",
+        AsyncMock(return_value=rule_count),
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        await EventSubscriptionService.delete(object(), _principal(), item.public_id)
+
+    assert fragment in exc_info.value.message
+    assert exc_info.value.details == {
+        "code": "subscription_in_use",
+        "auto_outbound_task_count": task_count,
+        "call_event_rule_count": rule_count,
+    }
+    delete_with_audit.assert_not_awaited()

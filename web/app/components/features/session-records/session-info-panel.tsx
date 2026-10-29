@@ -53,7 +53,7 @@ function formatCount(value: number | null | undefined): string {
   return value == null ? '-' : String(value)
 }
 
-const ENDED_BY_LABEL_KEYS = new Set(['agent', 'visitor', 'bot_timeout', 'system_timeout'])
+const ENDED_BY_LABEL_KEYS = new Set(['agent', 'visitor', 'bot_timeout', 'system_timeout', 'history_start'])
 
 function endedByLabel(value: string | null, locale: Locale): string {
   if (!value) return '-'

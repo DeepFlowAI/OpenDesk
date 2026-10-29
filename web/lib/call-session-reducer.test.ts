@@ -5,6 +5,7 @@ import {
   canPollHydrate,
   hangupMatches,
   initialCallSession,
+  isRecentlyEndedIncoming,
   retainConnectedCallScreenPop,
   shouldHydrateMediaReconnect,
   shouldLeaveOnCallFromPoll,
@@ -33,6 +34,7 @@ describe('callSessionReducer', () => {
       phase: 'outbound_ringing' as const,
       ringingCallId: 'out-1',
       callStart: 2000,
+      statusFetchedAtMs: 9_000,
     }
     expect(
       shouldLeaveOutboundRingingFromPoll({
@@ -96,10 +98,82 @@ describe('callSessionReducer', () => {
     ).toBe(false)
   })
 
+  it('ignores a pre-call snapshot even when the browser clock runs behind the server', () => {
+    // Accepted at 10_000 (browser clock); the poll was fetched at 9_500, before
+    // the offer, but its server-side resource_updated_at reads 12_000.
+    const stale = {
+      callStart: 10_000,
+      resourceState: 'idle',
+      resourceUpdatedAtMs: 12_000,
+      statusFetchedAtMs: 9_500,
+    }
+    expect(shouldLeaveOnCallFromPoll({ phase: 'on_call', ...stale })).toBe(false)
+    expect(
+      shouldLeaveOutboundRingingFromPoll({
+        phase: 'outbound_ringing',
+        ringingCallId: 'out-1',
+        currentCallId: null,
+        ...stale,
+      }),
+    ).toBe(false)
+    expect(
+      shouldLeaveOnCallFromPoll({ phase: 'on_call', ...stale, statusFetchedAtMs: 10_500 }),
+    ).toBe(true)
+  })
+
+  it('ignores the pre-transfer idle snapshot after accepting a transferred call', () => {
+    // Customer answered by the prior agent at 1_000 (inherited callStart); this
+    // agent went ready at 4_000, got the transfer ring at 6_000 and accepted.
+    const transferred = {
+      phase: 'on_call' as const,
+      callStart: 1_000,
+      sessionStartedAt: 6_000,
+      resourceState: 'idle',
+      resourceUpdatedAtMs: 4_000,
+      statusFetchedAtMs: 6_500,
+    }
+    expect(shouldLeaveOnCallFromPoll(transferred)).toBe(false)
+    expect(
+      shouldLeaveOnCallFromPoll({ ...transferred, resourceUpdatedAtMs: 7_000, statusFetchedAtMs: 7_500 }),
+    ).toBe(true)
+  })
+
+  it('keeps the desk ring time when a transfer re-keys the call with an older restore', () => {
+    // Accepted the internal transfer offer rung at 6_000; the server then
+    // republishes the customer call as a restore anchored to its 1_000 answer.
+    const onTransfer: CallSessionState = {
+      ...initialCallSession,
+      phase: 'on_call',
+      incoming: incoming({ call_id: 'internal:x', startedAt: 6_000 }),
+      callStart: 6_500,
+    }
+    const next = callSessionReducer(onTransfer, {
+      type: 'SOCKET_INCOMING',
+      restore: true,
+      callStart: 1_000,
+      incoming: incoming({ call_id: 'customer-1', startedAt: 1_000 }),
+    })
+    expect(next.phase).toBe('on_call')
+    expect(next.incoming?.call_id).toBe('customer-1')
+    expect(next.callStart).toBe(1_000)
+    expect(next.incoming?.startedAt).toBe(6_000)
+    expect(
+      shouldLeaveOnCallFromPoll({
+        phase: next.phase,
+        callStart: next.callStart,
+        sessionStartedAt: next.incoming?.startedAt,
+        resourceState: 'idle',
+        resourceUpdatedAtMs: 4_000,
+        statusFetchedAtMs: 4_500,
+      }),
+    ).toBe(false)
+  })
+
   it('leaves on_call only when a fresh poll shows the resource freed', () => {
     expect(
       shouldLeaveOnCallFromPoll({
         phase: 'on_call',
+        statusFetchedAtMs: 9_000,
         callStart: 1_000,
         resourceState: 'idle',
         resourceUpdatedAtMs: 2_000,
@@ -108,6 +182,7 @@ describe('callSessionReducer', () => {
     expect(
       shouldLeaveOnCallFromPoll({
         phase: 'on_call',
+        statusFetchedAtMs: 9_000,
         callStart: 1_000,
         resourceState: 'after_call_work',
         resourceUpdatedAtMs: 2_000,
@@ -117,6 +192,7 @@ describe('callSessionReducer', () => {
     expect(
       shouldLeaveOnCallFromPoll({
         phase: 'on_call',
+        statusFetchedAtMs: 9_000,
         callStart: 1_000,
         resourceState: 'in_call',
         resourceUpdatedAtMs: 2_000,
@@ -126,6 +202,7 @@ describe('callSessionReducer', () => {
     expect(
       shouldLeaveOnCallFromPoll({
         phase: 'on_call',
+        statusFetchedAtMs: 9_000,
         callStart: 5_000,
         resourceState: 'idle',
         resourceUpdatedAtMs: 2_000,
@@ -134,6 +211,7 @@ describe('callSessionReducer', () => {
     expect(
       shouldLeaveOnCallFromPoll({
         phase: 'on_call',
+        statusFetchedAtMs: 9_000,
         callStart: 1_000,
         resourceState: 'idle',
         resourceUpdatedAtMs: null,
@@ -370,6 +448,45 @@ describe('callSessionReducer', () => {
     })
     expect(next.phase).toBe('idle')
     expect(next.incoming).toBeNull()
+  })
+
+  it('rings a second conference invite for the same customer call', () => {
+    // The first invite ended: both its internal id and the customer id are recorded.
+    const ended = ['internal:first-offer', 'customer-call']
+    expect(
+      isRecentlyEndedIncoming(ended, {
+        call_id: 'internal:second-offer',
+        source_call_id: 'customer-call',
+      }),
+    ).toBe(false)
+    expect(
+      isRecentlyEndedIncoming(ended, {
+        call_id: 'internal:first-offer',
+        source_call_id: 'customer-call',
+      }),
+    ).toBe(true)
+    expect(
+      isRecentlyEndedIncoming(ended, {
+        call_id: 'other-leg',
+        source_call_id: 'customer-call',
+        restore: true,
+      }),
+    ).toBe(true)
+  })
+
+  it('ignores a late outbound hangup for an earlier call while on a new call', () => {
+    const onCall: CallSessionState = {
+      ...initialCallSession,
+      phase: 'on_call',
+      incoming: incoming({ call_id: 'new-call', direction: 'outbound' }),
+      callStart: 5000,
+      epoch: 1,
+    }
+    const next = callSessionReducer(onCall, {
+      type: 'SOCKET_OUTBOUND_HANGUP',
+      callId: 'previous-call',
+    })
+    expect(next).toBe(onCall)
   })
 
   it('does not revive an outbound call when its dial response arrives after hangup', () => {

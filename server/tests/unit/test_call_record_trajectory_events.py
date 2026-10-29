@@ -13,11 +13,22 @@ STARTED = datetime(2026, 8, 9, 1, 0, tzinfo=timezone.utc)
 MARK_RECEPTION_STARTED = CallRecordService.mark_reception_started
 
 
-def _event(event_type: str, offset_ms: int, *, result: str | None = None):
+def _event(
+    event_type: str,
+    offset_ms: int,
+    *,
+    result: str | None = None,
+    sequence_no: int = 1,
+    source: str = "opendesk",
+    reason_detail: str | None = None,
+):
     return SimpleNamespace(
         event_type=event_type,
         occurred_at=STARTED + timedelta(milliseconds=offset_ms),
         result=result,
+        sequence_no=sequence_no,
+        source=source,
+        reason_detail=reason_detail,
     )
 
 
@@ -29,8 +40,14 @@ async def _settle(
     reason="customer_hangup",
     hangup_party="customer",
     hangup_details=None,
+    short_abandon_threshold_ms=None,
 ):
-    record = SimpleNamespace(id=1, direction=direction, started_at=STARTED)
+    record = SimpleNamespace(
+        id=1,
+        direction=direction,
+        started_at=STARTED,
+        short_abandon_threshold_ms=short_abandon_threshold_ms,
+    )
     monkeypatch.setattr(
         "app.services.call_trajectory_service.CallRecordRepository.get_by_id_unscoped",
         AsyncMock(return_value=record),
@@ -75,7 +92,7 @@ async def test_settlement_prioritizes_agent_answered_and_calculates_phases(monke
     assert details["phase_durations_ms"]["talk"] == 6_200
     assert details["phase_durations_ms"]["hold"] == 1_000
     assert details["customer_agent_talk_duration_ms"] == 5_200
-    assert details["result_rule_version"] == 2
+    assert details["result_rule_version"] == 4
     assert details["actual_reception_type"] == "agent"
 
 
@@ -113,6 +130,105 @@ async def test_settlement_uses_short_abandon_threshold_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_settlement_uses_frozen_custom_threshold(monkeypatch):
+    details = await _settle(
+        monkeypatch,
+        [
+            _event("call_created", 0),
+            _event("queue_entered", 1_000),
+            _event("queue_exited", 4_500),
+        ],
+        reason="customer_hangup",
+        short_abandon_threshold_ms=3_000,
+    )
+
+    assert details["call_result"] == "agent_no_answer"
+    assert details["short_abandon_threshold_ms"] == 3_000
+
+
+@pytest.mark.asyncio
+async def test_settlement_short_abandon_boundary_is_inclusive(monkeypatch):
+    at_boundary = await _settle(
+        monkeypatch,
+        [
+            _event("call_created", 0),
+            _event("queue_entered", 1_000),
+            _event("queue_exited", 6_000),
+        ],
+        short_abandon_threshold_ms=5_000,
+    )
+    above_boundary = await _settle(
+        monkeypatch,
+        [
+            _event("call_created", 0),
+            _event("queue_entered", 1_000),
+            _event("queue_exited", 6_001),
+        ],
+        short_abandon_threshold_ms=5_000,
+    )
+
+    assert at_boundary["call_result"] == "customer_short_abandon"
+    assert above_boundary["call_result"] == "agent_no_answer"
+
+
+@pytest.mark.asyncio
+async def test_settlement_rebuilds_first_event_times(monkeypatch):
+    details = await _settle(
+        monkeypatch,
+        [
+            _event("call_created", 0),
+            _event("agent_offer_started", 3_000),
+            _event("queue_entered", 2_000),
+            _event("bot_handoff_requested", 1_000),
+            _event("bot_handoff_succeeded", 1_500),
+            _event("queue_exited", 5_000),
+        ],
+    )
+
+    assert details["human_service_requested_at"] == STARTED + timedelta(seconds=1)
+    assert details["first_agent_wait_started_at"] == STARTED + timedelta(seconds=2)
+    assert details["first_agent_offer_started_at"] == STARTED + timedelta(seconds=3)
+    assert details["bot_handoff_requested_at"] == STARTED + timedelta(seconds=1)
+    assert details["bot_handoff_succeeded_at"] == STARTED + timedelta(milliseconds=1_500)
+
+
+@pytest.mark.asyncio
+async def test_settlement_completes_after_late_fact_resolves_prior_gap(monkeypatch):
+    details = await _settle(
+        monkeypatch,
+        [
+            _event("call_created", 0, sequence_no=1),
+            _event("queue_entered", 1_000, sequence_no=2),
+            _event("queue_exited", 5_000, sequence_no=5),
+            _event("trajectory_gap_detected", 9_000, sequence_no=3),
+            _event("call_ended", 10_000, sequence_no=4),
+        ],
+    )
+
+    assert details["agent_wait_duration_ms"] == 4_000
+    assert details["projection_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_settlement_keeps_in_call_after_transfer_queue_and_offer(monkeypatch):
+    details = await _settle(
+        monkeypatch,
+        [
+            _event("call_created", 0),
+            _event("reception_started", 1_000),
+            _event("reception_ended", 3_000),
+            _event("transfer_started", 3_100),
+            _event("queue_entered", 3_200),
+            _event("queue_exited", 4_000),
+            _event("agent_offer_started", 4_100),
+            _event("agent_offer_canceled", 5_000),
+        ],
+    )
+
+    assert details["hangup_stage"] == "in_call"
+
+
+@pytest.mark.asyncio
 async def test_settlement_maps_outbound_busy_before_queue_rules(monkeypatch):
     details = await _settle(
         monkeypatch,
@@ -125,6 +241,32 @@ async def test_settlement_maps_outbound_busy_before_queue_rules(monkeypatch):
     assert details["call_result"] == "customer_busy"
     assert details["hangup_party"] == "carrier"
     assert details["hangup_reason_code"] == "customer_busy"
+
+
+@pytest.mark.parametrize(
+    ("sip_status", "expected"),
+    [
+        (180, "customer_no_answer"),
+        (183, "provider_answer_unconfirmed"),
+        (480, "provider_temporarily_unavailable"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_settlement_splits_outbound_no_answer_by_last_sip_status(
+    monkeypatch, sip_status, expected
+):
+    details = await _settle(
+        monkeypatch,
+        [_event("call_created", 0), _event("customer_ringing_started", 100)],
+        direction="outbound",
+        reason="no_answer",
+        hangup_party=None,
+        hangup_details={"sip_status": sip_status},
+    )
+
+    assert details["call_result"] == expected
+    assert details["hangup_reason_code"] == expected
+    assert details["hangup_party"] == "carrier"
 
 
 # The telephony kernel reports a raw reason and never a business role, so the
@@ -214,7 +356,7 @@ async def test_settlement_classifies_and_preserves_supplier_detail(monkeypatch):
     assert details["hangup_match_strategy"] == "sip_status"
     assert details["sip_reason"] == "Not Found"
     assert details["sip_call_id"] == "provider-call-id"
-    assert details["result_rule_version"] == 2
+    assert details["result_rule_version"] == 4
 
 
 @pytest.mark.asyncio
@@ -352,3 +494,22 @@ async def test_reception_started_snapshots_agent_name(monkeypatch):
     for _, payload in written:
         assert payload.actor_name_snapshot == "张三"
         assert payload.target_name_snapshot == "张三"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["bot_hangup", "user_hangup"])
+async def test_settlement_labels_bot_requested_hangup(monkeypatch, reason):
+    details = await _settle(
+        monkeypatch,
+        [
+            _event("call_created", 0),
+            _event("bot_started", 100),
+            _event("bot_ended", 9_000, result="succeeded", reason_detail="hangup"),
+        ],
+        reason=reason,
+        hangup_party=None,
+    )
+
+    assert details["hangup_reason_code"] == "bot_hangup"
+    assert details["hangup_party"] == "bot"
+    assert details["call_result"] == "bot_completed"

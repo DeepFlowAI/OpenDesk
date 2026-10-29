@@ -837,6 +837,12 @@ class CcAgentResourceService:
                         current = cls._snapshot_from_raw(employee_id, raw) if raw else None
                         if current and current.get("current_call_id") not in {None, "", call_id}:
                             raise ConflictError("Call resource belongs to another call")
+                        if (
+                            current
+                            and current.get("resource_state") == "after_call_work"
+                            and current.get("wrap_up_call_id") == call_id
+                        ):
+                            return current
                         pipe.multi()
                         pipe.hset(key, mapping=mapping)
                         await pipe.execute()

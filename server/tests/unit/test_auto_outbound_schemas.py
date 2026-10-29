@@ -66,6 +66,17 @@ class TestAutoOutboundTaskCreateSchema:
         )
         assert ok.voicespeed_agent_id == "agent-1"
 
+    def test_duplicate_field_names_rejected_when_fields_carried(self):
+        fields = [
+            {"key": "field_1", "name": "customer_name", "field_type": "single_line_text"},
+            {"key": "field_2", "name": "Customer Name", "field_type": "single_line_text"},
+        ]
+        with pytest.raises(ValidationError, match="duplicates"):
+            AutoOutboundTaskCreate(**_base_kwargs(fields=fields))
+        with pytest.raises(ValidationError, match="duplicates"):
+            AutoOutboundTaskUpdate(fields=fields)
+        assert AutoOutboundTaskUpdate(name="x").fields is None
+
     def test_agent_requires_queue_and_pacing(self):
         with pytest.raises(ValidationError):
             AutoOutboundTaskCreate(
@@ -278,3 +289,4 @@ class TestAutoOutboundTargetAndStatsSchemas:
 
     def test_target_responses_expose_auto_resume_result(self):
         assert AutoOutboundTargetResponse.model_fields["task_auto_resumed"].default is False
+        assert AutoOutboundTargetResponse.model_fields["can_delete"].default is False

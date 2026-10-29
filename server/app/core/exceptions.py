@@ -76,6 +76,11 @@ class NotImplementedApiError(BusinessError):
         super().__init__(message, status_code=501, code="NOT_IMPLEMENTED")
 
 
+class ServiceUnavailableError(BusinessError):
+    def __init__(self, message: str = "Service unavailable", code: str = "SERVICE_UNAVAILABLE"):
+        super().__init__(message, status_code=503, code=code)
+
+
 def _short_session_id(value: object | None) -> str:
     if value is None:
         return "-"

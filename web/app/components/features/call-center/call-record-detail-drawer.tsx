@@ -17,6 +17,7 @@ import {
   callRecordServiceNumber,
   formatCallRecordDate,
   formatCallRecordDuration,
+  recordingPhaseLabel,
   selectDisplayRecording,
 } from '@/app/components/features/call-center/call-record-utils'
 
@@ -37,6 +38,9 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
   const isZh = locale === 'zh'
   const { data, isLoading } = useCallRecord(recordId)
   const displayRecording = selectDisplayRecording(data?.recordings)
+  const displayRecordingPhase = displayRecording
+    ? recordingPhaseLabel(displayRecording.phase, isZh)
+    : null
   const [summaryDirty, setSummaryDirty] = useState(false)
   const [activeTab, setActiveTab] = useState<'overview' | 'trajectory'>('overview')
   const [recordingDownloading, setRecordingDownloading] = useState<string | null>(null)
@@ -138,6 +142,11 @@ export function CallRecordDetailDrawer({ recordId, onClose }: CallRecordDetailDr
                 {displayRecording ? (
                   <div className="space-y-3">
                     <div className="space-y-2 rounded-lg border border-border p-3">
+                        {displayRecordingPhase ? (
+                          <p className="text-xs font-medium text-foreground">
+                            {displayRecordingPhase}
+                          </p>
+                        ) : null}
                         {displayRecording.access_url ? (
                           <div className="flex items-center gap-3">
                             <audio src={displayRecording.access_url} controls className="min-w-0 flex-1" />

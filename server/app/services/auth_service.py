@@ -11,6 +11,7 @@ from jose import JWTError, jwt
 from app.configs.settings import settings
 from app.core.exceptions import UnauthorizedError, NotFoundError
 from app.core.security import verify_password, create_access_token
+from app.core.tenant_platform_auth import tenant_api_key_configured
 from app.repositories.tenant_repository import TenantRepository
 from app.repositories.employee_repository import EmployeeRepository
 from app.schemas.auth import LoginRequest, LoginResponse, SsoLoginRequest, UserInfo, UserPreferencesUpdate
@@ -26,7 +27,10 @@ _SSO_JTI_CLAIM_FALLBACK_TTL_SECONDS = 120
 class AuthService:
     @staticmethod
     def _sso_secret() -> str:
-        return settings.TENANT_PLATFORM_SSO_SECRET or settings.TENANT_API_KEY
+        if settings.TENANT_PLATFORM_SSO_SECRET:
+            return settings.TENANT_PLATFORM_SSO_SECRET
+        # A placeholder TENANT_API_KEY is public, so it must never sign SSO tokens.
+        return settings.TENANT_API_KEY if tenant_api_key_configured() else ""
 
     @staticmethod
     def _sso_audiences() -> set[str]:

@@ -46,3 +46,15 @@ class BaseStorageClient(ABC):
     ) -> str:
         """Return a temporary signed URL that lets a client PUT one object directly."""
         ...
+
+    async def upload_private(self, key: str, data: bytes, content_type: str) -> None:
+        """Upload with private object ACL; providers must explicitly support this."""
+        raise NotImplementedError("Private object uploads are not supported")
+
+    async def read_private(self, key: str, max_bytes: int) -> bytes:
+        """Read without a public URL, enforcing the maximum size before buffering.
+
+        Raise FileNotFoundError for a missing object and ValueError for an
+        oversized/corrupt object. Other failures are treated as transient I/O.
+        """
+        raise NotImplementedError("Private object reads are not supported")

@@ -1,7 +1,7 @@
 """
 Ticket model — work order / ticket entity with dynamic slot columns
 """
-from sqlalchemy import BigInteger, Integer, String, Text, ForeignKey, Index
+from sqlalchemy import BigInteger, Integer, String, Text, ForeignKey, Index, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -18,6 +18,24 @@ class Ticket(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
         Index("ix_tickets_assignee_group", "assignee_group_id"),
         Index("ix_tickets_conversation", "conversation_id"),
         Index("ix_tickets_call_record", "call_record_id"),
+        Index(
+            "ix_tickets_tenant_updated_id",
+            "tenant_id",
+            text("updated_at DESC"),
+            text("id DESC"),
+        ),
+        Index(
+            "ix_tickets_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_tickets_ticket_number_trgm",
+            "ticket_number",
+            postgresql_using="gin",
+            postgresql_ops={"ticket_number": "gin_trgm_ops"},
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

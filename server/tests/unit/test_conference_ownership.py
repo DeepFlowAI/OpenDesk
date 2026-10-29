@@ -274,6 +274,7 @@ async def test_conference_leave_hands_over_to_colleague(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "colleague-leg",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,

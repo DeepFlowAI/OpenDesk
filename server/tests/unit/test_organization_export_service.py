@@ -52,12 +52,17 @@ async def test_export_organizations_builds_xlsx(monkeypatch):
     monkeypatch.setattr(
         OrganizationRepository,
         "query_paginated",
-        AsyncMock(return_value=([organization], 1)),
+        AsyncMock(return_value=([10], 0)),
     )
     monkeypatch.setattr(
         OrganizationRepository,
-        "count_users",
-        AsyncMock(return_value=3),
+        "list_by_ids",
+        AsyncMock(return_value=[organization]),
+    )
+    monkeypatch.setattr(
+        OrganizationRepository,
+        "count_users_by_org_ids",
+        AsyncMock(return_value={10: 3}),
     )
     monkeypatch.setattr(
         OrganizationService,
@@ -105,8 +110,45 @@ async def test_export_organizations_rejects_too_many_records(monkeypatch):
     monkeypatch.setattr(
         OrganizationRepository,
         "query_paginated",
-        AsyncMock(return_value=([], 5001)),
+        AsyncMock(return_value=(list(range(5001)), 0)),
     )
 
     with pytest.raises(ValidationError):
         await OrganizationService.export_organizations(db, 1, OrganizationExportRequest())
+
+
+@pytest.mark.asyncio
+async def test_export_organizations_skips_user_count_when_unselected(monkeypatch):
+    db = SimpleNamespace(get=AsyncMock(return_value=None))
+    organization = SimpleNamespace(id=10)
+    count_users = AsyncMock(return_value={10: 3})
+
+    monkeypatch.setattr(OrganizationService, "_get_slot_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(OrganizationService, "_get_field_key_slot_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        OrganizationRepository,
+        "query_paginated",
+        AsyncMock(return_value=([10], 0)),
+    )
+    monkeypatch.setattr(OrganizationRepository, "list_by_ids", AsyncMock(return_value=[organization]))
+    monkeypatch.setattr(OrganizationRepository, "count_users_by_org_ids", count_users)
+    monkeypatch.setattr(
+        OrganizationService,
+        "_get_custom_field_option_lookup",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        OrganizationService,
+        "_enrich_response",
+        lambda *_args: {"public_id": "org_export_00000001", "custom_fields": {}},
+    )
+
+    await OrganizationService.export_organizations(
+        db,
+        1,
+        OrganizationExportRequest(
+            columns=[OrganizationExportColumn(field_key="public_id", name="组织 ID")],
+        ),
+    )
+
+    count_users.assert_not_awaited()

@@ -1,7 +1,7 @@
 """
 Organization model — contact company / organization linked to visitors
 """
-from sqlalchemy import String, Integer, Text, ForeignKey, Index, UniqueConstraint
+from sqlalchemy import String, Integer, Text, ForeignKey, Index, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -13,6 +13,24 @@ class Organization(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
     __table_args__ = (
         UniqueConstraint("public_id", name="uq_organizations_public_id"),
         Index("ix_organizations_tenant_id", "tenant_id"),
+        Index(
+            "ix_organizations_tenant_updated_id",
+            "tenant_id",
+            text("updated_at DESC"),
+            text("id DESC"),
+        ),
+        Index(
+            "ix_organizations_public_id_trgm",
+            "public_id",
+            postgresql_using="gin",
+            postgresql_ops={"public_id": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_organizations_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

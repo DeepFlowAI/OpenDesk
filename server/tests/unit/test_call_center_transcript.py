@@ -209,6 +209,47 @@ async def test_final_is_persisted_partial_is_not(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_dialed_outbound_transcript_goes_to_owning_agent(monkeypatch):
+    transport = _FakeTransport()
+    orch = _orch(monkeypatch, transport)
+    monkeypatch.setattr(orch_module, "_get_redis_client", lambda: None)
+    appended: list[tuple] = []
+
+    class _FakeService:
+        @staticmethod
+        async def append(_db, *, tenant_id, call_id, role, text, seq=None):
+            appended.append((tenant_id, call_id, role, text))
+
+    class _Session:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(orch_module, "AsyncSessionLocal", lambda: _Session())
+    monkeypatch.setattr(orch_module, "CallTranscriptService", _FakeService)
+    # No workflow: the call was dialed by agent 42, then transferred to 77.
+    await orch.register_outbound_call(
+        call_id="out-1", tenant_id=7, employee_id=42, outbound_did="9000001"
+    )
+    await orch.reassign_outbound_originator("out-1", 77)
+
+    await orch._on_transcript_event(
+        CallEvent(
+            "call.bridge_transcript",
+            {"call_id": "out-1", "speaker": "user", "text": "你好", "final": True},
+        )
+    )
+
+    assert [room for _event, _data, room in transport.emits] == [
+        "agent:7:77",
+        "embedded-call-agent:7:77",
+    ]
+    assert appended == [(7, "out-1", "user", "你好")]
+
+
+@pytest.mark.asyncio
 async def test_no_relay_before_agent_bridged(monkeypatch):
     transport = _FakeTransport()
     orch = _orch(monkeypatch, transport)

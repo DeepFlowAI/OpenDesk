@@ -88,6 +88,25 @@ class CcAgentStatusService:
         except Exception:  # noqa: BLE001
             return base | _empty_resource_fields()
         result = base | _resource_fields(snapshot)
+        # Redis owns after-call work: once it has left wrap-up (agent finished
+        # or the sweep expired it), a lingering PG after_call_work is stale.
+        if (
+            base["status"] == "after_call_work"
+            and snapshot is not None
+            and snapshot.get("resource_state") == "idle"
+            and snapshot.get("visible_status") not in (None, "after_call_work")
+        ):
+            healed = snapshot["visible_status"]
+            result["status"] = healed
+            try:
+                await CcAgentStatusService.sync_pg_status(
+                    db, tenant_id, employee_id, healed, reason="wrap_up_already_ended"
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "stale after_call_work heal failed tenant=%s employee=%s",
+                    tenant_id, employee_id, exc_info=True,
+                )
         # PG stores the last *chosen* status; Redis resource is authoritative
         # while the agent is reserved/ringing/in_call (e.g. consult target
         # accepts without a CDR write, so PG stays "ready"). Surface busy so
@@ -262,8 +281,12 @@ class CcAgentStatusService:
         if status not in VALID_STATUS:
             raise NotFoundError(f"Invalid status: {status}")
         snapshot = None
+        previous_snapshot = None
         if r is not None:
             try:
+                previous_snapshot = await CcAgentResourceService.get_snapshot(
+                    r, tenant_id, employee_id
+                )
                 snapshot = await CcAgentResourceService.set_visible_status(
                     r, tenant_id, employee_id, status
                 )
@@ -276,6 +299,27 @@ class CcAgentStatusService:
                 )
                 snapshot = await CcAgentResourceService.set_visible_status(
                     r, tenant_id, employee_id, status
+                )
+        if (
+            previous_snapshot
+            and previous_snapshot.get("resource_state") == "after_call_work"
+            and status != "after_call_work"
+        ):
+            from app.services.call_agent_fact_service import CallAgentFactService
+
+            try:
+                await CallAgentFactService.close_after_call_work(
+                    db,
+                    tenant_id=tenant_id,
+                    agent_id=employee_id,
+                    call_id=previous_snapshot.get("wrap_up_call_id"),
+                    end_reason="status_change",
+                )
+            except Exception:
+                logger.exception(
+                    "after-call work fact close failed tenant=%s employee=%s",
+                    tenant_id,
+                    employee_id,
                 )
         base = await CcAgentStatusService.sync_pg_status(
             db, tenant_id, employee_id, status, reason

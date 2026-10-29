@@ -21,6 +21,7 @@ Lifecycle & resource safety:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 
@@ -47,6 +48,33 @@ _OFFER_AFFINITY_PREFIX = "cc:offer:affinity"
 
 def _offer_affinity_key(offer_id: str) -> str:
     return f"{_OFFER_AFFINITY_PREFIX}:{offer_id}"
+
+
+# The ring payload, kept while the target's browser is ringing so a reconnect
+# (which loses the one-shot cc.call_incoming) can be shown the ring again.
+_OFFER_PAYLOAD_PREFIX = "cc:offer:internal_payload"
+
+
+def internal_offer_payload_key(offer_id: str) -> str:
+    return f"{_OFFER_PAYLOAD_PREFIX}:{offer_id}"
+
+
+async def load_internal_offer_payload(r: aioredis.Redis, offer_id: str) -> dict | None:
+    """Ring payload of a still-ringing colleague offer, or None once it ended."""
+
+    if not offer_id:
+        return None
+    try:
+        raw = await r.get(internal_offer_payload_key(offer_id))
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 class InternalConsultService:
@@ -168,6 +196,17 @@ class InternalConsultService:
                     value = customer_context.get(key)
                     if value is not None and value != "":
                         payload[key] = value
+            try:
+                await r.set(
+                    internal_offer_payload_key(offer_id),
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    ex=int(timeout_seconds),
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "internal consult payload save failed offer=%s",
+                    offer_id, exc_info=True,
+                )
             pushed = await orchestrator.notify_agent_incoming(
                 tenant_id=tenant_id,
                 employee_id=target_employee_id,
@@ -280,7 +319,9 @@ class InternalConsultService:
 
         orchestrator.cancel_offer(offer_id)
         try:
-            await r.delete(_offer_affinity_key(offer_id))
+            await r.delete(
+                _offer_affinity_key(offer_id), internal_offer_payload_key(offer_id)
+            )
         except Exception:  # noqa: BLE001
             pass
         try:

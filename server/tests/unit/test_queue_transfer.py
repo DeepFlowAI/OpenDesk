@@ -574,6 +574,7 @@ async def test_queue_wait_handover_works_after_initiator_leg_gone(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "agent-leg-new",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,
@@ -701,6 +702,7 @@ async def test_first_pick_answers_and_handover(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "agent-leg-1",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,

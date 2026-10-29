@@ -250,6 +250,63 @@ describe('WorkspaceMessageBubble welcome message', () => {
   })
 })
 
+describe('WorkspaceMessageBubble OpenAgent trace collapse', () => {
+  it('collapses completed bot thinking when an agent opens the conversation', () => {
+    const html = renderToStaticMarkup(createElement(WorkspaceMessageBubble, {
+      message: {
+        id: 21,
+        conversation_id: 100,
+        sender_type: 'bot',
+        sender_id: 9,
+        sender_name: '智能助手',
+        sender_avatar: null,
+        content_type: 'text',
+        content: '我们主要提供两款产品',
+        created_at: '2026-01-01T00:00:00Z',
+        metadata: {
+          open_agent_thinking_blocks: [
+            {
+              id: 'think-1',
+              content: 'user is asking about features',
+              llmStepId: 1,
+              isStreaming: false,
+              timelineIndex: 1,
+            },
+          ],
+          open_agent_tool_blocks: [
+            {
+              id: 'tool-1',
+              toolName: 'search',
+              brief: '检索 OpenDesk 核心功能',
+              toolCallId: 'call-1',
+              stepId: 11,
+              isExecuting: false,
+              timelineIndex: 2,
+            },
+          ],
+          open_agent_text_blocks: [
+            {
+              id: 'text-1',
+              content: '我们主要提供两款产品',
+              isStreaming: false,
+              timelineIndex: 3,
+            },
+          ],
+        },
+      },
+      locale: 'zh',
+      mode: 'active',
+      attachmentContext: { kind: 'conversation', conversationId: 100 },
+    }))
+
+    expect(html).toContain('已思考')
+    expect(html).toContain('调用了 1 个工具')
+    expect(html).toContain('我们主要提供两款产品')
+    expect(html).not.toContain('user is asking about features')
+    expect(html).not.toContain('data-open-agent-thinking')
+  })
+})
+
 describe('WorkspaceMessageBubble knowledge actions', () => {
   it('places robot QA after create document and invokes its callback', async () => {
     const message = sessionRecordMessageToMessage(makeRecord())

@@ -7,7 +7,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-CLASSIFICATION_VERSION = 1
+CLASSIFICATION_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,15 @@ _INTERNAL_REASONS: dict[str, tuple[str, str]] = {
     "no_answer": ("customer_no_answer", "carrier"),
     "supervisor_force_hangup": ("supervisor_force_hangup", "supervisor"),
     "bot_completed": ("bot_completed", "bot"),
+    "bot_hangup": ("bot_hangup", "bot"),
     "bridge_peer_gone": ("customer_hangup", "customer"),
+    # The agent ended the service and handed the customer to the satisfaction
+    # survey; these are the system closing the call once the survey is over.
+    # A customer who hangs up during the survey reports remote_bye instead.
+    "satisfaction_completed": ("agent_hangup", "agent"),
+    "satisfaction_partial": ("agent_hangup", "agent"),
+    "satisfaction_unanswered": ("agent_hangup", "agent"),
+    "satisfaction_failed": ("agent_hangup", "agent"),
     "no_agent_online": ("no_agent_online", "system"),
     "queue_timeout": ("queue_timeout", "system"),
     "queue_limit_reached": ("queue_limit_reached", "system"),
@@ -80,7 +88,7 @@ _SIP_STATUS: dict[int, tuple[str, str]] = {
     433: ("provider_rejected", "carrier"),
     478: ("provider_unresolvable_destination", "carrier"),
     479: ("provider_unresolvable_destination", "carrier"),
-    480: ("customer_no_answer", "carrier"),
+    480: ("provider_temporarily_unavailable", "carrier"),
     481: ("provider_rejected", "carrier"),
     482: ("no_route", "system"),
     483: ("no_route", "system"),
@@ -100,11 +108,20 @@ _SIP_STATUS: dict[int, tuple[str, str]] = {
     513: ("provider_rejected", "carrier"),
     580: ("media_failed", "system"),
     600: ("customer_busy", "carrier"),
-    603: ("provider_rejected", "carrier"),
+    # 603 Decline is the callee pressing "reject"; a carrier block carries
+    # its own wording in Warning/Reason and is caught by the phrase rules.
+    603: ("customer_busy", "carrier"),
     604: ("invalid_number", "carrier"),
     606: ("provider_rejected", "carrier"),
     607: ("provider_rejected", "carrier"),
     608: ("provider_rejected", "carrier"),
+}
+
+_UNANSWERED_REASONS = frozenset({"no_answer", "timeout"})
+
+_UNANSWERED_BY_SIP_STATUS: dict[int | None, tuple[str, str]] = {
+    183: ("provider_answer_unconfirmed", "carrier"),
+    480: ("provider_temporarily_unavailable", "carrier"),
 }
 
 _PHRASE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -115,12 +132,22 @@ _PHRASE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("invalid_number", ("invalid number", "number does not exist", "空号", "号码无效")),
     ("customer_power_off", ("powered off", "subscriber switched off", "关机")),
     ("customer_unreachable", ("subscriber unreachable", "network out of order", "无法接通")),
-    ("provider_rejected", ("call rejected", "decline", "拒绝呼叫")),
+    ("provider_rejected", ("call rejected", "拒绝呼叫")),
 )
 
 
 def classify_hangup(signal: HangupSignal) -> HangupClassification:
     normalized_reason = (signal.reason or "").strip().lower()
+    # An unanswered call only proves the carrier never confirmed an answer.
+    # Its last SIP status says whether that is a plain ring timeout or not:
+    # after 183 the callee may have picked up without the carrier ever
+    # sending 200 OK, and 480 is the carrier's own "unavailable" verdict.
+    if normalized_reason in _UNANSWERED_REASONS:
+        refined = _UNANSWERED_BY_SIP_STATUS.get(signal.sip_status)
+        if refined is not None:
+            return HangupClassification(
+                *refined, strategy="internal_reason_sip_status", score=1.0
+            )
     known = _INTERNAL_REASONS.get(normalized_reason)
     if known is not None:
         return HangupClassification(*known, strategy="internal_reason", score=1.0)

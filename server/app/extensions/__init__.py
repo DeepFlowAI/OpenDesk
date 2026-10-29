@@ -1,16 +1,12 @@
-"""Extension loader for optional add-on modules.
+"""Extension loader.
 
-This package is intentionally empty in the default distribution. Deployments
-that bundle additional modules overlay them into this package before docker
-build (see deploy.sh / .github/workflows/deploy.yml).
+Product modules (reports, telephony, sms_platform, tenants, verify_files)
+live in this package and ship with the application. On startup, every
+subpackage that defines ``register(app: FastAPI) -> None`` is auto-loaded
+and typically registers extra routers.
 
-On startup, every subpackage that defines a top-level callable
-``register(app: FastAPI) -> None`` is auto-loaded — typically registering
-extra routers or replacing default service implementations.
-
-Adding a new extension is purely additive: drop a new subpackage into this
-package with a ``register(app)`` function; nothing in the default codebase
-needs to change.
+Adding a module is additive: drop a new subpackage here with a
+``register(app)`` function.
 """
 import importlib
 import logging
@@ -25,13 +21,9 @@ logger = logging.getLogger(__name__)
 
 
 def _augment_path_with_private_overlay() -> None:
-    """In local development, mount the ``private/extensions/server`` overlay into this package.
+    """Append an optional local overlay directory to this package's search path.
 
-    Production deploy copies overlay extensions into ``server/app/extensions/`` at
-    build time (see deploy.sh). In a local checkout we keep them in ``private/``
-    and extend ``__path__`` instead so ``pkgutil.iter_modules`` finds them as
-    additional ``app.extensions.<name>`` subpackages — no copy required.
-    No-op when the directory is absent (e.g. inside the default docker image).
+    In-tree modules are found first. No-op when the overlay directory is absent.
     """
     repo_root = Path(__file__).resolve().parents[3]
     private_dir = repo_root / "private" / "extensions" / "server"

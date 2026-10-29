@@ -1,5 +1,9 @@
 import type { UserInfo } from '@/models/auth'
-import { ADMIN_NAV_GROUPS } from '@/config/admin-permissions'
+import {
+  ADMIN_NAV_GROUPS,
+  type AdminNavItem,
+  type AdminRouteRule,
+} from '@/config/admin-permissions'
 
 export type DataScopeResource =
   | 'ticket'
@@ -60,12 +64,21 @@ export function getDefaultAccessiblePath(user: PermissionUser | null | undefined
   return '/403'
 }
 
+export function canAccessAdminNavItem(user: PermissionUser | null | undefined, item: AdminNavItem): boolean {
+  if (item.superAdminOnly) return Boolean(user?.is_super_admin)
+  if (item.anyPermissions) return hasAnyPermission(user, item.anyPermissions)
+  return hasPermission(user, item.permission)
+}
+
+export function canAccessAdminRoute(user: PermissionUser | null | undefined, rule: AdminRouteRule): boolean {
+  if (rule.superAdminOnly && !user?.is_super_admin) return false
+  return rule.matchAny ? hasAnyPermission(user, rule.permissions) : hasAllPermissions(user, rule.permissions)
+}
+
 export function getDefaultAdminPath(user: PermissionUser | null | undefined): string {
   if (!hasPermission(user, 'admin.access')) return '/403'
   for (const group of ADMIN_NAV_GROUPS) {
-    const item = group.items.find((navItem) => (
-      navItem.superAdminOnly ? Boolean(user?.is_super_admin) : hasPermission(user, navItem.permission)
-    ))
+    const item = group.items.find((navItem) => canAccessAdminNavItem(user, navItem))
     if (item) return item.href
   }
   return '/403'

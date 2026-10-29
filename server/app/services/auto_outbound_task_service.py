@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
+from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from app.libs.excel import parse_spreadsheet
 from app.models.auto_outbound import AutoOutboundTarget, AutoOutboundTask
 from app.models.tenant import Tenant
@@ -1273,7 +1273,9 @@ class AutoOutboundTaskService:
         )
         if record is None:
             raise NotFoundError("Auto outbound record not found")
-        if record.reception_type != "agent":
+        # Bot/IVR receptions keep their reception_type after handing the call
+        # to an agent; agent_id marks that a human took over.
+        if record.reception_type != "agent" and record.agent_id is None:
             raise ValidationError("Wrap-up is only available for agent reception records")
         if record.agent_id is None or int(record.agent_id) != int(principal.user_id):
             raise ForbiddenError("Only the assigned agent can submit wrap-up")
@@ -1824,13 +1826,60 @@ class AutoOutboundTaskService:
         target = await AutoOutboundRepository.get_target(db, target_id)
         if not target or target.tenant_id != principal.tenant_id:
             raise NotFoundError("Auto outbound target not found")
-        task = await AutoOutboundRepository.get_task(db, target.task_id)
-        if not task:
+        task = await AutoOutboundRepository.get_task_for_update(db, target.task_id)
+        if not task or task.tenant_id != principal.tenant_id:
             raise NotFoundError("Auto outbound task not found")
-        AutoOutboundTaskService._assert_can_manage_task(principal, task)
-        if task.status == "archived":
-            raise ValidationError("Archived tasks cannot be changed")
-        await AutoOutboundRepository.delete_target(db, target)
+        if not AutoOutboundTaskService._can_manage_task(principal, task):
+            raise ForbiddenError("Permission denied to delete auto outbound target")
+        if task.status not in TARGET_MUTATION_ALLOWED_STATUSES:
+            raise ConflictError(
+                "Auto outbound task has ended. Outbound targets cannot be deleted"
+            )
+
+        locked_target = await AutoOutboundRepository.get_target_for_update(
+            db,
+            target_id,
+            tenant_id=principal.tenant_id,
+            task_id=task.id,
+        )
+        if locked_target is None:
+            raise NotFoundError("Auto outbound target not found")
+        if (
+            locked_target.status not in {"pending", "invalid"}
+            or int(locked_target.call_count or 0) != 0
+            or await AutoOutboundRepository.target_has_call_records(db, target_id)
+        ):
+            raise ConflictError(
+                "Auto outbound target has entered the calling process and cannot be deleted"
+            )
+
+        await AutoOutboundRepository.delete_target(db, locked_target, commit=False)
+        open_count = await AutoOutboundRepository.count_targets_by_status(
+            db,
+            task.id,
+            statuses=["pending", "calling", "redial_pending"],
+        )
+        if task.status == "active" and open_count == 0:
+            now = datetime.now(timezone.utc)
+            updated = await AutoOutboundRepository.update_task(
+                db,
+                task,
+                {
+                    "status": "paused",
+                    "auto_pause_reason": AUTO_PAUSE_REASON_QUEUE_FINISHED,
+                },
+                commit=False,
+            )
+            await AutoOutboundEventService.emit_task_event(
+                db,
+                task=updated,
+                event_type="auto_outbound.task.paused",
+                occurred_at=now,
+                actor={"type": "system"},
+                previous_status="active",
+                reason=AUTO_PAUSE_REASON_QUEUE_FINISHED,
+            )
+        await db.commit()
 
     @staticmethod
     async def list_records(

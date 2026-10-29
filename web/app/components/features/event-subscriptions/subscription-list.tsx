@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { IconChevronLeft, IconChevronRight, IconPlus, IconSearch, IconWebhook } from '@tabler/icons-react'
+import { HTTPError } from 'ky'
 import { toast } from 'sonner'
 import { useLocaleStore } from '@/context/locale-store'
 import { t } from '@/utils/i18n'
@@ -60,8 +61,29 @@ export function SubscriptionList() {
       if (target.action === 'delete') await remove.mutateAsync(target.item.public_id)
       toast.success(t(`eventSubs.${target.action}.success`, locale))
       setTarget(null)
+    } catch (error) {
+      toast.error((await readReferenceMessage(error)) ?? t('eventSubs.operation.failed', locale))
+    }
+  }
+  const readReferenceMessage = async (error: unknown): Promise<string | null> => {
+    if (!(error instanceof HTTPError)) return null
+    try {
+      const body = (await error.response.clone().json()) as {
+        details?: { code?: string; auto_outbound_task_count?: number; call_event_rule_count?: number }
+      }
+      const details = body.details
+      if (details?.code !== 'subscription_in_use') return null
+      const parts: string[] = []
+      if (details.auto_outbound_task_count) {
+        parts.push(t('eventSubs.delete.inUse.tasks', locale, { count: details.auto_outbound_task_count }))
+      }
+      if (details.call_event_rule_count) {
+        parts.push(t('eventSubs.delete.inUse.callRules', locale, { count: details.call_event_rule_count }))
+      }
+      if (!parts.length) return null
+      return t('eventSubs.delete.inUse', locale, { refs: parts.join(locale === 'zh' ? '、' : ' and ') })
     } catch {
-      toast.error(t('eventSubs.operation.failed', locale))
+      return null
     }
   }
 

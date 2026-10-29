@@ -20,6 +20,7 @@ from app.models.user import User
 from app.repositories.call_record_access_scope_repository import (
     CallRecordAccessScopeRepository,
 )
+from app.repositories.call_event_repository import CallEventRepository
 from app.repositories.call_record_repository import CallRecordRepository
 from app.repositories.call_recording_repository import CallRecordingRepository
 from app.repositories.employee_group_repository import EmployeeGroupRepository
@@ -93,6 +94,7 @@ class CallRecordService:
         background task — phone matching loads every user with a phone and must
         not delay ``call.answer`` / the first prompt.
         """
+        await CallRecordRepository.lock_creation(db, tenant_id, call_id)
         existing = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
         if existing:
             if identify_user:
@@ -154,6 +156,43 @@ class CallRecordService:
             await _best_effort_identify_user(db, tenant_id, row)
 
     @staticmethod
+    async def record_outbound_customer_connected(call_id: str) -> None:
+        """Best-effort trajectory fact for the customer answering an outbound call.
+
+        Only the customer leg owns a call record, so answers on other legs
+        (for example an agent desk-phone leg) are ignored.
+        """
+        from app.db.session import AsyncSessionLocal
+
+        try:
+            async with AsyncSessionLocal() as db:
+                row = await CallRecordRepository.get_by_call_id_unscoped(db, call_id)
+                if row is None or row.direction != "outbound":
+                    return
+                event_id = f"flowkit:customer-connected:{call_id}"
+                await CallTrajectoryService.append_event(
+                    db,
+                    call_record_id=row.id,
+                    payload=CallEventCreate(
+                        event_id=event_id,
+                        event_type="customer_connected",
+                        event_category="lifecycle",
+                        actor_type="customer",
+                        source="flowkit",
+                        source_event_id=event_id,
+                        occurred_at=datetime.now(timezone.utc),
+                        call_leg_id=call_id,
+                        participant_role="customer",
+                        result="succeeded",
+                    ),
+                    commit=True,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "outbound customer_connected trajectory failed call_id=%s", call_id
+            )
+
+    @staticmethod
     async def create_for_outbound(
         db: AsyncSession,
         tenant_id: int,
@@ -183,6 +222,7 @@ class CallRecordService:
         must not delay post-answer reception / queue offer.
         """
 
+        await CallRecordRepository.lock_creation(db, tenant_id, call_id)
         existing = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
         if existing:
             if identify_user:
@@ -190,6 +230,11 @@ class CallRecordService:
             return _to_detail(existing, None)
         del device_type, device_identifier
         started_at = datetime.now(timezone.utc)
+        employee_names = (
+            await _employee_name_snapshots(db, tenant_id, [agent_id])
+            if agent_id is not None
+            else {}
+        )
         row = await CallRecordRepository.create(
             db,
             {
@@ -204,6 +249,8 @@ class CallRecordService:
                 "customer_number": normalize_call_number(to_number),
                 "service_number": normalize_call_number(from_number),
                 "initiator_agent_id": agent_id,
+                "initiator_agent_ref_id": agent_id,
+                "initiator_agent_name_snapshot": employee_names.get(agent_id),
                 "lifecycle_status": "active",
                 "started_at": started_at,
                 "recording_status": "none",
@@ -220,6 +267,7 @@ class CallRecordService:
                 event_category="lifecycle",
                 actor_type="agent" if agent_id is not None else "system",
                 actor_id=str(agent_id) if agent_id is not None else None,
+                actor_name_snapshot=employee_names.get(agent_id),
                 source="opendesk",
                 source_event_id=created_event_id,
                 occurred_at=row.started_at,
@@ -261,6 +309,18 @@ class CallRecordService:
         await db.refresh(row)
         if identify_user:
             await _best_effort_identify_user(db, tenant_id, row, actor_id=agent_id)
+            if agent_id is not None and row.user_id is not None:
+                # The record is created off the dial request, usually after the
+                # desk last refreshed its call list, so tell it to reload.
+                from app.constants.call_center import CcSocketEvent
+                from app.services.call_center.agent_notify import emit_to_agent
+
+                await emit_to_agent(
+                    tenant_id=tenant_id,
+                    employee_id=agent_id,
+                    method=CcSocketEvent.CALL_RECORD_UPDATED.value,
+                    payload={"call_id": call_id},
+                )
         return _to_detail(row, None)
 
     @staticmethod
@@ -476,13 +536,24 @@ class CallRecordService:
         row = await CallRecordRepository.get_by_call_id(db, call_id, tenant_id)
         if not row:
             return
-        if row.lifecycle_status == "ended" and row.ended_event_id:
+        if (
+            row.lifecycle_status == "ended"
+            and row.ended_event_id
+            and getattr(row, "finalization_status", None) == "completed"
+        ):
             await _project_satisfaction_best_effort(db, row.id)
             return
-        ts = datetime.now(timezone.utc)
+        ts = getattr(row, "ended_at", None) or datetime.now(timezone.utc)
         if not getattr(row, "id", None):
             return
         call_record_id = row.id
+        ending_details = dict(hangup_details or {})
+        ending_details.update(
+            {
+                "hangup_party": hangup_party,
+                "end_state": end_state,
+            }
+        )
         try:
             await CallTrajectoryService.append_event(
                 db,
@@ -498,27 +569,115 @@ class CallRecordService:
                     participant_role="customer",
                     reason_code="call_ended",
                     reason_detail=hangup_reason,
+                    details=ending_details,
                 ),
                 commit=False,
             )
+            await CallRecordRepository.update(
+                db,
+                row,
+                {
+                    "lifecycle_status": "ended",
+                    "ended_at": ts,
+                    "finalization_status": "pending",
+                    "finalized_at": None,
+                },
+                commit=False,
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            logger.exception(
+                "Failed to persist call ending fact call_record_id=%s",
+                call_record_id,
+            )
+            await CallRecordService._mark_finalization_failed(
+                db,
+                call_record_id=call_record_id,
+                ended_at=ts,
+            )
+            return
+
+        await CallRecordService._finalize_pending(
+            db,
+            call_record_id=call_record_id,
+        )
+
+    @staticmethod
+    async def retry_finalization(
+        db: AsyncSession,
+        *,
+        call_record_id: int,
+        pending_before: datetime,
+        failed_before: datetime,
+    ) -> bool:
+        """Retry one stale pending or failed CDR after locking and rechecking it."""
+        row = await CallRecordRepository.lock_by_id(db, call_record_id)
+        if row is None or row.lifecycle_status != "ended":
+            return False
+        updated_at = row.updated_at or row.ended_at or row.started_at
+        if row.finalization_status == "pending":
+            if updated_at > pending_before:
+                return False
+        elif row.finalization_status == "failed":
+            if updated_at > failed_before:
+                return False
+            await CallRecordRepository.update(
+                db,
+                row,
+                {"finalization_status": "pending", "finalized_at": None},
+                commit=False,
+            )
+            await db.commit()
+        else:
+            return False
+        return await CallRecordService._finalize_pending(
+            db,
+            call_record_id=call_record_id,
+        )
+
+    @staticmethod
+    async def _finalize_pending(
+        db: AsyncSession,
+        *,
+        call_record_id: int,
+    ) -> bool:
+        row = await CallRecordRepository.lock_by_id(db, call_record_id)
+        if row is None or row.finalization_status == "completed":
+            return False
+        events = await CallEventRepository.list_for_call(db, call_record_id)
+        ending_event = next(
+            (event for event in reversed(events) if event.event_type == "call_ending"),
+            None,
+        )
+        ended_at = row.ended_at or (
+            ending_event.occurred_at
+            if ending_event is not None
+            else datetime.now(timezone.utc)
+        )
+        ending_details = dict(getattr(ending_event, "details", None) or {})
+        hangup_party = ending_details.pop("hangup_party", None)
+        end_state = str(ending_details.pop("end_state", "completed"))
+        hangup_reason = getattr(ending_event, "reason_detail", None)
+        try:
             await CallTrajectoryService.reconcile_open_intervals(
                 db,
-                call_record_id=row.id,
-                ended_at=ts,
+                call_record_id=call_record_id,
+                ended_at=ended_at,
                 commit=False,
             )
             settlement = await CallTrajectoryService.build_settlement_details(
                 db,
-                call_record_id=row.id,
-                ended_at=ts,
+                call_record_id=call_record_id,
+                ended_at=ended_at,
                 hangup_reason=hangup_reason,
                 hangup_party=hangup_party,
-                hangup_details=hangup_details,
+                hangup_details=ending_details,
             )
-            ended_event_id = f"opendesk:call-ended:{row.id}"
+            ended_event_id = f"opendesk:call-ended:{call_record_id}"
             await CallTrajectoryService.append_event(
                 db,
-                call_record_id=row.id,
+                call_record_id=call_record_id,
                 payload=CallEventCreate(
                     event_id=ended_event_id,
                     event_type="call_ended",
@@ -529,7 +688,7 @@ class CallRecordService:
                         else "system"
                     ),
                     source="opendesk",
-                    occurred_at=ts,
+                    occurred_at=ended_at,
                     call_leg_id=row.call_id,
                     participant_role="customer",
                     result="succeeded" if end_state == "completed" else "failed",
@@ -539,12 +698,13 @@ class CallRecordService:
                 ),
                 commit=False,
             )
+            finalized_at = datetime.now(timezone.utc)
             await CallRecordRepository.update(
                 db,
                 row,
                 {
                     "lifecycle_status": "ended",
-                    "ended_at": ts,
+                    "ended_at": ended_at,
                     "finalization_status": (
                         "completed"
                         if settlement["projection_complete"]
@@ -552,11 +712,30 @@ class CallRecordService:
                     ),
                     "ended_event_id": ended_event_id,
                     "result_rule_version": settlement["result_rule_version"],
-                    "finalized_at": ts,
+                    "finalized_at": finalized_at,
                     "actual_reception_type": settlement["actual_reception_type"],
                     "call_result": settlement["call_result"],
                     "hangup_party": settlement["hangup_party"],
                     "hangup_reason_code": settlement["hangup_reason_code"],
+                    "human_service_requested_at": settlement.get(
+                        "human_service_requested_at"
+                    ),
+                    "first_agent_wait_started_at": settlement.get(
+                        "first_agent_wait_started_at"
+                    ),
+                    "first_agent_offer_started_at": settlement.get(
+                        "first_agent_offer_started_at"
+                    ),
+                    "bot_handoff_requested_at": settlement.get(
+                        "bot_handoff_requested_at"
+                    ),
+                    "bot_handoff_succeeded_at": settlement.get(
+                        "bot_handoff_succeeded_at"
+                    ),
+                    "hangup_stage": settlement.get("hangup_stage"),
+                    "short_abandon_threshold_ms": settlement.get(
+                        "short_abandon_threshold_ms"
+                    ),
                     "total_duration_ms": settlement["total_duration_ms"],
                     "customer_ring_duration_ms": settlement[
                         "customer_ring_duration_ms"
@@ -568,11 +747,19 @@ class CallRecordService:
                 },
                 commit=False,
             )
+            from app.services.call_queue_fact_service import CallQueueFactService
+            from app.services.call_agent_fact_service import CallAgentFactService
+
+            await CallQueueFactService.project_for_call(db, call_record_id)
+            await CallAgentFactService.project_for_call(db, call_record_id)
+            from app.services.call_event_publisher import CallEventPublisher
+
+            await CallEventPublisher.publish_call_ended(db, row)
             await db.commit()
             log_extra = {
                 "event": "call_hangup_classified",
-                "hangup_call_id": call_id,
-                "tenant_id": tenant_id,
+                "hangup_call_id": row.call_id,
+                "tenant_id": getattr(row, "tenant_id", None),
                 "hangup_reason_code": settlement["hangup_reason_code"],
                 "hangup_party": settlement["hangup_party"],
                 "hangup_match_strategy": settlement.get("hangup_match_strategy"),
@@ -594,32 +781,49 @@ class CallRecordService:
             )
             log_method(
                 "call_hangup_classified call_id=%s code=%s strategy=%s score=%s",
-                call_id,
+                row.call_id,
                 settlement["hangup_reason_code"],
                 settlement.get("hangup_match_strategy"),
                 settlement.get("hangup_match_score"),
                 extra=log_extra,
             )
             await _project_satisfaction_best_effort(db, call_record_id)
+            return True
         except Exception:  # noqa: BLE001
             await db.rollback()
             logger.exception(
                 "Failed to settle call trajectory call_record_id=%s",
                 call_record_id,
             )
-            failed_row = await CallRecordRepository.get_by_call_id(
-                db, call_id, tenant_id
+            await CallRecordService._mark_finalization_failed(
+                db,
+                call_record_id=call_record_id,
+                ended_at=ended_at,
             )
-            if failed_row is not None:
-                await CallRecordRepository.update(
-                    db,
-                    failed_row,
-                    {
-                        "lifecycle_status": "ended",
-                        "ended_at": ts,
-                        "finalization_status": "failed",
-                    },
-                )
+            return False
+
+    @staticmethod
+    async def _mark_finalization_failed(
+        db: AsyncSession,
+        *,
+        call_record_id: int,
+        ended_at: datetime,
+    ) -> None:
+        failed_row = await CallRecordRepository.get_by_id_unscoped(
+            db, call_record_id
+        )
+        if failed_row is None:
+            return
+        await CallRecordRepository.update(
+            db,
+            failed_row,
+            {
+                "lifecycle_status": "ended",
+                "ended_at": ended_at,
+                "finalization_status": "failed",
+                "finalized_at": None,
+            },
+        )
 
     @staticmethod
     async def bind_queue(
@@ -736,8 +940,15 @@ class CallRecordService:
         """Upsert one recording artifact and refresh the CDR recording summary."""
 
         row = await CallRecordRepository.find_by_media_call_id(db, call_id)
-        if row is None:
+        if row is None or not getattr(row, "id", None):
             return False
+        # Lock the CDR before inserting the recording. A foreign-key insert
+        # only takes a share lock; upgrading that to a row lock later deadlocks
+        # when another recording or hangup finalization locks the same row.
+        locked = await CallRecordRepository.lock_by_id(db, row.id)
+        if locked is None:
+            return False
+        row = locked
         await CallRecordingRepository.upsert(
             db,
             {
@@ -1243,8 +1454,15 @@ def _to_list_item(
         "started_at": row.started_at,
         "customer_connected_at": row.customer_connected_at,
         "first_agent_connected_at": row.first_agent_connected_at,
+        "human_service_requested_at": getattr(row, "human_service_requested_at", None),
+        "first_agent_wait_started_at": getattr(row, "first_agent_wait_started_at", None),
+        "first_agent_offer_started_at": getattr(row, "first_agent_offer_started_at", None),
+        "bot_handoff_requested_at": getattr(row, "bot_handoff_requested_at", None),
+        "bot_handoff_succeeded_at": getattr(row, "bot_handoff_succeeded_at", None),
         "ended_at": row.ended_at,
         "human_service_ended_at": row.human_service_ended_at,
+        "hangup_stage": getattr(row, "hangup_stage", None),
+        "short_abandon_threshold_ms": getattr(row, "short_abandon_threshold_ms", None),
         "total_duration_ms": row.total_duration_ms,
         "customer_ring_duration_ms": row.customer_ring_duration_ms,
         "agent_wait_duration_ms": row.agent_wait_duration_ms,
@@ -1311,8 +1529,15 @@ def _to_detail(
         "started_at": row.started_at,
         "customer_connected_at": row.customer_connected_at,
         "first_agent_connected_at": row.first_agent_connected_at,
+        "human_service_requested_at": getattr(row, "human_service_requested_at", None),
+        "first_agent_wait_started_at": getattr(row, "first_agent_wait_started_at", None),
+        "first_agent_offer_started_at": getattr(row, "first_agent_offer_started_at", None),
+        "bot_handoff_requested_at": getattr(row, "bot_handoff_requested_at", None),
+        "bot_handoff_succeeded_at": getattr(row, "bot_handoff_succeeded_at", None),
         "ended_at": row.ended_at,
         "human_service_ended_at": row.human_service_ended_at,
+        "hangup_stage": getattr(row, "hangup_stage", None),
+        "short_abandon_threshold_ms": getattr(row, "short_abandon_threshold_ms", None),
         "total_duration_ms": row.total_duration_ms,
         "customer_ring_duration_ms": row.customer_ring_duration_ms,
         "agent_wait_duration_ms": row.agent_wait_duration_ms,

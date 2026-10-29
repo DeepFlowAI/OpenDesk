@@ -46,9 +46,10 @@ import {
   type AdminNavIconKey,
 } from '@/config/admin-permissions'
 import {
+  canAccessAdminNavItem,
+  canAccessAdminRoute,
   getDefaultAccessiblePath,
   getDefaultAdminPath,
-  hasAllPermissions,
   hasPermission,
 } from '@/utils/permissions'
 
@@ -98,9 +99,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
     () => ADMIN_NAV_GROUPS
       .map((group) => ({
         ...group,
-        items: group.items.filter((item) => (
-          item.superAdminOnly ? Boolean(user?.is_super_admin) : hasPermission(user, item.permission)
-        )),
+        items: group.items.filter((item) => canAccessAdminNavItem(user, item)),
       }))
       .filter((group) => group.items.length > 0),
     [user]
@@ -129,8 +128,8 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
       router.replace('/403')
       return
     }
-    if (routeRule && !hasAllPermissions(user, routeRule.permissions)) {
-      router.replace(getDefaultAdminPath(user))
+    if (routeRule && !canAccessAdminRoute(user, routeRule)) {
+      router.replace(routeRule.forbidOnDeny ? '/403' : getDefaultAdminPath(user))
     }
   }, [authRefreshing, mounted, token, user, pathname, router])
 
@@ -138,7 +137,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
   if (!hasPermission(user, 'admin.access')) return null
   const routeRule = getAdminRouteRule(pathname)
   if (routeRule?.superAdminOnly && !user.is_super_admin) return null
-  if (routeRule && !hasAllPermissions(user, routeRule.permissions)) return null
+  if (routeRule && !canAccessAdminRoute(user, routeRule)) return null
   if (visibleNavGroups.length === 0) return null
 
   return (

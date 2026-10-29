@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { CallRecordingItem } from '@/models/call-center'
 
-import { selectDisplayRecording } from './call-record-utils'
+import { recordingPhaseLabel, selectDisplayRecording } from './call-record-utils'
 
 function recording(overrides: Partial<CallRecordingItem> & Pick<CallRecordingItem, 'recording_id'>): CallRecordingItem {
   return {
@@ -84,5 +84,14 @@ describe('selectDisplayRecording', () => {
     const inProgress = recording({ recording_id: 'recording', status: 'recording' })
 
     expect(selectDisplayRecording([failed, inProgress])?.recording_id).toBe('recording')
+  })
+})
+
+describe('recordingPhaseLabel', () => {
+  it('labels carrier early media without relabeling normal recordings', () => {
+    expect(recordingPhaseLabel('early_media', true)).toBe('线路提示录音')
+    expect(recordingPhaseLabel('early_media', false)).toBe('Carrier announcement')
+    expect(recordingPhaseLabel('ai', true)).toBeNull()
+    expect(recordingPhaseLabel(null, false)).toBeNull()
   })
 })

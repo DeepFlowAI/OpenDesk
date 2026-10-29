@@ -4,7 +4,10 @@ Tickets router — ticket CRUD + workspace list & detail APIs
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.deps import get_db, get_current_principal, require_permission
+from app.db.deps import get_db, get_current_principal, require_permission, get_current_principal_short_session
+from app.libs.export_types import register_export_type
+from app.schemas.ticket_export import TicketExportPrepare
+from app.services.ticket_export_service import TicketExportService
 from app.schemas.permission import EffectivePrincipal
 from app.schemas.ticket import (
     TicketResponse,
@@ -27,6 +30,15 @@ from app.services.ticket_comment_service import TicketCommentService
 from app.services.ticket_service import TicketService
 
 router = APIRouter(prefix="/tickets", tags=["Tickets"])
+register_export_type(TicketExportService())
+
+
+@router.post("/export-config")
+async def prepare_export(
+    body: TicketExportPrepare,
+    principal: EffectivePrincipal = Depends(get_current_principal_short_session),
+) -> dict:
+    return await TicketExportService.prepare(principal, body)
 
 
 @router.post(

@@ -4,6 +4,7 @@ export type SystemSettings = {
   organization_enabled: boolean
   bridge_asr_enabled: boolean
   call_wrapup_seconds: number
+  call_short_abandon_threshold_seconds: number
 }
 
 export type UpdateSystemSettingsPayload = {
@@ -20,5 +21,9 @@ export type UpdateCallTranscriptionPayload = {
 }
 
 export type UpdateCallWrapupPayload = {
+  seconds: number
+}
+
+export type UpdateCallShortAbandonPayload = {
   seconds: number
 }

@@ -532,9 +532,14 @@ export function AgentChatRuntimeProvider({
       if (!socket || !convId) return
       if (composerMode === 'internal' && !chatConfig.canCreateInternalNote) return
       if (composerMode === 'public' && !chatConfig.canSendPublicReply) return
-      const sendConversation = composerMode === 'public'
-        ? await ensureSendConversation()
-        : conversation
+      let sendConversation = conversation
+      if (composerMode === 'public') {
+        try {
+          sendConversation = await ensureSendConversation()
+        } catch {
+          return
+        }
+      }
       await emitDeferredAwareMessage({
         conversation: sendConversation,
         content: textPart.text,

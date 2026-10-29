@@ -4,6 +4,22 @@ import { t } from '@/utils/i18n'
 
 const API_MESSAGE_I18N: Array<{ match: string; key: string }> = [
   // Order matters: the first substring hit wins.
+  {
+    match: 'target has entered the calling process',
+    key: 'ws.autoOutbound.deleteTarget.error.enteredCalling',
+  },
+  {
+    match: 'task has ended. Outbound targets cannot be deleted',
+    key: 'ws.autoOutbound.deleteTarget.error.taskEnded',
+  },
+  {
+    match: 'Permission denied to delete auto outbound target',
+    key: 'ws.autoOutbound.deleteTarget.error.forbidden',
+  },
+  {
+    match: 'Auto outbound target not found',
+    key: 'ws.autoOutbound.deleteTarget.error.notFound',
+  },
   { match: 'Archived tasks cannot', key: 'ws.autoOutbound.validation.taskArchived' },
   { match: 'Completed tasks cannot accept', key: 'ws.autoOutbound.validation.taskCompleted' },
   { match: 'Add pending numbers before resuming', key: 'ws.autoOutbound.validation.resumeNoPending' },

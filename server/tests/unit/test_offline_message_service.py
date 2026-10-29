@@ -11,6 +11,7 @@ from app.models.offline_message import OfflineMessage, OfflineMessageEntry
 from app.schemas.permission import EffectivePrincipal
 from app.services.offline_message_service import (
     DataScopeService,
+    LEAVE_MESSAGE_HOURS_OPEN_CODE,
     OFFLINE_MESSAGE_BOT_AUTO_CLOSE_ENDED_BY,
     OFFLINE_MESSAGE_CONVERSATION_CREATED_EVENT,
     OFFLINE_MESSAGE_CONVERSATION_CREATED_TEXT,
@@ -256,13 +257,16 @@ async def test_leave_message_rejects_regular_entry_during_service_hours(monkeypa
         }),
     )
 
-    with pytest.raises(BusinessError):
+    with pytest.raises(BusinessError) as exc_info:
         await OfflineMessageService._ensure_leave_message_allowed(
             AsyncMock(),
             AsyncMock(),
             channel.id,
             visitor_id=20,
         )
+
+    assert exc_info.value.message == "Leave message is only available outside service hours"
+    assert exc_info.value.code == LEAVE_MESSAGE_HOURS_OPEN_CODE
 
 
 @pytest.mark.asyncio
@@ -610,6 +614,8 @@ async def test_create_conversation_appends_created_event_after_offline_messages(
             added_messages.append(obj)
 
     db = SimpleNamespace(
+        execute=AsyncMock(),
+        refresh=AsyncMock(),
         add=Mock(side_effect=add_object),
         flush=AsyncMock(),
         commit=AsyncMock(),
@@ -743,6 +749,8 @@ async def test_create_conversation_reuses_existing_active_conversation(monkeypat
             added_messages.append(obj)
 
     db = SimpleNamespace(
+        execute=AsyncMock(),
+        refresh=AsyncMock(),
         add=Mock(side_effect=add_object),
         flush=AsyncMock(),
         commit=AsyncMock(),
@@ -872,6 +880,7 @@ async def test_create_conversation_reuses_existing_active_conversation(monkeypat
         tenant_id=row.tenant_id,
         visitor_id=row.visitor_id,
         channel_id=row.channel_id,
+        for_update=True,
     )
     generate_public_id.assert_not_awaited()
     generate_share_code.assert_not_awaited()
@@ -896,6 +905,8 @@ async def test_create_conversation_closes_single_offline_bot_conversation(monkey
             added_messages.append(obj)
 
     db = SimpleNamespace(
+        execute=AsyncMock(),
+        refresh=AsyncMock(),
         add=Mock(side_effect=add_object),
         flush=AsyncMock(),
         commit=AsyncMock(),
@@ -983,7 +994,7 @@ async def test_create_conversation_closes_single_offline_bot_conversation(monkey
         AsyncMock(return_value=1),
     )
     monkeypatch.setattr(
-        "app.services.offline_message_service.VisitorWebStatusService.get_status",
+        "app.services.offline_bot_conversation_service.VisitorWebStatusService.get_status",
         AsyncMock(return_value="offline"),
     )
     monkeypatch.setattr(

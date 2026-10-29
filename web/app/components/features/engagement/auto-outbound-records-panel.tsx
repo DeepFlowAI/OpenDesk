@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 
 import { CallRecordDetailDrawer } from '@/app/components/features/call-center/call-record-detail-drawer'
 import {
@@ -13,8 +13,38 @@ import {
 import { EmptyState } from '@/app/components/features/engagement/outbound-task-ui'
 import type { Locale } from '@/context/locale-store'
 import { summarizeReceptionResult } from '@/lib/auto-outbound-reception-result'
-import type { AutoOutboundRecord } from '@/models/auto-outbound-task'
+import type { AutoOutboundCallVariable, AutoOutboundRecord } from '@/models/auto-outbound-task'
 import { t } from '@/utils/i18n'
+
+function CallVariablesList({ locale, items }: { locale: Locale; items: AutoOutboundCallVariable[] }) {
+  return (
+    <div data-testid="auto-outbound-record-call-variables">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <span className="text-sm font-medium text-foreground">
+          {t('ws.autoOutbound.records.callVariables.title', locale)}
+        </span>
+        <span className="text-xs text-muted-foreground">
+          {t('ws.autoOutbound.records.callVariables.hint', locale)}
+        </span>
+      </div>
+      <dl className="mt-2 grid grid-cols-[minmax(120px,max-content)_1fr] gap-x-6 gap-y-1.5 text-sm">
+        {items.map((item) => (
+          <Fragment key={item.name}>
+            <dt className="font-mono text-xs leading-5 text-muted-foreground">{item.name}</dt>
+            <dd className="break-all text-foreground">
+              {item.value || '—'}
+              {item.truncated ? (
+                <span className="ml-2 text-xs text-warning">
+                  {t('ws.autoOutbound.records.callVariables.truncated', locale)}
+                </span>
+              ) : null}
+            </dd>
+          </Fragment>
+        ))}
+      </dl>
+    </div>
+  )
+}
 
 export function RecordsPanel({
   locale,
@@ -30,6 +60,7 @@ export function RecordsPanel({
   onOpenTarget: (targetId: number) => void
 }) {
   const [detailRecordId, setDetailRecordId] = useState<string | null>(null)
+  const [expandedRecordId, setExpandedRecordId] = useState<number | null>(null)
 
   if (loading) return <TableSkeleton cols={8} />
   if (!items.length) return <EmptyState title={t('ws.autoOutbound.records.empty', locale)} />
@@ -60,8 +91,11 @@ export function RecordsPanel({
                 locale,
               )
               const publicId = record.call_record_public_id
+              const callVariables = record.reception_type === 'bot' ? record.call_variables : null
+              const variablesExpanded = callVariables?.status === 'passed' && expandedRecordId === record.id
               return (
-                <tr key={record.id} className="border-t border-border">
+                <Fragment key={record.id}>
+                <tr className="border-t border-border">
                   <td className="px-4 py-3">{record.phone_number}</td>
                   <td className="px-4 py-3">
                     <button type="button" className="hover:underline" onClick={() => onOpenTarget(record.target_id)}>
@@ -87,13 +121,39 @@ export function RecordsPanel({
                       : '—'}
                   </td>
                   <td className="px-4 py-3">{formatDurationMs(record.duration_ms)}</td>
-                  <td
-                    data-testid="auto-outbound-record-result"
-                    className="max-w-[220px] truncate px-4 py-3 text-muted-foreground"
-                    title={resultSummary}
-                  >
-                    {resultSummary}
-                  </td>
+                  {callVariables ? (
+                    <td
+                      data-testid="auto-outbound-record-result"
+                      className="max-w-[220px] px-4 py-3 text-muted-foreground"
+                    >
+                      <span className="block truncate" title={resultSummary}>{resultSummary}</span>
+                      {callVariables.status === 'passed' ? (
+                        <button
+                          type="button"
+                          data-testid="auto-outbound-record-call-variables-toggle"
+                          aria-expanded={variablesExpanded}
+                          className="mt-1 text-xs text-foreground hover:underline"
+                          onClick={() => setExpandedRecordId(variablesExpanded ? null : record.id)}
+                        >
+                          {t('ws.autoOutbound.records.callVariables.toggle', locale, {
+                            count: callVariables.items.length,
+                          })}
+                        </button>
+                      ) : (
+                        <p className="mt-1 text-xs text-warning">
+                          {t('ws.autoOutbound.records.callVariables.failed', locale)}
+                        </p>
+                      )}
+                    </td>
+                  ) : (
+                    <td
+                      data-testid="auto-outbound-record-result"
+                      className="max-w-[220px] truncate px-4 py-3 text-muted-foreground"
+                      title={resultSummary}
+                    >
+                      {resultSummary}
+                    </td>
+                  )}
                   <td className="px-4 py-3">
                     {canViewCallRecord && publicId ? (
                       <button
@@ -109,6 +169,14 @@ export function RecordsPanel({
                     )}
                   </td>
                 </tr>
+                {variablesExpanded && callVariables ? (
+                  <tr className="border-t border-border bg-muted/30">
+                    <td colSpan={8} className="px-4 py-3">
+                      <CallVariablesList locale={locale} items={callVariables.items} />
+                    </td>
+                  </tr>
+                ) : null}
+                </Fragment>
               )
             })}
           </tbody>

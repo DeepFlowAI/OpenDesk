@@ -33,6 +33,7 @@ from app.services.fd_field_definition_service import coerce_slot_value
 
 
 ORGANIZATION_EXPORT_MAX_ROWS = 5000
+ORGANIZATION_EXPORT_ROW_BATCH_SIZE = 250
 
 
 ORG_SYSTEM_FIELD_LABELS: dict[str, str] = {
@@ -372,10 +373,13 @@ class OrganizationService:
             per_page=req.per_page,
         )
 
-        enriched = []
-        for org in items:
-            user_count = await OrganizationRepository.count_users(db, tenant_id, org.id)
-            enriched.append(OrganizationService._enrich_response(org, slot_to_key, user_count))
+        user_counts = await OrganizationRepository.count_users_by_org_ids(
+            db, tenant_id, [org.id for org in items]
+        )
+        enriched = [
+            OrganizationService._enrich_response(org, slot_to_key, user_counts.get(org.id, 0))
+            for org in items
+        ]
 
         pages = (total + req.per_page - 1) // req.per_page if req.per_page > 0 else 0
         return {
@@ -409,7 +413,7 @@ class OrganizationService:
                     group_field_col = slot_map.get(view.group_field_id)
 
         temp_conds = [c.model_dump() for c in req.temp_conditions] if req.temp_conditions else []
-        items, total = await OrganizationRepository.query_paginated(
+        ids, _ = await OrganizationRepository.query_paginated(
             db,
             tenant_id,
             search=req.search,
@@ -424,18 +428,33 @@ class OrganizationService:
             sort_order=req.sort_order,
             page=1,
             per_page=ORGANIZATION_EXPORT_MAX_ROWS + 1,
+            ids_only=True,
+            include_count=False,
         )
-        if total > ORGANIZATION_EXPORT_MAX_ROWS:
+        if len(ids) > ORGANIZATION_EXPORT_MAX_ROWS:
             raise ValidationError("Too many records to export")
 
+        items = await OrganizationService._load_export_rows(db, tenant_id, ids)
         columns = OrganizationService._normalize_export_columns(req.columns)
         option_lookup = await OrganizationService._get_custom_field_option_lookup(db, tenant_id, "organization")
 
         headers = [column.name for column in columns]
-        enriched = []
-        for organization in items:
-            user_count = await OrganizationRepository.count_users(db, tenant_id, organization.id)
-            enriched.append(OrganizationService._enrich_response(organization, slot_to_key, user_count))
+        need_user_count = any(
+            column.field_key in {"__user_count", "user_count"} for column in columns
+        )
+        user_counts: dict[int, int] = {}
+        if need_user_count:
+            user_counts = await OrganizationRepository.count_users_by_org_ids(
+                db, tenant_id, [organization.id for organization in items]
+            )
+        enriched = [
+            OrganizationService._enrich_response(
+                organization,
+                slot_to_key,
+                user_counts.get(organization.id, 0) if need_user_count else 0,
+            )
+            for organization in items
+        ]
         rows = [
             [
                 OrganizationService._export_cell_value(row, column, option_lookup)
@@ -446,6 +465,25 @@ class OrganizationService:
         workbook = build_xlsx(headers, rows, sheet_name="Organizations")
         filename = f"organizations-export-{datetime.now().strftime('%Y%m%d-%H%M')}.xlsx"
         return workbook, filename
+
+    @staticmethod
+    async def _load_export_rows(
+        db: AsyncSession,
+        tenant_id: int,
+        ids: list[int],
+    ) -> list[Organization]:
+        """Load export rows in id order, batched to avoid a 5000-element IN list.
+
+        Batch size is 250 to match ticket export, keeping per-batch memory
+        and IN list size bounded.
+        """
+        items: list[Organization] = []
+        for start in range(0, len(ids), ORGANIZATION_EXPORT_ROW_BATCH_SIZE):
+            batch_ids = ids[start:start + ORGANIZATION_EXPORT_ROW_BATCH_SIZE]
+            rows = await OrganizationRepository.list_by_ids(db, tenant_id, batch_ids)
+            by_id = {row.id: row for row in rows}
+            items.extend(by_id[row_id] for row_id in batch_ids if row_id in by_id)
+        return items
 
     @staticmethod
     def _normalize_export_columns(

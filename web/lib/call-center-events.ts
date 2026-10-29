@@ -19,6 +19,7 @@ export const CcSocketEvent = {
   TRANSCRIPT: 'cc.transcript',
   WRAP_UP_STARTED: 'cc.wrap_up_started',
   WRAP_UP_TIMEOUT: 'cc.wrap_up_timeout',
+  CALL_RECORD_UPDATED: 'cc.call_record_updated',
 } as const
 
 export type CcSocketEventName = (typeof CcSocketEvent)[keyof typeof CcSocketEvent]

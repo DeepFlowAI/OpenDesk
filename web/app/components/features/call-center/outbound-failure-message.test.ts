@@ -29,6 +29,17 @@ describe('mapOutboundFailure', () => {
     expect(result.isFallback).toBe(false)
   })
 
+  it('treats the end of the post-call satisfaction survey as a normal end', () => {
+    for (const reason of [
+      'satisfaction_completed',
+      'satisfaction_partial',
+      'satisfaction_unanswered',
+      'satisfaction_failed',
+    ]) {
+      expect(mapOutboundFailure({ reason }).message).toBeNull()
+    }
+  })
+
   it('keeps local_cancel as ring timeout even when SIP 487 is attached', () => {
     const result = mapOutboundFailure({ reason: 'local_cancel', sip_status: 487 })
     expect(result.message).toBe('振铃超时，对方未接听')

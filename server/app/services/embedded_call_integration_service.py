@@ -40,6 +40,14 @@ SESSION_TTL_SECONDS = 300
 MANAGE_PERMISSION = "call.admin.embed.manage"
 USE_PERMISSION = "call.embed.use"
 
+# Atomic one-time read for embed signatures. GETDEL needs Redis >= 6.2;
+# this script works on any version and keeps a signature single-use.
+_GET_AND_DELETE = """
+local value = redis.call('GET', KEYS[1])
+if value then redis.call('DEL', KEYS[1]) end
+return value
+"""
+
 
 def _embed_error(code: str, message: str, status_code: int = 400) -> BusinessError:
     return BusinessError(message, status_code=status_code, code=code)
@@ -408,8 +416,10 @@ class EmbeddedCallIntegrationService:
         *,
         data: EmbedSessionRequest,
     ) -> EmbedSessionResponse:
-        raw_claims = await redis.getdel(
-            EmbeddedCallIntegrationService._signature_key(data.embed_signature)
+        raw_claims = await redis.eval(
+            _GET_AND_DELETE,
+            1,
+            EmbeddedCallIntegrationService._signature_key(data.embed_signature),
         )
         claims = EmbeddedCallIntegrationService._decode_redis_json(raw_claims)
         if claims is None:

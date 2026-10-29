@@ -1201,6 +1201,7 @@
   "chat.handoff.needsAgent": "Este problema precisa da atenção de um agente de suporte humano.",
   "chat.attachment.upload": "Enviar anexo",
   "chat.attachment.failed": "Falha ao enviar o anexo. Clique para tentar novamente.",
+  "chat.attachment.empty": "A imagem ainda não está pronta. Tente novamente.",
   "chat.bot.noResponse": "O assistente não está respondendo. Tente novamente ou contate o suporte.",
   "chat.recall.mine": "Você retirou uma mensagem",
   "chat.recall.named": "{name} retirou uma mensagem",

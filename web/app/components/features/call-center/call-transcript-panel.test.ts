@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   applyTranscriptEvent,
+  formatHandoffTime,
   transcriptCallIdMatches,
 } from './call-transcript-panel'
 import type { TranscriptBubble } from './transcript-bubbles'
@@ -218,5 +219,17 @@ describe('transcriptCallIdMatches', () => {
         sourceCallId: '',
       }),
     ).toBe(false)
+  })
+})
+
+describe('formatHandoffTime', () => {
+  it('returns null for missing or invalid values', () => {
+    expect(formatHandoffTime(null)).toBeNull()
+    expect(formatHandoffTime('not-a-date')).toBeNull()
+  })
+
+  it('formats an ISO instant as local HH:mm:ss', () => {
+    const label = formatHandoffTime('2026-10-22T11:21:06+08:00')
+    expect(label).toMatch(/^\d{2}:\d{2}:\d{2}$/)
   })
 })

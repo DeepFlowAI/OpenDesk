@@ -936,6 +936,7 @@ class QueueTransferMixin:
             await telephony.call_bridge(
                 customer_call_id,
                 agent_leg_call_id,
+                user_call_id=customer_call_id,
                 transcribe=transcribe,
                 keepalive_on_peer_hangup=agent_leg_is_webrtc,
             )

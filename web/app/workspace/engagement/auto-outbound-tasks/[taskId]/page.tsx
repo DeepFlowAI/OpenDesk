@@ -103,7 +103,7 @@ export default function AutoOutboundTaskDetailPage() {
   const [addNumbers, setAddNumbers] = useState('')
   const [addFailures, setAddFailures] = useState<Array<{ phone: string; reason: string }>>([])
   const [selectedTarget, setSelectedTarget] = useState<AutoOutboundTarget | null>(null)
-  const [deleteTargetId, setDeleteTargetId] = useState<number | null>(null)
+  const [deleteTargetCandidate, setDeleteTargetCandidate] = useState<AutoOutboundTarget | null>(null)
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null)
 
   const page = Number(searchParams.get('page') ?? '1') || 1
@@ -149,6 +149,9 @@ export default function AutoOutboundTaskDetailPage() {
     if (!hasPermission(user, 'engagement.auto_outbound_task.create')) return false
     return task.created_by_id != null && task.created_by_id === user.id
   }, [task, user])
+  const taskAllowsTargetDelete = task
+    ? TARGET_APPENDABLE_STATUSES.includes(task.status)
+    : false
 
   const canViewCallRecord = hasPermission(user, 'call.record.view')
   const canManageSubscription = hasPermission(
@@ -214,6 +217,16 @@ export default function AutoOutboundTaskDetailPage() {
     () => autoOutboundTargetDetailFields(task?.fields ?? []),
     [task?.fields],
   )
+
+  useEffect(() => {
+    if (!selectedTarget || !targets) return
+    const latest = targets.items.find((item) => item.id === selectedTarget.id)
+    if (!latest) {
+      setSelectedTarget(null)
+    } else if (latest !== selectedTarget) {
+      setSelectedTarget(latest)
+    }
+  }, [selectedTarget, targets])
 
   if (editing && task) {
     return (
@@ -639,32 +652,87 @@ export default function AutoOutboundTaskDetailPage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={deleteTargetId != null} onOpenChange={(open) => { if (!open) setDeleteTargetId(null) }}>
+      <Dialog
+        open={deleteTargetCandidate != null}
+        onOpenChange={(open) => {
+          if (!open && !deleteTarget.isPending) setDeleteTargetCandidate(null)
+        }}
+      >
         <DialogContent className="sm:max-w-[460px]">
           <DialogHeader>
             <DialogTitle>{t('ws.autoOutbound.deleteTarget.title', locale)}</DialogTitle>
             <DialogDescription>{t('ws.autoOutbound.deleteTarget.body', locale)}</DialogDescription>
           </DialogHeader>
+          {deleteTargetCandidate && (
+            <div className="space-y-3">
+              <div className="space-y-2 rounded-md border border-border p-3 text-sm">
+                <div className="flex justify-between gap-4">
+                  <span className="text-muted-foreground">
+                    {t('ws.autoOutbound.deleteTarget.phone', locale)}
+                  </span>
+                  <span className="font-medium">{deleteTargetCandidate.phone_number}</span>
+                </div>
+                <div className="flex justify-between gap-4">
+                  <span className="text-muted-foreground">
+                    {t('ws.autoOutbound.deleteTarget.user', locale)}
+                  </span>
+                  <span className="font-medium">
+                    {deleteTargetCandidate.user_name
+                      || t('ws.autoOutbound.deleteTarget.notMatched', locale)}
+                  </span>
+                </div>
+              </div>
+              <p className="text-sm text-muted-foreground">
+                {t('ws.autoOutbound.deleteTarget.impact', locale)}
+              </p>
+            </div>
+          )}
           <DialogFooter className="pb-0">
-            <button type="button" onClick={() => setDeleteTargetId(null)} className="h-10 rounded-md border border-border px-3 text-sm">
+            <button
+              type="button"
+              autoFocus
+              disabled={deleteTarget.isPending}
+              onClick={() => setDeleteTargetCandidate(null)}
+              className="h-10 rounded-md border border-border px-3 text-sm disabled:opacity-50"
+            >
               {t('ws.autoOutbound.action.cancel', locale)}
             </button>
             <button
               type="button"
               disabled={deleteTarget.isPending}
               onClick={async () => {
-                if (deleteTargetId == null) return
+                if (!deleteTargetCandidate) return
                 try {
-                  await deleteTarget.mutateAsync(deleteTargetId)
-                  setDeleteTargetId(null)
+                  await deleteTarget.mutateAsync(deleteTargetCandidate.id)
+                  const shouldGoToPreviousPage = page > 1 && targets?.items.length === 1
+                  setDeleteTargetCandidate(null)
+                  setSelectedTarget(null)
+                  if (shouldGoToPreviousPage) setPage(page - 1)
                   toast.success(t('ws.autoOutbound.toast.deleted', locale))
                 } catch (err) {
-                  toast.error(await readAutoOutboundErrorMessage(err, t('ws.autoOutbound.toast.actionFailed', locale)))
+                  const status = err instanceof HTTPError ? err.response.status : 0
+                  toast.error(await readLocalizedAutoOutboundError(
+                    err,
+                    locale,
+                    t('ws.autoOutbound.deleteTarget.error.failed', locale),
+                  ))
+                  if (status === 409) {
+                    setSelectedTarget(deleteTargetCandidate)
+                    setDeleteTargetCandidate(null)
+                  } else if (status === 403 || status === 404) {
+                    setSelectedTarget(null)
+                    setDeleteTargetCandidate(null)
+                  }
                 }
               }}
               className="h-10 rounded-md bg-destructive px-3 text-sm text-white disabled:opacity-50"
             >
-              {t('ws.autoOutbound.deleteTarget.confirm', locale)}
+              {t(
+                deleteTarget.isPending
+                  ? 'ws.autoOutbound.deleteTarget.submitting'
+                  : 'ws.autoOutbound.deleteTarget.confirm',
+                locale,
+              )}
             </button>
           </DialogFooter>
         </DialogContent>
@@ -780,11 +848,11 @@ export default function AutoOutboundTaskDetailPage() {
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">{t('ws.autoOutbound.targets.col.calls', locale)}</span>
-                <span>{selectedTarget.call_count}</span>
+                <span>{yesNo(selectedTarget.call_count, locale)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">{t('ws.autoOutbound.targets.col.answered', locale)}</span>
-                <span>{selectedTarget.answered_count}</span>
+                <span>{yesNo(selectedTarget.answered_count, locale)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">{t('ws.autoOutbound.targets.col.lastResult', locale)}</span>
@@ -815,18 +883,28 @@ export default function AutoOutboundTaskDetailPage() {
             </div>
           )}
           <DialogFooter className="pb-0">
-            {canManage && selectedTarget && (
+            {canManage
+              && taskAllowsTargetDelete
+              && selectedTarget?.can_delete && (
               <button
                 type="button"
                 onClick={() => {
-                  setDeleteTargetId(selectedTarget.id)
+                  setDeleteTargetCandidate(selectedTarget)
                   setSelectedTarget(null)
                 }}
                 className="inline-flex h-10 items-center gap-2 rounded-md border border-destructive px-3 text-sm text-destructive"
               >
                 <IconTrash size={16} />
-                {t('ws.autoOutbound.action.delete', locale)}
+                {t('ws.autoOutbound.deleteTarget.title', locale)}
               </button>
+            )}
+            {canManage
+              && taskAllowsTargetDelete
+              && selectedTarget
+              && !selectedTarget.can_delete && (
+              <p className="mr-auto text-sm text-muted-foreground">
+                {t('ws.autoOutbound.deleteTarget.unavailable', locale)}
+              </p>
             )}
             {canManage && selectedTarget && selectedTarget.status !== 'invalid' && (
               <button
@@ -1024,8 +1102,8 @@ function TargetsPanel({
                     <td className="px-4 py-3">
                       <AutoTargetStatusBadge status={target.status} locale={locale} />
                     </td>
-                    <td className="px-4 py-3">{target.call_count}</td>
-                    <td className="px-4 py-3">{target.answered_count}</td>
+                    <td className="px-4 py-3">{yesNo(target.call_count, locale)}</td>
+                    <td className="px-4 py-3">{yesNo(target.answered_count, locale)}</td>
                     <td className="px-4 py-3 text-muted-foreground">{target.last_call_result || '—'}</td>
                     <td className="px-4 py-3">{target.remaining_retries}</td>
                     {listFields.map((field) => (
@@ -1138,6 +1216,10 @@ function StatsPanel({
 
 function formatCapacityValue(value: number | null | undefined): string {
   return value == null ? '—' : String(value)
+}
+
+function yesNo(count: number, locale: ReturnType<typeof useLocaleStore.getState>['locale']): string {
+  return t(count > 0 ? 'ws.autoOutbound.targets.yes' : 'ws.autoOutbound.targets.no', locale)
 }
 
 function MonitorPanel({

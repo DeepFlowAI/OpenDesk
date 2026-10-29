@@ -7,6 +7,7 @@ that NO database session is held while the kernel runs the conversation
 (CLAUDE.md rule #8). In v2 the kernel owns ASR/TTS/barge-in and calls the
 agent's turn endpoint; OpenDesk only kicks it off and routes the events.
 """
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,8 @@ import pytest
 
 from app.libs.telephony.providers.mock.client import MockTelephonyClient
 from app.services.call_center.nodes import (
+    CALL_VARIABLES_KEY,
+    CALL_VARIABLES_STATUS_KEY,
     ExecutionContext,
     Goto,
     VoiceSpeedExecutor,
@@ -240,6 +243,101 @@ class TestVoiceSpeedExecutor:
         assert "sys._handoff_handled" not in ctx.variables
 
 
+class _OpeningVSClient(_FakeVSClient):
+    """VoiceSpeed client that answers the call-opening lookup."""
+
+    def __init__(self, opening: dict | None = None, error: Exception | None = None):
+        super().__init__()
+        self.opening = opening
+        self.error = error
+        self.opening_calls: list[dict] = []
+
+    async def get_call_opening(
+        self, base_url, api_key, agent_id, *, session_id, fallback_greeting, user_identifier=None
+    ):
+        self.opening_calls.append(
+            {"agent_id": agent_id, "session_id": session_id, "fallback_greeting": fallback_greeting,
+             "user_identifier": user_identifier}
+        )
+        if self.error:
+            raise self.error
+        return self.opening
+
+
+async def _converse_params(
+    monkeypatch, client, node_data: dict | None = None, variables: dict | None = None
+) -> dict:
+    _patch_runtime(monkeypatch, client=client)
+    tel = MockTelephonyClient()
+    await tel.connect()
+    node = {"id": "vs", "type": "voicespeed", "data": {"agent_id": "ag_1", **(node_data or {})}}
+    ctx = ExecutionContext(call_id="call-1", tenant_id=1, telephony=tel)
+    ctx.variables.update(variables or {})
+    await VoiceSpeedExecutor().execute(ctx, node)
+    return next(p for m, p in tel.recorded if m == "call.converse_external_agent")
+
+
+class TestVoiceSpeedOpening:
+    @pytest.mark.asyncio
+    async def test_agent_fixed_greeting_is_spoken(self, monkeypatch):
+        client = _OpeningVSClient({"greeting": "您好，我是移动客服", "opening": ""})
+        conv = await _converse_params(monkeypatch, client)
+
+        assert conv["greeting"] == "您好，我是移动客服"
+        assert conv["opening"] is None
+        assert client.opening_calls == [
+            {"agent_id": "ag_1", "session_id": "call-1",
+             "fallback_greeting": VoiceSpeedExecutor._DEFAULT_GREETING,
+             "user_identifier": None}
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("variables", "expected"),
+        [
+            ({"sys.caller_number": "13800000001", "sys.called_number": "4001"}, "13800000001"),
+            ({"sys.caller_number": "", "sys.called_number": "13900000002",
+              "sys._direction": "outbound"}, "13900000002"),
+        ],
+    )
+    async def test_customer_number_is_sent_as_user_identifier(self, monkeypatch, variables, expected):
+        client = _OpeningVSClient({"greeting": "", "opening": "model"})
+        await _converse_params(monkeypatch, client, variables=variables)
+
+        assert client.opening_calls[0]["user_identifier"] == expected
+
+    @pytest.mark.asyncio
+    async def test_agent_model_opening_is_passed_through(self, monkeypatch):
+        conv = await _converse_params(monkeypatch, _OpeningVSClient({"greeting": "", "opening": "model"}))
+
+        assert conv["greeting"] == ""
+        assert conv["opening"] == "model"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("opening", "expected"), [
+        ({"greeting": "您好", "opening": "", "voice_spk_id": "general"}, "general"),
+        ({"greeting": "您好", "opening": ""}, None),
+    ])
+    async def test_agent_voice_applies_from_the_opening(self, monkeypatch, opening, expected):
+        conv = await _converse_params(monkeypatch, _OpeningVSClient(opening))
+
+        assert conv["voice_spk_id"] == expected
+
+    @pytest.mark.asyncio
+    async def test_node_greeting_is_the_fallback(self, monkeypatch):
+        client = _OpeningVSClient({"greeting": "节点欢迎语", "opening": ""})
+        await _converse_params(monkeypatch, client, {"greeting_text": " 节点欢迎语 "})
+
+        assert client.opening_calls[0]["fallback_greeting"] == "节点欢迎语"
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_keeps_default_greeting(self, monkeypatch):
+        conv = await _converse_params(monkeypatch, _OpeningVSClient(error=RuntimeError("down")))
+
+        assert conv["greeting"] == VoiceSpeedExecutor._DEFAULT_GREETING
+        assert conv["opening"] is None
+
+
 class TestVoiceSpeedManagedSession:
     @pytest.mark.asyncio
     async def test_no_db_session_held_while_converse_in_flight(self, monkeypatch):
@@ -372,6 +470,74 @@ class TestVoiceSpeedEventOrderingRace:
         assert "CONNECT_FAILED" in _says(tel)
         hangup = next(p for m, p in tel.recorded if m == "call.hangup")
         assert hangup["reason"] == "voicespeed_connect_failed"
+
+
+class _PresetVSClient(_FakeVSClient):
+    """Fake client that records call-variable presets in call order."""
+
+    def __init__(self, tel, *, error: Exception | None = None, delay: float = 0.0):
+        super().__init__()
+        self._tel = tel
+        self._error = error
+        self._delay = delay
+        self.presets: list[dict] = []
+
+    async def preset_call_variables(self, base_url, api_key, agent_id, call_id, variables):
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        self.presets.append({"agent_id": agent_id, "call_id": call_id, "variables": variables})
+        # Converse must not have started before the preset completes.
+        assert "call.converse_external_agent" not in _methods(self._tel)
+        if self._error is not None:
+            raise self._error
+
+
+class TestVoiceSpeedCallVariables:
+    async def _start(self, monkeypatch, *, variables, **client_kwargs):
+        tel = MockTelephonyClient()
+        await tel.connect()
+        client = _PresetVSClient(tel, **client_kwargs)
+        _patch_runtime(monkeypatch, client=client)
+        initial = {CALL_VARIABLES_KEY: variables} if variables is not None else {}
+        wf = VoiceFlowWorkflow(
+            call_id="call-1", tenant_id=1, graph=_graph(), telephony=tel,
+            initial_variables=initial,
+        )
+        await wf.start()
+        return wf, tel, client
+
+    @pytest.mark.asyncio
+    async def test_presets_variables_before_conversation(self, monkeypatch):
+        wf, tel, client = await self._start(monkeypatch, variables={"customer_name": "张三"})
+        assert client.presets == [
+            {"agent_id": "ag_1", "call_id": "call-1", "variables": {"customer_name": "张三"}}
+        ]
+        assert wf.ctx.variables[CALL_VARIABLES_STATUS_KEY] == "passed"
+        assert "call.converse_external_agent" in _methods(tel)
+
+    @pytest.mark.asyncio
+    async def test_preset_failure_still_starts_conversation(self, monkeypatch):
+        wf, tel, _client = await self._start(
+            monkeypatch, variables={"a": "b"}, error=RuntimeError("409"),
+        )
+        assert wf.ctx.variables[CALL_VARIABLES_STATUS_KEY] == "failed"
+        assert "call.converse_external_agent" in _methods(tel)
+        assert wf.done.is_set() is False
+
+    @pytest.mark.asyncio
+    async def test_preset_timeout_counts_as_failed(self, monkeypatch):
+        monkeypatch.setattr(VoiceSpeedExecutor, "_CALL_VARIABLES_TIMEOUT_S", 0.01)
+        wf, tel, client = await self._start(monkeypatch, variables={"a": "b"}, delay=0.2)
+        assert wf.ctx.variables[CALL_VARIABLES_STATUS_KEY] == "failed"
+        assert client.presets == []
+        assert "call.converse_external_agent" in _methods(tel)
+
+    @pytest.mark.asyncio
+    async def test_no_variables_skips_preset(self, monkeypatch):
+        wf, tel, client = await self._start(monkeypatch, variables=None)
+        assert client.presets == []
+        assert CALL_VARIABLES_STATUS_KEY not in wf.ctx.variables
+        assert "call.converse_external_agent" in _methods(tel)
 
 
 class TestDirectConnectGraph:

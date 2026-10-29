@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.core.exceptions import ForbiddenError, NotFoundError, ValidationError
+from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from app.libs.excel import build_xlsx
 from app.models.auto_outbound import AutoOutboundTarget, AutoOutboundTask
 from app.models.outbound_task import OutboundTaskTemplate
@@ -91,7 +91,7 @@ def task(
         created_by_id=created_by_id,
         updated_by_id=created_by_id,
         start_date=date(2026, 8, 1),
-        end_date=date(2026, 8, 31),
+        end_date=date(2099, 12, 31),
         daily_time_windows=[{"start": "09:00", "end": "12:00"}, {"start": "14:00", "end": "20:00"}],
         caller_number_id="pn_1",
         max_concurrency=10,
@@ -212,6 +212,191 @@ class TestAutoOutboundBusinessRecordEvents:
         repo.update_target.assert_not_awaited()
         AutoOutboundEventService.emit_business_record_event.assert_not_awaited()
         db.commit.assert_not_awaited()
+
+
+class TestDeleteUncalledTarget:
+    @staticmethod
+    def target(
+        *,
+        status: str = "pending",
+        call_count: int = 0,
+    ) -> AutoOutboundTarget:
+        return AutoOutboundTarget(
+            id=10,
+            tenant_id=1,
+            task_id=1,
+            phone_number="13800138000",
+            status=status,
+            field_values={},
+            call_count=call_count,
+            answered_count=0,
+            retry_counts={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_delete_pending_target_commits_without_deleting_records(self):
+        db = AsyncMock()
+        p = principal(["engagement.auto_outbound_task.manage"])
+        current_task = task(status="draft")
+        target = self.target()
+
+        with patch("app.services.auto_outbound_task_service.AutoOutboundRepository") as repo:
+            repo.get_target = AsyncMock(return_value=target)
+            repo.get_task_for_update = AsyncMock(return_value=current_task)
+            repo.get_target_for_update = AsyncMock(return_value=target)
+            repo.target_has_call_records = AsyncMock(return_value=False)
+            repo.delete_target = AsyncMock()
+            repo.count_targets_by_status = AsyncMock(return_value=0)
+
+            await AutoOutboundTaskService.delete_target(db, p, target.id)
+
+        repo.delete_target.assert_awaited_once_with(db, target, commit=False)
+        repo.update_task.assert_not_called()
+        AutoOutboundEventService.emit_task_event.assert_not_awaited()
+        db.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_manual_invalid_target_is_allowed(self):
+        db = AsyncMock()
+        p = principal(["engagement.auto_outbound_task.manage"])
+        current_task = task(status="paused")
+        target = self.target(status="invalid")
+
+        with patch("app.services.auto_outbound_task_service.AutoOutboundRepository") as repo:
+            repo.get_target = AsyncMock(return_value=target)
+            repo.get_task_for_update = AsyncMock(return_value=current_task)
+            repo.get_target_for_update = AsyncMock(return_value=target)
+            repo.target_has_call_records = AsyncMock(return_value=False)
+            repo.delete_target = AsyncMock()
+            repo.count_targets_by_status = AsyncMock(return_value=0)
+
+            await AutoOutboundTaskService.delete_target(db, p, target.id)
+
+        repo.delete_target.assert_awaited_once_with(db, target, commit=False)
+        repo.update_task.assert_not_called()
+        db.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "call_count", "has_records"),
+        [
+            ("calling", 0, False),
+            ("redial_pending", 1, True),
+            ("completed", 1, True),
+            ("pending", 1, False),
+            ("pending", 0, True),
+            ("invalid", 1, True),
+        ],
+    )
+    async def test_delete_executed_target_returns_conflict(
+        self,
+        status: str,
+        call_count: int,
+        has_records: bool,
+    ):
+        db = AsyncMock()
+        p = principal(["engagement.auto_outbound_task.manage"])
+        current_task = task(status="active")
+        target = self.target(status=status, call_count=call_count)
+
+        with patch("app.services.auto_outbound_task_service.AutoOutboundRepository") as repo:
+            repo.get_target = AsyncMock(return_value=target)
+            repo.get_task_for_update = AsyncMock(return_value=current_task)
+            repo.get_target_for_update = AsyncMock(return_value=target)
+            repo.target_has_call_records = AsyncMock(return_value=has_records)
+
+            with pytest.raises(ConflictError, match="entered the calling process"):
+                await AutoOutboundTaskService.delete_target(db, p, target.id)
+
+        repo.delete_target.assert_not_called()
+        db.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_from_completed_task_returns_conflict(self):
+        db = AsyncMock()
+        p = principal(["engagement.auto_outbound_task.manage"])
+        current_task = task(status="completed")
+        target = self.target()
+
+        with patch("app.services.auto_outbound_task_service.AutoOutboundRepository") as repo:
+            repo.get_target = AsyncMock(return_value=target)
+            repo.get_task_for_update = AsyncMock(return_value=current_task)
+
+            with pytest.raises(ConflictError, match="task has ended"):
+                await AutoOutboundTaskService.delete_target(db, p, target.id)
+
+        repo.get_target_for_update.assert_not_called()
+        repo.delete_target.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_without_management_access_returns_forbidden(self):
+        db = AsyncMock()
+        p = principal(["engagement.auto_outbound_task.create"], user_id=11)
+        current_task = task(status="draft", created_by_id=10)
+        target = self.target()
+
+        with patch("app.services.auto_outbound_task_service.AutoOutboundRepository") as repo:
+            repo.get_target = AsyncMock(return_value=target)
+            repo.get_task_for_update = AsyncMock(return_value=current_task)
+
+            with pytest.raises(ForbiddenError, match="Permission denied to delete"):
+                await AutoOutboundTaskService.delete_target(db, p, target.id)
+
+        repo.get_target_for_update.assert_not_called()
+        repo.delete_target.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_last_open_target_auto_pauses_active_task(self):
+        db = AsyncMock()
+        p = principal(["engagement.auto_outbound_task.manage"])
+        current_task = task(status="active")
+        paused_task = task(status="paused", auto_pause_reason="queue_finished")
+        target = self.target()
+
+        with patch("app.services.auto_outbound_task_service.AutoOutboundRepository") as repo:
+            repo.get_target = AsyncMock(return_value=target)
+            repo.get_task_for_update = AsyncMock(return_value=current_task)
+            repo.get_target_for_update = AsyncMock(return_value=target)
+            repo.target_has_call_records = AsyncMock(return_value=False)
+            repo.delete_target = AsyncMock()
+            repo.count_targets_by_status = AsyncMock(return_value=0)
+            repo.update_task = AsyncMock(return_value=paused_task)
+
+            await AutoOutboundTaskService.delete_target(db, p, target.id)
+
+        repo.update_task.assert_awaited_once_with(
+            db,
+            current_task,
+            {"status": "paused", "auto_pause_reason": "queue_finished"},
+            commit=False,
+        )
+        event = AutoOutboundEventService.emit_task_event
+        event.assert_awaited_once()
+        assert event.await_args.kwargs["event_type"] == "auto_outbound.task.paused"
+        assert event.await_args.kwargs["actor"] == {"type": "system"}
+        assert event.await_args.kwargs["reason"] == "queue_finished"
+        db.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_with_calling_target_does_not_pause_active_task(self):
+        db = AsyncMock()
+        p = principal(["engagement.auto_outbound_task.manage"])
+        current_task = task(status="active")
+        target = self.target()
+
+        with patch("app.services.auto_outbound_task_service.AutoOutboundRepository") as repo:
+            repo.get_target = AsyncMock(return_value=target)
+            repo.get_task_for_update = AsyncMock(return_value=current_task)
+            repo.get_target_for_update = AsyncMock(return_value=target)
+            repo.target_has_call_records = AsyncMock(return_value=False)
+            repo.delete_target = AsyncMock()
+            repo.count_targets_by_status = AsyncMock(return_value=1)
+
+            await AutoOutboundTaskService.delete_target(db, p, target.id)
+
+        repo.update_task.assert_not_called()
+        AutoOutboundEventService.emit_task_event.assert_not_awaited()
+        db.commit.assert_awaited_once()
 
 
 class TestAutoOutboundPermissions:

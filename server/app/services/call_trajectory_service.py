@@ -36,6 +36,43 @@ EVENT_SOURCES = frozenset({"opendesk", "flowkit", "voicespeed", "carrier", "reco
 ACTOR_TYPES = frozenset(
     {"customer", "agent", "supervisor", "bot", "system", "carrier", "external_party"}
 )
+_FINALIZATION_FACT_EVENT_TYPES = frozenset(
+    {
+        "call_created",
+        "customer_ringing_started",
+        "customer_ringing_ended",
+        "customer_connected",
+        "ivr_entered",
+        "ivr_exited",
+        "ivr_failed",
+        "bot_started",
+        "bot_ended",
+        "bot_handoff_requested",
+        "bot_handoff_succeeded",
+        "queue_entered",
+        "queue_exited",
+        "queue_timeout",
+        "queue_limit_reached",
+        "agent_offer_started",
+        "agent_offer_accepted",
+        "agent_offer_rejected",
+        "agent_offer_timeout",
+        "agent_offer_canceled",
+        "reception_started",
+        "reception_ended",
+        "human_service_ended",
+        "hold_started",
+        "hold_ended",
+        "consult_connected",
+        "consult_ended",
+        "consult_failed",
+        "consult_canceled",
+        "conference_merged",
+        "conference_ended",
+        "conference_failed",
+        "trajectory_gap_detected",
+    }
+)
 _FORBIDDEN_DETAIL_KEYS = frozenset(
     {"authorization", "credential", "credentials", "dtmf", "dtmf_digits", "digits", "password", "secret", "token"}
 )
@@ -66,6 +103,32 @@ class CallTrajectoryService:
         )
         if created:
             await _project_event(db, call_record, payload)
+            from app.services.call_queue_fact_service import (
+                QUEUE_FACT_EVENT_TYPES,
+                CallQueueFactService,
+            )
+
+            if (
+                payload.event_type in QUEUE_FACT_EVENT_TYPES
+                and getattr(event, "event_id", None)
+            ):
+                await CallQueueFactService.project_for_call(db, call_record_id)
+            from app.services.call_agent_fact_service import (
+                AGENT_FACT_EVENT_TYPES,
+                CallAgentFactService,
+            )
+
+            if payload.event_type in AGENT_FACT_EVENT_TYPES:
+                await CallAgentFactService.project_for_call(db, call_record_id)
+            from app.services.call_event_publisher import (
+                TRAJECTORY_EVENT_MAP,
+                CallEventPublisher,
+            )
+
+            if payload.event_type in TRAJECTORY_EVENT_MAP:
+                await CallEventPublisher.publish_trajectory_event(
+                    db, call_record, event, event_type=payload.event_type
+                )
         if commit:
             await db.commit()
             await db.refresh(event)
@@ -174,6 +237,32 @@ class CallTrajectoryService:
         events = await CallEventRepository.list_for_call(db, call_record_id)
         phase_durations = _phase_durations(events)
         hangup_stage = _hangup_stage(events)
+        human_service_requested_at = _first_event_time(
+            events,
+            {"bot_handoff_requested", "queue_entered", "agent_offer_started"},
+        )
+        first_agent_wait_started_at = _first_event_time(events, {"queue_entered"})
+        first_agent_offer_started_at = _first_event_time(
+            events, {"agent_offer_started"}
+        )
+        bot_handoff_requested_at = _first_event_time(
+            events, {"bot_handoff_requested"}
+        )
+        bot_handoff_succeeded_at = _first_event_time(
+            events, {"bot_handoff_succeeded"}
+        )
+        short_abandon_threshold_ms = None
+        if first_agent_wait_started_at is not None:
+            frozen_threshold = getattr(
+                call_record, "short_abandon_threshold_ms", None
+            )
+            short_abandon_threshold_ms = (
+                frozen_threshold
+                if isinstance(frozen_threshold, int)
+                and not isinstance(frozen_threshold, bool)
+                and 1_000 <= frozen_threshold <= 60_000
+                else 5_000
+            )
         # The telephony kernel only reports a raw reason string — it has no
         # notion of business roles — so an explicit party is the exception and
         # the reason has to be classified when it is absent.
@@ -200,12 +289,17 @@ class CallTrajectoryService:
             )
         ):
             reason_code = _normalize_hangup_reason(hangup_reason, hangup_party)
+        if reason_code == "unknown" and _bot_hung_up(events):
+            # The kernel can end a bot-requested hangup under a generic reason;
+            # the bot's own end event says who actually hung up.
+            reason_code, resolved_hangup_party = "bot_hangup", "bot"
         call_result = _call_result(
             call_record.direction,
             events,
             reason_code,
             resolved_hangup_party,
             phase_durations,
+            short_abandon_threshold_ms,
         )
         started_at = next(
             (event.occurred_at for event in events if event.event_type == "call_created"),
@@ -229,9 +323,9 @@ class CallTrajectoryService:
             phase_durations.get("agent_waiting"),
             customer_agent_talk_duration_ms,
         )
-        projection_complete = not any(
-            event.event_type == "trajectory_gap_detected" for event in events
-        ) and all(value is not None for value in required_durations)
+        projection_complete = not _has_unresolved_trajectory_gap(events) and all(
+            value is not None for value in required_durations
+        )
         details: dict[str, Any] = {
             "call_result": call_result,
             "hangup_party": resolved_hangup_party,
@@ -256,8 +350,13 @@ class CallTrajectoryService:
             "agent_wait_duration_ms": phase_durations.get("agent_waiting"),
             "customer_agent_talk_duration_ms": customer_agent_talk_duration_ms,
             "phase_durations_ms": phase_durations,
-            "short_abandon_threshold_ms": 5_000 if call_result == "customer_short_abandon" else None,
-            "result_rule_version": 2,
+            "human_service_requested_at": human_service_requested_at,
+            "first_agent_wait_started_at": first_agent_wait_started_at,
+            "first_agent_offer_started_at": first_agent_offer_started_at,
+            "bot_handoff_requested_at": bot_handoff_requested_at,
+            "bot_handoff_succeeded_at": bot_handoff_succeeded_at,
+            "short_abandon_threshold_ms": short_abandon_threshold_ms,
+            "result_rule_version": 4,
             "actual_reception_type": _actual_reception_type(events),
             "projection_complete": projection_complete,
         }
@@ -375,6 +474,20 @@ async def _project_event(
         if isinstance(voice_flow_version_id, int):
             patch["voice_flow_version_id"] = voice_flow_version_id
     elif payload.event_type == "queue_entered":
+        first_wait_started_at = getattr(
+            call_record, "first_agent_wait_started_at", None
+        )
+        earlier_wait = _earlier_timestamp(first_wait_started_at, payload.occurred_at)
+        if earlier_wait != first_wait_started_at:
+            patch["first_agent_wait_started_at"] = earlier_wait
+        human_requested_at = getattr(call_record, "human_service_requested_at", None)
+        earlier_request = _earlier_timestamp(human_requested_at, payload.occurred_at)
+        if earlier_request != human_requested_at:
+            patch["human_service_requested_at"] = earlier_request
+        if getattr(call_record, "short_abandon_threshold_ms", None) is None:
+            patch["short_abandon_threshold_ms"] = (
+                await _short_abandon_threshold_ms(db, call_record.tenant_id)
+            )
         if payload.queue_type and payload.queue_id is not None:
             patch["last_queue_type"] = payload.queue_type
             patch["last_queue_id"] = payload.queue_id
@@ -389,6 +502,33 @@ async def _project_event(
                     source_event_id=payload.source_event_id or payload.event_id,
                     commit=False,
                 )
+    elif payload.event_type == "agent_offer_started":
+        first_offer_started_at = getattr(
+            call_record, "first_agent_offer_started_at", None
+        )
+        earlier_offer = _earlier_timestamp(first_offer_started_at, payload.occurred_at)
+        if earlier_offer != first_offer_started_at:
+            patch["first_agent_offer_started_at"] = earlier_offer
+        human_requested_at = getattr(call_record, "human_service_requested_at", None)
+        earlier_request = _earlier_timestamp(human_requested_at, payload.occurred_at)
+        if earlier_request != human_requested_at:
+            patch["human_service_requested_at"] = earlier_request
+    elif payload.event_type == "bot_handoff_requested":
+        bot_requested_at = getattr(call_record, "bot_handoff_requested_at", None)
+        earlier_bot_request = _earlier_timestamp(
+            bot_requested_at, payload.occurred_at
+        )
+        if earlier_bot_request != bot_requested_at:
+            patch["bot_handoff_requested_at"] = earlier_bot_request
+        human_requested_at = getattr(call_record, "human_service_requested_at", None)
+        earlier_request = _earlier_timestamp(human_requested_at, payload.occurred_at)
+        if earlier_request != human_requested_at:
+            patch["human_service_requested_at"] = earlier_request
+    elif payload.event_type == "bot_handoff_succeeded":
+        bot_succeeded_at = getattr(call_record, "bot_handoff_succeeded_at", None)
+        earlier_success = _earlier_timestamp(bot_succeeded_at, payload.occurred_at)
+        if earlier_success != bot_succeeded_at:
+            patch["bot_handoff_succeeded_at"] = earlier_success
     elif payload.event_type == "reception_started":
         agent_id = _positive_int(payload.target_id or payload.actor_id)
         if agent_id is not None:
@@ -429,6 +569,15 @@ async def _project_event(
         if call_record.human_service_ended_at is None:
             patch["human_service_ended_at"] = payload.occurred_at
 
+    if (
+        getattr(call_record, "lifecycle_status", None) == "ended"
+        and getattr(call_record, "finalization_status", None) == "incomplete"
+        and payload.event_type in _FINALIZATION_FACT_EVENT_TYPES
+        and payload.source != "reconciliation"
+    ):
+        patch["finalization_status"] = "pending"
+        patch["finalized_at"] = None
+
     if patch:
         await CallRecordRepository.update(
             db,
@@ -436,6 +585,28 @@ async def _project_event(
             patch,
             commit=False,
         )
+
+
+def _earlier_timestamp(
+    current: datetime | None, candidate: datetime
+) -> datetime:
+    return candidate if current is None or candidate < current else current
+
+
+async def _short_abandon_threshold_ms(db: AsyncSession, tenant_id: int) -> int:
+    try:
+        from app.services.system_settings_service import SystemSettingsService
+
+        settings = await SystemSettingsService.get_settings(db, tenant_id)
+        seconds = settings.call_short_abandon_threshold_seconds
+        if isinstance(seconds, int) and not isinstance(seconds, bool) and 1 <= seconds <= 60:
+            return seconds * 1_000
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Failed to read short-abandon threshold tenant_id=%s; using default",
+            tenant_id,
+        )
+    return 5_000
 
 
 def _reconciliation_event_id(end_type: str, start_event_id: str) -> str:
@@ -474,6 +645,9 @@ def _sanitize_details(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [_sanitize_details(item) for item in value]
+    if isinstance(value, datetime):
+        # Event details land in a JSON column, which cannot hold datetimes.
+        return value.isoformat()
     return value
 
 
@@ -515,7 +689,7 @@ def _trajectory_warnings(
         warnings.append({"code": "missing_call_created", "message": "Call start event is missing"})
     if lifecycle_status == "ended" and events and settlement is None:
         warnings.append({"code": "missing_call_ended", "message": "Final settlement event is missing"})
-    if any(event.event_type == "trajectory_gap_detected" for event in events):
+    if _has_unresolved_trajectory_gap(events):
         warnings.append({"code": "trajectory_gap", "message": "Part of the call trajectory may be incomplete"})
     return warnings
 
@@ -529,6 +703,29 @@ def _event_response_data(event: CallEvent) -> dict[str, Any]:
     details.pop("storage_key", None)
     data["details"] = details
     return data
+
+
+def _has_unresolved_trajectory_gap(events: list[CallEvent]) -> bool:
+    """Treat a gap as resolved only after a relevant fact arrives post-settlement."""
+    if not any(event.event_type == "trajectory_gap_detected" for event in events):
+        return False
+    settlement_sequences = [
+        event.sequence_no
+        for event in events
+        if event.event_type == "call_ended"
+        and isinstance(getattr(event, "sequence_no", None), int)
+    ]
+    if not settlement_sequences:
+        return True
+    last_settlement_sequence = max(settlement_sequences)
+    return not any(
+        event.event_type in _FINALIZATION_FACT_EVENT_TYPES
+        and event.event_type != "trajectory_gap_detected"
+        and getattr(event, "source", None) != "reconciliation"
+        and isinstance(getattr(event, "sequence_no", None), int)
+        and event.sequence_no > last_settlement_sequence
+        for event in events
+    )
 
 
 _PHASE_PAIRS: dict[str, tuple[set[str], set[str]]] = {
@@ -552,6 +749,15 @@ def _phase_for_start(event_type: str) -> str:
         if event_type in starts:
             return phase
     return event_type
+
+
+def _first_event_time(
+    events: list[CallEvent], event_types: set[str]
+) -> datetime | None:
+    timestamps = [
+        event.occurred_at for event in events if event.event_type in event_types
+    ]
+    return min(timestamps) if timestamps else None
 
 
 def _phase_durations(events: list[CallEvent]) -> dict[str, int | None]:
@@ -597,19 +803,24 @@ _STAGE_BY_EVENT = {
     "queue_entered": "agent_waiting",
     "agent_offer_started": "agent_ringing",
     "reception_started": "in_call",
-    "hold_started": "hold",
-    "hold_ended": "in_call",
-    "transfer_started": "transfer",
-    "consult_started": "consult",
-    "conference_invite_started": "conference",
 }
 
 
 def _hangup_stage(events: list[CallEvent]) -> str:
+    if any(event.event_type == "reception_started" for event in events):
+        return "in_call"
     stage = "pre_route"
     for event in events:
         stage = _STAGE_BY_EVENT.get(event.event_type, stage)
-    return stage or "unknown"
+    return stage if stage in {
+        "pre_route",
+        "customer_ringing",
+        "ivr",
+        "bot",
+        "agent_waiting",
+        "agent_ringing",
+        "in_call",
+    } else "unknown"
 
 
 def _hangup_party(reason: str | None) -> str:
@@ -638,6 +849,7 @@ def _call_result(
     reason: str | None,
     party: str,
     phase_durations: dict[str, int | None],
+    short_abandon_threshold_ms: int | None,
 ) -> str:
     event_types = {event.event_type for event in events}
     normalized = (reason or "").lower()
@@ -650,11 +862,18 @@ def _call_result(
             return "customer_unreachable"
         if "invalid" in normalized:
             return "invalid_number"
+        if normalized in {"provider_answer_unconfirmed", "provider_temporarily_unavailable"}:
+            return normalized
         if any(token in normalized for token in ("no_answer", "timeout")):
             return "customer_no_answer"
     if "queue_entered" in event_types:
         waiting = phase_durations.get("agent_waiting")
-        if party == "customer" and waiting is not None and waiting <= 5_000:
+        if (
+            party == "customer"
+            and waiting is not None
+            and short_abandon_threshold_ms is not None
+            and waiting <= short_abandon_threshold_ms
+        ):
             return "customer_short_abandon"
         return "agent_no_answer"
     if "bot_started" in event_types:
@@ -668,6 +887,15 @@ def _call_result(
     if "cancel" in normalized or "call_canceled" in event_types:
         return "canceled"
     return "failed"
+
+
+def _bot_hung_up(events: list[CallEvent]) -> bool:
+    return any(
+        event.event_type == "bot_ended"
+        and event.result == "succeeded"
+        and (event.reason_detail or "").lower() == "hangup"
+        for event in events
+    )
 
 
 def _normalize_hangup_reason(reason: str | None, party: str) -> str:

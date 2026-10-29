@@ -4,12 +4,16 @@ User model — end users (formerly visitors) who contact support
 `name` doubles as the "nickname" system field — SYSTEM_USER_FIELDS key
 "nickname" maps to this column so there is no separate nickname column.
 """
-from sqlalchemy import String, Integer, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import String, Integer, ForeignKey, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
 from app.models.base import AuditActorMixin, MetadataMixin, SlotColumnMixin
+
+
+# Keep the expression literal so prepared queries can use its expression index.
+NORMALIZED_PHONE_SQL = r"regexp_replace(regexp_replace(phone, '\D', '', 'g'), '^00', '')"
 
 
 class User(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
@@ -18,8 +22,34 @@ class User(Base, MetadataMixin, AuditActorMixin, SlotColumnMixin):
         UniqueConstraint("tenant_id", "external_id", name="uq_users_tenant_external"),
         UniqueConstraint("public_id", name="uq_users_public_id"),
         Index("ix_users_tenant_id", "tenant_id"),
+        Index("ix_users_tenant_normalized_phone", "tenant_id", text(NORMALIZED_PHONE_SQL)),
         Index("ix_users_agent", "agent_id"),
         Index("ix_users_assignee_group", "assignee_group_id"),
+        Index(
+            "ix_users_tenant_created_id",
+            "tenant_id",
+            text("created_at DESC"),
+            text("id DESC"),
+        ),
+        Index("ix_users_tenant_organization_id", "tenant_id", "organization_id"),
+        Index(
+            "ix_users_public_id_trgm",
+            "public_id",
+            postgresql_using="gin",
+            postgresql_ops={"public_id": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_users_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_users_external_id_trgm",
+            "external_id",
+            postgresql_using="gin",
+            postgresql_ops={"external_id": "gin_trgm_ops"},
+        ),
     )
 
     # ── Core identity ──

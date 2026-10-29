@@ -94,7 +94,7 @@ async def test_list_targets_attaches_user_name_and_remaining_retries():
     count_result = MagicMock()
     count_result.scalar_one.return_value = 1
     rows_result = MagicMock()
-    rows_result.all.return_value = [(target, "Alice")]
+    rows_result.all.return_value = [(target, "Alice", False)]
     db.execute = AsyncMock(side_effect=[count_result, rows_result])
 
     items, total = await AutoOutboundRepository.list_targets(
@@ -105,6 +105,111 @@ async def test_list_targets_attaches_user_name_and_remaining_retries():
     assert items[0].user_name == "Alice"
     # max_policy=3, used_total=1 → remaining 2
     assert items[0].remaining_retries == 2
+    assert items[0].can_delete is False
+    list_stmt = db.execute.await_args_list[1].args[0]
+    list_sql = str(list_stmt).lower()
+    assert "exists" in list_sql
+    assert "call_count" in list_sql
+    assert ["pending", "invalid"] in list_stmt.compile().params.values()
+
+
+@pytest.mark.asyncio
+async def test_list_targets_marks_uncalled_target_deletable_for_mutable_task():
+    current_task = AutoOutboundTask(
+        id=1,
+        tenant_id=1,
+        name="t",
+        template_name="tpl",
+        fields=[],
+        status="paused",
+        execution_mode="ivr",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 31),
+        daily_time_windows=[],
+        max_concurrency=1,
+        retry_policy={},
+        daily_per_number_limit=1,
+    )
+    target = AutoOutboundTarget(
+        id=10,
+        tenant_id=1,
+        task_id=1,
+        phone_number="13800138000",
+        status="invalid",
+        field_values={},
+        call_count=0,
+        answered_count=0,
+        retry_counts={},
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=current_task)
+    count_result = MagicMock()
+    count_result.scalar_one.return_value = 1
+    rows_result = MagicMock()
+    rows_result.all.return_value = [(target, None, True)]
+    db.execute = AsyncMock(side_effect=[count_result, rows_result])
+
+    items, _ = await AutoOutboundRepository.list_targets(
+        db, tenant_id=1, task_id=1, page=1, per_page=20
+    )
+
+    assert items[0].can_delete is True
+
+
+@pytest.mark.asyncio
+async def test_get_target_for_update_locks_scoped_target_row():
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    db.execute = AsyncMock(return_value=result)
+
+    await AutoOutboundRepository.get_target_for_update(
+        db,
+        10,
+        tenant_id=1,
+        task_id=2,
+    )
+
+    stmt = db.execute.await_args.args[0]
+    compiled = str(stmt).lower()
+    assert "for update" in compiled
+    assert "tenant_id" in compiled
+    assert "task_id" in compiled
+
+
+@pytest.mark.asyncio
+async def test_target_has_call_records_uses_exists_query():
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalar_one.return_value = True
+    db.execute = AsyncMock(return_value=result)
+
+    has_records = await AutoOutboundRepository.target_has_call_records(db, 10)
+
+    assert has_records is True
+    assert "exists" in str(db.execute.await_args.args[0]).lower()
+
+
+@pytest.mark.asyncio
+async def test_delete_target_can_flush_without_committing():
+    db = AsyncMock()
+    target = AutoOutboundTarget(
+        id=10,
+        tenant_id=1,
+        task_id=1,
+        phone_number="13800138000",
+        status="pending",
+        field_values={},
+        call_count=0,
+        answered_count=0,
+        retry_counts={},
+    )
+
+    await AutoOutboundRepository.delete_target(db, target, commit=False)
+
+    db.delete.assert_awaited_once_with(target)
+    db.flush.assert_awaited_once()
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

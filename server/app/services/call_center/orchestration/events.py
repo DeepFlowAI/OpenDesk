@@ -529,9 +529,17 @@ class EventHandlersMixin:
             return
         self.bind_call_trace(call_id)
         wf = self._workflows.get(call_id)
-        if wf is None:
-            return
-        agent = wf.bridged_agent_info()
+        if wf is not None:
+            agent = wf.bridged_agent_info()
+        else:
+            # Agent-dialed outbound calls run without a workflow; their bridge
+            # transcript belongs to whichever agent currently owns the call.
+            originator = await self._peek_outbound_originator(call_id)
+            agent = (
+                {"tenant_id": originator[0], "employee_id": originator[1]}
+                if originator is not None
+                else None
+            )
         if agent is None:
             return
         text = (event.data.get("text") or "").strip()
@@ -787,13 +795,13 @@ class EventHandlersMixin:
             _orch.logger.exception(
                 "auto_outbound ended hook failed call_id=%s", call_id
             )
-        if outbound_info is not None or self._is_outbound_early_fail(
-            reason, sip_status
-        ):
+        early_fail = self._is_outbound_early_fail(reason, sip_status)
+        if outbound_info is not None or early_fail:
             # Supplier-facing SIP detail from FlowKit (status phrase / Warning /
             # Reason / Call-ID). Keep in OpenDesk logs so triage can paste it
-            # without SSHing into the kernel host.
-            _orch.logger.warning(
+            # without SSHing into the kernel host. Failures stay WARNING;
+            # normal outbound ends are INFO.
+            (_orch.logger.warning if early_fail else _orch.logger.info)(
                 "outbound SIP ended: call_id=%s reason=%s sip_status=%s "
                 "sip_reason=%s sip_warning=%s sip_reason_hdr=%s sip_call_id=%s",
                 call_id,
@@ -814,7 +822,7 @@ class EventHandlersMixin:
             # Push cc.outbound_hangup only after Redis/PG status is restored
             # below. The workbench refetches on that event; notifying first
             # leaves the agent stuck on busy until the next 30s poll.
-        elif self._is_outbound_early_fail(reason, sip_status):
+        elif early_fail:
             # Hangup beat register_outbound_call: still remember the SIP
             # failure so dial-webrtc returns 410 with the real reason.
             await self._mark_outbound_ended(
@@ -1026,6 +1034,30 @@ class EventHandlersMixin:
                         call_id=call_id,
                         reason=event.data.get("reason") or "call_hangup",
                     )
+                # No workflow (e.g. an agent-dialled outbound call), so the
+                # bridged-agent cleanup above never ran: still release / withdraw
+                # the serving agent's conference colleague.
+                if (
+                    bridged_agent is None
+                    and row is not None
+                    and row.last_serving_agent_id is not None
+                ):
+                    try:
+                        from app.services.call_center.call_control_service import (
+                            CallControlService,
+                        )
+
+                        await CallControlService.cleanup_conference_for_host(
+                            row.tenant_id,
+                            int(row.last_serving_agent_id),
+                            reason=event.data.get("reason") or "call_hangup",
+                        )
+                    except Exception:  # noqa: BLE001
+                        _orch.logger.warning(
+                            "conference cleanup on call end failed agent=%s",
+                            row.last_serving_agent_id,
+                            exc_info=True,
+                        )
                 if outbound_info:
                     _tid, _eid, _ = outbound_info
                     await self._maybe_release_sip_occupancy(redis, _tid, _eid)
@@ -1269,10 +1301,10 @@ class EventHandlersMixin:
 
         Tears down the agent's OWN WebRTC leg (so the browser call always ends)
         in addition to the customer SIP leg. If the customer leg is already gone
-        (FlowKit -32002 "call not found"), that's treated as already-ended and we
-        reset the agent's status directly — no customer `call.hangup` event will
-        arrive to drive the usual cleanup, so without this the agent stays stuck
-        on 忙碌. Short DB session for the lookup is closed before the RPCs.
+        (FlowKit -32002 "call not found"), reset the agent's status here so they
+        are not stuck on 忙碌. A `call.hangup` event may still arrive when the
+        -32002 is a race with remote BYE; that event owns CDR finalization.
+        Short DB session for the lookup is closed before the RPCs.
         """
 
         from sqlalchemy import desc, select
@@ -1373,13 +1405,17 @@ class EventHandlersMixin:
                 return {"ok": False, "error": "rpc_error", "code": exc.code}
 
         if customer_gone:
-            # No customer call.hangup event will arrive — reset the agent here.
+            # SIP is already gone. A call.hangup event is often still in flight
+            # (agent hangup raced with remote BYE) and that path owns CDR
+            # finalization. Reset the agent here so they are not stuck busy if
+            # the event never arrives; do not mark the CDR completed or the two
+            # writers deadlock / abort the same transaction.
             await self.finalize_agent_call(
                 tenant_id=tenant_id,
                 employee_id=employee_id,
                 call_id=target_call_id,
                 reason="agent_hangup",
-                mark_cdr_completed=True,
+                mark_cdr_completed=False,
             )
             return {"ok": True, "note": "already_ended", "call_id": target_call_id}
         return {"ok": True, "call_id": target_call_id}
@@ -1403,28 +1439,40 @@ class EventHandlersMixin:
         # recording/event identifiers converge through database upserts.
         self.bind_call_trace(call_id)
         try:
-            async with _orch.AsyncSessionLocal() as db:
-                saved = await _orch.CallRecordService.save_recording(
-                    db,
-                    call_id=call_id,
-                    recording_id=str(recording_id),
-                    storage_key=str(storage_key) if storage_key else None,
-                    source_event_id=str(source_event_id),
-                    status="partial" if bool(data.get("partial", False)) else "completed",
-                    call_leg_id=data.get("call_leg_id") or call_id,
-                    phase=data.get("phase"),
-                    started_at=_recording_datetime(data.get("started_at")),
-                    ended_at=_recording_datetime(data.get("ended_at")),
-                    duration_ms=data.get("duration_ms"),
-                )
+            from app.db.retry import run_db_op_with_deadlock_retry
+
+            async def _persist() -> bool:
+                async with _orch.AsyncSessionLocal() as db:
+                    return await _orch.CallRecordService.save_recording(
+                        db,
+                        call_id=call_id,
+                        recording_id=str(recording_id),
+                        storage_key=str(storage_key) if storage_key else None,
+                        source_event_id=str(source_event_id),
+                        status="partial" if bool(data.get("partial", False)) else "completed",
+                        call_leg_id=data.get("call_leg_id") or call_id,
+                        phase=data.get("phase"),
+                        started_at=_recording_datetime(data.get("started_at")),
+                        ended_at=_recording_datetime(data.get("ended_at")),
+                        duration_ms=data.get("duration_ms"),
+                    )
+
+            saved = await run_db_op_with_deadlock_retry(
+                _persist,
+                log_label=f"save_recording call_id={call_id}",
+            )
             if saved:
                 _orch.logger.info(
                     "Recording saved call_id=%s phase=%s partial=%s",
                     call_id, data.get("phase"), data.get("partial", False),
                 )
             else:
-                _orch.logger.warning(
-                    "call.recording.completed: no CDR for call_id=%s", call_id,
+                # Agent / media-reconnect legs never own a CDR; FlowKit still
+                # broadcasts recording events for those legs — skip, not fail.
+                _orch.logger.info(
+                    "call.recording.completed: skipping call_id=%s; "
+                    "call leg has no CDR (agent or reconnect legs do not own one)",
+                    call_id,
                 )
         except Exception:  # noqa: BLE001
             _orch.logger.exception(

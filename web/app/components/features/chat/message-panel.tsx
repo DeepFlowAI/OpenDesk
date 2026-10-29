@@ -365,7 +365,9 @@ export function MessagePanel({
         startNewConversationDisabledReason={startNewDisabledReason}
         startingNewConversation={Boolean(startingNewConversation)}
         onStartNewConversation={() => {
-          if (convId) void onStartNewConversation?.(convId)
+          if (convId) {
+            void Promise.resolve(onStartNewConversation?.(convId)).catch(() => {})
+          }
         }}
         resolveConversationForSend={
           canSendDeferredPublicReply

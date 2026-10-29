@@ -43,6 +43,20 @@ class CallRecordingRepository:
         return row
 
     @staticmethod
+    async def get_by_recording_id(
+        db: AsyncSession, tenant_id: int, recording_id: str
+    ) -> CallRecording | None:
+        query = (
+            select(CallRecording)
+            .where(
+                CallRecording.tenant_id == tenant_id,
+                CallRecording.recording_id == recording_id,
+            )
+            .execution_options(populate_existing=True)
+        )
+        return (await db.execute(query)).scalar_one_or_none()
+
+    @staticmethod
     async def list_for_call(
         db: AsyncSession, call_record_id: int
     ) -> list[CallRecording]:

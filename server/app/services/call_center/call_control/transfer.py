@@ -260,6 +260,7 @@ class TransferMixin:
             await telephony.call_bridge(
                 call.customer_call_id,
                 target_call_id,
+                user_call_id=call.customer_call_id,
                 keepalive_on_peer_hangup=target_is_webrtc,
             )
         except Exception:  # noqa: BLE001
@@ -273,6 +274,7 @@ class TransferMixin:
                     await telephony.call_bridge(
                         call.customer_call_id,
                         call.webrtc_call_id,
+                        user_call_id=call.customer_call_id,
                         keepalive_on_peer_hangup=True,
                     )
                 except Exception:  # noqa: BLE001
@@ -439,6 +441,11 @@ class TransferMixin:
                     reason_code="bridge_failed",
                 )
                 return
+            # Mute / hold / hangup resolve the agent's live media leg from here;
+            # without it the colleague keeps a leg from an earlier call.
+            await _ccs.CallControlService.bind_agent_media_leg(
+                tenant_id, target_employee_id, target_leg_id,
+            )
             await _ccs.CallControlService._finalize_initiator_after_transfer(
                 tenant_id=tenant_id,
                 employee_id=employee_id,

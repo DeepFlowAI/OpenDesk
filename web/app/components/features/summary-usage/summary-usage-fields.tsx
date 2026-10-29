@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { IconLoader2 } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import type { FdFieldDefinition, UnifiedField } from '@/models/field-definition'
@@ -77,6 +77,11 @@ export function SummaryUsageFields({
   const [editingKey, setEditingKey] = useState<string | null>(null)
   const [draftValue, setDraftValue] = useState<unknown>(null)
   const [fieldError, setFieldError] = useState<string | null>(null)
+  const [savingKey, setSavingKey] = useState<string | null>(null)
+  // A blur saves the field being left while a click opens the next one, so a
+  // save that settles late must not close or annotate the newer editor.
+  const editingKeyRef = useRef<string | null>(null)
+  editingKeyRef.current = editingKey
 
   const states = useMemo(() => calculateSummaryFieldStates(fields, rules, values), [fields, rules, values])
   const dirty = !!editingKey || isSaving || !!fieldError
@@ -131,15 +136,18 @@ export function SummaryUsageFields({
       setFieldError(texts.fieldRequired)
       return
     }
+    setSavingKey(key)
     try {
       await onSaveField({
         field_definition_id: configField.field_definition_id,
         field_key: configField.field_key,
         value: normalizeEmptyValue(submittedValue),
       })
-      cancelEdit()
+      if (editingKeyRef.current === key) cancelEdit()
     } catch {
-      setFieldError(texts.saveFailed)
+      if (editingKeyRef.current === key) setFieldError(texts.saveFailed)
+    } finally {
+      setSavingKey((current) => (current === key ? null : current))
     }
   }
 
@@ -155,7 +163,7 @@ export function SummaryUsageFields({
             state={state}
             value={editing ? draftValue : values[key] ?? null}
             editing={editing}
-            saving={editing && isSaving}
+            saving={editing && savingKey === key}
             error={editing ? fieldError : null}
             editFieldText={texts.editField}
             onEdit={() => {

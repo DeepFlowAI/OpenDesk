@@ -45,6 +45,8 @@ class CallFinalizationStatus(str, enum.Enum):
 class CallSource(str, enum.Enum):
     INBOUND = "inbound"
     AGENT_DIAL = "agent_dial"
+    EMBEDDED_CALL = "embedded_call"
+    PERSONAL_AUTO_OUTBOUND = "personal_auto_outbound"
     MANUAL_OUTBOUND_TASK = "manual_outbound_task"
     AUTO_OUTBOUND = "auto_outbound"
 
@@ -85,6 +87,7 @@ class CcSocketEvent(str, enum.Enum):
     TRANSCRIPT = "cc.transcript"
     WRAP_UP_STARTED = "cc.wrap_up_started"
     WRAP_UP_TIMEOUT = "cc.wrap_up_timeout"
+    CALL_RECORD_UPDATED = "cc.call_record_updated"
 
 
 VISIBLE_STATUSES: frozenset[str] = frozenset(s.value for s in AgentStatus)

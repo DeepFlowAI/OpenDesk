@@ -32,7 +32,9 @@ alibabacloud_dysmsapi20170525>=3.1.0,<4.0.0
 alibabacloud_vod20170321>=3.6.0,<4.0.0
 
 # LLM routing and local language detection
-litellm
+# Pinned: unpinned, pip backtracks through dozens of ~30 MB litellm releases to
+# find one compatible with the pins above, turning a rebuild into 40+ minutes.
+litellm==1.95.1
 fasttext-wheel
 # fasttext-wheel 0.9.2 uses a NumPy 1.x-only copy=False call in predict().
 numpy<2
@@ -43,6 +45,9 @@ numpy<2
 opentelemetry-api
 opentelemetry-sdk
 opentelemetry-exporter-otlp-proto-http
+
+# Streaming XLSX exports
+openpyxl==3.1.5
 
 # Testing
 httpx==0.28.1

@@ -148,6 +148,7 @@ export type AutoOutboundTarget = {
   call_count: number
   answered_count: number
   remaining_retries: number
+  can_delete: boolean
   last_called_at: string | null
   last_call_result: string | null
   next_call_at: string | null
@@ -182,6 +183,18 @@ export type AutoOutboundTargetImportResponse = {
   task_auto_resumed: boolean
 }
 
+export type AutoOutboundCallVariable = {
+  name: string
+  value: string
+  truncated: boolean
+}
+
+/** Variables preset to the voice bot for one call; null when none were sent. */
+export type AutoOutboundCallVariables = {
+  status: 'passed' | 'failed'
+  items: AutoOutboundCallVariable[]
+}
+
 export type AutoOutboundRecord = {
   id: number
   phone_number: string
@@ -192,6 +205,7 @@ export type AutoOutboundRecord = {
   agent_name: string | null
   duration_ms: number | null
   reception_result: Record<string, unknown> | string | null
+  call_variables?: AutoOutboundCallVariables | null
   call_record_id: number | null
   call_record_public_id: string | null
 }

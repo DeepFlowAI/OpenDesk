@@ -1,6 +1,7 @@
 """
 Conversation repository
 """
+import hashlib
 import logging
 import secrets
 from datetime import datetime, timezone
@@ -256,7 +257,7 @@ class ConversationRepository:
         return result.scalar_one()
 
     @staticmethod
-    async def create(db: AsyncSession, data: dict) -> Conversation:
+    async def create(db: AsyncSession, data: dict, *, commit: bool = True) -> Conversation:
         if not data.get("public_id"):
             data = {**data, "public_id": await ConversationRepository.generate_unique_public_id(db)}
         if not data.get("share_code"):
@@ -273,7 +274,10 @@ class ConversationRepository:
         }
         item = Conversation(**data)
         db.add(item)
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
         await db.refresh(item, attribute_names=["visitor", "agent", "channel", "group"])
         return item
 
@@ -491,7 +495,7 @@ class ConversationRepository:
 
     @staticmethod
     async def end_conversation(
-        db: AsyncSession, conversation: Conversation, ended_by: str
+        db: AsyncSession, conversation: Conversation, ended_by: str, *, commit: bool = True
     ) -> Conversation:
         conversation.status = ConversationStatus.CLOSED.value
         conversation.ended_at = datetime.now(timezone.utc)
@@ -520,7 +524,10 @@ class ConversationRepository:
                     "from_agent_id": conversation.agent_id,
                 },
             )
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
         await db.refresh(conversation)
         return conversation
 
@@ -694,6 +701,8 @@ class ConversationRepository:
         preview: str,
         timestamp: datetime,
         increment_unread: bool = False,
+        *,
+        commit: bool = True,
     ) -> None:
         values: dict = {
             "last_message_at": timestamp,
@@ -714,7 +723,10 @@ class ConversationRepository:
                 .where(Conversation.id == conversation_id)
                 .values(**values)
             )
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
 
     @staticmethod
     async def increment_unread(
@@ -778,11 +790,22 @@ class ConversationRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def lock_visitor_conversations(
+        db: AsyncSession, *, tenant_id: int, visitor_id: int, channel_id: int,
+    ) -> None:
+        """Serialize agent-initiated creation for one visitor and channel until commit."""
+        key = f"visitor-conversations:{tenant_id}:{visitor_id}:{channel_id}"
+        lock_id = int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big", signed=True)
+        await db.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})
+
+    @staticmethod
     async def get_active_visitor_conversation(
         db: AsyncSession,
         tenant_id: int,
         visitor_id: int,
         channel_id: int,
+        *,
+        for_update: bool = False,
     ) -> Conversation | None:
         """Check if visitor already has an active conversation in the channel.
 
@@ -791,7 +814,7 @@ class ConversationRepository:
         conversation creation can leave duplicates. Tolerate that here — return
         the most recent one and warn — instead of raising MultipleResultsFound.
         """
-        result = await db.execute(
+        statement = (
             select(Conversation)
             .options(
                 selectinload(Conversation.visitor),
@@ -812,7 +835,14 @@ class ConversationRepository:
             )
             .order_by(Conversation.id.desc())
         )
+        if for_update:
+            statement = statement.with_for_update().execution_options(populate_existing=True)
+        result = await db.execute(statement)
         conversations = result.scalars().all()
+        if for_update and not conversations:
+            # A concurrent replacement can close the row while this query waits.
+            result = await db.execute(statement)
+            conversations = result.scalars().all()
         if len(conversations) > 1:
             logger.warning(
                 "Visitor has %d active conversations (expected 1); using latest "

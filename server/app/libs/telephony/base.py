@@ -234,6 +234,7 @@ class BaseTelephonyClient(ABC):
         turn_url: str,
         token: str,
         greeting: str | None = None,
+        opening: str | None = None,
         voice_spk_id: str | None = None,
         performance: dict | None = None,
         traceparent: str | None = None,
@@ -250,6 +251,9 @@ class BaseTelephonyClient(ABC):
 
         ``performance`` is an optional VoiceSpeed dialog-timing override map
         (endpoint / turn / barge / TTS knobs). Omitted fields keep FlowKit env.
+
+        ``opening="model"`` makes the agent generate the first line instead of a
+        fixed ``greeting``; a non-empty greeting takes precedence.
         """
 
     @abstractmethod

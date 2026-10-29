@@ -149,7 +149,7 @@ export function SendSmsDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={(next) => { if (!next) requestClose() }}>
-        <DialogContent className="gap-0 p-0 sm:max-w-[520px]">
+        <DialogContent className="grid-cols-[minmax(0,1fr)] gap-0 p-0 sm:max-w-[520px]">
           <DialogHeader className="border-b border-border px-5 py-4">
             <DialogTitle>{t('sms.send.title', locale)}</DialogTitle>
           </DialogHeader>

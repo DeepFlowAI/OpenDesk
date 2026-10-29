@@ -81,7 +81,7 @@ class InMemoryAutoOutboundStore:
             created_by_id=10,
             updated_by_id=10,
             start_date=date(2026, 8, 1),
-            end_date=date(2026, 8, 31),
+            end_date=date(2099, 12, 31),
             daily_time_windows=[{"start": "00:00", "end": "23:59"}],
             caller_number_id="pn_1",
             max_concurrency=10,

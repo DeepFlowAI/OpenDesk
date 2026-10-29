@@ -81,6 +81,12 @@ def _coerce_filter_value(col, value):
     return value
 
 
+def _is_null_only_empty_column(col) -> bool:
+    """Number and date columns have no empty-string state; treat empty as NULL."""
+    col_type = getattr(col, "type", None)
+    return isinstance(col_type, (Integer, Numeric, Float, Date, DateTime))
+
+
 def _build_condition_clause(col, operator: str, value):
     if col is None:
         return None
@@ -107,8 +113,14 @@ def _build_condition_clause(col, operator: str, value):
     if op in ("lte", "<="):
         return col <= coerced_value
     if op in ("is_empty", "is_null"):
+        if _is_null_only_empty_column(col):
+            return col.is_(None)
+        # JSON empty-array (`[]`) is not treated as empty; that would change
+        # saved-view semantics. Non-numeric types stay NULL-or-cast-text.
         return or_(col.is_(None), cast(col, SAString) == "")
     if op in ("is_not_empty", "is_not_null"):
+        if _is_null_only_empty_column(col):
+            return col.isnot(None)
         return and_(col.isnot(None), cast(col, SAString) != "")
     if op in ("in",) and isinstance(coerced_value, list):
         return col.in_(coerced_value)
@@ -241,6 +253,8 @@ class TicketRepository:
         page: int = 1,
         per_page: int = 20,
         scope_predicate: ColumnElement | None = None,
+        ids_only: bool = False,
+        include_count: bool = True,
     ) -> tuple[list[Ticket], int]:
         _slot_map = slot_map or {}
         base_where = [Ticket.tenant_id == tenant_id]
@@ -248,11 +262,13 @@ class TicketRepository:
             base_where.append(scope_predicate)
 
         if search:
+            # description is long text and is not covered by the trgm indexes.
+            # Omit it from the search OR so PostgreSQL can use those indexes;
+            # restore the branch only after evaluating an expression index.
             base_where.append(
                 or_(
                     Ticket.title.ilike(f"%{search}%"),
                     Ticket.ticket_number.ilike(f"%{search}%"),
-                    Ticket.description.ilike(f"%{search}%"),
                 )
             )
 
@@ -278,19 +294,22 @@ class TicketRepository:
                 else:
                     base_where.append(col == group_value)
 
-        count_q = select(func.count()).select_from(Ticket).where(*base_where)
-        total = (await db.execute(count_q)).scalar_one()
+        total = 0
+        if include_count:
+            count_q = select(func.count()).select_from(Ticket).where(*base_where)
+            total = (await db.execute(count_q)).scalar_one()
 
         order_col = getattr(Ticket, sort_by, None) if sort_by else Ticket.updated_at
         if order_col is None:
             order_col = Ticket.updated_at
         order_expr = order_col.desc() if sort_order == "desc" else order_col.asc()
+        id_expr = Ticket.id.desc() if sort_order == "desc" else Ticket.id.asc()
 
         offset = (page - 1) * per_page
         data_q = (
-            select(Ticket)
+            select(Ticket.id if ids_only else Ticket)
             .where(*base_where)
-            .order_by(order_expr)
+            .order_by(order_expr, id_expr)
             .offset(offset)
             .limit(per_page)
         )
@@ -349,11 +368,13 @@ class TicketRepository:
             base_where.append(scope_predicate)
 
         if search:
+            # description is long text and is not covered by the trgm indexes.
+            # Omit it from the search OR so PostgreSQL can use those indexes;
+            # restore the branch only after evaluating an expression index.
             base_where.append(
                 or_(
                     Ticket.title.ilike(f"%{search}%"),
                     Ticket.ticket_number.ilike(f"%{search}%"),
-                    Ticket.description.ilike(f"%{search}%"),
                 )
             )
 

@@ -7,10 +7,8 @@ import pytest
 import sys
 import importlib
 
-# The reports extension lives under private/extensions/server/. In a dev checkout
-# its package path is mounted by app.extensions._augment_path_with_private_overlay
-# at startup. Importing the app package triggers that augmentation.
-import app.extensions  # noqa: F401 — triggers private overlay path injection
+# Reports ships in app.extensions. Importing the package loads its submodules.
+import app.extensions  # noqa: F401
 
 buckets = importlib.import_module("app.extensions.reports.lib.buckets")
 TrendType = buckets.TrendType

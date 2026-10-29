@@ -92,11 +92,10 @@ class QueuePicker:
         ]
         if not candidates:
             return None
-        # Only offer to agents whose browser is actually connected. The DB
-        # "ready" status records the status an agent last *chose* and is never
-        # cleared on disconnect, so without this a call gets offered to a
-        # colleague who closed their tab — it rings a dead browser until the
-        # caller gives up, while a genuinely-connected agent never gets a turn.
+        # Only offer to agents whose browser is actually connected. After the
+        # disconnect grace window, PG ``agent_status`` is synced to offline, but
+        # within the grace window (or if DB sync lags) a stale "ready" row can
+        # still appear — ``is_connected`` keeps those from receiving offers.
         # An agent inside the brief disconnect grace window still counts as
         # connected, so ordinary socket flaps don't drop them from rotation.
         if r is not None:

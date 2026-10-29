@@ -262,18 +262,33 @@ class EventSubscriptionService:
         if item.is_active:
             raise ValidationError("Disable the event subscription before deleting it")
         from app.repositories.auto_outbound_event_repository import AutoOutboundEventRepository
-
-        reference_count = (
-            await AutoOutboundEventRepository.count_bindings_for_subscription(
-                db,
-                tenant_id=principal.tenant_id,
-                subscription_public_id=public_id,
-            )
+        from app.repositories.call_event_subscription_repository import (
+            CallEventSubscriptionRepository,
         )
-        if reference_count:
+
+        task_count = await AutoOutboundEventRepository.count_bindings_for_subscription(
+            db,
+            tenant_id=principal.tenant_id,
+            subscription_public_id=public_id,
+        )
+        rule_count = await CallEventSubscriptionRepository.count_for_subscription(
+            db,
+            tenant_id=principal.tenant_id,
+            subscription_id=item.id,
+        )
+        if task_count or rule_count:
+            parts = []
+            if task_count:
+                parts.append(f"{task_count} auto outbound tasks")
+            if rule_count:
+                parts.append(f"{rule_count} call event subscription rules")
             raise ValidationError(
-                f"This subscription is used by {reference_count} auto outbound tasks. "
-                "Remove the bindings first"
+                f"This subscription is used by {' and '.join(parts)}. Remove the bindings first",
+                details={
+                    "code": "subscription_in_use",
+                    "auto_outbound_task_count": task_count,
+                    "call_event_rule_count": rule_count,
+                },
             )
         await EventSubscriptionRepository.delete_with_audit(
             db,

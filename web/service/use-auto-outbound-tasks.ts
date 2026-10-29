@@ -188,7 +188,7 @@ export const useDeleteAutoOutboundTarget = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => del(`v1/engagement/auto-outbound-targets/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: autoOutboundTaskKeys.all }),
+    onSettled: () => qc.invalidateQueries({ queryKey: autoOutboundTaskKeys.all }),
   })
 }
 

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { io, Socket } from 'socket.io-client'
 import { dedupeMessagesById } from '@/lib/message-list'
+import { isRecoverableVisitorSessionError } from '@/lib/visitor-session-recoverable-error'
 import type { Message } from '@/models/conversation'
 import type { SatisfactionSurveyRecord } from '@/models/satisfaction-survey'
 import type { HumanHandoffEventPayload } from '@/service/use-open-agent-conversation'
@@ -165,6 +166,8 @@ type VisitorChatState = {
   visitorId: string | null
 
   connect: (visitorSessionToken: string, visitorExternalId: string) => void
+  applySessionToken: (visitorSessionToken: string, visitorExternalId: string) => void
+  reconnectWithSession: (visitorSessionToken: string, visitorExternalId: string) => void
   disconnect: () => void
   clearAuthFailed: () => void
 
@@ -335,8 +338,7 @@ function resolveHandoffMessageUiPatch(state: VisitorChatState, msg: Message): Ha
 }
 
 function isVisitorAuthError(err: Error): boolean {
-  const msg = err.message?.toLowerCase() ?? ''
-  return msg.includes('visitor_session_token') || msg.includes('invalid visitor session')
+  return isRecoverableVisitorSessionError(err, { context: 'socket_connect' })
 }
 
 export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
@@ -401,9 +403,8 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     })
 
     socket.on('connect_error', (err: Error) => {
-      // Invalid/expired visitor session: the token won't fix itself by
-      // retrying, so stop and let the page surface it instead of spinning in a
-      // reconnect loop that re-fires on every `connecting: false`.
+      // Invalid/expired visitor session: stop Socket.IO's own reconnect loop
+      // and let the page remint, then reconnectWithSession with the new token.
       if (isVisitorAuthError(err)) {
         stopPresencePing()
         socket.disconnect()
@@ -524,6 +525,29 @@ export const useVisitorChatStore = create<VisitorChatState>((set, get) => ({
     })
 
     set({ socket })
+  },
+
+  applySessionToken: (visitorSessionToken, visitorExternalId) => {
+    const existing = get().socket
+    if (existing) {
+      existing.auth = { visitor_session_token: visitorSessionToken }
+    }
+    set({ visitorId: visitorExternalId, authFailed: false })
+  },
+
+  reconnectWithSession: (visitorSessionToken, visitorExternalId) => {
+    const existing = get().socket
+    if (!existing) {
+      get().connect(visitorSessionToken, visitorExternalId)
+      return
+    }
+
+    existing.auth = { visitor_session_token: visitorSessionToken }
+    set({ connecting: true, authFailed: false, visitorId: visitorExternalId, connected: false })
+    if (existing.connected) {
+      existing.disconnect()
+    }
+    existing.connect()
   },
 
   disconnect: () => {

@@ -56,6 +56,10 @@ class CallWrapupSettingsUpdate(BaseModel):
     seconds: int = Field(ge=0, le=60)
 
 
+class CallShortAbandonSettingsUpdate(BaseModel):
+    seconds: int = Field(ge=1, le=60)
+
+
 class SystemSettingsResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -64,6 +68,7 @@ class SystemSettingsResponse(BaseModel):
     organization_enabled: bool = False
     bridge_asr_enabled: bool = False
     call_wrapup_seconds: int = 30
+    call_short_abandon_threshold_seconds: int = 5
     lingomaster_enabled: bool = False
     lingomaster_visitor_prompt: str = ""
     lingomaster_agent_prompt: str = ""

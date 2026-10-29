@@ -84,6 +84,12 @@ def _coerce_filter_value(col, value):
     return value
 
 
+def _is_null_only_empty_column(col) -> bool:
+    """Number and date columns have no empty-string state; treat empty as NULL."""
+    col_type = getattr(col, "type", None)
+    return isinstance(col_type, (Integer, Numeric, Float, Date, DateTime))
+
+
 def _build_condition_clause(col, operator: str, value):
     """Build a single SQLAlchemy filter clause from operator + value."""
     if col is None:
@@ -111,8 +117,14 @@ def _build_condition_clause(col, operator: str, value):
     if op in ("lte", "<="):
         return col <= coerced_value
     if op in ("is_empty", "is_null"):
+        if _is_null_only_empty_column(col):
+            return col.is_(None)
+        # JSON empty-array (`[]`) is not treated as empty; that would change
+        # saved-view semantics. Non-numeric types stay NULL-or-cast-text.
         return or_(col.is_(None), cast(col, SAString) == "")
     if op in ("is_not_empty", "is_not_null"):
+        if _is_null_only_empty_column(col):
+            return col.isnot(None)
         return and_(col.isnot(None), cast(col, SAString) != "")
     if op in ("in",) and isinstance(coerced_value, list):
         return col.in_(coerced_value)
@@ -212,6 +224,27 @@ class OrganizationRepository:
         return (await db.execute(q)).scalar_one()
 
     @staticmethod
+    async def count_users_by_org_ids(
+        db: AsyncSession,
+        tenant_id: int,
+        org_ids: list[int],
+    ) -> dict[int, int]:
+        """Count users for the given organizations in one GROUP BY query."""
+        ids = sorted({org_id for org_id in org_ids if org_id is not None})
+        if not ids:
+            return {}
+        result = await db.execute(
+            select(User.organization_id, func.count())
+            .where(User.tenant_id == tenant_id, User.organization_id.in_(ids))
+            .group_by(User.organization_id)
+        )
+        return {
+            org_id: int(count)
+            for org_id, count in result.all()
+            if org_id is not None
+        }
+
+    @staticmethod
     def _build_conditions_filters(
         conditions: list[dict],
         condition_logic: str,
@@ -255,16 +288,20 @@ class OrganizationRepository:
         sort_order: str = "desc",
         page: int = 1,
         per_page: int = 20,
+        ids_only: bool = False,
+        include_count: bool = True,
     ) -> tuple[list[Organization], int]:
         _slot_map = slot_map or {}
         base_where = [Organization.tenant_id == tenant_id]
 
         if search:
+            # description is long text and is not covered by the trgm indexes.
+            # Omit it from the search OR so PostgreSQL can use those indexes;
+            # restore the branch only after evaluating an expression index.
             base_where.append(
                 or_(
                     Organization.public_id.ilike(f"%{search}%"),
                     Organization.name.ilike(f"%{search}%"),
-                    Organization.description.ilike(f"%{search}%"),
                 )
             )
 
@@ -290,19 +327,22 @@ class OrganizationRepository:
                 else:
                     base_where.append(col == group_value)
 
-        count_q = select(func.count()).select_from(Organization).where(*base_where)
-        total = (await db.execute(count_q)).scalar_one()
+        total = 0
+        if include_count:
+            count_q = select(func.count()).select_from(Organization).where(*base_where)
+            total = (await db.execute(count_q)).scalar_one()
 
         order_col = getattr(Organization, sort_by, None) if sort_by else Organization.updated_at
         if order_col is None:
             order_col = Organization.updated_at
         order_expr = order_col.desc() if sort_order == "desc" else order_col.asc()
+        id_expr = Organization.id.desc() if sort_order == "desc" else Organization.id.asc()
 
         offset = (page - 1) * per_page
         data_q = (
-            select(Organization)
+            select(Organization.id if ids_only else Organization)
             .where(*base_where)
-            .order_by(order_expr)
+            .order_by(order_expr, id_expr)
             .offset(offset)
             .limit(per_page)
         )
@@ -353,10 +393,13 @@ class OrganizationRepository:
         base_where = [Organization.tenant_id == tenant_id]
 
         if search:
+            # description is long text and is not covered by the trgm indexes.
+            # Omit it from the search OR so PostgreSQL can use those indexes;
+            # restore the branch only after evaluating an expression index.
             base_where.append(
                 or_(
+                    Organization.public_id.ilike(f"%{search}%"),
                     Organization.name.ilike(f"%{search}%"),
-                    Organization.description.ilike(f"%{search}%"),
                 )
             )
 

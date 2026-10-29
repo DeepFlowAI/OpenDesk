@@ -1,4 +1,5 @@
-import { createElement } from 'react'
+import { act, createElement } from 'react'
+import { createRoot } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -93,5 +94,71 @@ describe('RecordsPanel', () => {
     )
 
     expect(html).not.toContain('data-testid="auto-outbound-record-call-detail"')
+  })
+
+  it('expands the variables passed to the voice bot', async () => {
+    ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const root = createRoot(host)
+    await act(async () => {
+      root.render(
+        createElement(RecordsPanel, {
+          locale: 'zh',
+          loading: false,
+          canViewCallRecord: false,
+          onOpenTarget: () => undefined,
+          items: [
+            makeRecord({
+              reception_type: 'bot',
+              reception_result: { intent: '有意向', handoff: false },
+              call_variables: {
+                status: 'passed',
+                items: [
+                  { name: 'customer_name', value: '张三', truncated: false },
+                  { name: 'note', value: '', truncated: false },
+                  { name: 'story', value: '长文本', truncated: true },
+                ],
+              },
+            }),
+          ],
+        }),
+      )
+    })
+
+    const toggle = host.querySelector<HTMLButtonElement>('[data-testid="auto-outbound-record-call-variables-toggle"]')
+    expect(toggle?.textContent).toBe('已传入变量 · 3')
+    expect(host.querySelector('[data-testid="auto-outbound-record-call-variables"]')).toBeNull()
+
+    await act(async () => toggle?.click())
+    const list = host.querySelector('[data-testid="auto-outbound-record-call-variables"]')
+    expect(list?.textContent).toContain('customer_name')
+    expect(list?.textContent).toContain('张三')
+    expect(list?.textContent).toContain('—')
+    expect(list?.textContent).toContain('已截断')
+    expect(list?.textContent).toContain('提示词中未使用的变量会被机器人忽略。')
+
+    await act(async () => root.unmount())
+    host.remove()
+  })
+
+  it('explains when variables could not be passed', () => {
+    const html = renderToStaticMarkup(
+      createElement(RecordsPanel, {
+        locale: 'zh',
+        loading: false,
+        canViewCallRecord: false,
+        onOpenTarget: () => undefined,
+        items: [
+          makeRecord({
+            reception_type: 'bot',
+            call_variables: { status: 'failed', items: [{ name: 'a', value: 'b', truncated: false }] },
+          }),
+        ],
+      }),
+    )
+
+    expect(html).toContain('变量未传入，机器人按空值继续对话。')
+    expect(html).not.toContain('auto-outbound-record-call-variables-toggle')
   })
 })

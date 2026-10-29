@@ -21,6 +21,7 @@ import { formatWebRtcDeviceError } from '@/lib/call-record-labels'
 import { useCallControl, type CallControlApi } from '@/app/components/features/call-center/use-call-control'
 import { useMicrophone } from '@/app/components/features/call-center/use-microphone'
 import { useRingtone } from '@/app/components/features/call-center/use-ringtone'
+import { useAutoAnswerChime } from '@/app/components/features/call-center/use-auto-answer-chime'
 import { useWebRTCLeg } from '@/app/components/features/call-center/use-webrtc-leg'
 import { useSocketStore } from '@/context/socket-store'
 import {
@@ -47,6 +48,7 @@ import {
   autoOutboundBusinessTabForIncoming,
   restoredAutoOutboundContext,
   shouldAutoAcceptAutoOutbound,
+  shouldKeepAutoAnswerChime,
 } from '@/lib/auto-outbound-incoming'
 import {
   callSessionReducer,
@@ -54,6 +56,7 @@ import {
   hangupMatches,
   initialCallSession,
   isRecentlyEndedCall,
+  isRecentlyEndedIncoming,
   retainConnectedCallScreenPop,
   shouldHydrateMediaReconnect,
   shouldLeaveOnCallFromPoll,
@@ -188,7 +191,7 @@ export function CallCenterProvider({
   controlEnabled = true,
 }: CallCenterProviderProps) {
   const mic = useMicrophone({ autoRequestOnGranted: false })
-  const { data: status, refetch: refetchStatus } = useMyAgentStatus()
+  const { data: status, dataUpdatedAt: statusFetchedAtMs, refetch: refetchStatus } = useMyAgentStatus()
   const { data: systemSettings } = useSystemSettings()
   const { data: currentDevice } = useMyCurrentCallDevice()
   const queryClient = useQueryClient()
@@ -221,6 +224,7 @@ export function CallCenterProvider({
     }
   }, [callControl, controlEnabled])
   const ringtone = useRingtone()
+  const autoAnswerChime = useAutoAnswerChime()
   const { socket } = useSocketStore()
   const [recordsPage, setRecordsPage] = useState(1)
   const recordsQueryParams = useMemo(
@@ -305,6 +309,11 @@ export function CallCenterProvider({
   // Dedup auto-accept for the same offer_id (push redelivery / re-render).
   const autoAcceptedOfferIdsRef = useRef<Set<string>>(new Set())
   const acceptRef = useRef<() => Promise<boolean>>(async () => false)
+  // Offer this tab is accepting or has accepted. Two triggers for one ring (a
+  // double click, or the panel and the call bar) both see the pre-render leg
+  // state, and a second accept rebuilds the leg and then tears down the media
+  // the first one connected.
+  const acceptingOfferRef = useRef<string | null>(null)
   const sessionRef = useRef(session)
   sessionRef.current = session
   // Dedupe keys for the repeat-prone diagnostics: a no-op event and a state
@@ -344,9 +353,10 @@ export function CallCenterProvider({
   useEffect(() => {
     if (controlEnabled) return
     ringtone.stop()
+    autoAnswerChime.stop()
     leg.goOffline()
     mic.stop()
-  }, [controlEnabled, leg, mic, ringtone])
+  }, [controlEnabled, leg, mic, ringtone, autoAnswerChime])
 
   /** Single write path for session state — logs every dispatched event. */
   const dispatch = useCallback((event: CallSessionEvent) => {
@@ -627,6 +637,7 @@ export function CallCenterProvider({
         currentCallId: status?.current_call_id,
         resourceState: status?.resource_state,
         resourceUpdatedAtMs: callStartMsFromIso(status?.resource_updated_at),
+        statusFetchedAtMs,
       })
     ) {
       return
@@ -658,6 +669,7 @@ export function CallCenterProvider({
     status?.current_call_id,
     status?.resource_state,
     status?.resource_updated_at,
+    statusFetchedAtMs,
     ringtone,
     leg,
     mic,
@@ -674,8 +686,10 @@ export function CallCenterProvider({
       !shouldLeaveOnCallFromPoll({
         phase,
         callStart: callStart ?? incoming?.startedAt,
+        sessionStartedAt: incoming?.startedAt,
         resourceState: status?.resource_state,
         resourceUpdatedAtMs: callStartMsFromIso(status?.resource_updated_at),
+        statusFetchedAtMs,
       })
     ) {
       return
@@ -703,6 +717,7 @@ export function CallCenterProvider({
     callStart,
     status?.resource_state,
     status?.resource_updated_at,
+    statusFetchedAtMs,
     leg,
     mic,
     dispatch,
@@ -837,7 +852,10 @@ export function CallCenterProvider({
     if (phase !== 'incoming' && phase !== 'outbound_ringing') {
       ringtone.stop()
     }
-  }, [phase, ringtone])
+    if (!shouldKeepAutoAnswerChime(phase)) {
+      autoAnswerChime.stop()
+    }
+  }, [phase, ringtone, autoAnswerChime])
 
   useEffect(() => {
     if (!socket || !controlEnabled) return
@@ -903,10 +921,9 @@ export function CallCenterProvider({
         rec,
         status?.employee_id,
       )
-      const recentlyEnded = isRecentlyEndedCall(
+      const recentlyEnded = isRecentlyEndedIncoming(
         sessionRef.current.lastEndedCallIds,
-        data.call_id,
-        data.source_call_id,
+        data,
       )
       trackSocket('call_incoming', data.call_id, {
         matched: !recentlyEnded,
@@ -1040,11 +1057,22 @@ export function CallCenterProvider({
         sessionRef.current.phase === 'outbound_ringing' &&
         (incoming?.call_id === data.call_id ||
           incoming?.source_call_id === data.call_id)
+      const forOtherCall =
+        !!incoming &&
+        incoming.call_id !== data.call_id &&
+        incoming.source_call_id !== data.call_id
       trackSocket('outbound_hangup', data.call_id, {
         matched: matchesActiveOutbound,
+        other_call: forOtherCall,
         reason: data.reason,
         sip_status: data.sip_status,
       })
+      // An earlier call ending late (e.g. after its satisfaction survey) must
+      // not toast over, or tear down the media of, the call on the desk now.
+      if (forOtherCall) {
+        refetchCallRecords()
+        return
+      }
       if (!matchesActiveOutbound) {
         earlyOutboundEndedRef.current.add(data.call_id)
       }
@@ -1180,6 +1208,10 @@ export function CallCenterProvider({
       refetchCallRecords()
     }
 
+    const onCallRecordUpdated = () => {
+      refetchCallRecords()
+    }
+
     socket.on(CcSocketEvent.CALL_INCOMING, onIncoming)
     socket.on(CcSocketEvent.CALL_ANSWERED, onCallAnswered)
     socket.on(CcSocketEvent.DEVICE_REGISTRATION_CHANGED, onDeviceRegistrationChanged)
@@ -1195,6 +1227,7 @@ export function CallCenterProvider({
     socket.on(CcSocketEvent.CONFERENCE_PARTICIPANT_LEFT, onConferenceParticipantLeft)
     socket.on(CcSocketEvent.WRAP_UP_STARTED, onWrapUpStarted)
     socket.on(CcSocketEvent.WRAP_UP_TIMEOUT, onWrapUpTimeout)
+    socket.on(CcSocketEvent.CALL_RECORD_UPDATED, onCallRecordUpdated)
     return () => {
       socket.off(CcSocketEvent.CALL_INCOMING, onIncoming)
       socket.off(CcSocketEvent.CALL_ANSWERED, onCallAnswered)
@@ -1211,6 +1244,7 @@ export function CallCenterProvider({
       socket.off(CcSocketEvent.CONFERENCE_PARTICIPANT_LEFT, onConferenceParticipantLeft)
       socket.off(CcSocketEvent.WRAP_UP_STARTED, onWrapUpStarted)
       socket.off(CcSocketEvent.WRAP_UP_TIMEOUT, onWrapUpTimeout)
+      socket.off(CcSocketEvent.CALL_RECORD_UPDATED, onCallRecordUpdated)
     }
   }, [
     socket,
@@ -1405,15 +1439,19 @@ export function CallCenterProvider({
     // SIP-phone calls are answered on the physical handset; there is no browser
     // WebRTC leg to accept. The backend's cc.call_answered moves us to 通话中.
     if (!browserOwnsMedia(current.device_type)) return false
+    if (acceptingOfferRef.current === current.offer_id) return false
+    acceptingOfferRef.current = current.offer_id
     ringtone.stop()
     if (mic.state !== 'granted') {
       const ok = await mic.request()
       if (!ok) {
+        acceptingOfferRef.current = null
         toast.error('请先授权麦克风')
         return false
       }
     }
     const ok = await leg.acceptOffer(current.offer_id)
+    if (!ok) acceptingOfferRef.current = null
     if (ok) {
       trackCallCenter('action', {
         action: 'accept',
@@ -1472,16 +1510,18 @@ export function CallCenterProvider({
     const offerId = incoming.offer_id
     if (autoAcceptedOfferIdsRef.current.has(offerId)) return
     autoAcceptedOfferIdsRef.current.add(offerId)
+    autoAnswerChime.play()
     void (async () => {
       const ok = await acceptRef.current()
       // Only a failed accept may retry on a later push of the same offer.
       // sessionRef.phase still reads pre-dispatch at this point, so it cannot
       // tell success from failure — use the returned flag instead.
       if (!ok) {
+        autoAnswerChime.stop()
         autoAcceptedOfferIdsRef.current.delete(offerId)
       }
     })()
-  }, [phase, incoming?.offer_id, incoming?.source, incoming?.device_type, controlEnabled])
+  }, [phase, incoming?.offer_id, incoming?.source, incoming?.device_type, controlEnabled, autoAnswerChime])
 
   // Track wrap-up start for auto-outbound countdown; open business-record tab.
   useEffect(() => {

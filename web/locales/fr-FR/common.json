@@ -1201,6 +1201,7 @@
   "chat.handoff.needsAgent": "Ce problème nécessite l'intervention d'un agent de support humain.",
   "chat.attachment.upload": "Téléverser une pièce jointe",
   "chat.attachment.failed": "Échec de l'envoi de la pièce jointe. Cliquez pour réessayer.",
+  "chat.attachment.empty": "L'image n'est pas encore prête. Veuillez réessayer.",
   "chat.bot.noResponse": "L'assistant ne répond pas. Veuillez réessayer ou contacter le support.",
   "chat.recall.mine": "Vous avez retiré un message",
   "chat.recall.named": "{name} a retiré un message",

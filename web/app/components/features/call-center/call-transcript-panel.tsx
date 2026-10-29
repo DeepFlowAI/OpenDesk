@@ -1,10 +1,18 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 
+import { useLocaleStore } from '@/context/locale-store'
 import { useSocketStore } from '@/context/socket-store'
-import { useCallTranscript } from '@/service/use-call-center'
+import {
+  useBotTranscript,
+  useCallTranscript,
+  useRecordBotTranscript,
+} from '@/service/use-call-center'
 import { useSystemSettings } from '@/service/use-system-settings'
+import type { BotTranscriptResponse } from '@/models/call-center'
+import type { Locale } from '@/context/locale-store'
+import { t } from '@/utils/i18n'
 import { TranscriptBubbles, type TranscriptBubble } from './transcript-bubbles'
 
 /**
@@ -111,19 +119,39 @@ export function transcriptCallIdMatches(opts: {
 export function CallTranscriptPanel({
   callId,
   live,
+  ringing = false,
+  hideBot = false,
   fallbackRecordId,
   sourceCallId,
+  flushTop = false,
+  onShownChange,
+  onContentChange,
 }: {
   callId: string
   live: boolean
+  /** Ringing screen-pop: show bot segment, hide the whole area if no bot. */
+  ringing?: boolean
+  /** Internal consult / conference invite — do not fetch bot transcript. */
+  hideBot?: boolean
   /** When live captions were cleared (e.g. remount after browsing history), show persisted lines. */
   fallbackRecordId?: string | null
   /** Real customer leg id when `callId` is a synthetic internal offer id. */
   sourceCallId?: string | null
+  /** Drop the top rule when call facts above are folded away. */
+  flushTop?: boolean
+  /** Reports whether this panel is actually on screen (ringing hides it when there is no bot). */
+  onShownChange?: (shown: boolean) => void
+  /** Reports whether any conversation line exists; `null` while still loading. */
+  onContentChange?: (hasContent: boolean | null) => void
 }) {
   const { socket } = useSocketStore()
+  const { locale } = useLocaleStore()
   const { data: settings } = useSystemSettings()
   const asrEnabled = settings?.bridge_asr_enabled ?? false
+  const botQuery = useBotTranscript(hideBot ? null : callId)
+  const bot = botQuery.data
+  const showBot = !hideBot && (botQuery.isPending || botQuery.isError || Boolean(bot?.available))
+  const conversationScrollRef = useRef<HTMLDivElement>(null)
   const [captions, setCaptions] = useState<TranscriptBubble[]>([])
   const nextIdRef = useRef(0)
   const hydratedCallIdRef = useRef<string | null>(null)
@@ -195,37 +223,90 @@ export function CallTranscriptPanel({
 
   const showHistoryFallback =
     !live && captions.length === 0 && (historySegments?.length ?? 0) > 0
+  // While the bot query is still pending, keep call facts open so a normal
+  // ring does not collapse and then snap back open.
+  const transcriptShown = ringing ? showBot && !botQuery.isPending : true
+
+  useEffect(() => {
+    onShownChange?.(transcriptShown)
+  }, [onShownChange, transcriptShown])
+
+  useEffect(() => {
+    return () => onShownChange?.(false)
+  }, [onShownChange])
+
+  const hasContent =
+    captions.length > 0 || showHistoryFallback || (showBot && (bot?.messages.length ?? 0) > 0)
+      ? true
+      : (showBot && botQuery.isPending) || historyQuery.isLoading
+        ? null
+        : false
+  useEffect(() => {
+    onContentChange?.(hasContent)
+  }, [onContentChange, hasContent])
+
+  useEffect(() => {
+    if (!live && !ringing) return
+    const el = conversationScrollRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+  }, [live, ringing, captions, bot?.messages])
+
+  if (ringing && !showBot) return null
+
+  const agentTitle = showHistoryFallback ? '对话记录' : '实时对话'
+  const agentNote = !asrEnabled
+    ? '暂未开启转写'
+    : captions.length > 0 || showHistoryFallback
+      ? null
+      : live
+        ? historyQuery.isLoading
+          ? '对话记录加载中…'
+          : '正在聆听通话，识别到对话后实时显示…'
+        : historyQuery.isLoading
+          ? '对话记录加载中…'
+          : '暂无对话记录'
+  const agentItems: TranscriptBubble[] = captions.length > 0
+    ? captions
+    : showHistoryFallback
+      ? (historySegments ?? []).map((s) => ({
+          id: s.id,
+          role: s.role,
+          text: s.text,
+        }))
+      : []
 
   return (
-    <section className="mt-4 flex min-h-0 flex-1 flex-col border-t border-border pt-4">
-      <h4 className="mb-2 shrink-0 text-xs font-semibold text-foreground/70">
-        {showHistoryFallback ? '对话记录' : '实时对话'}
-      </h4>
-      {!asrEnabled ? (
-        <p className="py-6 text-center text-xs text-muted-foreground">暂未开启转写</p>
-      ) : captions.length > 0 ? (
-        <TranscriptBubbles items={captions} autoScroll={live} fill />
-      ) : showHistoryFallback ? (
-        <TranscriptBubbles
-          fill
-          items={(historySegments ?? []).map((s) => ({
-            id: s.id,
-            role: s.role,
-            text: s.text,
-          }))}
-        />
-      ) : (
-        <p className="flex min-h-0 flex-1 items-center justify-center py-6 text-center text-xs text-muted-foreground">
-          {live
-            ? historyQuery.isLoading
-              ? '对话记录加载中…'
-              : '正在聆听通话，识别到对话后实时显示…'
-            : historyQuery.isLoading
-              ? '对话记录加载中…'
-              : '暂无对话记录'}
-        </p>
-      )}
-    </section>
+    <ConversationColumn
+      flushTop={flushTop}
+      scrollRef={conversationScrollRef}
+      bot={
+        showBot ? (
+          <BotSegmentView
+            locale={locale}
+            queryPending={botQuery.isPending || botQuery.isFetching}
+            queryError={botQuery.isError}
+            data={bot}
+            onRetry={() => {
+              void botQuery.refetch()
+            }}
+          />
+        ) : null
+      }
+      divider={
+        showBot &&
+        !botQuery.isPending &&
+        !botQuery.isError &&
+        bot?.available &&
+        (bot.entered_human || ringing)
+          ? bot
+          : undefined
+      }
+      locale={locale}
+      agentTitle={ringing ? undefined : agentTitle}
+      agentItems={ringing ? [] : agentItems}
+      agentNote={ringing ? undefined : agentNote}
+    />
   )
 }
 
@@ -233,26 +314,203 @@ export function CallTranscriptPanel({
  * Persisted transcript for a finished/historical call. Hidden when the call has
  * no stored lines (e.g. it never reached a human agent).
  */
-export function CallTranscriptHistory({ recordId }: { recordId: string }) {
+export function CallTranscriptHistory({
+  recordId,
+  flushTop = false,
+  onContentChange,
+}: {
+  recordId: string
+  /** Drop the top rule when call facts above are folded away. */
+  flushTop?: boolean
+  /** Reports whether any conversation line exists; `null` while still loading. */
+  onContentChange?: (hasContent: boolean | null) => void
+}) {
+  const { locale } = useLocaleStore()
   const { data, isLoading } = useCallTranscript(recordId)
+  const botQuery = useRecordBotTranscript(recordId)
+  const bot = botQuery.data
+  const showBot = botQuery.isPending || botQuery.isError || Boolean(bot?.available)
   const segments = data?.segments ?? []
+  const hasContent =
+    segments.length > 0 || (bot?.messages.length ?? 0) > 0
+      ? true
+      : isLoading || botQuery.isPending
+        ? null
+        : false
+  useEffect(() => {
+    onContentChange?.(hasContent)
+  }, [onContentChange, hasContent])
+  const agentNote = isLoading
+    ? '对话记录加载中…'
+    : segments.length === 0
+      ? '暂无对话记录'
+      : null
   return (
-    <section className="mt-4 flex min-h-0 flex-1 flex-col border-t border-border pt-4">
-      <h4 className="mb-2 shrink-0 text-xs font-semibold text-foreground/70">对话记录</h4>
-      {isLoading ? (
-        <p className="flex min-h-0 flex-1 items-end justify-center py-6 text-center text-xs text-muted-foreground">
-          对话记录加载中…
-        </p>
-      ) : segments.length === 0 ? (
-        <p className="flex min-h-0 flex-1 items-end justify-center py-6 text-center text-xs text-muted-foreground">
-          暂无对话记录
-        </p>
-      ) : (
+    <ConversationColumn
+      flushTop={flushTop}
+      bot={
+        showBot ? (
+          <BotSegmentView
+            locale={locale}
+            queryPending={botQuery.isPending || botQuery.isFetching}
+            queryError={botQuery.isError}
+            data={bot}
+            onRetry={() => {
+              void botQuery.refetch()
+            }}
+          />
+        ) : null
+      }
+      divider={showBot && bot?.entered_human ? bot : undefined}
+      locale={locale}
+      agentTitle="对话记录"
+      agentItems={segments.map((s) => ({ id: s.id, role: s.role, text: s.text }))}
+      agentNote={agentNote}
+    />
+  )
+}
+
+function ConversationColumn({
+  flushTop = false,
+  scrollRef,
+  bot,
+  divider,
+  locale,
+  agentTitle,
+  agentItems,
+  agentNote,
+}: {
+  flushTop?: boolean
+  scrollRef?: RefObject<HTMLDivElement | null>
+  bot: ReactNode
+  divider?: Pick<BotTranscriptResponse, 'handoff_at'> | undefined
+  locale: Locale
+  agentTitle?: string
+  agentItems: TranscriptBubble[]
+  agentNote?: string | null
+}) {
+  return (
+    <section
+      className={
+        flushTop
+          ? 'flex min-h-0 flex-1 flex-col pt-3'
+          : 'mt-4 flex min-h-0 flex-1 flex-col border-t border-border pt-4'
+      }
+    >
+      <div
+        ref={scrollRef}
+        className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto"
+      >
+        <div className="mt-auto flex flex-col gap-2">
+          {bot}
+          {divider && <HandoffLine locale={locale} handoffAt={divider.handoff_at} />}
+          {agentTitle && (
+            <h4 className="shrink-0 text-xs font-semibold text-foreground/70">{agentTitle}</h4>
+          )}
+          {agentItems.length > 0 && <TranscriptBubbles items={agentItems} embedded />}
+          {agentNote && (
+            <p className="flex min-h-16 items-center justify-center text-center text-xs text-muted-foreground">
+              {agentNote}
+            </p>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function BotSegmentView({
+  locale,
+  queryPending,
+  queryError,
+  data,
+  onRetry,
+}: {
+  locale: Locale
+  queryPending: boolean
+  queryError: boolean
+  data?: BotTranscriptResponse
+  onRetry: () => void
+}) {
+  const failed = queryError || data?.status === 'error'
+  const empty = !failed && !queryPending && (data?.status === 'empty' || (data?.messages.length ?? 0) === 0)
+  const name = data?.agent_name
+  return (
+    <section className="flex flex-col gap-2">
+      <div className="flex shrink-0 items-baseline justify-between gap-2">
+        <h4 className="text-xs font-semibold text-foreground/70">
+          {t('ws.call.botConversation', locale)}
+        </h4>
+        {name && !queryPending && !failed && (
+          <span className="text-xs text-muted-foreground">
+            {t('ws.call.botHandledBy', locale, { name })}
+          </span>
+        )}
+      </div>
+      {queryPending && (
+        <SegmentNote>{t('ws.call.botLoading', locale)}</SegmentNote>
+      )}
+      {!queryPending && failed && (
+        <SegmentNote>
+          {t('ws.call.botLoadFailed', locale)}
+          <button
+            type="button"
+            onClick={onRetry}
+            disabled={queryPending}
+            className="ml-2 text-xs text-primary disabled:opacity-50"
+          >
+            {t('ws.call.retry', locale)}
+          </button>
+        </SegmentNote>
+      )}
+      {!queryPending && !failed && empty && (
+        <SegmentNote>{t('ws.call.botEmpty', locale)}</SegmentNote>
+      )}
+      {!queryPending && !failed && data && data.messages.length > 0 && (
         <TranscriptBubbles
-          fill
-          items={segments.map((s) => ({ id: s.id, role: s.role, text: s.text }))}
+          embedded
+          items={data.messages.map((m, index) => ({
+            id: index + 1,
+            role: m.role,
+            text: m.text,
+            interrupted: m.interrupted,
+          }))}
         />
       )}
     </section>
   )
+}
+
+function SegmentNote({ children }: { children: ReactNode }) {
+  return (
+    <p className="flex min-h-16 items-center justify-center text-center text-xs text-muted-foreground">
+      {children}
+    </p>
+  )
+}
+
+function HandoffLine({ locale, handoffAt }: { locale: Locale; handoffAt: string | null }) {
+  const time = formatHandoffTime(handoffAt)
+  const label = time
+    ? t('ws.call.transferredToAgentAt', locale, { time })
+    : t('ws.call.transferredToAgent', locale)
+  return (
+    <div className="my-2 flex shrink-0 items-center gap-3">
+      <div className="h-px flex-1 bg-border" />
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <div className="h-px flex-1 bg-border" />
+    </div>
+  )
+}
+
+export function formatHandoffTime(iso: string | null | undefined): string | null {
+  if (!iso) return null
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return null
+  return date.toLocaleTimeString(undefined, {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
 }

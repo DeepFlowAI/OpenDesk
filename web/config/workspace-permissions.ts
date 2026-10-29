@@ -15,6 +15,7 @@ export type WorkspaceNavItem = {
   iconKey: WorkspaceNavIconKey
   permissions: string[]
   permissionSets?: string[][]
+  activePrefixes?: string[]
   /** Open in a new browser tab so the current workspace page stays intact. */
   openInNewTab?: boolean
 }
@@ -29,6 +30,13 @@ export type WorkspaceRecordIconKey =
   | 'callReports'
   | 'smsRecords'
   | 'dashboards'
+  | 'quality'
+
+export type WorkspaceRecordChildNavItem = {
+  labelKey: string
+  href: string
+  permission: string
+}
 
 export type WorkspaceRecordNavItem = {
   labelKey: string
@@ -37,6 +45,7 @@ export type WorkspaceRecordNavItem = {
   permissions: string[]
   requireAll?: boolean
   requiresReports?: boolean
+  children?: WorkspaceRecordChildNavItem[]
 }
 
 export type WorkspaceRecordNavGroup = {
@@ -93,8 +102,10 @@ export const WORKSPACE_NAV_ITEMS: WorkspaceNavItem[] = [
       'call.record.view',
       'call.report.view',
       'call.sms_record.view',
+      'quality.online.access',
     ],
     permissionSets: [['report.dashboard.view', 'ticket.workspace.view']],
+    activePrefixes: ['/workspace/quality'],
   },
   {
     labelKey: 'ws.nav.learning',
@@ -194,11 +205,30 @@ export const WORKSPACE_RECORD_NAV_GROUPS: WorkspaceRecordNavGroup[] = [
         permissions: ['report.dashboard.view', 'ticket.workspace.view'],
         requireAll: true,
       },
+      {
+        labelKey: 'ws.nav.quality',
+        href: '/workspace/quality',
+        iconKey: 'quality',
+        permissions: ['quality.online.access'],
+        children: [
+          {
+            labelKey: 'ws.quality.nav.plans',
+            href: '/workspace/quality/online/plans',
+            permission: 'quality.online.plan.view',
+          },
+          {
+            labelKey: 'ws.quality.nav.scorecards',
+            href: '/workspace/quality/online/scorecards',
+            permission: 'quality.online.scorecard.view',
+          },
+        ],
+      },
     ],
   },
 ]
 
 export const WORKSPACE_ROUTE_RULES: WorkspaceRouteRule[] = [
+  { prefix: '/workspace/quality', permissions: ['quality.online.access'] },
   { prefix: '/workspace/records/dashboards', permissions: ['report.dashboard.view', 'ticket.workspace.view'], requireAll: true },
   { prefix: '/workspace/records/online-monitor', permissions: ['chat.online_monitor.view'] },
   { prefix: '/workspace/records/session-reports', permissions: ['chat.session_report.view'] },

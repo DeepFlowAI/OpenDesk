@@ -181,6 +181,7 @@ async def test_agent_invite_failure_rebridges_original_call() -> None:
         "call.bridge",
         {
             "call_id": "customer-call",
+            "user_call_id": "customer-call",
             "other_call_id": "agent-leg",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,

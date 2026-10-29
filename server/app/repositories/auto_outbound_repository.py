@@ -160,18 +160,23 @@ class AutoOutboundRepository:
             answered = row["answered_count"]
             row["answer_rate"] = (answered / call_count) if call_count else None
 
-        # transfer_count: agent reception with assigned/transferred/handoff marker.
+        # transfer_count: agent reception with assigned/transferred/handoff marker,
+        # or a bot/IVR reception that was bridged to an agent (transferred).
         # abandon_count: reception_result.abandoned == true (no abandoned terminal_state).
         transfer_or_abandon = await db.execute(
             select(
                 AutoOutboundCallRecord.task_id,
                 func.count()
                 .filter(
-                    AutoOutboundCallRecord.reception_type == "agent",
                     or_(
-                        AutoOutboundCallRecord.reception_result["assigned"].astext == "true",
+                        and_(
+                            AutoOutboundCallRecord.reception_type == "agent",
+                            or_(
+                                AutoOutboundCallRecord.reception_result["assigned"].astext == "true",
+                                AutoOutboundCallRecord.reception_result["handoff"].astext == "true",
+                            ),
+                        ),
                         AutoOutboundCallRecord.reception_result["transferred"].astext == "true",
-                        AutoOutboundCallRecord.reception_result["handoff"].astext == "true",
                     ),
                 )
                 .label("transfer_count"),
@@ -227,8 +232,18 @@ class AutoOutboundRepository:
         if status:
             filters.append(AutoOutboundTarget.status == status)
 
+        has_call_records = (
+            select(AutoOutboundCallRecord.id)
+            .where(AutoOutboundCallRecord.target_id == AutoOutboundTarget.id)
+            .exists()
+        )
+        can_delete = and_(
+            AutoOutboundTarget.status.in_(["pending", "invalid"]),
+            AutoOutboundTarget.call_count == 0,
+            ~has_call_records,
+        ).label("can_delete")
         stmt = (
-            select(AutoOutboundTarget, User.name)
+            select(AutoOutboundTarget, User.name, can_delete)
             .outerjoin(User, User.id == AutoOutboundTarget.user_id)
             .where(*filters)
         )
@@ -238,11 +253,15 @@ class AutoOutboundRepository:
             _paginate_statement(stmt.order_by(AutoOutboundTarget.updated_at.desc()), page, per_page)
         )
         items: list[AutoOutboundTarget] = []
-        for target, user_name in result.all():
+        task_allows_delete = task is not None and task.status in {"draft", "active", "paused"}
+        for target, user_name, target_can_delete in result.all():
             # Ephemeral attributes for API serialization (not ORM columns).
             target.user_name = user_name  # type: ignore[attr-defined]
             target.remaining_retries = max(  # type: ignore[attr-defined]
                 0, max_policy - _used_retry_total(target.retry_counts)
+            )
+            target.can_delete = bool(  # type: ignore[attr-defined]
+                task_allows_delete and target_can_delete
             )
             items.append(target)
         return items, total
@@ -250,6 +269,36 @@ class AutoOutboundRepository:
     @staticmethod
     async def get_target(db: AsyncSession, target_id: int) -> AutoOutboundTarget | None:
         return await db.get(AutoOutboundTarget, target_id)
+
+    @staticmethod
+    async def get_target_for_update(
+        db: AsyncSession,
+        target_id: int,
+        *,
+        tenant_id: int,
+        task_id: int,
+    ) -> AutoOutboundTarget | None:
+        result = await db.execute(
+            select(AutoOutboundTarget)
+            .where(
+                AutoOutboundTarget.id == target_id,
+                AutoOutboundTarget.tenant_id == tenant_id,
+                AutoOutboundTarget.task_id == task_id,
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def target_has_call_records(db: AsyncSession, target_id: int) -> bool:
+        result = await db.execute(
+            select(
+                select(AutoOutboundCallRecord.id)
+                .where(AutoOutboundCallRecord.target_id == target_id)
+                .exists()
+            )
+        )
+        return bool(result.scalar_one())
 
     @staticmethod
     async def create_target(
@@ -294,9 +343,17 @@ class AutoOutboundRepository:
         return item
 
     @staticmethod
-    async def delete_target(db: AsyncSession, item: AutoOutboundTarget) -> None:
+    async def delete_target(
+        db: AsyncSession,
+        item: AutoOutboundTarget,
+        *,
+        commit: bool = True,
+    ) -> None:
         await db.delete(item)
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
 
     @staticmethod
     async def count_records_for_number_on_day(

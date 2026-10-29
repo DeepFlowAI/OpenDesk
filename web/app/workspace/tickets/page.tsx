@@ -12,6 +12,7 @@ import {
   IconX,
   IconTicket,
   IconArrowLeft,
+  IconDownload,
 } from '@tabler/icons-react'
 import { useLocaleStore } from '@/context/locale-store'
 import { useAuthStore } from '@/context/auth-store'
@@ -41,6 +42,9 @@ import { richTextToPlainCell } from '@/lib/rich-text-plain'
 import { FieldOptionPill } from '@/app/components/features/field-system/field-select-pill-editors'
 import { colorForSelectValue, labelForSelectValue } from '@/lib/field-select-from-unified'
 import { hasPermission } from '@/utils/permissions'
+import { Button } from '@/components/ui/button'
+import { TicketExportDialog } from '@/app/workspace/tickets/ticket-export-dialog'
+import type { TicketExportSource } from '@/models/ticket-export'
 
 // ── localStorage helpers ──
 
@@ -157,6 +161,8 @@ export default function WorkspaceTicketsPage() {
   const [columnsDrawerOpen, setColumnsDrawerOpen] = useState(false)
   const [createModalOpen, setCreateModalOpen] = useState(false)
   const canCreateTicket = hasPermission(user, 'ticket.workspace.create')
+  const [exportSource, setExportSource] = useState<TicketExportSource | null>(null)
+  const canExportTicket = hasPermission(user, 'ticket.workspace.view') && hasPermission(user, 'ticket.workspace.export')
 
   const [sidebarOpen, setSidebarOpen] = useState(true)
 
@@ -218,7 +224,7 @@ export default function WorkspaceTicketsPage() {
     ]
   )
 
-  const { data: ticketsData, isLoading: ticketsLoading } = useQueryTickets(queryPayload)
+  const { data: ticketsData, isLoading: ticketsLoading, isFetching: ticketsFetching, isError: ticketsError, isPlaceholderData: ticketsPlaceholder } = useQueryTickets(queryPayload)
 
   const visibleColumns = useMemo(() => {
     if (columnOverrides) {
@@ -498,6 +504,11 @@ export default function WorkspaceTicketsPage() {
             <IconColumns3 size={16} />
             {locale === 'zh' ? '列字段' : 'Columns'}
           </button>
+          {canExportTicket && <Button variant="outline" className="h-9 px-3 font-normal text-foreground/80 hover:bg-accent" disabled={ticketsFetching || ticketsError || ticketsPlaceholder || !ticketsData || !fieldsData || viewsLoading} onClick={() => {
+            let timezone = 'UTC'
+            try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' } catch { /* Use UTC when unavailable. */ }
+            setExportSource(structuredClone({ query: queryPayload, columns: displayColumns, language: locale === 'zh' ? 'zh' : 'en', timezone }))
+          }}><IconDownload size={16} />{locale === 'zh' ? '导出' : 'Export'}</Button>}
         </div>
 
         {groupsEnabled && (
@@ -674,6 +685,7 @@ export default function WorkspaceTicketsPage() {
       )}
 
       {/* Columns Drawer */}
+      {exportSource && <TicketExportDialog source={exportSource} onClose={() => setExportSource(null)} />}
       {columnsDrawerOpen && (
         <ColumnsDrawer
           locale={locale}

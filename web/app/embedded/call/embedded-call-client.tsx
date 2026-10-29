@@ -147,14 +147,14 @@ export function EmbeddedCallClient({
     postToHost(type, { nonce, integrationKey })
   }, [integrationKey, postToHost])
 
-  const releaseControl = useCallback(async () => {
+  const releaseControl = useCallback(async (keepalive = false) => {
     const current = leaseRef.current
     if (!current?.lease_token) return
     try {
       await updateEmbeddedControl('release', {
         instanceId,
         leaseToken: current.lease_token,
-      })
+      }, { keepalive })
     } catch {
       // The short lease expires automatically if the page is already unloading.
     }
@@ -287,6 +287,33 @@ export function EmbeddedCallClient({
     }, 5000)
     return () => window.clearInterval(timer)
   }, [instanceId, lease?.lease_token])
+
+  // An observer keeps asking for control: a reloaded page's previous instance
+  // may still hold an unreleased lease until it expires.
+  const isObserver = lease ? !lease.is_owner : false
+  useEffect(() => {
+    if (!isObserver) return
+    const timer = window.setInterval(() => {
+      void updateEmbeddedControl('acquire', { instanceId }).then((result) => {
+        setLease((current) => (
+          current
+          && current.is_owner === result.is_owner
+          && current.owner_instance_id === result.owner_instance_id
+            ? current
+            : result
+        ))
+      }).catch(() => {})
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [instanceId, isObserver])
+
+  // Release on reload/close so the next page load gets control immediately;
+  // unmount cleanup does not run when the document is torn down.
+  useEffect(() => {
+    const onPageHide = () => { void releaseControl(true) }
+    window.addEventListener('pagehide', onPageHide)
+    return () => window.removeEventListener('pagehide', onPageHide)
+  }, [releaseControl])
 
   useEffect(() => {
     if (!authFailed || !session) return

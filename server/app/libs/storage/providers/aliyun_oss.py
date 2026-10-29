@@ -1,8 +1,10 @@
 """
 Alibaba Cloud OSS storage implementation.
 """
+import asyncio
 import logging
 from functools import lru_cache
+from urllib.parse import quote
 
 import oss2
 
@@ -37,7 +39,7 @@ class AliyunOSSClient(BaseStorageClient):
     async def delete(self, key: str) -> None:
         """Delete an object from OSS by key."""
         bucket = _get_bucket()
-        bucket.delete_object(key)
+        await asyncio.to_thread(bucket.delete_object, key)
         logger.info("Deleted from OSS: %s", key)
 
     async def copy(self, source_key: str, destination_key: str) -> None:
@@ -59,7 +61,7 @@ class AliyunOSSClient(BaseStorageClient):
         if image_process:
             params["x-oss-process"] = image_process
         if download_name:
-            params["response-content-disposition"] = f'attachment; filename="{download_name}"'
+            params["response-content-disposition"] = f"attachment; filename*=UTF-8''{quote(download_name, safe='')}"
         return bucket.sign_url("GET", key, expires_seconds, params=params)
 
     async def get_presigned_upload_url(
@@ -72,3 +74,26 @@ class AliyunOSSClient(BaseStorageClient):
         bucket = _get_bucket()
         headers = {"Content-Type": content_type}
         return bucket.sign_url("PUT", key, expires_seconds, headers=headers)
+
+    async def upload_private(self, key: str, data: bytes, content_type: str) -> None:
+        await asyncio.to_thread(
+            _get_bucket().put_object, key, data,
+            headers={"Content-Type": content_type, "x-oss-object-acl": "private"},
+        )
+
+    async def read_private(self, key: str, max_bytes: int) -> bytes:
+        def read() -> bytes:
+            try:
+                result = _get_bucket().get_object(key)
+            except oss2.exceptions.NoSuchKey as exc:
+                raise FileNotFoundError("Export object is missing") from exc
+            try:
+                if result.content_length is not None and result.content_length > max_bytes:
+                    raise ValueError("Export object is oversized")
+                data = result.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ValueError("Export object is oversized")
+                return data
+            finally:
+                result.resp.response.close()
+        return await asyncio.to_thread(read)

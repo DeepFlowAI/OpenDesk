@@ -4,7 +4,7 @@
  */
 
 import type { Locale } from '@/context/locale-store'
-import type { IncomingCall } from '@/lib/call-session-reducer'
+import type { CallCenterPhase, IncomingCall } from '@/lib/call-session-reducer'
 import { t } from '@/utils/i18n'
 
 export const AUTO_OUTBOUND_SOURCE = 'auto_outbound' as const
@@ -94,6 +94,14 @@ export function shouldAutoAcceptAutoOutbound(opts: {
   if (opts.restore || opts.alreadyAnswered) return false
   if (opts.deviceType === 'sip_phone') return false
   return true
+}
+
+/**
+ * The auto-answer chime may finish over the connected call, but must stop
+ * once the offer is gone (hangup, withdrawn offer, wrap-up).
+ */
+export function shouldKeepAutoAnswerChime(phase: CallCenterPhase): boolean {
+  return phase === 'incoming' || phase === 'on_call'
 }
 
 /** Right-panel "外呼任务业务记录" tab is only for auto-outbound offers. */

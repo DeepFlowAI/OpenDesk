@@ -122,13 +122,16 @@ class MessageRepository:
         return items
 
     @staticmethod
-    async def create(db: AsyncSession, data: dict) -> Message:
+    async def create(db: AsyncSession, data: dict, *, commit: bool = True) -> Message:
         item = Message(**data)
         db.add(item)
         await MessageRepository._increment_conversation_message_counts(
             db, item.conversation_id, item.sender_type
         )
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
         await db.refresh(item)
         return item
 

@@ -104,6 +104,21 @@ class CallEventRepository:
         return row, True
 
     @staticmethod
+    async def get_latest_of_type(
+        db: AsyncSession, call_record_id: int, event_type: str
+    ) -> CallEvent | None:
+        query = (
+            select(CallEvent)
+            .where(
+                CallEvent.call_record_id == call_record_id,
+                CallEvent.event_type == event_type,
+            )
+            .order_by(CallEvent.occurred_at.desc(), CallEvent.id.desc())
+            .limit(1)
+        )
+        return (await db.execute(query)).scalar_one_or_none()
+
+    @staticmethod
     async def list_for_call(db: AsyncSession, call_record_id: int) -> list[CallEvent]:
         query = (
             select(CallEvent)

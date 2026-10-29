@@ -51,6 +51,10 @@ class _RealtimeHarness:
         ("GET", "/api/v1/call-center/embed/commands/eccmd_1"),
         ("POST", "/api/v1/call-center/agents/me/current-call/hangup"),
         ("POST", "/api/v1/call-center/agents/me/dial"),
+        ("GET", "/api/v1/call-center/agents/me/current-call/satisfaction"),
+        ("POST", "/api/v1/call-center/agents/me/current-call/satisfaction/invite"),
+        ("GET", "/api/v1/call-center/sms/workspace/templates"),
+        ("POST", "/api/v1/call-center/sms/send"),
     ],
 )
 def test_embedded_session_allows_only_call_runtime_endpoints(method, path):
@@ -66,6 +70,8 @@ def test_embedded_session_allows_only_call_runtime_endpoints(method, path):
         ("POST", "/api/v1/call-center/agents/me/current-call/future-action"),
         ("DELETE", "/api/v1/call-center/agents/me/current-call/hangup"),
         ("POST", "/api/v1/call-center/agents/consultable"),
+        ("GET", "/api/v1/call-center/sms/records"),
+        ("POST", "/api/v1/call-center/sms/templates"),
     ],
 )
 def test_embedded_session_rejects_non_runtime_endpoints(method, path):

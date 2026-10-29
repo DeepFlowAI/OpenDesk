@@ -4,8 +4,10 @@ Unit tests for OpenAgent conversation proxy service.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import logging
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.core.exceptions import ValidationError
 from app.enums import ConversationStatus
@@ -61,6 +63,7 @@ class FakeMessage:
     content: str
     sender_id: int | None = None
     metadata_: dict = field(default_factory=dict)
+    client_message_id: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -177,6 +180,42 @@ class FakeToolResultHandoffWithoutToolNameClient:
         yield f"event: tool_call\ndata: {json.dumps(tool_call, ensure_ascii=False)}\n\n".encode()
         yield f"event: tool_result\ndata: {json.dumps(tool_result, ensure_ascii=False)}\n\n".encode()
         yield b"event: done\ndata: {}\n\n"
+
+
+class FakeFailedThenPendingHandoffClient:
+    async def stream_chat(self, _base_url, _api_key, _agent_id, _payload):
+        failed_call = {
+            "tool_call_id": "call_failed",
+            "tool_name": "human_handoff",
+            "arguments": {"brief": "用户确认转人工", "reason": "发票报错"},
+        }
+        failed_result = {
+            "tool_call_id": "call_failed",
+            "tool_name": "human_handoff",
+            "result": (
+                '<human_handoff_response status="error" code="invalid_arguments">'
+                "brief is required"
+                "</human_handoff_response>"
+            ),
+        }
+        pending_call = {
+            "tool_call_id": "call_pending",
+            "tool_name": "human_handoff",
+            "arguments": {"brief": "用户确认转人工", "reason": "发票报错", "urgency": "normal"},
+        }
+        action = {
+            "type": "submit_tool_result",
+            "tool_call_step_id": 56,
+            "tool_call_id": "call_pending",
+            "tool_name": "human_handoff",
+            "tool_type": "human_handoff",
+            "brief": "用户确认转人工",
+        }
+        yield f"event: tool_call\ndata: {json.dumps(failed_call, ensure_ascii=False)}\n\n".encode()
+        yield f"event: tool_result\ndata: {json.dumps(failed_result, ensure_ascii=False)}\n\n".encode()
+        yield f"event: tool_call\ndata: {json.dumps(pending_call, ensure_ascii=False)}\n\n".encode()
+        yield f"event: requires_action\ndata: {json.dumps(action, ensure_ascii=False)}\n\n".encode()
+        yield b"event: done\ndata: {\"finish_reason\":\"tool_result_required\"}\n\n"
 
 
 class FakeRequiredActionHandoffClient:
@@ -405,7 +444,231 @@ async def test_stream_chat_saves_final_bot_message(monkeypatch):
     assert "open_agent_welcome_blocks" not in json.dumps(client.payloads[0], ensure_ascii=False)
     assert created_messages[-1]["sender_type"] == "bot"
     assert created_messages[-1]["content"] == "Hello"
+    assert created_messages[-1]["client_message_id"] == "cm_1"
     assert created_messages[-1]["metadata_"]["client_message_id"] == "cm_1"
+
+
+@pytest.mark.asyncio
+async def test_save_bot_message_reuses_existing_message(monkeypatch):
+    conversation = FakeConversation()
+    existing = FakeMessage(
+        id=12,
+        tenant_id=conversation.tenant_id,
+        conversation_id=conversation.id,
+        sender_type="bot",
+        sender_id=None,
+        content_type="text",
+        content="Hello",
+        metadata_={"client_message_id": "cm_1", "sender_name": "Support Bot"},
+        client_message_id="cm_1",
+    )
+
+    async def fake_get_by_client_message_id(
+        _db,
+        tenant_id,
+        conversation_id,
+        client_message_id,
+        *,
+        sender_type,
+        sender_id,
+    ):
+        assert (tenant_id, conversation_id, client_message_id) == (1, 101, "cm_1")
+        assert sender_type == "bot"
+        assert sender_id is None
+        return existing
+
+    async def fail_create(*_args, **_kwargs):
+        pytest.fail("an existing bot reply must not be inserted again")
+
+    async def fail_update(*_args, **_kwargs):
+        pytest.fail("deduplication must not change the conversation preview")
+
+    monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
+    monkeypatch.setattr(MessageRepository, "create", fail_create)
+    monkeypatch.setattr(ConversationRepository, "update_last_message", fail_update)
+
+    saved = await OpenAgentConversationService._save_bot_message(
+        object(),
+        conversation,
+        "Hello",
+        {"client_message_id": "cm_1", "open_agent_request_id": "req_1"},
+    )
+
+    assert saved["id"] == existing.id
+    assert saved["content"] == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_save_bot_message_recovers_from_concurrent_insert(monkeypatch):
+    conversation = FakeConversation()
+    existing = FakeMessage(
+        id=13,
+        tenant_id=conversation.tenant_id,
+        conversation_id=conversation.id,
+        sender_type="bot",
+        sender_id=None,
+        content_type="text",
+        content="Hello",
+        metadata_={"client_message_id": "cm_1", "sender_name": "Support Bot"},
+        client_message_id="cm_1",
+    )
+    lookup_count = 0
+
+    class FakeDb:
+        def __init__(self):
+            self.rollback_count = 0
+
+        async def rollback(self):
+            self.rollback_count += 1
+
+    db = FakeDb()
+
+    async def fake_get_by_client_message_id(*_args, **_kwargs):
+        nonlocal lookup_count
+        lookup_count += 1
+        return None if lookup_count == 1 else existing
+
+    async def fake_create(_db, data):
+        assert data["client_message_id"] == "cm_1"
+        raise IntegrityError("insert bot reply", {}, Exception("duplicate key"))
+
+    async def fail_update(*_args, **_kwargs):
+        pytest.fail("the losing insert must not change the conversation preview")
+
+    monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
+    monkeypatch.setattr(MessageRepository, "create", fake_create)
+    monkeypatch.setattr(ConversationRepository, "update_last_message", fail_update)
+
+    saved = await OpenAgentConversationService._save_bot_message(
+        db,
+        conversation,
+        "Hello",
+        {"client_message_id": "cm_1", "open_agent_request_id": "req_1"},
+    )
+
+    assert saved["id"] == existing.id
+    assert lookup_count == 2
+    assert db.rollback_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_unexpected_error_yields_generic_sse_error(monkeypatch):
+    conversation = FakeConversation()
+    secret_exc_text = "SECRET_INTERNAL_DETAIL_xyz"
+
+    class BoomOpenAgentClient:
+        async def stream_chat(self, _base_url, _api_key, _agent_id, _payload):
+            yield b"event: content_delta\ndata: {\"content\":\"partial\"}\n\n"
+            raise RuntimeError(secret_exc_text)
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    async def fake_get_credentials(*_args, **_kwargs):
+        return "https://openagent.example.com", "sk-test"
+
+    async def fake_get_by_client_message_id(*_args, **_kwargs):
+        return None
+
+    async def fake_send_message(*_args, **_kwargs):
+        return FakeMessage(
+            id=1,
+            tenant_id=1,
+            conversation_id=conversation.id,
+            sender_type="visitor",
+            sender_id=11,
+            content_type="text",
+            content="hi",
+            metadata_={},
+        )
+
+    async def fake_update_open_agent_state(_db, conv, data):
+        for key, value in data.items():
+            setattr(conv, key, value)
+        return conv
+
+    async def fake_noop(*_args, **_kwargs):
+        return None
+
+    async def fake_get_by_id(*_args, **_kwargs):
+        return conversation
+
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+    monkeypatch.setattr(OpenAgentSettingsService, "get_credentials", fake_get_credentials)
+    monkeypatch.setattr(MessageRepository, "get_by_client_message_id", fake_get_by_client_message_id)
+    monkeypatch.setattr(ConversationService, "send_message", fake_send_message)
+    monkeypatch.setattr(ConversationRepository, "update_open_agent_state", fake_update_open_agent_state)
+    monkeypatch.setattr(ConversationRepository, "update_last_message", fake_noop)
+    monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
+
+    stream = stream_chat_for_session_under_test(
+        object(),
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        OpenAgentChatRequest(message="hi", client_message_id="cm_unexpected"),
+        open_agent_client=BoomOpenAgentClient(),
+    )
+    chunks = [chunk async for chunk in stream]
+    joined = b"".join(chunks)
+
+    assert b"event: error" in joined
+    assert secret_exc_text.encode() not in joined
+    assert b"AI assistant temporarily unavailable" in joined
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_setup_business_error_yields_sse_error_without_error_log(monkeypatch, caplog):
+    conversation = FakeConversation(status=ConversationStatus.QUEUED.value)
+
+    async def fake_get_conversation(*_args, **_kwargs):
+        return conversation
+
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+
+    with caplog.at_level(logging.DEBUG, logger="app.services.open_agent_conversation_service"):
+        stream = stream_chat_for_session_under_test(
+            object(),
+            "cv_test",
+            {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+            OpenAgentChatRequest(message="hi", client_message_id="cm_queued"),
+        )
+        chunks = [chunk async for chunk in stream]
+
+    joined = b"".join(chunks)
+    assert b"event: error" in joined
+    assert b"Conversation is not in bot mode" in joined
+
+    service_records = [r for r in caplog.records if r.name == "app.services.open_agent_conversation_service"]
+    assert any("open_agent_stream_rejected" in r.getMessage() for r in service_records)
+    assert not any(r.levelno >= logging.ERROR for r in service_records)
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_setup_unexpected_error_logs_and_yields_generic_sse_error(monkeypatch, caplog):
+    async def fake_get_conversation(*_args, **_kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(ConversationService, "get_conversation_for_visitor_session", fake_get_conversation)
+
+    with caplog.at_level(logging.DEBUG, logger="app.services.open_agent_conversation_service"):
+        stream = stream_chat_for_session_under_test(
+            object(),
+            "cv_test",
+            {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+            OpenAgentChatRequest(message="hi", client_message_id="cm_setup_boom"),
+        )
+        chunks = [chunk async for chunk in stream]
+
+    joined = b"".join(chunks)
+    assert b"event: error" in joined
+    assert b"AI assistant temporarily unavailable" in joined
+    assert b"db down" not in joined
+
+    service_records = [r for r in caplog.records if r.name == "app.services.open_agent_conversation_service"]
+    assert any(
+        r.levelno >= logging.ERROR and "open_agent_stream_setup_error" in r.getMessage()
+        for r in service_records
+    )
 
 
 @pytest.mark.asyncio
@@ -1628,6 +1891,140 @@ async def test_pending_duplicate_tool_result_updates_handoff_payload(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_later_pending_tool_call_retargets_confirm_requested(monkeypatch):
+    conversation = FakeConversation(
+        status=ConversationStatus.HANDOFF_PENDING.value,
+        open_agent_handoff_state="pending",
+        open_agent_handoff_payload={
+            "event_kind": "human_handoff",
+            "schema_version": 1,
+            "tool_call_id": "call_failed",
+            "handoff": {"brief": "旧话术", "reason": "old"},
+        },
+    )
+    existing = FakeMessage(
+        id=31,
+        tenant_id=conversation.tenant_id,
+        conversation_id=conversation.id,
+        sender_type="system",
+        content_type="system",
+        content="旧话术",
+        metadata_={
+            "event_type": "open_agent_handoff_event",
+            "handoff_event_type": "confirm_requested",
+            "handoff_payload": {"tool_call_id": "call_failed"},
+            "tool_call_id": "call_failed",
+        },
+    )
+    updated_metadata: list[dict] = []
+
+    async def fake_get_by_id(*_args, **_kwargs):
+        return conversation
+
+    async def fake_update_open_agent_state(_db, conv, data):
+        for key, value in data.items():
+            setattr(conv, key, value)
+        return conv
+
+    async def fake_get_existing(*_args, **_kwargs):
+        return existing
+
+    async def fake_update_metadata(_db, message, metadata):
+        updated_metadata.append(metadata)
+        message.metadata_ = metadata
+        return message
+
+    monkeypatch.setattr(ConversationRepository, "get_by_id", fake_get_by_id)
+    monkeypatch.setattr(ConversationRepository, "update_open_agent_state", fake_update_open_agent_state)
+    monkeypatch.setattr(MessageRepository, "get_handoff_event_by_tool_call_id", fake_get_existing)
+    monkeypatch.setattr(MessageRepository, "update_metadata", fake_update_metadata)
+
+    saved = await OpenAgentConversationService._save_handoff_event(
+        object(),
+        conversation,
+        {
+            "event_kind": "human_handoff",
+            "schema_version": 1,
+            "tool_call_id": "call_pending",
+            "handoff": {"brief": "新话术", "reason": "new"},
+        },
+        handoff_source="bot_tool",
+        handoff_event_type="confirm_requested",
+        tool_call_id="call_pending",
+    )
+
+    assert saved is not None
+    assert saved["event"] == "open_desk_handoff_updated"
+    assert conversation.open_agent_handoff_payload["tool_call_id"] == "call_pending"
+    assert updated_metadata[0]["tool_call_id"] == "call_pending"
+    assert updated_metadata[0]["handoff_payload"]["tool_call_id"] == "call_pending"
+
+
+@pytest.mark.asyncio
+async def test_failed_handoff_tool_result_does_not_create_confirm_requested(monkeypatch):
+    conversation = FakeConversation()
+
+    async def fail_save(*_args, **_kwargs):
+        raise AssertionError("failed handoff tool result should not prompt confirm")
+
+    monkeypatch.setattr(OpenAgentConversationService, "_save_handoff_event", fail_save)
+
+    saved = await OpenAgentConversationService._handle_human_handoff_tool_result(
+        object(),
+        conversation,
+        {
+            "tool_call_id": "call_failed",
+            "tool_name": "human_handoff",
+            "result": (
+                '<human_handoff_response status="error" code="invalid_arguments">'
+                "brief is required"
+                "</human_handoff_response>"
+            ),
+        },
+        {},
+        set(),
+    )
+
+    assert saved is None
+
+
+@pytest.mark.asyncio
+async def test_submit_handoff_uses_latest_pending_tool_call_id(monkeypatch):
+    conversation = FakeConversation(
+        open_agent_conversation_id=42,
+        open_agent_handoff_state="pending",
+        open_agent_handoff_payload={"tool_call_id": "call_pending"},
+    )
+    created_messages: list[dict] = []
+
+    class RecordingClient:
+        def __init__(self):
+            self.payloads: list[dict] = []
+
+        async def stream_tool_result(self, _base_url, _api_key, _agent_id, _conversation_id, payload):
+            self.payloads.append(payload)
+            yield b"event: done\ndata: {\"finish_reason\":\"handoff_success\"}\n\n"
+
+    patch_required_action_stream_dependencies(monkeypatch, conversation, created_messages)
+    client = RecordingClient()
+    await OpenAgentConversationService.submit_handoff_tool_result_for_session(
+        object(),
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        tool_call_id="call_failed",
+        status=OpenAgentConversationService._HANDOFF_TOOL_RESULT_SUCCESS,
+        message="已为您转接人工客服",
+        open_agent_client=client,
+    )
+
+    assert client.payloads == [{
+        "tool_call_id": "call_pending",
+        "status": "handoff_success",
+        "message": "已为您转接人工客服",
+    }]
+
+
+@pytest.mark.asyncio
 async def test_dismissed_tool_call_is_consumed(monkeypatch):
     conversation = FakeConversation(
         status=ConversationStatus.BOT.value,
@@ -1884,6 +2281,27 @@ async def test_requires_action_handoff_confirm_mode_saves_pending_without_tool_r
     assert created_messages[0]["metadata_"]["event_type"] == "open_agent_handoff_event"
     assert created_messages[0]["metadata_"]["handoff_event_type"] == "confirm_requested"
     assert created_messages[0]["metadata_"]["tool_call_id"] == "call_handoff"
+
+
+@pytest.mark.asyncio
+async def test_failed_then_pending_handoff_uses_latest_pending_tool_call_id(monkeypatch):
+    conversation = FakeConversation()
+    created_messages: list[dict] = []
+    patch_required_action_stream_dependencies(monkeypatch, conversation, created_messages)
+
+    stream = stream_chat_for_session_under_test(
+        object(),
+        "cv_test",
+        {"tenant_id": 1, "channel_id": 10, "visitor_external_id": "v_1"},
+        OpenAgentChatRequest(message="转人工", client_message_id="cm_failed_then_pending"),
+        open_agent_client=FakeFailedThenPendingHandoffClient(),
+    )
+    _chunks = [chunk async for chunk in stream]
+
+    system_messages = [item for item in created_messages if item["sender_type"] == "system"]
+    assert len(system_messages) == 1
+    assert system_messages[0]["metadata_"]["tool_call_id"] == "call_pending"
+    assert conversation.open_agent_handoff_payload["tool_call_id"] == "call_pending"
 
 
 @pytest.mark.asyncio

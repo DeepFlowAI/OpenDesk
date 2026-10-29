@@ -178,6 +178,7 @@ async def test_unhold_calls_kernel_on_customer_leg(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "webrtc-1",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,
@@ -266,6 +267,75 @@ async def test_mute_gates_the_agent_leg_in_the_kernel(monkeypatch):
     assert ("call.unmute", {"call_id": "webrtc-1"}) in tel.recorded
 
 
+@pytest.mark.asyncio
+async def test_mute_maps_kernel_call_not_found_to_validation_error(monkeypatch):
+    """A gone kernel leg is a business state, not an unhandled 500."""
+
+    _install_session(monkeypatch, _active_row(), SessionTracker())
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _webrtc_active)
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+
+    async def _gone(_call_id):
+        raise TelephonyRPCError(-32002, "call not found: webrtc-1")
+
+    monkeypatch.setattr(tel, "call_mute", _gone)
+
+    with pytest.raises(ValidationError):
+        await CallControlService.mute(tel, tenant_id=7, employee_id=42, muted=True)
+
+
+@pytest.mark.asyncio
+async def test_mute_reraises_non_call_not_found_rpc_error(monkeypatch):
+    """Timeouts and other kernel faults must stay unhandled 500s."""
+
+    _install_session(monkeypatch, _active_row(), SessionTracker())
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _webrtc_active)
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+    timeout = TelephonyRPCError(-1, "RPC call.mute timed out after 5s")
+
+    async def _timeout(_call_id):
+        raise timeout
+
+    monkeypatch.setattr(tel, "call_mute", _timeout)
+
+    with pytest.raises(TelephonyRPCError) as exc_info:
+        await CallControlService.mute(tel, tenant_id=7, employee_id=42, muted=True)
+    assert exc_info.value is timeout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legs",
+    [
+        ccs_module.InCallLegs(consult_call_id="colleague-leg", consult_target_employee_id=13),
+        ccs_module.InCallLegs(
+            conference_participant_call_id="colleague-leg",
+            conference_target_employee_id=13,
+        ),
+    ],
+)
+async def test_mute_gates_a_colleagues_own_leg(monkeypatch, legs):
+    """A consult target or three-way colleague has no call record of their own;
+    their leg lives on the host's call state."""
+
+    _install_session(monkeypatch, _active_row(), SessionTracker())
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _webrtc_active)
+    legs.agent_media_call_id = "webrtc-1"
+    ccs_module._in_call_state[(7, 42)] = legs
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+
+    result = await CallControlService.mute(tel, tenant_id=7, employee_id=13, muted=True)
+    assert result == {"ok": True, "call_id": "sip-customer"}
+    assert ("call.mute", {"call_id": "colleague-leg"}) in tel.recorded
+    assert ("call.mute", {"call_id": "webrtc-1"}) not in tel.recorded
+
+
 # ───────────────────────────── no active call ─────────────────────────────
 
 
@@ -316,6 +386,7 @@ def _fake_orchestrator(monkeypatch):
             self.republished: list[tuple] = []
             self._workflows: dict = {}
             self.discarded: list[str] = []
+            self.finalized: list[tuple] = []
             self.republish_error: Exception | None = None
 
         def register_leg_wait(self, call_id):
@@ -343,6 +414,12 @@ def _fake_orchestrator(monkeypatch):
             self, *, tenant_id, employee_id, call_id, reason
         ):
             self.ended.append((tenant_id, employee_id, call_id, reason))
+
+        async def finalize_agent_call(
+            self, *, tenant_id, employee_id, call_id, reason,
+            mark_cdr_completed=False,
+        ):
+            self.finalized.append((tenant_id, employee_id, call_id, reason))
 
         async def notify_conference_participant_left(self, *, tenant_id, employee_id):
             self.participant_left.append((tenant_id, employee_id))
@@ -450,6 +527,7 @@ async def test_transfer_bridges_customer_and_drops_agent_on_answer(monkeypatch):
     bridge_idx = tel.recorded.index(
         ("call.bridge", {
             "call_id": "sip-customer", "other_call_id": "target-1", "transcribe": True,
+            "user_call_id": "sip-customer",
         })
     )
     assert unbridge_idx < bridge_idx
@@ -669,6 +747,7 @@ async def test_transfer_no_answer_keeps_customer(monkeypatch):
 
     assert ("call.bridge", {
         "call_id": "sip-customer", "other_call_id": "target-1", "transcribe": True,
+        "user_call_id": "sip-customer",
     }) not in tel.recorded
     # Customer leg was never hung up.
     assert ("call.hangup", {"call_id": "sip-customer", "reason": None}) not in tel.recorded
@@ -746,6 +825,7 @@ async def test_consult_end_drops_third_party_and_resumes(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "webrtc-1",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,
@@ -927,6 +1007,7 @@ async def test_conference_add_aborts_on_no_answer(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "webrtc-1",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,
@@ -1056,6 +1137,7 @@ async def test_conference_add_webrtc_notifies_on_failure(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "webrtc-1",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,
@@ -1064,6 +1146,70 @@ async def test_conference_add_webrtc_notifies_on_failure(monkeypatch):
     conf = [r for r in orch.control_results if r[2] == "cc.conference_result"]
     assert conf and conf[-1][3]["ok"] is False
     assert conf[-1][3]["reason"] == "目标坐席拒接"
+
+
+@pytest.mark.asyncio
+async def test_host_call_end_withdraws_ringing_conference_invite(monkeypatch):
+    """The host's call ends while a browser colleague is still being rung:
+    the invite is withdrawn and the colleague's browser told, instead of the
+    colleague ringing on and later accepting into a call that no longer exists."""
+
+    from app.services.call_center import internal_consult_service as ics_mod
+
+    _install_session(monkeypatch, _active_row(), SessionTracker())
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _webrtc_active)
+    _bypass_tone(monkeypatch)
+    _route_employee_webrtc(monkeypatch, True)
+    _stub_internal_consult(monkeypatch)
+    orch = _fake_orchestrator(monkeypatch)
+
+    ring: dict = {}
+
+    async def _ringing(_tel, _r, **kw):
+        ring["offer_id"] = kw["offer_id"]
+        ring["future"] = asyncio.get_event_loop().create_future()
+        return await ring["future"]
+
+    monkeypatch.setattr(
+        ics_mod.InternalConsultService,
+        "initiate_webrtc_consult",
+        staticmethod(_ringing),
+    )
+    cancelled: list[tuple[str, str]] = []
+
+    async def _cancel(offer_id, reason):
+        cancelled.append((offer_id, reason))
+        ring["future"].set_exception(ValidationError("目标坐席拒接"))
+
+    monkeypatch.setattr(
+        CallControlService, "_cancel_pending_consult_offer", staticmethod(_cancel)
+    )
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+    await CallControlService.conference_add(
+        tel, tenant_id=7, employee_id=42,
+        target_type="employee", target_id=99, number=None,
+    )
+    for _ in range(6):
+        await asyncio.sleep(0)
+    offer_id = ring["offer_id"]
+    bridges_before = _recorded_methods(tel).count("call.bridge")
+
+    withdrawn = await CallControlService.cleanup_conference_for_host(
+        7, 42, reason="agent_hangup",
+    )
+    for _ in range(6):
+        await asyncio.sleep(0)
+
+    assert withdrawn is True
+    assert cancelled == [(offer_id, "agent_hangup")]
+    assert (7, 99, f"internal:{offer_id}", "conference_ended") in orch.ended
+    legs = ccs_module._in_call_state[(7, 42)]
+    assert legs.conference_invite_offer_id is None
+    # The host is gone: no failure toast and no attempt to re-bridge the customer.
+    assert not [r for r in orch.control_results if r[2] == "cc.conference_result"]
+    assert _recorded_methods(tel).count("call.bridge") == bridges_before
 
 
 @pytest.mark.asyncio
@@ -1129,7 +1275,12 @@ async def test_conference_leave_notifies_agent_browser(monkeypatch):
     )
     assert (
         "call.bridge",
-        {"call_id": "sip-customer", "other_call_id": "party-1", "transcribe": True},
+        {
+            "call_id": "sip-customer",
+            "other_call_id": "party-1",
+            "transcribe": True,
+            "user_call_id": "sip-customer",
+        },
     ) in tel.recorded
     # Browser hangup uses the customer call id (what the UI stores), not the media leg.
     assert any(e[1] == 42 and e[2] == "sip-customer" for e in orch.ended)
@@ -1237,6 +1388,29 @@ async def test_conference_end_all_finalizes_cdr(monkeypatch):
     ]
 
 
+
+@pytest.mark.asyncio
+async def test_conference_end_all_releases_host_agent(monkeypatch):
+    """The closed room sends no call.hangup, so end-all must move the host out
+    of in_call itself — otherwise a refresh brings the call bar back."""
+
+    _install_session(monkeypatch, _active_row(), SessionTracker())
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _webrtc_active)
+    orch = _fake_orchestrator(monkeypatch)
+
+    tel = MockTelephonyClient()
+    await tel.connect()
+
+    ccs_module._in_call_state[(7, 42)] = ccs_module.InCallLegs(
+        conference_participant_call_id="party-1",
+        room_id="room-9",
+        room_legs=["sip-customer", "webrtc-1", "party-1"],
+    )
+
+    await CallControlService.conference_end_all(tel, tenant_id=7, employee_id=42)
+
+    assert orch.finalized == [(7, 42, "sip-customer", "conference_ended")]
+
 # ─────────────────────── prompt tones (hold/consult) ───────────────────────
 
 
@@ -1301,6 +1475,7 @@ async def test_unhold_stops_tone(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "webrtc-1",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,
@@ -1468,6 +1643,7 @@ async def test_consult_webrtc_employee_decline_resumes_customer(monkeypatch):
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "webrtc-1",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,
@@ -1591,6 +1767,7 @@ async def test_consult_webrtc_end_during_ringing_ignores_late_accept(monkeypatch
         "call.bridge",
         {
             "call_id": "sip-customer",
+            "user_call_id": "sip-customer",
             "other_call_id": "webrtc-1",
             "transcribe": True,
             "keepalive_on_peer_hangup": True,
@@ -2241,6 +2418,42 @@ async def test_conference_participant_departed_collapses_host(monkeypatch):
     assert (7, 42) in orch.participant_left
     assert await r.get(ccs_module._conf_host_key("party-leg")) is None
     assert (7, 99, "conference_participant_departed") in tracker.force_released
+
+
+@pytest.mark.asyncio
+async def test_conference_participant_departed_restores_plain_bridge(monkeypatch):
+    """Once only customer + host remain, the room becomes a normal bridge so a
+    later transfer / hold can bridge the customer again."""
+    import fakeredis.aioredis
+    import app.libs.telephony as tel_lib
+    import app.services.call_center.orchestrator as orch_mod
+
+    r = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(orch_mod, "_get_redis_client", lambda: r)
+    _fake_orchestrator(monkeypatch)
+    tracker = _ResourceTracker()
+    tracker.install(monkeypatch)
+    _install_session(monkeypatch, _active_row(), SessionTracker())
+    monkeypatch.setattr(AgentWebRTCSessionService, "get_active", _webrtc_active)
+    tel = MockTelephonyClient()
+    await tel.connect()
+    monkeypatch.setattr(tel_lib, "get_telephony_client", lambda: tel)
+
+    await ccs_module._register_conference_participant(7, 42, "party-leg")
+    ccs_module._in_call_state[(7, 42)] = ccs_module.InCallLegs(
+        room_id="room-1",
+        room_legs=["sip-customer", "webrtc-1", "party-leg"],
+        conference_participant_call_id="party-leg",
+        conference_target_employee_id=99,
+    )
+
+    await CallControlService.on_conference_participant_departed("party-leg")
+
+    legs = await ccs_module._legs(7, 42)
+    assert legs.room_id is None
+    assert legs.room_legs == []
+    assert ("room.remove_leg", {"room_id": "room-1", "call_id": "webrtc-1"}) in tel.recorded
+    assert _has_bridge(tel, "sip-customer", "webrtc-1", keepalive=True)
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,11 @@ function recordingPhaseRank(phase: string | null): number {
   return 0
 }
 
+export function recordingPhaseLabel(phase: string | null, isZh: boolean): string | null {
+  if (phase !== 'early_media') return null
+  return isZh ? '线路提示录音' : 'Carrier announcement'
+}
+
 function compareDisplayRecordings(left: CallRecordingItem, right: CallRecordingItem): number {
   const playable = Number(Boolean(left.access_url)) - Number(Boolean(right.access_url))
   if (playable) return playable

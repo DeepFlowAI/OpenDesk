@@ -1201,6 +1201,7 @@
   "chat.handoff.needsAgent": "Ten problem wymaga uwagi konsultanta.",
   "chat.attachment.upload": "Prześlij załącznik",
   "chat.attachment.failed": "Nie udało się wysłać załącznika. Kliknij, aby spróbować ponownie.",
+  "chat.attachment.empty": "Obraz nie jest jeszcze gotowy. Spróbuj ponownie.",
   "chat.bot.noResponse": "Asystent nie odpowiada. Spróbuj ponownie lub skontaktuj się z pomocą.",
   "chat.recall.mine": "Wycofałeś wiadomość",
   "chat.recall.named": "{name} wycofał wiadomość",

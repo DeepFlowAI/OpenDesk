@@ -4,6 +4,7 @@ from fastapi import FastAPI
 def register_routers(app: FastAPI) -> None:
     from app.routers.v1 import (
         health,
+        exports,
         system_info,
         auth,
         system_settings,
@@ -31,8 +32,12 @@ def register_routers(app: FastAPI) -> None:
         channels,
         knowledge,
         scheduling,
+        quality_scorecards,
+        quality_plans,
+        quality_reviews,
     )
 
+    app.include_router(exports.router, prefix="/api/v1")
     app.include_router(health.router, prefix="/api/v1")
     app.include_router(system_info.router, prefix="/api/v1")
     app.include_router(auth.router, prefix="/api/v1")
@@ -63,6 +68,9 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(channels.router, prefix="/api/v1")
     app.include_router(knowledge.router, prefix="/api/v1")
     app.include_router(scheduling.router, prefix="/api/v1")
+    app.include_router(quality_scorecards.router, prefix="/api/v1")
+    app.include_router(quality_plans.router, prefix="/api/v1")
+    app.include_router(quality_reviews.router, prefix="/api/v1")
     # Tenant CRUD endpoints are provided by an optional tenant-management
     # extension (see app.extensions). Single-tenant deployments rely on the
     # auto-provisioned default tenant from app.db.seed instead.
@@ -81,6 +89,11 @@ def register_routers(app: FastAPI) -> None:
     app.include_router(queue_workspace.router, prefix="/api/v1")
 
     from app.routers.v1 import form_layouts, interaction_rules, session_summary, call_summary, user_views, ticket_views, organization_views, users, organizations, tickets, call_center, call_center_sms, embedded_call, sms_callback, learning_admin, learning_callback, learning_my, learning_exam_admin, learning_exam_my, queue, engagement, engagement_sms_tasks, sip_extensions
+    from app.routers.v1 import call_event_subscriptions, call_event_tester, open_call_center
+    app.include_router(call_event_subscriptions.router, prefix="/api/v1")
+    app.include_router(call_event_tester.router, prefix="/api/v1")
+    app.include_router(call_event_tester.public_router, prefix="/api/v1")
+    app.include_router(open_call_center.router, prefix="/api/v1")
     app.include_router(call_center.router, prefix="/api/v1")
     app.include_router(call_center_sms.router, prefix="/api/v1")
     app.include_router(embedded_call.router, prefix="/api/v1")

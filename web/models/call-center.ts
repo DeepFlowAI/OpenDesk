@@ -133,8 +133,24 @@ export type CallRecordListItem = {
   started_at: string
   customer_connected_at: string | null
   first_agent_connected_at: string | null
+  human_service_requested_at: string | null
+  first_agent_wait_started_at: string | null
+  first_agent_offer_started_at: string | null
+  bot_handoff_requested_at: string | null
+  bot_handoff_succeeded_at: string | null
   ended_at: string | null
   human_service_ended_at: string | null
+  hangup_stage:
+    | 'pre_route'
+    | 'customer_ringing'
+    | 'ivr'
+    | 'bot'
+    | 'agent_waiting'
+    | 'agent_ringing'
+    | 'in_call'
+    | 'unknown'
+    | null
+  short_abandon_threshold_ms: number | null
   total_duration_ms: number | null
   customer_ring_duration_ms: number | null
   agent_wait_duration_ms: number | null
@@ -279,6 +295,21 @@ export type CallTranscriptSegment = {
 export type CallTranscriptResponse = {
   call_id: string | null
   segments: CallTranscriptSegment[]
+}
+
+export type BotTranscriptMessage = {
+  role: 'user' | 'bot'
+  text: string
+  interrupted: boolean
+}
+
+export type BotTranscriptResponse = {
+  available: boolean
+  status: 'ok' | 'empty' | 'error'
+  agent_name: string | null
+  handoff_at: string | null
+  entered_human: boolean
+  messages: BotTranscriptMessage[]
 }
 
 export type CallUserAssociationResponse = {

@@ -10,6 +10,7 @@ import pytest
 
 from app.services import call_wrapup_service as wrapup_module
 from app.services import call_wrapup_timeout_service as sweep_module
+from app.services import call_agent_fact_service as agent_fact_module
 from app.services.call_wrapup_service import apply_post_call_agent_status
 from app.services.call_wrapup_timeout_service import CallWrapupTimeoutService
 from app.services.cc_agent_resource_service import CcAgentResourceService
@@ -127,6 +128,35 @@ async def test_apply_post_call_agent_status_positive_marks_acw_with_deadline(
 
 
 @pytest.mark.asyncio
+async def test_apply_post_call_rolls_back_after_acw_fact_failure(monkeypatch):
+    """A failed ACW insert must not leave the session aborted for sync_pg."""
+    fake = _fake_redis()
+    emit = AsyncMock(return_value=True)
+    monkeypatch.setattr(wrapup_module, "emit_to_agent", emit)
+
+    db = AsyncMock()
+    sync_pg = AsyncMock()
+    monkeypatch.setattr(
+        wrapup_module.CcAgentStatusService, "sync_pg_status", sync_pg
+    )
+    monkeypatch.setattr(
+        agent_fact_module.CallAgentFactService,
+        "start_after_call_work",
+        AsyncMock(side_effect=RuntimeError("insert failed")),
+    )
+
+    result = await apply_post_call_agent_status(
+        db, fake, 1, 42, call_id="call-1", reason="agent_hangup", wrapup_seconds=30
+    )
+
+    assert result == "after_call_work"
+    db.rollback.assert_awaited_once()
+    sync_pg.assert_awaited_once()
+    assert sync_pg.await_args.args[1:4] == (1, 42, "after_call_work")
+    assert sync_pg.await_args.kwargs["reason"] == "agent_hangup"
+
+
+@pytest.mark.asyncio
 async def test_process_expired_flips_ready_syncs_pg_and_notifies(monkeypatch):
     fake = _fake_redis()
     await CcAgentResourceService.mark_after_call_work(
@@ -139,15 +169,26 @@ async def test_process_expired_flips_ready_syncs_pg_and_notifies(monkeypatch):
     )
 
     sync_pg = AsyncMock()
+    close_fact = AsyncMock(return_value=True)
     emit = AsyncMock(return_value=True)
     monkeypatch.setattr(sweep_module, "AsyncSessionLocal", _fake_session)
     monkeypatch.setattr(
         sweep_module.CcAgentStatusService, "sync_pg_status", sync_pg
     )
+    monkeypatch.setattr(
+        agent_fact_module.CallAgentFactService, "close_after_call_work", close_fact
+    )
     monkeypatch.setattr(sweep_module, "emit_to_agent", emit)
 
     processed = await CallWrapupTimeoutService.process_expired(fake)
     assert processed == 1
+    close_fact.assert_awaited_once_with(
+        sync_pg.await_args.args[0],
+        tenant_id=1,
+        agent_id=42,
+        call_id="call-1",
+        end_reason="timeout",
+    )
 
     snap = await CcAgentResourceService.get_snapshot(fake, 1, 42)
     assert snap["visible_status"] == "ready"
@@ -194,3 +235,51 @@ async def test_process_expired_skips_agent_reserved_by_new_call(monkeypatch):
     emit.assert_not_awaited()
     snap = await CcAgentResourceService.get_snapshot(fake, 1, 42)
     assert snap["resource_state"] == "reserved"
+
+
+@pytest.mark.asyncio
+async def test_post_call_pg_skips_acw_when_agent_already_finished(monkeypatch):
+    """Agent clicks 整理完成 between the Redis ACW write and the PG write: PG
+    must not be pinned to after_call_work while Redis says ready."""
+    fake = _fake_redis()
+    pg_writes: list[str] = []
+
+    async def _finish_during_push(**_kwargs):
+        await CcAgentResourceService.set_visible_status(fake, 1, 42, "ready")
+        return True
+
+    async def _sync_pg(_db, _tenant_id, _employee_id, status, reason=None):
+        pg_writes.append(status)
+        return {}
+
+    monkeypatch.setattr(wrapup_module, "emit_to_agent", _finish_during_push)
+    monkeypatch.setattr(
+        agent_fact_module.CallAgentFactService, "start_after_call_work", AsyncMock()
+    )
+    monkeypatch.setattr(wrapup_module.CcAgentStatusService, "sync_pg_status", _sync_pg)
+
+    await apply_post_call_agent_status(
+        AsyncMock(), fake, 1, 42, call_id="call-1", reason="call_hangup", wrapup_seconds=30
+    )
+    assert pg_writes == []
+
+    monkeypatch.setattr(wrapup_module, "emit_to_agent", AsyncMock(return_value=True))
+    await apply_post_call_agent_status(
+        AsyncMock(), fake, 1, 42, call_id="call-2", reason="call_hangup", wrapup_seconds=30
+    )
+    assert pg_writes == ["after_call_work"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_hangup_does_not_extend_wrapup_deadline(monkeypatch):
+    fake = _fake_redis()
+    monkeypatch.setattr(CcAgentResourceService, '_now_epoch', staticmethod(lambda: 1000.0))
+    original = await CcAgentResourceService.mark_after_call_work(
+        fake, 1, 42, call_id='call-1', wrap_up_seconds=30,
+    )
+    monkeypatch.setattr(CcAgentResourceService, '_now_epoch', staticmethod(lambda: 1010.0))
+    duplicate = await CcAgentResourceService.mark_after_call_work(
+        fake, 1, 42, call_id='call-1', wrap_up_seconds=30,
+    )
+    assert duplicate['wrap_up_until_epoch'] == original['wrap_up_until_epoch']
+    assert duplicate['last_released_at'] == original['last_released_at']

@@ -473,6 +473,7 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         turn_url: str,
         token: str,
         greeting: str | None = None,
+        opening: str | None = None,
         voice_spk_id: str | None = None,
         performance: dict | None = None,
         traceparent: str | None = None,
@@ -492,6 +493,8 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         }
         if greeting:
             params["greeting"] = greeting
+        if opening:
+            params["opening"] = opening
         if voice_spk_id:
             params["voice_spk_id"] = voice_spk_id
         if performance:

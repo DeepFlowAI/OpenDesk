@@ -39,6 +39,7 @@ from app.schemas.open_agent_settings import OpenAgentWelcomeMessage
 from app.schemas.message import FileMessageContent
 from app.schemas.permission import EffectivePrincipal
 from app.repositories.user_repository import UserRepository
+from app.services.offline_bot_conversation_service import OfflineBotConversationService
 from app.services.agent_status_service import AgentStatusService
 from app.services.conversation_collaboration_service import (
     COLLABORATION_MESSAGE_SEND_PERMISSION,
@@ -98,6 +99,7 @@ QUEUE_ENTERED_SYSTEM_MESSAGE = "已进入人工客服队列"
 AGENT_ASSIGNED_SYSTEM_MESSAGE = "客服已接入会话"
 AGENT_ASSIGNED_EVENT_TYPE = "agent_assigned"
 BOT_DISABLED_ENDED_BY = "bot_disabled"
+HISTORY_START_ENDED_BY = "history_start"
 # A human handoff that ends up routing the visitor to leave a message (or is
 # blocked by a full queue) closes the bot conversation, so a lingering bot
 # session can't keep occupying the visitor's single active conversation slot.
@@ -1002,6 +1004,7 @@ class ConversationService:
             tenant_id=tenant_id,
             visitor_id=user.id,
             channel_id=channel_id,
+            for_update=True,
         )
         if existing and existing.status in {
             ConversationStatus.BOT.value,
@@ -1887,59 +1890,103 @@ class ConversationService:
         if channel.channel_type != "web":
             raise BusinessError("Channel does not support starting a new conversation")
 
-        existing = await ConversationRepository.get_active_visitor_conversation(
-            db,
-            tenant_id=principal.tenant_id,
-            visitor_id=history.visitor_id,
-            channel_id=history.channel_id,
-        )
-        if existing:
-            if existing.agent_id == principal.user_id:
-                return {
-                    "conversation": ConversationService._workspace_conversation_item(
-                        existing,
-                        viewer_relation="own",
-                        collaborated=False,
-                        has_history=True,
-                    ),
-                    "is_new": False,
-                    "already_active": True,
-                }
-            raise BusinessError("Visitor already has an active conversation")
+        closed_bot = None
+        try:
+            await ConversationRepository.lock_visitor_conversations(
+                db, tenant_id=principal.tenant_id, visitor_id=history.visitor_id, channel_id=history.channel_id,
+            )
+            existing = await ConversationRepository.get_active_visitor_conversation(
+                db,
+                tenant_id=principal.tenant_id,
+                visitor_id=history.visitor_id,
+                channel_id=history.channel_id,
+                for_update=True,
+            )
+            if existing and existing.agent_id != principal.user_id:
+                reason = await OfflineBotConversationService.check(db, r, existing, source=f"history:{history.id}")
+                if reason == "eligible":
+                    await OfflineBotConversationService.close(db, existing, ended_by=HISTORY_START_ENDED_BY)
+                    closed_bot = existing
+                    existing = None
+                elif reason in {"online", "status_unavailable"}:
+                    raise BusinessError(
+                        "Visitor is online" if reason == "online" else "Visitor status is unavailable",
+                        code="BOT_VISITOR_ONLINE" if reason == "online" else "VISITOR_STATUS_UNAVAILABLE",
+                    )
+            if existing:
+                if existing.agent_id == principal.user_id:
+                    result = {
+                        "conversation": ConversationService._workspace_conversation_item(
+                            existing,
+                            viewer_relation="own",
+                            collaborated=False,
+                            has_history=True,
+                        ),
+                        "is_new": False,
+                        "already_active": True,
+                    }
+                    await db.rollback()
+                    return result
+                raise BusinessError("Visitor already has an active conversation", code="ACTIVE_CONVERSATION_EXISTS")
 
-        now = datetime.now(timezone.utc)
-        conversation = await ConversationRepository.create(db, {
-            "tenant_id": principal.tenant_id,
-            "visitor_id": history.visitor_id,
-            "channel_id": history.channel_id,
-            "group_id": history.group_id,
-            "agent_id": principal.user_id,
-            "status": ConversationStatus.ACTIVE.value,
-            "started_at": now,
-            "unread_count": 0,
-        })
-        system_msg = await MessageRepository.create(db, {
-            "tenant_id": principal.tenant_id,
-            "conversation_id": conversation.id,
-            "sender_type": MessageSenderType.SYSTEM.value,
-            "content_type": MessageContentType.SYSTEM.value,
-            "content": "客服发起了新会话",
-            "metadata_": {
-                "event_type": "new_conversation_from_history",
-                "source_conversation_id": history.id,
-            },
-        })
-        await ConversationRepository.update_last_message(
-            db,
-            conversation.id,
-            ConversationService.build_message_preview(system_msg.content_type, system_msg.content),
-            system_msg.created_at or now,
-        )
-        await AgentStatusService.increment_count(r, principal.tenant_id, principal.user_id)
-        from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
+            now = datetime.now(timezone.utc)
+            conversation = await ConversationRepository.create(db, {
+                "tenant_id": principal.tenant_id,
+                "visitor_id": history.visitor_id,
+                "channel_id": history.channel_id,
+                "group_id": history.group_id,
+                "agent_id": principal.user_id,
+                "status": ConversationStatus.ACTIVE.value,
+                "started_at": now,
+                "unread_count": 0,
+            }, commit=False)
+            system_msg = await MessageRepository.create(db, {
+                "tenant_id": principal.tenant_id,
+                "conversation_id": conversation.id,
+                "sender_type": MessageSenderType.SYSTEM.value,
+                "content_type": MessageContentType.SYSTEM.value,
+                "content": "客服发起了新会话",
+                "metadata_": {
+                    "event_type": "new_conversation_from_history",
+                    "source_conversation_id": history.id,
+                },
+            }, commit=False)
+            await ConversationRepository.update_last_message(
+                db,
+                conversation.id,
+                ConversationService.build_message_preview(system_msg.content_type, system_msg.content),
+                system_msg.created_at or now,
+                commit=False,
+            )
+            from app.services.visitor_timeout_close_service import VisitorTimeoutCloseService
 
-        await VisitorTimeoutCloseService.initialize_for_conversation(db, conversation)
-        conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            await VisitorTimeoutCloseService.initialize_for_conversation(db, conversation, commit=False)
+            conversation = await ConversationRepository.get_by_id(db, conversation.id)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+        try:
+            await AgentStatusService.increment_count(r, principal.tenant_id, principal.user_id)
+        except Exception:
+            logger.exception(
+                "history_start_count_failed tenant_id=%s conversation_id=%s agent_id=%s",
+                principal.tenant_id, conversation.id, principal.user_id,
+            )
+        if closed_bot:
+            await OfflineBotConversationService.emit_closed(closed_bot, ended_by=HISTORY_START_ENDED_BY)
+        from app.services.conversation_realtime_service import ConversationRealtimeService
+
+        await ConversationRealtimeService.emit_conversation_list_updated(
+            principal.tenant_id, action="created", conversation_id=conversation.id,
+        )
+        logger.info(
+            "history_conversation_started tenant_id=%s source_conversation_id=%s "
+            "closed_bot_conversation_id=%s conversation_id=%s agent_id=%s",
+            principal.tenant_id, history.id, closed_bot.id if closed_bot else None,
+            conversation.id, principal.user_id,
+        )
         return {
             "conversation": ConversationService._workspace_conversation_item(
                 conversation,

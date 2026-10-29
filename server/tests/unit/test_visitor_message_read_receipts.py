@@ -547,6 +547,88 @@ async def test_visitor_messages_delivered_rejects_invalid_batches(payload, error
     rt.emit.assert_not_awaited()
 
 
+class _DeadlockDetectedError(Exception):
+    sqlstate = "40P01"
+
+
+@pytest.mark.asyncio
+async def test_visitor_messages_delivered_retries_deadlock_then_succeeds(monkeypatch):
+    db = SimpleNamespace()
+    session = {"tenant_id": 1, "channel_id": 2, "visitor_external_id": "visitor-1"}
+    rt = _RealtimeHarness(session=session)
+    delivery_result = {
+        "tenant_id": 1,
+        "conversation_id": 100,
+        "conversation_public_id": "cv_100",
+        "message_ids": [201],
+        "recipient_agent_ids": [9],
+    }
+    mark_delivered = AsyncMock(
+        side_effect=[_DeadlockDetectedError("deadlock detected"), delivery_result],
+    )
+    monkeypatch.setattr("app.db.retry.asyncio.sleep", AsyncMock())
+    monkeypatch.setattr(visitor_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(
+        visitor_handlers.ConversationService,
+        "mark_agent_messages_visitor_delivered_for_session",
+        mark_delivered,
+    )
+
+    visitor_handlers.register_visitor_handlers(rt)
+    response = await rt.handlers[("/visitor", "messages_delivered")](
+        "sid-1",
+        {"conversation_public_id": "cv_100", "message_ids": [201]},
+    )
+
+    assert response == {"ok": True, "message_ids": [201]}
+    assert mark_delivered.await_count == 2
+    assert rt.emit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_visitor_messages_delivered_returns_internal_instead_of_raising(monkeypatch):
+    db = SimpleNamespace()
+    session = {"tenant_id": 1, "channel_id": 2, "visitor_external_id": "visitor-1"}
+    rt = _RealtimeHarness(session=session)
+    monkeypatch.setattr(visitor_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(
+        visitor_handlers.ConversationService,
+        "mark_agent_messages_visitor_delivered_for_session",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    visitor_handlers.register_visitor_handlers(rt)
+    response = await rt.handlers[("/visitor", "messages_delivered")](
+        "sid-1",
+        {"conversation_public_id": "cv_100", "message_ids": [201]},
+    )
+
+    assert response == {"ok": False, "error": "INTERNAL"}
+    rt.emit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_visitor_mark_read_returns_internal_instead_of_raising(monkeypatch):
+    db = SimpleNamespace()
+    session = {"tenant_id": 1, "channel_id": 2, "visitor_external_id": "visitor-1"}
+    rt = _RealtimeHarness(session=session)
+    monkeypatch.setattr(visitor_handlers, "AsyncSessionLocal", lambda: _SessionContext(db))
+    monkeypatch.setattr(
+        visitor_handlers.ConversationService,
+        "mark_agent_messages_visitor_read_for_session",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    visitor_handlers.register_visitor_handlers(rt)
+    response = await rt.handlers[("/visitor", "mark_read")](
+        "sid-1",
+        {"conversation_public_id": "cv_100"},
+    )
+
+    assert response == {"ok": False, "error": "INTERNAL"}
+    rt.emit.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_visitor_handoff_success_notifies_visitor_and_assigned_agent(monkeypatch):
     db = SimpleNamespace()

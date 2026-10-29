@@ -32,6 +32,7 @@ import {
   prependConversationToListCache,
 } from '@/service/use-conversations'
 import { GlobalCallBar } from '@/app/components/features/call-center/global-call-bar'
+import { ExportTaskEntry } from '@/app/components/features/export-task-entry'
 import { NetworkMonitor } from '@/app/components/features/network-monitor'
 import { UserDropdown } from '@/app/components/features/user-dropdown'
 import { KnowledgeFloatingDrawer } from '@/app/components/features/knowledge/knowledge-floating-drawer'
@@ -40,6 +41,7 @@ import { cn } from '@/lib/utils'
 import {
   WORKSPACE_NAV_ITEMS,
   getWorkspaceRouteRule,
+  isWorkspacePathMatch,
   type WorkspaceNavIconKey,
   type WorkspaceNavItem,
 } from '@/config/workspace-permissions'
@@ -452,7 +454,8 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
           {/* Nav items */}
           <nav className="flex flex-col items-center gap-1">
             {visibleNavItems.map((item) => {
-              const active = pathname.startsWith(item.href)
+              const active = isWorkspacePathMatch(pathname, item.href)
+                || item.activePrefixes?.some((prefix) => isWorkspacePathMatch(pathname, prefix))
               const Icon = WORKSPACE_NAV_ICONS[item.iconKey]
               const className = cn(
                 'group relative flex h-11 w-11 items-center justify-center rounded-xl transition-colors',
@@ -531,6 +534,7 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
             </div>
             <div className="flex shrink-0 items-center gap-2 py-2.5">
               <NetworkMonitor />
+              <ExportTaskEntry />
               <UserDropdown />
             </div>
           </header>

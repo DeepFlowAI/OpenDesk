@@ -9,6 +9,7 @@ import type {
   CallRecordFilterOptionsResponse,
   CallRecordListResponse,
   CallTrajectoryResponse,
+  BotTranscriptResponse,
   CallTranscriptResponse,
   CallUserAssociationResponse,
   WebRTCSession,
@@ -26,6 +27,9 @@ const keys = {
   recordFilterOptions: () => [NS, 'records', 'filter-options'] as const,
   record: (publicId: string | null | undefined) => [NS, 'records', publicId ?? null] as const,
   transcript: (publicId: string | null | undefined) => [NS, 'records', publicId ?? null, 'transcript'] as const,
+  botTranscript: (callId: string | null | undefined) => [NS, 'bot-transcript', callId ?? null] as const,
+  recordBotTranscript: (publicId: string | null | undefined) =>
+    [NS, 'records', publicId ?? null, 'bot-transcript'] as const,
   trajectory: (publicId: string | null | undefined) => [NS, 'records', publicId ?? null, 'trajectory'] as const,
   satisfaction: () => [NS, 'current-call', 'satisfaction'] as const,
 }
@@ -427,6 +431,29 @@ export const useCallTranscript = (publicId: string | null | undefined) =>
     queryFn: () =>
       get<CallTranscriptResponse>(`v1/call-center/call-records/${publicId}/transcript`),
     enabled: Boolean(publicId),
+  })
+
+export const useBotTranscript = (
+  callId: string | null | undefined,
+  enabled = true,
+) =>
+  useQuery({
+    queryKey: keys.botTranscript(callId),
+    queryFn: () =>
+      get<BotTranscriptResponse>(`v1/call-center/calls/${callId}/bot-transcript`),
+    enabled: enabled && Boolean(callId),
+    staleTime: Infinity,
+    retry: false,
+  })
+
+export const useRecordBotTranscript = (publicId: string | null | undefined) =>
+  useQuery({
+    queryKey: keys.recordBotTranscript(publicId),
+    queryFn: () =>
+      get<BotTranscriptResponse>(`v1/call-center/call-records/${publicId}/bot-transcript`),
+    enabled: Boolean(publicId),
+    staleTime: Infinity,
+    retry: false,
   })
 
 export const useIdentifyCallRecordUser = () => {

@@ -19,6 +19,7 @@ import { IconArrowUp, IconLoader2, IconPaperclip, IconPlayerStop, IconStar } fro
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogTitle } from '@/components/ui/dialog'
 import { t } from '@/utils/i18n'
+import { isEmptyUploadFile } from '@/utils/file-send-error'
 import { MessageQuotePreview } from '@/app/components/features/chat/message-quote'
 import type { Message } from '@/models/conversation'
 import { quoteFromMessage } from '@/lib/message-quote'
@@ -302,7 +303,11 @@ export function VisitorComposer({
       try {
         await onFileSend(file)
       } catch {
-        setUploadError(t('ws.chat.attachmentUploadFailed', locale))
+        setUploadError(
+          isEmptyUploadFile(file)
+            ? t('chat.attachment.empty', locale)
+            : t('ws.chat.attachmentUploadFailed', locale),
+        )
       } finally {
         fileSendLockRef.current = false
         setUploading(false)
@@ -342,7 +347,11 @@ export function VisitorComposer({
       await onFileSend(pastedAttachment.file)
       setPastedAttachment(null)
     } catch {
-      setUploadError(t('ws.chat.attachmentUploadFailed', locale))
+      setUploadError(
+        isEmptyUploadFile(pastedAttachment.file)
+          ? t('chat.attachment.empty', locale)
+          : t('ws.chat.attachmentUploadFailed', locale),
+      )
     } finally {
       setUploading(false)
     }

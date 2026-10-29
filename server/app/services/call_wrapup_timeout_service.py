@@ -45,6 +45,22 @@ class CallWrapupTimeoutService:
                 continue
             try:
                 async with AsyncSessionLocal() as db:
+                    from app.services.call_agent_fact_service import CallAgentFactService
+
+                    try:
+                        await CallAgentFactService.close_after_call_work(
+                            db,
+                            tenant_id=tenant_id,
+                            agent_id=employee_id,
+                            call_id=call_id,
+                            end_reason="timeout",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "wrap-up timeout: fact close failed tenant=%s employee=%s",
+                            tenant_id,
+                            employee_id,
+                        )
                     await CcAgentStatusService.sync_pg_status(
                         db,
                         tenant_id,

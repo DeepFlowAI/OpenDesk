@@ -144,6 +144,96 @@ async def test_queue_agent_counts_use_realtime_resource_ownership(redis, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_no_idle_agent_log_throttles_identical_blocked_signature(
+    redis, monkeypatch, caplog
+):
+    import logging
+
+    import app.services.auto_outbound.reception as reception_mod
+    from app.services.auto_outbound.reception import _count_queue_agent_capacity
+
+    reception_mod._no_idle_log_state.clear()
+
+    db = MagicMock()
+    result = MagicMock()
+    result.all.return_value = [(1, "ready"), (2, "ready")]
+    db.execute = AsyncMock(return_value=result)
+    monkeypatch.setattr(
+        "app.services.auto_outbound.reception.AsyncSessionLocal",
+        lambda: _SessionCM(db),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_status_service.AgentStatusService.is_connected",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "app.services.cc_agent_resource_service.CcAgentResourceService.get_snapshot",
+        AsyncMock(return_value={"resource_state": "idle"}),
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.auto_outbound.reception"):
+        await _count_queue_agent_capacity(1, 30, redis=redis)
+        await _count_queue_agent_capacity(1, 30, redis=redis)
+        await _count_queue_agent_capacity(1, 30, redis=redis)
+
+    messages = [
+        r.message
+        for r in caplog.records
+        if "auto_outbound no idle agent" in r.message
+    ]
+    assert len(messages) == 1
+    assert "1:ready/disconnected,2:ready/disconnected" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_no_idle_agent_log_emits_immediately_on_signature_change(
+    redis, monkeypatch, caplog
+):
+    import logging
+
+    import app.services.auto_outbound.reception as reception_mod
+    from app.services.auto_outbound.reception import _count_queue_agent_capacity
+
+    reception_mod._no_idle_log_state.clear()
+
+    db = MagicMock()
+    result = MagicMock()
+    result.all.return_value = [(1, "ready")]
+    db.execute = AsyncMock(return_value=result)
+    monkeypatch.setattr(
+        "app.services.auto_outbound.reception.AsyncSessionLocal",
+        lambda: _SessionCM(db),
+    )
+
+    connected = AsyncMock(side_effect=[False, False])
+    monkeypatch.setattr(
+        "app.services.agent_status_service.AgentStatusService.is_connected",
+        connected,
+    )
+    monkeypatch.setattr(
+        "app.services.cc_agent_resource_service.CcAgentResourceService.get_snapshot",
+        AsyncMock(return_value={"resource_state": "idle"}),
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.auto_outbound.reception"):
+        await _count_queue_agent_capacity(1, 30, redis=redis)
+
+        # Same agent now busy/disconnected signature would differ if status
+        # from DB changes — swap the DB row status for the second probe.
+        result.all.return_value = [(1, "busy")]
+        await _count_queue_agent_capacity(1, 30, redis=redis)
+
+    messages = [
+        r.message
+        for r in caplog.records
+        if "auto_outbound no idle agent" in r.message
+    ]
+    assert len(messages) == 2
+    assert "1:ready/disconnected" in messages[0]
+    assert "1:busy/disconnected" in messages[1]
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_routes_by_mode(monkeypatch):
     ivr = AsyncMock()
     bot = AsyncMock()
@@ -262,6 +352,100 @@ async def test_bot_skips_intent_when_field_key_missing(monkeypatch):
         "sim-1", _ctx(), _snap(intent_result_field_key=None)
     )
     merge.assert_not_awaited()
+
+
+class _FakeBotWorkflow:
+    """Captures initial variables and mimics the VoiceSpeed node's preset outcome."""
+
+    instances: list["_FakeBotWorkflow"] = []
+    preset_status: str | None = "passed"
+
+    def __init__(self, *, initial_variables, **_kwargs):
+        self.ctx = SimpleNamespace(variables=dict(initial_variables))
+        self.done = asyncio.Event()
+        self.ended_reason = "voicespeed_ended"
+        _FakeBotWorkflow.instances.append(self)
+
+    async def start(self):
+        if self.preset_status and "sys._voicespeed_call_variables" in self.ctx.variables:
+            self.ctx.variables["sys._voicespeed_call_variables_status"] = self.preset_status
+        self.done.set()
+
+    def bridged_agent_info(self):
+        return None
+
+
+async def _run_bot_with_target(monkeypatch, field_values, *, preset_status="passed"):
+    _FakeBotWorkflow.instances = []
+    _FakeBotWorkflow.preset_status = preset_status
+    monkeypatch.setattr(
+        "app.services.call_center.workflow.VoiceFlowWorkflow", _FakeBotWorkflow
+    )
+
+    def _no_orchestrator():
+        raise RuntimeError("no orchestrator in unit tests")
+
+    monkeypatch.setattr(
+        "app.services.call_center.orchestrator.get_orchestrator", _no_orchestrator
+    )
+    monkeypatch.setattr(
+        "app.services.auto_outbound.reception._get_telephony", AsyncMock(return_value=object())
+    )
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=object())
+    session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr("app.services.auto_outbound.reception.AsyncSessionLocal", lambda: session)
+    monkeypatch.setattr(
+        "app.services.auto_outbound.reception.AutoOutboundRepository.get_target",
+        AsyncMock(return_value=SimpleNamespace(field_values=field_values)),
+    )
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setattr(
+        "app.services.auto_outbound.reception.resolve_tenant_timezone",
+        AsyncMock(return_value=ZoneInfo("Asia/Shanghai")),
+    )
+    update = AsyncMock()
+    monkeypatch.setattr("app.services.auto_outbound.reception._update_record", update)
+    snap = _snap(
+        execution_mode="bot",
+        intent_result_field_key=None,
+        fields=[
+            {"key": "field_1", "name": "customer_name", "field_type": "single_line_text", "enabled": True},
+            {"key": "field_2", "name": "备注", "field_type": "single_line_text", "enabled": True},
+        ],
+    )
+    await BotReception()._run_bot("call-1", _ctx(), snap)
+    return _FakeBotWorkflow.instances[0], update
+
+
+@pytest.mark.asyncio
+async def test_bot_injects_call_variables_and_records_snapshot(monkeypatch):
+    workflow, update = await _run_bot_with_target(
+        monkeypatch, {"field_1": "张三", "field_2": "VIP"}
+    )
+    assert workflow.ctx.variables["sys._voicespeed_call_variables"] == {"customer_name": "张三"}
+    payload = update.await_args.args[1]
+    assert payload["call_variables"] == {
+        "status": "passed",
+        "items": [{"name": "customer_name", "value": "张三", "truncated": False}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_bot_records_failed_call_variables(monkeypatch):
+    _workflow, update = await _run_bot_with_target(
+        monkeypatch, {"field_1": "张三"}, preset_status="failed"
+    )
+    assert update.await_args.args[1]["call_variables"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_bot_skips_call_variables_when_node_never_presets(monkeypatch):
+    _workflow, update = await _run_bot_with_target(
+        monkeypatch, {"field_1": "张三"}, preset_status=None
+    )
+    assert "call_variables" not in update.await_args.args[1]
 
 
 @pytest.mark.asyncio

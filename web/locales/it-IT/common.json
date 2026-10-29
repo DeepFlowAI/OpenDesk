@@ -1201,6 +1201,7 @@
   "chat.handoff.needsAgent": "Questo problema richiede l'intervento di un agente di supporto umano.",
   "chat.attachment.upload": "Carica allegato",
   "chat.attachment.failed": "Invio dell'allegato non riuscito. Fai clic per riprovare.",
+  "chat.attachment.empty": "L'immagine non è ancora pronta. Riprova.",
   "chat.bot.noResponse": "L'assistente non risponde. Riprova o contatta il supporto.",
   "chat.recall.mine": "Hai ritirato un messaggio",
   "chat.recall.named": "{name} ha ritirato un messaggio",

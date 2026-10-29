@@ -14,6 +14,7 @@ No other code needs to change (Open-Closed Principle).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -24,6 +25,11 @@ from app.services.call_center.queue import get_queue_picker
 from app.services.call_center.variables import evaluate_group
 
 logger = logging.getLogger(__name__)
+
+# Workflow variables carrying VoiceSpeed call variables ({name: value}) to
+# preset before the bot's first turn, and the preset outcome ("passed"/"failed").
+CALL_VARIABLES_KEY = "sys._voicespeed_call_variables"
+CALL_VARIABLES_STATUS_KEY = "sys._voicespeed_call_variables_status"
 
 # Sentinel: the picked agent is a Web-phone (WebRTC) agent, so assign_queue
 # must fall through to the unchanged browser-offer path.
@@ -1525,6 +1531,7 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
     _DEFAULT_UNAVAILABLE = "当前智能语音服务不可用，请稍后再拨。"
     _DEFAULT_CONNECT_FAILED = "暂时无法接入智能语音服务，请稍后再拨。"
     _DEFAULT_GREETING = "您好，请问有什么可以帮您？"
+    _CALL_VARIABLES_TIMEOUT_S = 1.5
 
     async def execute(self, ctx: ExecutionContext, node: dict) -> NextStep:
         import logging
@@ -1569,26 +1576,63 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
 
         vs_client = create_voice_speed_client()
         turn_url = vs_client.build_turn_url(base_url, agent_id)
-        greeting = (data.get("greeting_text") or "").strip() or self._DEFAULT_GREETING
-        # Best-effort: VoiceSpeed dialog-timing knobs override FlowKit env when set.
-        performance: dict = {}
-        try:
-            performance = await vs_client.get_performance_settings(
-                base_url, api_key, agent_id
-            )
-        except Exception:  # noqa: BLE001
-            log.warning(
-                "voicespeed: performance_settings fetch failed call_id=%s",
-                ctx.call_id,
-                exc_info=True,
-            )
+        # The agent's own opening wins; the node's greeting (or the default) is
+        # spoken only when the agent has none configured or VoiceSpeed is unreachable.
+        fallback_greeting = (data.get("greeting_text") or "").strip() or self._DEFAULT_GREETING
+        customer_number = (
+            ctx.variables.get("sys.called_number")
+            if ctx.variables.get("sys._direction") == "outbound"
+            else ctx.variables.get("sys.caller_number")
+        ) or None
+
+        async def _fetch_opening() -> dict:
+            try:
+                return await vs_client.get_call_opening(
+                    base_url,
+                    api_key,
+                    agent_id,
+                    session_id=ctx.call_id,
+                    fallback_greeting=fallback_greeting,
+                    user_identifier=customer_number,
+                )
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "voicespeed: call_opening fetch failed call_id=%s",
+                    ctx.call_id,
+                    exc_info=True,
+                )
+                return {"greeting": fallback_greeting, "opening": ""}
+
+        async def _fetch_performance() -> dict:
+            # Best-effort: VoiceSpeed dialog-timing knobs override FlowKit env when set.
+            try:
+                return await vs_client.get_performance_settings(
+                    base_url, api_key, agent_id
+                )
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "voicespeed: performance_settings fetch failed call_id=%s",
+                    ctx.call_id,
+                    exc_info=True,
+                )
+                return {}
+
+        # Variables first: VoiceSpeed rejects a preset once the call has a
+        # session, and resolving the opening creates it.
+        await self._preset_call_variables(ctx, vs_client, base_url, api_key, agent_id)
+        opening, performance = await asyncio.gather(
+            _fetch_opening(),
+            _fetch_performance(),
+        )
         try:
             await ctx.telephony.call_converse_external_agent(
                 ctx.call_id,
                 provider="voicespeed",
                 turn_url=turn_url,
                 token=api_key,
-                greeting=greeting,
+                greeting=opening["greeting"],
+                opening=opening["opening"] or None,
+                voice_spk_id=opening.get("voice_spk_id") or None,
                 performance=performance or None,
                 traceparent=ctx.variables.get("sys._traceparent"),
                 trace_call_id=ctx.variables.get("sys._trace_call_id") or ctx.call_id,
@@ -1625,6 +1669,42 @@ class VoiceSpeedExecutor(BaseNodeExecutor):
 
         # (d) Conversation is running in the kernel — wait holding NO db session.
         return self._wait()
+
+    @classmethod
+    async def _preset_call_variables(
+        cls,
+        ctx: ExecutionContext,
+        vs_client: Any,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+    ) -> None:
+        """Preset caller-supplied `{{name}}` values before the first dialog turn.
+
+        Runs only when the caller put variables on the context. A failure or a
+        slow VoiceSpeed never blocks the call: the bot just sees empty values.
+        The outcome is left in ``sys._voicespeed_call_variables_status``.
+        """
+        variables = ctx.variables.get(CALL_VARIABLES_KEY)
+        if not isinstance(variables, dict) or not variables:
+            return
+        try:
+            await asyncio.wait_for(
+                vs_client.preset_call_variables(
+                    base_url, api_key, agent_id, ctx.call_id, variables
+                ),
+                timeout=cls._CALL_VARIABLES_TIMEOUT_S,
+            )
+        except Exception:  # noqa: BLE001 — includes TimeoutError
+            logger.warning(
+                "voicespeed: call variables preset failed call_id=%s count=%d",
+                ctx.call_id,
+                len(variables),
+                exc_info=True,
+            )
+            ctx.variables[CALL_VARIABLES_STATUS_KEY] = "failed"
+            return
+        ctx.variables[CALL_VARIABLES_STATUS_KEY] = "passed"
 
     def _wait(self) -> NextStep:
         return WaitForEvent(method=self._EVENTS, on_event=self._on_agent_event)

@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import Field
@@ -82,6 +83,13 @@ class Settings(BaseSettings):
     EVENT_DELIVERY_CLEANUP_INTERVAL_SECONDS: int = Field(default=60, ge=10)
     EVENT_DELIVERY_CLEANUP_BATCH_SIZE: int = Field(default=1000, ge=1, le=10000)
 
+    # Platform-wide asynchronous LLM dispatcher
+    PLATFORM_LLM_WORKER_ENABLED: bool = Field(default=True)
+    PLATFORM_LLM_SCAN_INTERVAL_SECONDS: int = Field(default=2, ge=1)
+    PLATFORM_LLM_CLAIM_STALE_SECONDS: int = Field(default=120, ge=30)
+    QUALITY_CONTINUOUS_WORKER_ENABLED: bool = Field(default=True)
+    QUALITY_CONTINUOUS_SCAN_INTERVAL_SECONDS: int = Field(default=5, ge=1)
+
     # OpenAgent integration
     OPEN_AGENT_PROVIDER: str = Field(default="http")
     VOICE_SPEED_PROVIDER: str = Field(default="http")
@@ -118,6 +126,23 @@ class Settings(BaseSettings):
     OPEN_AGENT_BOT_TIMEOUT_SCAN_BATCH_SIZE: int = Field(default=100, ge=1, le=500)
     CALL_WRAPUP_TIMEOUT_WORKER_ENABLED: bool = Field(default=True)
     CALL_WRAPUP_TIMEOUT_SCAN_INTERVAL_SECONDS: int = Field(default=2, ge=1)
+    CALL_FINALIZATION_RETRY_WORKER_ENABLED: bool = Field(default=True)
+    CALL_FINALIZATION_RETRY_SCAN_INTERVAL_SECONDS: int = Field(default=10, ge=1)
+    CALL_FINALIZATION_PENDING_TIMEOUT_SECONDS: int = Field(default=30, ge=5)
+    CALL_FINALIZATION_FAILED_RETRY_SECONDS: int = Field(default=60, ge=5)
+    CALL_FINALIZATION_RETRY_BATCH_SIZE: int = Field(default=100, ge=1, le=500)
+    CALL_REPORT_DATA_EFFECTIVE_AT: datetime = Field(
+        default=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        description="UTC instant from which the newest call-report projections are reliable",
+    )
+    CALL_QUEUE_REPORT_DATA_EFFECTIVE_AT: datetime = Field(
+        default=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        description="UTC instant from which persisted call queue facts are reliable",
+    )
+    CALL_AGENT_REPORT_DATA_EFFECTIVE_AT: datetime = Field(
+        default=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        description="UTC instant from which persisted call employee facts are reliable",
+    )
 
     # ── Auto outbound dial engine (触达中心 · 自动外呼) ────────────────────
     AUTO_OUTBOUND_DIAL_WORKER_ENABLED: bool = Field(default=True)
@@ -160,13 +185,16 @@ class Settings(BaseSettings):
     DEFAULT_ADMIN_USERNAME: str = Field(default="admin")
     DEFAULT_ADMIN_PASSWORD: str = Field(default="Admin123456")
 
-    # Tenant Platform API Key — optional setting consumed by tenant-management
-    # extensions registered via the ``app.extensions`` loader. The default
-    # single-tenant build does not read this value.
-    TENANT_API_KEY: str = Field(default="change-me-tenant-api-key")
+    # Tenant Platform API Key — authenticates the tenants, telephony, SMS
+    # platform and verify-file APIs (X-API-Key). Empty or placeholder values
+    # keep those APIs disabled.
+    TENANT_API_KEY: str = Field(default="")
     TENANT_PLATFORM_SSO_SECRET: str = Field(
         default="",
-        description="HS256 secret used to verify Tenant Platform SSO tokens. Falls back to TENANT_API_KEY when empty.",
+        description=(
+            "HS256 secret used to verify Tenant Platform SSO tokens. Falls back to "
+            "TENANT_API_KEY when empty; SSO is disabled if neither is configured."
+        ),
     )
     TENANT_PLATFORM_SSO_AUDIENCES: str = Field(
         default="opendesk,opendesk-test",

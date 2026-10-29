@@ -260,12 +260,7 @@ class CallUserAssociationService:
         tenant_id: int,
         target_keys: set[str],
     ) -> list[User]:
-        users = await UserRepository.list_with_phone(db, tenant_id)
-        return [
-            user
-            for user in users
-            if phone_match_keys(user.phone) & target_keys
-        ]
+        return await UserRepository.list_by_phone_match_keys(db, tenant_id, target_keys)
 
     @staticmethod
     async def _create_user_from_number(
