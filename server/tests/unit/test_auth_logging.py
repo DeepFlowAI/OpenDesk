@@ -67,7 +67,7 @@ def test_get_client_ip_prefers_cf_connecting_ip():
             "x-forwarded-for": "198.51.100.1, 10.0.0.1",
             "x-real-ip": "192.0.2.1",
         },
-        client_host="172.27.0.2",
+        client_host="192.0.2.10",
     )
     assert get_client_ip(request) == "203.0.113.9"
 
@@ -75,7 +75,7 @@ def test_get_client_ip_prefers_cf_connecting_ip():
 def test_get_client_ip_x_forwarded_for_takes_first():
     request = _request_with_headers(
         {"x-forwarded-for": "198.51.100.1, 10.0.0.1"},
-        client_host="172.27.0.2",
+        client_host="192.0.2.10",
     )
     assert get_client_ip(request) == "198.51.100.1"
 
@@ -83,14 +83,14 @@ def test_get_client_ip_x_forwarded_for_takes_first():
 def test_get_client_ip_falls_back_to_x_real_ip():
     request = _request_with_headers(
         {"x-real-ip": "192.0.2.55"},
-        client_host="172.27.0.2",
+        client_host="192.0.2.10",
     )
     assert get_client_ip(request) == "192.0.2.55"
 
 
 def test_get_client_ip_falls_back_to_request_client_host():
-    request = _request_with_headers({}, client_host="172.27.0.2")
-    assert get_client_ip(request) == "172.27.0.2"
+    request = _request_with_headers({}, client_host="192.0.2.10")
+    assert get_client_ip(request) == "192.0.2.10"
 
 
 def test_get_client_ip_returns_dash_when_unavailable():

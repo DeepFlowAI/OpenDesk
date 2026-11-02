@@ -265,6 +265,35 @@ class TestFlowKitClientFailPending:
             await fut
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("api_key", "expected"),
+        [("s3cret", {"Authorization": "Bearer s3cret"}), ("", None)],
+    )
+    async def test_handshake_sends_api_key_as_bearer(self, monkeypatch, api_key, expected):
+        from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
+
+        client = FlowKitTelephonyClient(
+            ws_url="ws://127.0.0.1:1/ws",
+            sdk_name="test",
+            sdk_version="0",
+            api_key=api_key,
+        )
+        seen: dict = {}
+
+        async def _capture_connect(*_args, **kwargs):
+            seen.update(kwargs)
+            raise ConnectionRefusedError("stop after capturing headers")
+
+        monkeypatch.setattr(
+            "app.libs.telephony.providers.flowkit.client.websockets.connect",
+            _capture_connect,
+        )
+
+        with pytest.raises(ConnectionRefusedError):
+            await client._open_and_handshake()
+        assert seen["additional_headers"] == expected
+
+    @pytest.mark.asyncio
     async def test_initial_connect_failure_schedules_reconnect(self, monkeypatch):
         from app.libs.telephony.providers.flowkit.client import FlowKitTelephonyClient
 

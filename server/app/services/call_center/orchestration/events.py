@@ -54,6 +54,7 @@ class EventHandlersMixin:
                 sdk_name=f"{settings.TELEPHONY_SDK_NAME}-reconcile",
                 sdk_version=settings.TELEPHONY_SDK_VERSION,
                 rpc_timeout=min(settings.TELEPHONY_RPC_TIMEOUT, 5.0),
+                api_key=settings.TELEPHONY_API_KEY,
             )
             try:
                 await asyncio.wait_for(client._open_and_handshake(), timeout=5.0)

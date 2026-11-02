@@ -34,7 +34,7 @@
   "forgot.submit": "Şifreyi sıfırla",
   "forgot.submitting": "Sıfırlanıyor...",
   "forgot.backToLogin": "Girişe dön",
-  "forgot.codeSent": "Doğrulama kodu e-posta adresinize gönderildi",
+  "forgot.codeSent": "Hesap mevcutsa ve bir e-posta adresi varsa doğrulama kodu gönderildi",
   "forgot.resetSuccess": "Şifre sıfırlandı. Yeni şifrenizle oturum açın.",
   "validation.loginTenant.required": "Kurumsal ID girin",
   "validation.tenant.required": "Kiracı kodu veya kiracı ID'si girin",

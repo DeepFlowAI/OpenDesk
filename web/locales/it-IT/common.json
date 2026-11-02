@@ -34,7 +34,7 @@
   "forgot.submit": "Reimposta password",
   "forgot.submitting": "Reimpostazione in corso...",
   "forgot.backToLogin": "Torna all'accesso",
-  "forgot.codeSent": "Il codice di verifica è stato inviato alla tua email",
+  "forgot.codeSent": "Se l'account esiste e ha un'email, il codice di verifica è stato inviato",
   "forgot.resetSuccess": "Password reimpostata con successo. Accedi con la nuova password.",
   "validation.loginTenant.required": "Inserisci l'ID azienda",
   "validation.tenant.required": "Inserisci slug tenant o ID tenant",

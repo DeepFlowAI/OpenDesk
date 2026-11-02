@@ -3,7 +3,7 @@ Tenant schemas — matching Tenant Platform API spec
 """
 import re
 from datetime import datetime
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.repositories.tenant_repository import (
     TENANT_SLUG_MAX_LENGTH,
@@ -144,3 +144,19 @@ class TenantListResponse(BaseModel):
     page: int
     per_page: int
     pages: int
+
+
+class TenantConsoleLoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class TenantConsoleTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    username: str
+
+
+class TenantConsoleMeResponse(BaseModel):
+    username: str

@@ -22,13 +22,36 @@ def _unique(prefix: str = "test") -> str:
 @pytest.mark.asyncio
 async def test_missing_api_key(client):
     resp = await client.get(BASE)
-    assert resp.status_code == 422  # missing required header
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_invalid_api_key(client):
     resp = await client.get(BASE, headers={"X-API-Key": "wrong-key"})
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_console_login_token_can_list_tenants(client, monkeypatch):
+    monkeypatch.setattr(settings, "TENANT_CONSOLE_USERNAME", "console_admin")
+    monkeypatch.setattr(settings, "TENANT_CONSOLE_PASSWORD", "Console-Pass-123")
+
+    bad = await client.post(
+        "/api/v1/tenant-console/auth/login",
+        json={"username": "console_admin", "password": "wrong"},
+    )
+    assert bad.status_code == 401
+
+    login = await client.post(
+        "/api/v1/tenant-console/auth/login",
+        json={"username": "console_admin", "password": "Console-Pass-123"},
+    )
+    assert login.status_code == 200
+    token = login.json()["access_token"]
+
+    resp = await client.get(BASE, headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert "items" in resp.json()
 
 
 # ── Create ────────────────────────────────────────────────

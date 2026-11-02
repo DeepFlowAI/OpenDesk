@@ -34,7 +34,7 @@
   "forgot.submit": "Restablecer contraseña",
   "forgot.submitting": "Restableciendo...",
   "forgot.backToLogin": "Volver al inicio de sesión",
-  "forgot.codeSent": "Se ha enviado el código de verificación a tu email",
+  "forgot.codeSent": "Si la cuenta existe y tiene un email, se ha enviado el código de verificación",
   "forgot.resetSuccess": "Contraseña restablecida correctamente. Inicia sesión con tu nueva contraseña.",
   "validation.loginTenant.required": "Introduce el ID de la empresa",
   "validation.tenant.required": "Introduce el slug o ID del tenant",

@@ -64,10 +64,14 @@ services:
       DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-default}
       DEFAULT_TENANT_NAME: ${DEFAULT_TENANT_NAME:-Default Workspace}
       DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
-      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-Admin123456}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:?DEFAULT_ADMIN_PASSWORD must be set in .env (password of the first super-admin)}
       # Optional. Empty keeps the Tenant Platform APIs and SSO disabled.
       TENANT_API_KEY: ${TENANT_API_KEY:-}
       TENANT_PLATFORM_SSO_SECRET: ${TENANT_PLATFORM_SSO_SECRET:-}
+      # Optional. Empty password keeps the /tenant console disabled.
+      TENANT_CONSOLE_USERNAME: ${TENANT_CONSOLE_USERNAME:-admin}
+      TENANT_CONSOLE_PASSWORD: ${TENANT_CONSOLE_PASSWORD:-}
+      TENANT_CONSOLE_TOKEN_EXPIRE_HOURS: ${TENANT_CONSOLE_TOKEN_EXPIRE_HOURS:-12}
       # Optional SMTP (for password reset / email notifications)
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-465}

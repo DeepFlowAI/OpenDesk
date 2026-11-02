@@ -34,7 +34,7 @@
   "forgot.submit": "Redefinir senha",
   "forgot.submitting": "Redefinindo...",
   "forgot.backToLogin": "Voltar ao login",
-  "forgot.codeSent": "O código de verificação foi enviado para seu e-mail",
+  "forgot.codeSent": "Se a conta existir e tiver um e-mail, o código de verificação foi enviado",
   "forgot.resetSuccess": "Senha redefinida com sucesso. Entre com sua nova senha.",
   "validation.loginTenant.required": "Informe o ID da empresa",
   "validation.tenant.required": "Informe o slug ou ID do tenant",

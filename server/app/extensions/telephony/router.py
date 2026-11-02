@@ -1,7 +1,7 @@
 """
 Telephony catalog routers — SIP Trunk and phone number APIs for Tenant Platform.
 
-Authenticated via X-API-Key (same key as /api/v1/tenants).
+Authenticated via X-API-Key or a tenant console Bearer token (same as /api/v1/tenants).
 """
 import csv
 import io
@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.tenant_platform_auth import verify_tenant_api_key
+from app.core.tenant_platform_auth import verify_tenant_platform_access
 from app.db.deps import get_db
 
 from .phone_number_service import PhoneNumberService
@@ -33,13 +33,13 @@ from .sip_trunk_service import SipTrunkService
 sip_trunks_router = APIRouter(
     prefix="/sip-trunks",
     tags=["SIP Trunks"],
-    dependencies=[Depends(verify_tenant_api_key)],
+    dependencies=[Depends(verify_tenant_platform_access)],
 )
 
 phone_numbers_router = APIRouter(
     prefix="/phone-numbers",
     tags=["Phone Numbers"],
-    dependencies=[Depends(verify_tenant_api_key)],
+    dependencies=[Depends(verify_tenant_platform_access)],
 )
 
 

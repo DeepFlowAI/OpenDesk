@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from jose import JWTError, jwt
 
 from app.configs.settings import settings
-from app.core.exceptions import UnauthorizedError, NotFoundError
+from app.core import login_throttle
+from app.core.exceptions import RateLimitedError, UnauthorizedError, NotFoundError
 from app.core.security import verify_password, create_access_token
 from app.core.tenant_platform_auth import tenant_api_key_configured
 from app.repositories.tenant_repository import TenantRepository
@@ -22,6 +23,22 @@ logger = logging.getLogger(__name__)
 
 # Fallback TTL when the SSO JWT has no usable exp (matches issuer TOKEN_EXPIRE_SECONDS).
 _SSO_JTI_CLAIM_FALLBACK_TTL_SECONDS = 120
+
+# The account counter is the real brute-force guard: client IPs come from
+# X-Forwarded-For and can be spoofed, so the IP limit is only a loose backstop.
+LOGIN_ACCOUNT_FAIL_LIMIT = 10
+LOGIN_IP_FAIL_LIMIT = 50
+LOGIN_FAIL_WINDOW_SECONDS = 900
+
+
+def _account_fail_key(tenant_id: int, username: str) -> str:
+    return f"auth:login_fail:acct:{tenant_id}:{(username or '').strip().lower()}"
+
+
+def _ip_fail_key(client_ip: str | None) -> str | None:
+    if not client_ip or client_ip == "-":
+        return None
+    return f"auth:login_fail:ip:{client_ip}"
 
 
 class AuthService:
@@ -178,6 +195,12 @@ class AuthService:
         )
 
     @staticmethod
+    async def _record_login_failure(account_key: str, ip_key: str | None) -> None:
+        await login_throttle.record_failure(account_key, LOGIN_FAIL_WINDOW_SECONDS)
+        if ip_key:
+            await login_throttle.record_failure(ip_key, LOGIN_FAIL_WINDOW_SECONDS)
+
+    @staticmethod
     def _log_login_failure(
         *,
         reason: str,
@@ -228,8 +251,14 @@ class AuthService:
         user_agent: str | None = None,
     ) -> LoginResponse:
         """Authenticate user and return JWT token."""
+        ip_key = _ip_fail_key(client_ip)
+        if ip_key and await login_throttle.failure_count(ip_key) >= LOGIN_IP_FAIL_LIMIT:
+            raise RateLimitedError("Too many failed login attempts, try again later")
+
         tenant = await TenantRepository.resolve_by_identifier(db, data.tenant)
         if not tenant or not tenant.is_active:
+            if ip_key:
+                await login_throttle.record_failure(ip_key, LOGIN_FAIL_WINDOW_SECONDS)
             AuthService._log_login_failure(
                 reason="tenant_not_found",
                 tenant_input=data.tenant,
@@ -240,8 +269,13 @@ class AuthService:
             )
             raise NotFoundError("Tenant not found")
 
+        account_key = _account_fail_key(tenant.id, data.username)
+        if await login_throttle.failure_count(account_key) >= LOGIN_ACCOUNT_FAIL_LIMIT:
+            raise RateLimitedError("Too many failed login attempts, try again later")
+
         user = await EmployeeRepository.get_by_username_or_email(db, tenant.id, data.username)
         if not user:
+            await AuthService._record_login_failure(account_key, ip_key)
             AuthService._log_login_failure(
                 reason="user_not_found",
                 tenant_input=data.tenant,
@@ -254,6 +288,7 @@ class AuthService:
             raise UnauthorizedError("Invalid credentials")
 
         if not verify_password(data.password, user.password_hash):
+            await AuthService._record_login_failure(account_key, ip_key)
             AuthService._log_login_failure(
                 reason="invalid_password",
                 tenant_input=data.tenant,
@@ -278,6 +313,7 @@ class AuthService:
                 user_agent=user_agent,
             )
             raise UnauthorizedError("Account is disabled")
+        await login_throttle.clear_failures(account_key)
         replaced_previous = bool(user.current_session_id)
         await EmployeeSessionService.disconnect_current_socket(tenant.id, user.id)
         session_id = EmployeeSessionService.generate_session_id()

@@ -15,7 +15,12 @@ import logging
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.configs.settings import settings
+from app.configs.settings import (
+    DEFAULT_ADMIN_PASSWORD_PLACEHOLDER,
+    ENV,
+    is_production_env,
+    settings,
+)
 from app.core.security import hash_password
 from app.models.employee import Employee
 from app.models.system_settings import SystemSettings
@@ -58,6 +63,14 @@ async def _ensure_default_tenant(db: AsyncSession) -> None:
     if count > 0:
         return
 
+    password = settings.DEFAULT_ADMIN_PASSWORD or ""
+    if is_production_env() and password.strip() in {"", DEFAULT_ADMIN_PASSWORD_PLACEHOLDER}:
+        raise RuntimeError(
+            f"Refusing to create the first super-admin in '{ENV}' with an empty or "
+            "publicly documented DEFAULT_ADMIN_PASSWORD. Set a strong "
+            "DEFAULT_ADMIN_PASSWORD via environment variables and restart."
+        )
+
     tenant = Tenant(
         tenant_id=settings.DEFAULT_TENANT_ID,
         name=settings.DEFAULT_TENANT_NAME,
@@ -70,7 +83,7 @@ async def _ensure_default_tenant(db: AsyncSession) -> None:
         tenant_id=tenant.id,
         username=settings.DEFAULT_ADMIN_USERNAME,
         name=settings.DEFAULT_ADMIN_USERNAME,
-        password_hash=hash_password(settings.DEFAULT_ADMIN_PASSWORD),
+        password_hash=hash_password(password),
         roles=["admin"],
         is_super_admin=True,
         is_active=True,

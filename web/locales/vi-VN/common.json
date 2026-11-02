@@ -34,7 +34,7 @@
   "forgot.submit": "Đặt lại mật khẩu",
   "forgot.submitting": "Đang đặt lại",
   "forgot.backToLogin": "Quay lại đăng nhập",
-  "forgot.codeSent": "Mã xác minh đã được gửi đến email của bạn",
+  "forgot.codeSent": "Nếu tài khoản tồn tại và đã liên kết email, mã xác minh đã được gửi",
   "forgot.resetSuccess": "Đặt lại mật khẩu thành công. Vui lòng đăng nhập bằng mật khẩu mới.",
   "validation.loginTenant.required": "Vui lòng nhập ID doanh nghiệp",
   "validation.tenant.required": "Vui lòng nhập slug tenant hoặc ID tenant",

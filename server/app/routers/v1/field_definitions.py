@@ -224,7 +224,7 @@ async def get_field_definition(
     user: dict = Depends(get_current_user),
 ):
     """Get field definition detail with options/tree nodes."""
-    return await FdFieldDefinitionService.get_by_id(db, definition_id)
+    return await FdFieldDefinitionService.get_by_id(db, definition_id, user["tenant_id"])
 
 
 @router.put("/{definition_id}", response_model=FdFieldDefinitionResponse)
@@ -261,7 +261,7 @@ async def list_options(
     user: dict = Depends(get_current_user),
 ):
     """List options for a select-type field."""
-    return await FdFieldDefinitionService.get_options(db, definition_id)
+    return await FdFieldDefinitionService.get_options(db, definition_id, user["tenant_id"])
 
 
 @router.post(
@@ -317,7 +317,7 @@ async def list_tree_nodes(
     user: dict = Depends(get_current_user),
 ):
     """Get tree nodes for a tree-type field."""
-    return await FdFieldDefinitionService.get_tree_nodes(db, definition_id)
+    return await FdFieldDefinitionService.get_tree_nodes(db, definition_id, user["tenant_id"])
 
 
 @router.post(

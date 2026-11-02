@@ -201,6 +201,13 @@ class Settings(BaseSettings):
         description="Comma-separated accepted JWT audiences for Tenant Platform SSO.",
     )
 
+    # Built-in tenant console (/tenant) admin account. The console stays
+    # disabled while the password is empty. Changing either value signs out
+    # every existing console session.
+    TENANT_CONSOLE_USERNAME: str = Field(default="admin")
+    TENANT_CONSOLE_PASSWORD: str = Field(default="")
+    TENANT_CONSOLE_TOKEN_EXPIRE_HOURS: int = Field(default=12, ge=1, le=168)
+
     # ── Bulk SMS send engine (触达中心 · 短信群发) ───────────────────────
     SMS_BULK_SEND_WORKER_ENABLED: bool = Field(default=True)
     SMS_BULK_SEND_SCAN_INTERVAL_SECONDS: int = Field(default=5, ge=1)
@@ -281,6 +288,9 @@ class Settings(BaseSettings):
     # reconciliation. In single-active blue/green, the stable URL points at
     # the new color while established calls may still drain on the old color.
     TELEPHONY_RECONCILE_WS_URLS: str = Field(default="")
+    # Shared secret matching the kernel's FLOWKIT_API_KEY, sent as a Bearer
+    # token on every FlowKit WebSocket. Empty = no Authorization header.
+    TELEPHONY_API_KEY: str = Field(default="")
     TELEPHONY_SDK_NAME: str = Field(default="opendesk-cc")
     TELEPHONY_SDK_VERSION: str = Field(default="1.0.0")
     TELEPHONY_RPC_TIMEOUT: float = Field(default=30.0)
@@ -380,6 +390,13 @@ settings = Settings()
 # Environments treated as production-like, where booting with an insecure
 # default SECRET_KEY is refused. "dev"/"test"/"local" keep the default.
 _PRODUCTION_ENVS = {"prod", "production", "staging"}
+
+# Publicly documented first-run password; never acceptable for a production seed.
+DEFAULT_ADMIN_PASSWORD_PLACEHOLDER = "Admin123456"
+
+
+def is_production_env() -> bool:
+    return ENV.lower() in _PRODUCTION_ENVS
 
 
 def assert_safe_production_config() -> None:

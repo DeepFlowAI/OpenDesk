@@ -11,11 +11,12 @@ cp .env.example .env
 
 # 必填：生成强随机 SECRET_KEY 追加到 .env
 python -c "import secrets; print('SECRET_KEY=' + secrets.token_hex(32))" >> .env
+# 必填：在 .env 里填写 DEFAULT_ADMIN_PASSWORD（首个管理员的密码）
 
 docker compose up -d
 ```
 
-打开 <http://localhost:3000> → 用 `default / admin / Admin123456` 登录 → **立刻改密码**。
+打开 <http://localhost:3000> → 用 `default / admin / 你设置的 DEFAULT_ADMIN_PASSWORD` 登录。
 
 ## 切换模式（编辑 `.env`）
 

@@ -253,6 +253,7 @@ function LoginPage() {
 
   const mapApiError = (status: number, code?: string): string => {
     if (code === 'NOT_FOUND') return t('error.tenant_not_found', locale)
+    if (code === 'RATE_LIMITED') return t('error.rate_limited', locale)
     if (code === 'UNAUTHORIZED') {
       return t('error.invalid_credentials', locale)
     }

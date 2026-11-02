@@ -34,7 +34,7 @@
   "forgot.submit": "Atur ulang kata sandi",
   "forgot.submitting": "Mengatur ulang...",
   "forgot.backToLogin": "Kembali ke halaman masuk",
-  "forgot.codeSent": "Kode verifikasi telah dikirim ke email Anda",
+  "forgot.codeSent": "Jika akun ada dan memiliki email, kode verifikasi telah dikirim",
   "forgot.resetSuccess": "Kata sandi berhasil diatur ulang. Silakan masuk dengan kata sandi baru Anda.",
   "validation.loginTenant.required": "Silakan masukkan ID perusahaan",
   "validation.tenant.required": "Silakan masukkan slug tenant atau ID tenant",

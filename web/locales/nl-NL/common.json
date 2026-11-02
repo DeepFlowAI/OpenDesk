@@ -34,7 +34,7 @@
   "forgot.submit": "Wachtwoord opnieuw instellen",
   "forgot.submitting": "Resetten...",
   "forgot.backToLogin": "Terug naar inloggen",
-  "forgot.codeSent": "Er is een verificatiecode naar uw e-mailadres verzonden",
+  "forgot.codeSent": "Als het account bestaat en een e-mailadres heeft, is er een verificatiecode verzonden",
   "forgot.resetSuccess": "Wachtwoord opnieuw instellen gelukt. Meld u aan met uw nieuwe wachtwoord.",
   "validation.loginTenant.required": "Voer uw ondernemings-ID in",
   "validation.tenant.required": "Voer de tenant-slug of tenant-ID in",

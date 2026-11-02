@@ -53,6 +53,7 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
         sdk_name: str,
         sdk_version: str,
         rpc_timeout: float = 30.0,
+        api_key: str = "",
     ) -> None:
         if not ws_urls:
             raise ValueError("ws_urls must be non-empty")
@@ -62,6 +63,7 @@ class MultiKernelTelephonyClient(BaseTelephonyClient):
                 sdk_name=sdk_name,
                 sdk_version=sdk_version,
                 rpc_timeout=rpc_timeout,
+                api_key=api_key,
             )
             for url in ws_urls
         ]

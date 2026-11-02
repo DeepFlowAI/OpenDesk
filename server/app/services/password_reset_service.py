@@ -1,8 +1,9 @@
 """
 Password reset service
 """
-import random
+import hmac
 import logging
+import secrets
 
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 VERIFY_CODE_KEY = "verify_code:{tenant_id}:{user_id}"
 VERIFY_COOLDOWN_KEY = "verify_cooldown:{tenant_id}:{user_id}"
+VERIFY_ATTEMPTS_KEY = "verify_attempts:{tenant_id}:{user_id}"
+
+# A 6-digit code has 10^6 values; burning it after a few wrong guesses keeps
+# brute force impractical within the code's lifetime.
+VERIFY_CODE_MAX_ATTEMPTS = 5
 
 ZH_SUBJECT = "【OpenDesk】找回密码验证码"
 ZH_BODY = """您好，
@@ -51,26 +57,34 @@ class PasswordResetService:
         redis: aioredis.Redis,
         data: SendVerifyCodeRequest,
     ) -> None:
-        """Generate verification code and send to user email."""
+        """Generate verification code and send to user email.
+
+        Unknown accounts and accounts without an email return silently, so the
+        response does not reveal which usernames exist.
+        """
         tenant = await TenantRepository.resolve_by_identifier(db, data.tenant)
         if not tenant or not tenant.is_active:
             raise NotFoundError("Tenant not found")
 
         user = await EmployeeRepository.get_by_username_or_email(db, tenant.id, data.username)
-        if not user:
-            raise NotFoundError("Account not found")
-
-        if not user.email:
-            raise ValidationError("User has no email configured")
+        if not user or not user.email:
+            logger.info(
+                "Password reset code skipped: tenant_id=%s reason=%s",
+                tenant.id,
+                "account_not_found" if not user else "no_email",
+            )
+            return
 
         cooldown_key = VERIFY_COOLDOWN_KEY.format(tenant_id=tenant.id, user_id=user.id)
         if await redis.exists(cooldown_key):
             raise RateLimitedError("Too many attempts. Please try again later.")
 
-        code = f"{random.randint(0, 999999):06d}"
+        code = f"{secrets.randbelow(1_000_000):06d}"
 
         code_key = VERIFY_CODE_KEY.format(tenant_id=tenant.id, user_id=user.id)
+        attempts_key = VERIFY_ATTEMPTS_KEY.format(tenant_id=tenant.id, user_id=user.id)
         await redis.setex(code_key, settings.VERIFY_CODE_EXPIRE_SECONDS, code)
+        await redis.delete(attempts_key)
         await redis.setex(cooldown_key, settings.VERIFY_CODE_COOLDOWN_SECONDS, "1")
 
         is_zh = data.locale.startswith("zh")
@@ -98,15 +112,29 @@ class PasswordResetService:
 
         user = await EmployeeRepository.get_by_username_or_email(db, tenant.id, data.username)
         if not user:
-            raise NotFoundError("Account not found")
+            raise InvalidCodeError("Invalid or expired verification code")
 
         code_key = VERIFY_CODE_KEY.format(tenant_id=tenant.id, user_id=user.id)
+        attempts_key = VERIFY_ATTEMPTS_KEY.format(tenant_id=tenant.id, user_id=user.id)
         stored_code = await redis.get(code_key)
+        if not stored_code:
+            raise InvalidCodeError("Invalid or expired verification code")
 
-        if not stored_code or stored_code != data.verify_code:
+        if not hmac.compare_digest(str(stored_code), str(data.verify_code or "")):
+            attempts = await redis.incr(attempts_key)
+            if attempts == 1:
+                await redis.expire(attempts_key, settings.VERIFY_CODE_EXPIRE_SECONDS)
+            if attempts >= VERIFY_CODE_MAX_ATTEMPTS:
+                await redis.delete(code_key, attempts_key)
+                logger.warning(
+                    "Password reset code burned after %s wrong attempts: tenant_id=%s user_id=%s",
+                    attempts,
+                    tenant.id,
+                    user.id,
+                )
             raise InvalidCodeError("Invalid or expired verification code")
 
         new_hash = hash_password(data.new_password)
         await EmployeeRepository.update_password(db, user, new_hash)
 
-        await redis.delete(code_key)
+        await redis.delete(code_key, attempts_key)

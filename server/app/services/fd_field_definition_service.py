@@ -453,9 +453,11 @@ class FdFieldDefinitionService:
         }
 
     @staticmethod
-    async def get_by_id(db: AsyncSession, definition_id: int) -> "FdFieldDefinition":
+    async def get_by_id(
+        db: AsyncSession, definition_id: int, tenant_id: int | None = None,
+    ) -> "FdFieldDefinition":
         item = await FdFieldDefinitionRepository.get_by_id(db, definition_id)
-        if not item:
+        if not item or (tenant_id is not None and item.tenant_id != tenant_id):
             raise NotFoundError("Field definition not found")
         return item
 
@@ -627,7 +629,8 @@ class FdFieldDefinitionService:
     # ── Options ──
 
     @staticmethod
-    async def get_options(db: AsyncSession, definition_id: int) -> list:
+    async def get_options(db: AsyncSession, definition_id: int, tenant_id: int) -> list:
+        await FdFieldDefinitionService.get_by_id(db, definition_id, tenant_id)
         return await FdFieldDefinitionRepository.get_options(db, definition_id)
 
     @staticmethod
@@ -675,7 +678,8 @@ class FdFieldDefinitionService:
     # ── Tree Nodes ──
 
     @staticmethod
-    async def get_tree_nodes(db: AsyncSession, definition_id: int) -> list:
+    async def get_tree_nodes(db: AsyncSession, definition_id: int, tenant_id: int) -> list:
+        await FdFieldDefinitionService.get_by_id(db, definition_id, tenant_id)
         return await FdFieldDefinitionRepository.get_tree_nodes(db, definition_id)
 
     @staticmethod

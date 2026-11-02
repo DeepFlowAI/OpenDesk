@@ -56,10 +56,10 @@ describe('adoptNewerTokenIfAny', () => {
   // must not skip session clear.
   it('does not skip clear when the refreshed token itself was rejected', () => {
     localStorage.setItem('auth_token', 'token-used-for-refresh')
-    useAuthStore.setState({ token: 'older-request-token' })
+    useAuthStore.setState({ token: 'old-token' })
 
     expect(adoptNewerTokenIfAny('token-used-for-refresh')).toBe(false)
-    expect(useAuthStore.getState().token).toBe('older-request-token')
+    expect(useAuthStore.getState().token).toBe('old-token')
   })
 
   it('returns false when there is no stored token', () => {

@@ -86,6 +86,13 @@ VISITOR_HISTORY_PAGE_SIZE = 10
 VISITOR_HISTORY_MESSAGE_LIMIT = 200
 VISITOR_HISTORY_TOTAL_MESSAGE_LIMIT = 1000
 VISITOR_UNREAD_OFFLINE_REPLY_LIMIT = 3
+# Visitors are untrusted: rich_text is rendered as HTML in the agent workspace,
+# and system-style types would impersonate platform messages.
+VISITOR_SENDABLE_CONTENT_TYPES = frozenset({
+    MessageContentType.TEXT.value,
+    MessageContentType.IMAGE.value,
+    MessageContentType.FILE.value,
+})
 WORKSPACE_MY_HISTORY_DAYS = 30
 WORKSPACE_MY_HISTORY_PAGE_SIZE = 20
 PEER_VIEW_PERMISSION = "chat.conversation.peer.view"
@@ -2458,6 +2465,8 @@ class ConversationService:
         content: str,
         quoted_message_id: int | None = None,
     ) -> tuple[dict, int | None, object | None]:
+        if content_type not in VISITOR_SENDABLE_CONTENT_TYPES:
+            raise ValidationError("Unsupported content_type for visitor messages")
         conversation = await ConversationService.get_conversation_for_visitor_session(
             db,
             conversation_public_id=conversation_public_id,

@@ -34,7 +34,7 @@
   "forgot.submit": "Сбросить пароль",
   "forgot.submitting": "Сброс...",
   "forgot.backToLogin": "Вернуться ко входу",
-  "forgot.codeSent": "Код подтверждения отправлен на ваш email",
+  "forgot.codeSent": "Если аккаунт существует и к нему привязан email, код подтверждения отправлен",
   "forgot.resetSuccess": "Пароль успешно сброшен. Войдите с новым паролем.",
   "validation.loginTenant.required": "Введите ID предприятия",
   "validation.tenant.required": "Введите slug или ID арендатора",

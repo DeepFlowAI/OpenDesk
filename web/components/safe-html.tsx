@@ -1,5 +1,6 @@
 'use client'
 
+import DOMPurify from 'isomorphic-dompurify'
 import { useMemo } from 'react'
 import type { HTMLAttributes } from 'react'
 
@@ -9,8 +10,8 @@ type SafeHtmlProps = {
 } & Omit<HTMLAttributes<HTMLDivElement>, 'dangerouslySetInnerHTML' | 'children'>
 
 /**
- * Renders an HTML string inside a div after stripping scripts and event handlers
- * while keeping safe rich-text markup.
+ * Renders an HTML string inside a div after sanitizing it with DOMPurify,
+ * keeping safe rich-text markup.
  *
  * Use this instead of a raw `dangerouslySetInnerHTML` for any content that
  * originated from user or operator input.
@@ -20,30 +21,31 @@ export function SafeHtml({ html, ...divProps }: SafeHtmlProps) {
   return <div {...divProps} dangerouslySetInnerHTML={{ __html: clean }} />
 }
 
-function sanitizeHtmlString(html: string): string {
-  return html
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
-    .replace(/\s+on[a-z]+\s*=\s*(".*?"|'.*?'|[^\s>]+)/gi, '')
-    .replace(/\s+(href|src)\s*=\s*("|')\s*javascript:[\s\S]*?\2/gi, '')
-    .replace(/\s+(href|src)\s*=\s*javascript:[^\s>]+/gi, '')
+// DOMPurify's default URI allowlist plus `blob:`, which the composer uses for
+// local image previews before upload.
+const ALLOWED_URI_REGEXP =
+  /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|blob):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
+
+const SANITIZE_CONFIG = {
+  ADD_ATTR: ['target'],
+  FORBID_TAGS: ['style', 'form', 'iframe', 'object', 'embed'],
+  ALLOWED_URI_REGEXP,
 }
 
-function sanitizeHtml(html: string): string {
-  if (typeof document === 'undefined') return sanitizeHtmlString(html)
+let hooksInstalled = false
 
-  const template = document.createElement('template')
-  template.innerHTML = sanitizeHtmlString(html)
-  template.content.querySelectorAll('script, style, iframe, object, embed').forEach((node) => node.remove())
-  template.content.querySelectorAll('*').forEach((node) => {
-    Array.from(node.attributes).forEach((attr) => {
-      const name = attr.name.toLowerCase()
-      const value = attr.value.trim().toLowerCase()
-      if (name.startsWith('on')) node.removeAttribute(attr.name)
-      if ((name === 'href' || name === 'src') && value.startsWith('javascript:')) {
-        node.removeAttribute(attr.name)
-      }
-    })
+function installHooks() {
+  if (hooksInstalled) return
+  hooksInstalled = true
+  DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+    if (node.tagName === 'A' && node.getAttribute('target') === '_blank') {
+      node.setAttribute('rel', 'noopener noreferrer')
+    }
   })
-  return template.innerHTML
+}
+
+export function sanitizeHtml(html: string): string {
+  if (!html) return ''
+  installHooks()
+  return DOMPurify.sanitize(html, SANITIZE_CONFIG)
 }

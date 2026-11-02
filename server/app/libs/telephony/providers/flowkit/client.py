@@ -56,11 +56,15 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         sdk_name: str,
         sdk_version: str,
         rpc_timeout: float = 30.0,
+        api_key: str = "",
     ) -> None:
         self._ws_url = ws_url
         self._sdk_name = sdk_name
         self._sdk_version = sdk_version
         self._rpc_timeout = rpc_timeout
+        # Sent as "Authorization: Bearer <key>" on the WebSocket handshake;
+        # required when the kernel sets FLOWKIT_API_KEY.
+        self._api_key = api_key
 
         self._ws: WebSocketClientProtocol | None = None
         self._id_counter = count(1)
@@ -174,7 +178,13 @@ class FlowKitTelephonyClient(BaseTelephonyClient):
         )
 
     async def _open_and_handshake(self) -> None:
-        ws = await websockets.connect(self._ws_url, ping_interval=20, ping_timeout=20)
+        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+        ws = await websockets.connect(
+            self._ws_url,
+            ping_interval=20,
+            ping_timeout=20,
+            additional_headers=headers,
+        )
         try:
             # Send hello inline (recv loop not running yet) so we don't race
             hello = {

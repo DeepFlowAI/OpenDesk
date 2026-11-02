@@ -50,7 +50,7 @@ async def _create_tenant(client) -> str:
 @pytest.mark.asyncio
 async def test_missing_api_key(client):
     resp = await client.get(TRUNKS)
-    assert resp.status_code == 422
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio

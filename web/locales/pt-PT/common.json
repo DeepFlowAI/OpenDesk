@@ -34,7 +34,7 @@
   "forgot.submit": "Repor palavra-passe",
   "forgot.submitting": "A repor...",
   "forgot.backToLogin": "Voltar ao início de sessão",
-  "forgot.codeSent": "O código de verificação foi enviado para o seu email",
+  "forgot.codeSent": "Se a conta existir e tiver um email, o código de verificação foi enviado",
   "forgot.resetSuccess": "Palavra-passe reposta com sucesso. Inicie sessão com a nova palavra-passe.",
   "validation.loginTenant.required": "Introduza o ID empresarial",
   "validation.tenant.required": "Introduza o slug ou ID do tenant",

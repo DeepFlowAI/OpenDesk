@@ -53,6 +53,7 @@ def get_telephony_client() -> BaseTelephonyClient:
                     sdk_name=settings.TELEPHONY_SDK_NAME,
                     sdk_version=settings.TELEPHONY_SDK_VERSION,
                     rpc_timeout=settings.TELEPHONY_RPC_TIMEOUT,
+                    api_key=settings.TELEPHONY_API_KEY,
                 )
             else:
                 from app.libs.telephony.providers.flowkit.multi_client import (
@@ -64,6 +65,7 @@ def get_telephony_client() -> BaseTelephonyClient:
                     sdk_name=settings.TELEPHONY_SDK_NAME,
                     sdk_version=settings.TELEPHONY_SDK_VERSION,
                     rpc_timeout=settings.TELEPHONY_RPC_TIMEOUT,
+                    api_key=settings.TELEPHONY_API_KEY,
                 )
         case "mock":
             from app.libs.telephony.providers.mock.client import MockTelephonyClient

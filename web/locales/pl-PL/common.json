@@ -34,7 +34,7 @@
   "forgot.submit": "Zresetuj hasło",
   "forgot.submitting": "Resetowanie...",
   "forgot.backToLogin": "Wróć do logowania",
-  "forgot.codeSent": "Kod weryfikacyjny został wysłany na Twój e-mail",
+  "forgot.codeSent": "Jeśli konto istnieje i ma przypisany e-mail, kod weryfikacyjny został wysłany",
   "forgot.resetSuccess": "Hasło zostało zresetowane. Zaloguj się nowym hasłem.",
   "validation.loginTenant.required": "Wprowadź identyfikator firmy",
   "validation.tenant.required": "Wprowadź slug lub identyfikator najemcy",

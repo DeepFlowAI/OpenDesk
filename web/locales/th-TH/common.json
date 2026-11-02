@@ -34,7 +34,7 @@
   "forgot.submit": "รีเซ็ตรหัสผ่าน",
   "forgot.submitting": "กำลังรีเซ็ต...",
   "forgot.backToLogin": "กลับไปหน้าเข้าสู่ระบบ",
-  "forgot.codeSent": "ส่งรหัสยืนยันไปยังอีเมลของคุณแล้ว",
+  "forgot.codeSent": "หากบัญชีนี้มีอยู่และผูกอีเมลไว้ ระบบได้ส่งรหัสยืนยันแล้ว",
   "forgot.resetSuccess": "รีเซ็ตรหัสผ่านสำเร็จ กรุณาเข้าสู่ระบบด้วยรหัสผ่านใหม่",
   "validation.loginTenant.required": "กรุณากรอก enterprise ID",
   "validation.tenant.required": "กรุณากรอก tenant slug หรือ tenant ID",

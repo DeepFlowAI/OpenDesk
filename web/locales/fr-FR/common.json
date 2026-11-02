@@ -34,7 +34,7 @@
   "forgot.submit": "Réinitialiser le mot de passe",
   "forgot.submitting": "Réinitialisation en cours...",
   "forgot.backToLogin": "Retour à la connexion",
-  "forgot.codeSent": "Le code de vérification a été envoyé à votre e-mail",
+  "forgot.codeSent": "Si le compte existe et possède un e-mail, le code de vérification a été envoyé",
   "forgot.resetSuccess": "Mot de passe réinitialisé avec succès. Veuillez vous connecter avec votre nouveau mot de passe.",
   "validation.loginTenant.required": "Veuillez saisir l'identifiant entreprise",
   "validation.tenant.required": "Veuillez saisir le slug ou l'identifiant du tenant",

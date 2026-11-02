@@ -173,7 +173,7 @@ function ForgotPasswordPage() {
 
   const mapApiError = (status: number, code?: string): string => {
     if (code === 'NOT_FOUND') {
-      return t('error.account_not_found', locale)
+      return t('error.tenant_not_found', locale)
     }
     if (code === 'RATE_LIMITED') return t('error.rate_limited', locale)
     if (code === 'INVALID_CODE') return t('error.invalid_code', locale)
